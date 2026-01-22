@@ -247,6 +247,90 @@ app.get("/api/sap/items", async (req, res) => {
   }
 });
 
+/* ========= Crear Cotización (Quotation) =========
+   POST /api/sap/quotation
+   Body:
+   {
+     customer: { nombre, tel, mail, dir },
+     items: [{ sku, qty, price }]
+   }
+*/
+const SAP_WEB_CARD_CODE = process.env.SAP_WEB_CARD_CODE || "C00001";
+
+app.post("/api/sap/quotation", async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({
+        ok: false,
+        message: "Faltan variables SAP en Render > Environment",
+      });
+    }
+
+    const { customer, items } = req.body;
+
+    if (!customer?.nombre || !customer?.tel || !customer?.dir) {
+      return res.status(400).json({ ok: false, message: "Faltan datos del cliente." });
+    }
+
+    if (!items?.length) {
+      return res.status(400).json({ ok: false, message: "Carrito vacío." });
+    }
+
+    // Validación mínima items
+    for (const it of items) {
+      if (!it?.sku || !it?.qty) {
+        return res.status(400).json({ ok: false, message: "Items inválidos." });
+      }
+    }
+
+    // ✅ Armamos el payload SAP Quotation
+    const payload = {
+      CardCode: SAP_WEB_CARD_CODE,
+      DocDate: new Date().toISOString().slice(0, 10),
+      DocDueDate: new Date().toISOString().slice(0, 10),
+      Comments: `Pedido Web - Pago contra entrega
+Cliente: ${customer.nombre}
+Tel: ${customer.tel}
+Correo: ${customer.mail || ""}
+Dirección: ${customer.dir}`,
+
+      DocumentLines: items.map((it) => {
+        const line = {
+          ItemCode: String(it.sku).replace("E-", "").trim(), // si tu SKU viene tipo "E-0110"
+          Quantity: Number(it.qty || 1),
+          WarehouseCode: SAP_WAREHOUSE,
+        };
+
+        // ✅ Si viene price, lo mandamos (opcional)
+        // Si no viene, SAP intenta calcular con lista del BP (depende configuración)
+        if (it.price != null && !isNaN(Number(it.price))) {
+          line.UnitPrice = Number(it.price);
+        }
+
+        return line;
+      }),
+    };
+
+    // ✅ Crear cotización en SAP
+    const sapResult = await slFetch(`/Quotations`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+
+    // SAP normalmente devuelve DocEntry / DocNum
+    return res.json({
+      ok: true,
+      message: "✅ Cotización creada en SAP",
+      docEntry: sapResult.DocEntry,
+      docNum: sapResult.DocNum,
+    });
+  } catch (err) {
+    console.error("❌ /api/sap/quotation error:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+
 /* ========= START ========= */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT));
