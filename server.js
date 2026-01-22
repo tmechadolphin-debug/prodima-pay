@@ -145,9 +145,6 @@ async function getPriceListNoByName(name) {
   return null;
 }
 
-/* ========= Endpoint: item + precio + stock por bodega =========
-   GET /api/sap/item/0110
-*/
 app.get("/api/sap/item/:code", async (req, res) => {
   try {
     if (missingSapEnv()) {
@@ -160,39 +157,36 @@ app.get("/api/sap/item/:code", async (req, res) => {
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
 
-    // ✅ 1) Pedimos el item con sus colecciones internas
-    const item = await slFetch(
-      `/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection`
-    );
+    // ✅ 1) Pedir el item COMPLETO (SIN $select)
+    const item = await slFetch(`/Items('${encodeURIComponent(code)}')`);
 
-    // ✅ 2) BUSCAR STOCK POR BODEGA dentro de ItemWarehouseInfoCollection
-    const whArray = Array.isArray(item.ItemWarehouseInfoCollection)
-      ? item.ItemWarehouseInfoCollection
-      : [];
-
-    const wh = whArray.find((w) => String(w.WarehouseCode) === String(SAP_WAREHOUSE));
-
-    // algunos Service Layer usan InStock / OnHand / Committed, etc.
-    const onHand =
-      wh?.InStock ?? wh?.OnHand ?? wh?.OnHandQty ?? wh?.QuantityOnStock ?? null;
-
-    const committed = wh?.Committed ?? wh?.CommittedQty ?? 0;
-
-    const available =
-      onHand !== null ? Number(onHand) - Number(committed) : null;
-
-    const hasStock = available !== null ? available > 0 : null;
-
-    // ✅ 3) PRECIO: buscar PriceListNo (ya lo tienes)
+    // ✅ 2) PriceListNo por nombre (ya lo tienes)
     const priceListNo = await getPriceListNoByName(SAP_PRICE_LIST);
 
-    // ✅ 4) Buscar el precio dentro de ItemPrices[]
-    const pricesArray = Array.isArray(item.ItemPrices) ? item.ItemPrices : [];
-
+    // ✅ 3) Precio desde ItemPrices (si existe)
     let price = null;
-    if (priceListNo !== null) {
-      const p = pricesArray.find((x) => Number(x.PriceList) === Number(priceListNo));
+    if (priceListNo !== null && Array.isArray(item.ItemPrices)) {
+      const p = item.ItemPrices.find((x) => Number(x.PriceList) === Number(priceListNo));
       if (p?.Price != null) price = Number(p.Price);
+    }
+
+    // ✅ 4) Stock desde ItemWarehouseInfoCollection (si existe)
+    let onHand = null;
+    let committed = 0;
+    let available = null;
+    let hasStock = null;
+
+    if (Array.isArray(item.ItemWarehouseInfoCollection)) {
+      const wh = item.ItemWarehouseInfoCollection.find(
+        (w) => String(w.WarehouseCode) === String(SAP_WAREHOUSE)
+      );
+
+      if (wh) {
+        onHand = wh.InStock ?? wh.OnHand ?? null;
+        committed = wh.Committed ?? 0;
+        available = onHand !== null ? Number(onHand) - Number(committed) : null;
+        hasStock = available !== null ? available > 0 : null;
+      }
     }
 
     return res.json({
@@ -207,18 +201,14 @@ app.get("/api/sap/item/:code", async (req, res) => {
       priceList: SAP_PRICE_LIST,
       priceListNo,
       price,
-      stock: {
-        onHand,
-        committed,
-        available,
-        hasStock,
-      },
+      stock: { onHand, committed, available, hasStock },
     });
   } catch (err) {
     console.error("❌ /api/sap/item error:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
+
 
 /* ========= START ========= */
 const PORT = process.env.PORT || 10000;
