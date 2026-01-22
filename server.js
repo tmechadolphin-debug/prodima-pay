@@ -2,52 +2,65 @@ import express from "express";
 import cors from "cors";
 
 const app = express();
-app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 /**
  * =========================
- * CONFIG SAP (ENV VARS)
+ * ENV VARS (Render)
  * =========================
- * Render -> Environment Variables:
- *
- * SAP_SL_URL       = https://india.pa2.sap.topmanage.cloud/b1s/v1
- * SAP_COMPANY_DB   = C7357449_PRDMA_PRD
- * SAP_USERNAME     = adm-red@prodima.com.pa
- * SAP_PASSWORD     = (tu password)
  */
-const SAP_SL_URL = process.env.SAP_SL_URL;
-const SAP_COMPANY_DB = process.env.SAP_COMPANY_DB;
-const SAP_USERNAME = process.env.SAP_USERNAME;
-const SAP_PASSWORD = process.env.SAP_PASSWORD;
+const SAP_BASE_URL   = process.env.SAP_BASE_URL;      // https://india.pa2.sap.topmanage.cloud/b1s/v1
+const SAP_COMPANYDB  = process.env.SAP_COMPANYDB;     // C7357449_PRDMA_PRD
+const SAP_USER       = process.env.SAP_USER;          // adm-red@prodima.com.pa
+const SAP_PASS       = process.env.SAP_PASS;          // tu password
+const SAP_WAREHOUSE  = process.env.SAP_WAREHOUSE || "01";
+const SAP_PRICE_LIST = process.env.SAP_PRICE_LIST || "Lista Distribuidor";
 
-if (!SAP_SL_URL || !SAP_COMPANY_DB || !SAP_USERNAME || !SAP_PASSWORD) {
+const YAPPY_ALIAS    = process.env.YAPPY_ALIAS || "@prodimasansae";
+const CORS_ORIGIN    = process.env.CORS_ORIGIN || "*";
+
+/**
+ * =========================
+ * CORS (solo tu dominio)
+ * =========================
+ */
+app.use(
+  cors({
+    origin: CORS_ORIGIN === "*" ? "*" : [CORS_ORIGIN],
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
+
+if (!SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS) {
   console.warn("⚠️ Faltan variables de entorno SAP. Revisa Render > Environment.");
 }
 
 /**
  * =========================
- * COOKIE SESSION EN MEMORIA
+ * SAP SESSION COOKIE EN MEMORIA
  * =========================
  */
 let sapCookie = "";
 
-/**
- * Extrae la cookie de sesión desde el header set-cookie.
- * Normalmente incluye B1SESSION y/o ROUTEID.
- */
+// toma el set-cookie completo
 function extractCookie(headers) {
   return headers.get("set-cookie") || "";
 }
 
 async function sapLogin() {
+  if (!SAP_BASE_URL) throw new Error("Falta SAP_BASE_URL");
+  if (!SAP_COMPANYDB) throw new Error("Falta SAP_COMPANYDB");
+  if (!SAP_USER) throw new Error("Falta SAP_USER");
+  if (!SAP_PASS) throw new Error("Falta SAP_PASS");
+
   const payload = {
-    CompanyDB: SAP_COMPANY_DB,
-    UserName: SAP_USERNAME,
-    Password: SAP_PASSWORD,
+    CompanyDB: SAP_COMPANYDB,
+    UserName: SAP_USER,
+    Password: SAP_PASS,
   };
 
-  const resp = await fetch(`${SAP_SL_URL}/Login`, {
+  const resp = await fetch(`${SAP_BASE_URL}/Login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -60,33 +73,30 @@ async function sapLogin() {
 
   sapCookie = extractCookie(resp.headers);
   if (!sapCookie) {
-    console.warn("⚠️ Login OK pero no recibí set-cookie. Verifica el host/proxy de SAP.");
+    console.warn("⚠️ Login OK pero no recibí set-cookie. Verifica SAP Service Layer.");
   }
-  return true;
 }
 
 async function sapFetch(path, { method = "GET", body } = {}) {
-  if (!sapCookie) {
-    await sapLogin();
-  }
+  if (!sapCookie) await sapLogin();
 
   const headers = {
     "Content-Type": "application/json",
     Cookie: sapCookie,
   };
 
-  let resp = await fetch(`${SAP_SL_URL}${path}`, {
+  let resp = await fetch(`${SAP_BASE_URL}${path}`, {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
   });
 
-  // Si expiró la sesión, reintenta
+  // si expiró sesión, re-login 1 vez
   if (resp.status === 401) {
     sapCookie = "";
     await sapLogin();
 
-    resp = await fetch(`${SAP_SL_URL}${path}`, {
+    resp = await fetch(`${SAP_BASE_URL}${path}`, {
       method,
       headers: {
         "Content-Type": "application/json",
@@ -106,7 +116,22 @@ async function sapFetch(path, { method = "GET", body } = {}) {
 
 /**
  * =========================
- * BUSCAR PriceListNo por nombre (exacto)
+ * HEALTH
+ * =========================
+ */
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    message: "✅ PRODIMA API activa",
+    yappy: YAPPY_ALIAS,
+    warehouse: SAP_WAREHOUSE,
+    priceList: SAP_PRICE_LIST,
+  });
+});
+
+/**
+ * =========================
+ * BUSCAR PriceListNo por nombre exacto
  * =========================
  */
 async function getPriceListNoByName(priceListName) {
@@ -120,27 +145,19 @@ async function getPriceListNoByName(priceListName) {
 
 /**
  * =========================
- * HEALTH
+ * STOCK + PRECIO POR SKU
  * =========================
- */
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true, message: "✅ PRODIMA API activa" });
-});
-
-/**
- * =========================
- * ITEMS + STOCK + PRICE
- * =========================
- * GET /api/sap/items?warehouse=01&pricelist=Lista%20Distribuidor&skus=E-0100,E-0101
+ * GET /api/sap/items?skus=E-0100,E-0101
  */
 app.get("/api/sap/items", async (req, res) => {
   try {
-    const warehouse = (req.query.warehouse || "01").toString();
-    const priceListName = (req.query.pricelist || "Lista Distribuidor").toString();
+    const warehouse = (req.query.warehouse || SAP_WAREHOUSE).toString();
+    const priceListName = (req.query.pricelist || SAP_PRICE_LIST).toString();
 
-    // Lista de SKUs opcional (separados por coma)
     const skusRaw = (req.query.skus || "").toString().trim();
-    const skus = skusRaw ? skusRaw.split(",").map((x) => x.trim()).filter(Boolean) : [];
+    const skus = skusRaw
+      ? skusRaw.split(",").map((x) => x.trim()).filter(Boolean)
+      : [];
 
     const priceListNo = await getPriceListNoByName(priceListName);
     if (priceListNo === null) {
@@ -150,47 +167,39 @@ app.get("/api/sap/items", async (req, res) => {
       });
     }
 
-    let results = [];
+    if (!skus.length) {
+      return res.status(400).json({
+        ok: false,
+        message: "Debes enviar skus=SKU1,SKU2,...",
+      });
+    }
 
-    if (skus.length) {
-      // Consulta por SKU para asegurar stock y precio por warehouse y lista
-      for (const sku of skus) {
-        const item = await sapFetch(
-          `/Items('${encodeURIComponent(sku)}')?$select=ItemCode,ItemName,ItemPrices,ItemWarehouseInfoCollection&$expand=ItemPrices,ItemWarehouseInfoCollection`
-        );
+    const results = [];
 
-        // Stock en warehouse
-        const wh = (item.ItemWarehouseInfoCollection || []).find(
-          (w) => (w.WarehouseCode || "").toString() === warehouse
-        );
+    for (const sku of skus) {
+      const item = await sapFetch(
+        `/Items('${encodeURIComponent(sku)}')?$select=ItemCode,ItemName,ItemPrices,ItemWarehouseInfoCollection&$expand=ItemPrices,ItemWarehouseInfoCollection`
+      );
 
-        // Dependiendo de la versión puede venir InStock u OnHand
-        const stock = Number(wh?.InStock ?? wh?.OnHand ?? 0);
+      const wh = (item.ItemWarehouseInfoCollection || []).find(
+        (w) => (w.WarehouseCode || "").toString() === warehouse
+      );
 
-        // Precio en lista
-        const priceRow = (item.ItemPrices || []).find(
-          (p) => Number(p.PriceList) === Number(priceListNo)
-        );
-        const price = Number(priceRow?.Price ?? 0);
+      // En SAP puede venir InStock o OnHand (depende versión)
+      const stock = Number(wh?.InStock ?? wh?.OnHand ?? 0);
 
-        results.push({
-          sku: item.ItemCode,
-          name: item.ItemName,
-          price,
-          stock,
-          available: stock > 0,
-        });
-      }
-    } else {
-      // Si no pasan SKUs, devuelve los primeros 50 como demo (sin precios/stock)
-      const data = await sapFetch(`/Items?$select=ItemCode,ItemName&$orderby=ItemCode asc&$top=50`);
-      results = (data.value || []).map((x) => ({
-        sku: x.ItemCode,
-        name: x.ItemName,
-        price: 0,
-        stock: 0,
-        available: false,
-      }));
+      const priceRow = (item.ItemPrices || []).find(
+        (p) => Number(p.PriceList) === Number(priceListNo)
+      );
+      const price = Number(priceRow?.Price ?? 0);
+
+      results.push({
+        sku: item.ItemCode,
+        name: item.ItemName,
+        price,
+        stock,
+        available: stock > 0,
+      });
     }
 
     return res.json({ ok: true, warehouse, priceListName, results });
@@ -202,7 +211,64 @@ app.get("/api/sap/items", async (req, res) => {
 
 /**
  * =========================
- * START
+ * YAPPY ORDER (REGISTRO)
+ * POST /api/yappy-order
+ * =========================
+ */
+const yappyOrders = [];
+
+app.post("/api/yappy-order", (req, res) => {
+  try {
+    const order = req.body;
+
+    if (!order?.customer?.nombre || !order?.customer?.tel || !order?.customer?.mail || !order?.customer?.dir) {
+      return res.status(400).send("Pedido incompleto: faltan datos del cliente.");
+    }
+    if (!order?.items?.length) {
+      return res.status(400).send("Pedido incompleto: carrito vacío.");
+    }
+    if (!order?.amount || Number(order.amount) <= 0) {
+      return res.status(400).send("Pedido incompleto: monto inválido.");
+    }
+
+    const orderId = "YP-" + Date.now();
+
+    const payload = {
+      orderId,
+      createdAt: new Date().toISOString(),
+      paymentMethod: "Yappy",
+      yappyAlias: YAPPY_ALIAS,
+      amount: Number(order.amount),
+      reference: order?.reference || "",
+      comments: order?.comments || "",
+      customer: order.customer,
+      retiroPorTerceros: order?.retiroPorTerceros || null,
+      items: order.items,
+      status: "PENDIENTE_VALIDACION",
+      origin: order?.origin || "",
+    };
+
+    yappyOrders.push(payload);
+
+    console.log("✅ NUEVO PEDIDO YAPPY:", payload);
+
+    return res.json({ ok: true, orderId, yappyAlias: YAPPY_ALIAS });
+  } catch (err) {
+    console.error("❌ Error en /api/yappy-order:", err);
+    return res.status(500).send("Error interno registrando pedido.");
+  }
+});
+
+/**
+ * (opcional) ver pedidos rápido
+ */
+app.get("/api/yappy-orders", (req, res) => {
+  res.json({ ok: true, count: yappyOrders.length, orders: yappyOrders });
+});
+
+/**
+ * =========================
+ * START SERVER
  * =========================
  */
 const PORT = process.env.PORT || 3000;
