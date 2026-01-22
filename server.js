@@ -158,49 +158,42 @@ app.get("/api/sap/item/:code", async (req, res) => {
     }
 
     const code = String(req.params.code || "").trim();
-    if (!code) {
-      return res.status(400).json({ ok: false, message: "ItemCode vacío." });
-    }
+    if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
 
-    const safeCode = odataEscape(code);
-    const safeWH = odataEscape(SAP_WAREHOUSE);
-
-    // 1) Info básica del item (SIN encodeURIComponent dentro del string)
+    // ✅ 1) Pedimos el item con sus colecciones internas
     const item = await slFetch(
-      `/Items('${safeCode}')?$select=ItemCode,ItemName,SalesUnit,InventoryItem`
+      `/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection`
     );
 
-    // 2) Stock por bodega (ItemWarehouseInfoCollection)
-    // Campos correctos: InStock, Committed, Ordered
-    let whRow = null;
-    try {
-      const whRes = await slFetch(
-        `/ItemWarehouseInfoCollection?$select=ItemCode,WarehouseCode,InStock,Committed,Ordered&$filter=ItemCode eq '${safeCode}' and WarehouseCode eq '${safeWH}'`
-      );
-      if (whRes?.value?.length) whRow = whRes.value[0];
-    } catch {
-      whRow = null;
-    }
+    // ✅ 2) BUSCAR STOCK POR BODEGA dentro de ItemWarehouseInfoCollection
+    const whArray = Array.isArray(item.ItemWarehouseInfoCollection)
+      ? item.ItemWarehouseInfoCollection
+      : [];
 
-    // 3) Precio por lista (opcional)
-    let price = null;
+    const wh = whArray.find((w) => String(w.WarehouseCode) === String(SAP_WAREHOUSE));
+
+    // algunos Service Layer usan InStock / OnHand / Committed, etc.
+    const onHand =
+      wh?.InStock ?? wh?.OnHand ?? wh?.OnHandQty ?? wh?.QuantityOnStock ?? null;
+
+    const committed = wh?.Committed ?? wh?.CommittedQty ?? 0;
+
+    const available =
+      onHand !== null ? Number(onHand) - Number(committed) : null;
+
+    const hasStock = available !== null ? available > 0 : null;
+
+    // ✅ 3) PRECIO: buscar PriceListNo (ya lo tienes)
     const priceListNo = await getPriceListNoByName(SAP_PRICE_LIST);
 
-    if (priceListNo !== null) {
-      try {
-        const pRes = await slFetch(
-          `/ItemPrices?$select=ItemCode,PriceList,Price&$filter=ItemCode eq '${safeCode}' and PriceList eq ${priceListNo}`
-        );
-        if (pRes?.value?.length) price = Number(pRes.value[0].Price);
-      } catch {
-        price = null;
-      }
-    }
+    // ✅ 4) Buscar el precio dentro de ItemPrices[]
+    const pricesArray = Array.isArray(item.ItemPrices) ? item.ItemPrices : [];
 
-    // 4) Cálculo stock disponible
-    const onHand = whRow ? Number(whRow.InStock || 0) : null;
-    const committed = whRow ? Number(whRow.Committed || 0) : 0;
-    const available = whRow ? onHand - committed : null;
+    let price = null;
+    if (priceListNo !== null) {
+      const p = pricesArray.find((x) => Number(x.PriceList) === Number(priceListNo));
+      if (p?.Price != null) price = Number(p.Price);
+    }
 
     return res.json({
       ok: true,
@@ -218,7 +211,7 @@ app.get("/api/sap/item/:code", async (req, res) => {
         onHand,
         committed,
         available,
-        hasStock: available !== null ? available > 0 : null,
+        hasStock,
       },
     });
   } catch (err) {
