@@ -1,7 +1,5 @@
 import express from "express";
 import cors from "cors";
-import crypto from "crypto";
-import { Pool } from "pg";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -17,176 +15,26 @@ const SAP_PRICE_LIST = process.env.SAP_PRICE_LIST || "Lista Distribuidor";
 const YAPPY_ALIAS = process.env.YAPPY_ALIAS || "@prodimasansae";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
-/* === Seguridad Login/Admin === */
-const DATABASE_URL = process.env.DATABASE_URL || "";
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ""; // <-- este lo creas en Render
-const SESSION_TTL_HOURS = Number(process.env.SESSION_TTL_HOURS || 12);
-
 /* ========= CORS ========= */
 app.use(
   cors({
     origin: CORS_ORIGIN === "*" ? "*" : [CORS_ORIGIN],
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-admin-token"],
+    allowedHeaders: ["Content-Type"],
   })
 );
 
-/* ========= DB ========= */
-let pool = null;
-
-function dbEnabled() {
-  return Boolean(DATABASE_URL);
-}
-
-function getPool() {
-  if (!pool) {
-    pool = new Pool({
-      connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
-    });
-  }
-  return pool;
-}
-
-/* ========= Helpers / Crypto ========= */
-function nowPlusHours(h) {
-  return new Date(Date.now() + h * 60 * 60 * 1000);
-}
-
-function hashPin(pin) {
-  // guarda: salt:hash (hex)
-  const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(String(pin), salt, 32);
-  return `${salt.toString("hex")}:${hash.toString("hex")}`;
-}
-
-function verifyPin(pin, stored) {
-  try {
-    const [saltHex, hashHex] = String(stored).split(":");
-    const salt = Buffer.from(saltHex, "hex");
-    const hash = Buffer.from(hashHex, "hex");
-    const test = crypto.scryptSync(String(pin), salt, 32);
-    return crypto.timingSafeEqual(hash, test);
-  } catch {
-    return false;
-  }
-}
-
-function randomToken() {
-  return crypto.randomBytes(32).toString("hex");
-}
-
-async function audit(event_type, req, user, meta = {}) {
-  if (!dbEnabled()) return;
-
-  const ip =
-    req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() ||
-    req.socket?.remoteAddress ||
-    null;
-
-  const ua = req.headers["user-agent"] || null;
-
-  const payload = {
-    event_type,
-    user_id: user?.id ?? null,
-    username: user?.username ?? null,
-    ip,
-    user_agent: ua,
-    meta: meta ?? {},
-  };
-
-  try {
-    await getPool().query(
-      `insert into public.audit_events(event_type, user_id, username, ip, user_agent, meta)
-       values ($1,$2,$3,$4,$5,$6::jsonb)`,
-      [
-        payload.event_type,
-        payload.user_id,
-        payload.username,
-        payload.ip,
-        payload.user_agent,
-        JSON.stringify(payload.meta),
-      ]
-    );
-  } catch (e) {
-    console.log("⚠️ No pude guardar audit:", e.message);
-  }
-}
-
-/* ========= Auth Middleware ========= */
-async function requireAuth(req, res, next) {
-  try {
-    if (!dbEnabled()) {
-      return res.status(500).json({
-        ok: false,
-        message: "DB no configurada. Falta DATABASE_URL en Render.",
-      });
-    }
-
-    const auth = req.headers.authorization || "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-
-    if (!token) {
-      return res.status(401).json({ ok: false, message: "No autorizado (sin token)" });
-    }
-
-    const r = await getPool().query(
-      `select s.id as session_id, s.expires_at, s.user_id,
-              u.username, u.full_name, u.is_active
-       from public.sessions s
-       join public.users u on u.id = s.user_id
-       where s.token = $1
-       limit 1`,
-      [token]
-    );
-
-    if (!r.rows.length) {
-      return res.status(401).json({ ok: false, message: "Sesión inválida" });
-    }
-
-    const row = r.rows[0];
-    if (!row.is_active) {
-      return res.status(403).json({ ok: false, message: "Usuario inactivo" });
-    }
-
-    const exp = new Date(row.expires_at).getTime();
-    if (Date.now() > exp) {
-      return res.status(401).json({ ok: false, message: "Sesión expirada" });
-    }
-
-    // actualizar last_seen
-    await getPool().query(`update public.sessions set last_seen_at = now() where id = $1`, [
-      row.session_id,
-    ]);
-
-    req.user = {
-      id: row.user_id,
-      username: row.username,
-      full_name: row.full_name,
-      session_id: row.session_id,
-      token,
-    };
-
-    next();
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-}
-
-function requireAdmin(req, res, next) {
-  const t = req.headers["x-admin-token"] || "";
-  if (!ADMIN_TOKEN) {
-    return res.status(500).json({ ok: false, message: "ADMIN_TOKEN no configurado en Render" });
-  }
-  if (String(t) !== String(ADMIN_TOKEN)) {
-    return res.status(403).json({ ok: false, message: "Admin token inválido" });
-  }
-  next();
-}
-
-/* ========= SAP Helpers ========= */
+/* ========= Helpers ========= */
 let SL_COOKIE = null;
 let SL_COOKIE_TIME = 0;
+
+/** Cache para PriceListNo (evita buscarlo para cada item) */
+let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
+const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000; // 6 horas
+
+/** Cache corta para items (evita que refresh repita todo) */
+const ITEM_CACHE = new Map(); // code -> { ts, data }
+const ITEM_TTL_MS = 20 * 1000; // 20 segundos (puedes subir a 60s si quieres)
 
 function missingSapEnv() {
   return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
@@ -243,6 +91,7 @@ async function slFetch(path, options = {}) {
 
   const text = await res.text();
 
+  // Reintento si expiró
   if (res.status === 401 || res.status === 403) {
     SL_COOKIE = null;
     await slLogin();
@@ -264,183 +113,125 @@ async function slFetch(path, options = {}) {
 }
 
 /* ========= API Health ========= */
-app.get("/api/health", async (req, res) => {
+app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     message: "✅ PRODIMA API activa",
     yappy: YAPPY_ALIAS,
     warehouse: SAP_WAREHOUSE,
     priceList: SAP_PRICE_LIST,
-    db: dbEnabled() ? "OK" : "OFF",
   });
 });
 
-/* ========= AUTH ========= */
-/* Login mercaderista */
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    if (!dbEnabled()) {
-      return res.status(500).json({
-        ok: false,
-        message: "DB no configurada. Falta DATABASE_URL en Render.",
-      });
-    }
+/* ========= Obtener PriceListNo por nombre (CACHEADO) ========= */
+async function getPriceListNoByNameCached(name) {
+  const now = Date.now();
 
-    const { username, pin } = req.body || {};
-    const u = String(username || "").trim().toLowerCase();
-    const p = String(pin || "").trim();
-
-    if (!u || !p) {
-      return res.status(400).json({ ok: false, message: "username y pin son requeridos" });
-    }
-
-    const r = await getPool().query(
-      `select id, username, full_name, pin_hash, is_active
-       from public.users
-       where username = $1
-       limit 1`,
-      [u]
-    );
-
-    if (!r.rows.length) {
-      await audit("LOGIN_FAIL", req, null, { username: u, reason: "user_not_found" });
-      return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
-    }
-
-    const user = r.rows[0];
-    if (!user.is_active) {
-      await audit("LOGIN_FAIL", req, { id: user.id, username: user.username }, { reason: "inactive" });
-      return res.status(403).json({ ok: false, message: "Usuario inactivo" });
-    }
-
-    if (!verifyPin(p, user.pin_hash)) {
-      await audit("LOGIN_FAIL", req, { id: user.id, username: user.username }, { reason: "bad_pin" });
-      return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
-    }
-
-    // crear sesión
-    const token = randomToken();
-    const expiresAt = nowPlusHours(SESSION_TTL_HOURS);
-
-    await getPool().query(
-      `insert into public.sessions(user_id, token, expires_at)
-       values ($1,$2,$3)`,
-      [user.id, token, expiresAt]
-    );
-
-    await audit("LOGIN_OK", req, { id: user.id, username: user.username }, { ttl_hours: SESSION_TTL_HOURS });
-
-    return res.json({
-      ok: true,
-      token,
-      user: { id: user.id, username: user.username, fullName: user.full_name },
-      expiresAt,
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
+  if (
+    PRICE_LIST_CACHE.name === name &&
+    PRICE_LIST_CACHE.no !== null &&
+    now - PRICE_LIST_CACHE.ts < PRICE_LIST_TTL_MS
+  ) {
+    return PRICE_LIST_CACHE.no;
   }
-});
 
-/* Logout */
-app.post("/api/auth/logout", requireAuth, async (req, res) => {
-  try {
-    await getPool().query(`delete from public.sessions where id = $1`, [req.user.session_id]);
-    await audit("LOGOUT", req, req.user, {});
-    return res.json({ ok: true });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-/* ========= ADMIN USERS ========= */
-/* Crear usuario mercaderista */
-app.post("/api/admin/users", requireAdmin, async (req, res) => {
-  try {
-    if (!dbEnabled()) {
-      return res.status(500).json({ ok: false, message: "DB no configurada. Falta DATABASE_URL" });
-    }
-
-    const { username, fullName, pin } = req.body || {};
-    const u = String(username || "").trim().toLowerCase();
-    const fn = String(fullName || "").trim();
-    const p = String(pin || "").trim();
-
-    if (!u || !fn || !p) {
-      return res.status(400).json({ ok: false, message: "username, fullName y pin son requeridos" });
-    }
-
-    const pin_hash = hashPin(p);
-
-    const r = await getPool().query(
-      `insert into public.users(username, full_name, pin_hash)
-       values ($1,$2,$3)
-       returning id, username, full_name, created_at`,
-      [u, fn, pin_hash]
-    );
-
-    return res.json({ ok: true, user: r.rows[0] });
-  } catch (e) {
-    if (String(e.message || "").includes("duplicate key")) {
-      return res.status(409).json({ ok: false, message: "Ese username ya existe" });
-    }
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-/* Listar usuarios */
-app.get("/api/admin/users", requireAdmin, async (req, res) => {
-  try {
-    const r = await getPool().query(
-      `select id, username, full_name, is_active, created_at
-       from public.users
-       order by created_at desc`
-    );
-    return res.json({ ok: true, users: r.rows });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-/* ========= AUDIT ========= */
-app.get("/api/admin/audit_events", requireAdmin, async (req, res) => {
-  try {
-    const limit = Math.min(Number(req.query.limit || 100), 500);
-    const r = await getPool().query(
-      `select id, event_type, username, ip, created_at, meta
-       from public.audit_events
-       order by created_at desc
-       limit $1`,
-      [limit]
-    );
-    return res.json({ ok: true, events: r.rows });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-/* ========= PRICE LIST NO ========= */
-async function getPriceListNoByName(name) {
   const safe = name.replace(/'/g, "''");
+  let no = null;
 
+  // Intento A: PriceListName
   try {
     const r1 = await slFetch(
       `/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`
     );
-    if (r1?.value?.length) return r1.value[0].PriceListNo;
+    if (r1?.value?.length) no = r1.value[0].PriceListNo;
   } catch {}
 
-  try {
-    const r2 = await slFetch(
-      `/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`
+  // Intento B: ListName
+  if (no === null) {
+    try {
+      const r2 = await slFetch(
+        `/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`
+      );
+      if (r2?.value?.length) no = r2.value[0].PriceListNo;
+    } catch {}
+  }
+
+  PRICE_LIST_CACHE = { name, no, ts: now };
+  return no;
+}
+
+/* ========= Construir respuesta desde el Item FULL ========= */
+function buildItemResponse(itemFull, code, priceListNo) {
+  const item = {
+    ItemCode: itemFull.ItemCode ?? code,
+    ItemName: itemFull.ItemName ?? `Producto ${code}`,
+    SalesUnit: itemFull.SalesUnit ?? "",
+    InventoryItem: itemFull.InventoryItem ?? null,
+  };
+
+  // Precio
+  let price = null;
+  if (priceListNo !== null && Array.isArray(itemFull.ItemPrices)) {
+    const p = itemFull.ItemPrices.find(
+      (x) => Number(x.PriceList) === Number(priceListNo)
     );
-    if (r2?.value?.length) return r2.value[0].PriceListNo;
-  } catch {}
+    if (p && p.Price != null) price = Number(p.Price);
+  }
 
-  return null;
+  // Stock
+  let wh = null;
+  if (Array.isArray(itemFull.ItemWarehouseInfoCollection)) {
+    wh = itemFull.ItemWarehouseInfoCollection.find(
+      (x) => String(x.WarehouseCode) === String(SAP_WAREHOUSE)
+    );
+  }
+
+  const onHand = wh?.InStock ?? wh?.OnHand ?? wh?.QuantityOnStock ?? null;
+  const committed = wh?.Committed ?? 0;
+  const available = onHand !== null ? Number(onHand) - Number(committed) : null;
+
+  return {
+    ok: true,
+    item,
+    price,
+    stock: {
+      onHand,
+      committed,
+      available,
+      hasStock: available !== null ? available > 0 : null,
+    },
+  };
+}
+
+/* ========= Obtener 1 item (con cache corto) ========= */
+async function getOneItem(code, priceListNo) {
+  const now = Date.now();
+  const cached = ITEM_CACHE.get(code);
+  if (cached && now - cached.ts < ITEM_TTL_MS) {
+    return cached.data;
+  }
+
+  // ✅ Truco: pedimos solo lo necesario (si SAP lo soporta)
+  // Si tu SAP no respeta $select para arrays, igual cae al fallback FULL.
+  let itemFull;
+  try {
+    itemFull = await slFetch(
+      `/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection`
+    );
+  } catch {
+    // Fallback FULL (tu método actual)
+    itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
+  }
+
+  const data = buildItemResponse(itemFull, code, priceListNo);
+
+  ITEM_CACHE.set(code, { ts: now, data });
+  return data;
 }
 
 /* =========================================================
-   ✅ ITEM (para formulario)
+   ✅ Endpoint seguro 1 item
+   GET /api/sap/item/0110
 ========================================================= */
 app.get("/api/sap/item/:code", async (req, res) => {
   try {
@@ -452,49 +243,21 @@ app.get("/api/sap/item/:code", async (req, res) => {
     }
 
     const code = String(req.params.code || "").trim();
-    if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
-
-    const priceListNo = await getPriceListNoByName(SAP_PRICE_LIST);
-
-    const itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
-
-    const item = {
-      ItemCode: itemFull.ItemCode,
-      ItemName: itemFull.ItemName,
-      SalesUnit: itemFull.SalesUnit,
-      InventoryItem: itemFull.InventoryItem,
-    };
-
-    let price = null;
-    if (priceListNo !== null && Array.isArray(itemFull.ItemPrices)) {
-      const p = itemFull.ItemPrices.find((x) => Number(x.PriceList) === Number(priceListNo));
-      if (p && p.Price != null) price = Number(p.Price);
+    if (!code) {
+      return res.status(400).json({ ok: false, message: "ItemCode vacío." });
     }
 
-    let wh = null;
-    if (Array.isArray(itemFull.ItemWarehouseInfoCollection)) {
-      wh = itemFull.ItemWarehouseInfoCollection.find(
-        (x) => String(x.WarehouseCode) === String(SAP_WAREHOUSE)
-      );
-    }
-
-    const onHand = wh?.InStock ?? wh?.OnHand ?? wh?.QuantityOnStock ?? null;
-    const committed = wh?.Committed ?? 0;
-    const available = onHand !== null ? Number(onHand) - Number(committed) : null;
+    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
+    const r = await getOneItem(code, priceListNo);
 
     return res.json({
       ok: true,
-      item,
+      item: r.item,
       warehouse: SAP_WAREHOUSE,
       priceList: SAP_PRICE_LIST,
       priceListNo,
-      price,
-      stock: {
-        onHand,
-        committed,
-        available,
-        hasStock: available !== null ? available > 0 : null,
-      },
+      price: r.price,
+      stock: r.stock,
     });
   } catch (err) {
     console.error("❌ /api/sap/item error:", err.message);
@@ -503,77 +266,180 @@ app.get("/api/sap/item/:code", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ CUSTOMER
+   ✅ Endpoint MULTI-ITEM RÁPIDO (1 llamada desde frontend)
+   GET /api/sap/items?codes=0110,0105,0124
 ========================================================= */
-app.get("/api/sap/customer/:cardCode", async (req, res) => {
+app.get("/api/sap/items", async (req, res) => {
   try {
-    const cardCode = String(req.params.cardCode || "").trim();
-    if (!cardCode) return res.status(400).json({ ok: false, message: "CardCode vacío." });
+    if (missingSapEnv()) {
+      return res.status(400).json({
+        ok: false,
+        message: "Faltan variables SAP en Render > Environment",
+      });
+    }
 
-    const r = await slFetch(`/BusinessPartners('${encodeURIComponent(cardCode)}')`);
+    const codes = String(req.query.codes || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
 
-    const customer = {
-      CardCode: r.CardCode,
-      CardName: r.CardName,
-      Phone1: r.Phone1,
-      Phone2: r.Phone2,
-      EmailAddress: r.EmailAddress,
-      Address: r.Address || r.BPAddresses?.[0]?.Street || "",
-    };
+    if (!codes.length) {
+      return res.status(400).json({ ok: false, message: "codes vacío" });
+    }
 
-    return res.json({ ok: true, customer });
+    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
+
+    // ✅ Paralelo CON LÍMITE (para no saturar SAP)
+    const CONCURRENCY = 5;
+    const items = {};
+    let i = 0;
+
+    async function worker() {
+      while (i < codes.length) {
+        const idx = i++;
+        const code = codes[idx];
+        try {
+          const r = await getOneItem(code, priceListNo);
+          items[code] = {
+            ok: true,
+            name: r.item.ItemName,
+            unit: r.item.SalesUnit,
+            price: r.price,
+            stock: r.stock,
+          };
+        } catch (e) {
+          items[code] = { ok: false, message: String(e.message || e) };
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+    return res.json({
+      ok: true,
+      warehouse: SAP_WAREHOUSE,
+      priceList: SAP_PRICE_LIST,
+      priceListNo,
+      items,
+    });
   } catch (err) {
+    console.error("❌ /api/sap/items error:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
 
 /* =========================================================
-   ✅ CREATE QUOTE (PROTEGIDO POR LOGIN)
+   ✅ CLIENTE: trae info del Business Partner
+   GET /api/sap/customer/C12345
 ========================================================= */
-app.post("/api/sap/quote", requireAuth, async (req, res) => {
+app.get("/api/sap/customer/:code", async (req, res) => {
   try {
     if (missingSapEnv()) {
       return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
     }
 
-    const { cardCode, comments, lines } = req.body || {};
-    const cc = String(cardCode || "").trim();
+    const code = String(req.params.code || "").trim();
+    if (!code) return res.status(400).json({ ok: false, message: "CardCode vacío." });
 
-    if (!cc) return res.status(400).json({ ok: false, message: "cardCode requerido" });
-    if (!Array.isArray(lines) || !lines.length) {
-      return res.status(400).json({ ok: false, message: "lines requerido" });
+    // BusinessPartners('Cxxxx')
+    const bp = await slFetch(
+      `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Phone1,Phone2,EmailAddress,Address,City,Country,ZipCode`
+    );
+
+    // armamos una dirección bonita
+    const addrParts = [
+      bp.Address,
+      bp.City,
+      bp.ZipCode,
+      bp.Country
+    ].filter(Boolean).join(", ");
+
+    return res.json({
+      ok: true,
+      customer: {
+        CardCode: bp.CardCode,
+        CardName: bp.CardName,
+        Phone1: bp.Phone1,
+        Phone2: bp.Phone2,
+        EmailAddress: bp.EmailAddress,
+        Address: addrParts || bp.Address || "",
+      },
+    });
+  } catch (err) {
+    console.error("❌ /api/sap/customer error:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+
+/* =========================================================
+   ✅ CREAR COTIZACIÓN (Quotation) en SAP
+   POST /api/sap/quote
+   body:
+   {
+     "cardCode":"C12345",
+     "comments":"...",
+     "paymentMethod":"CONTRA_ENTREGA",
+     "lines":[ {"itemCode":"0110","qty":2}, ... ]
+   }
+========================================================= */
+app.post("/api/sap/quote", async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
     }
 
-    // ✅ Cotización se debe poder crear aunque no haya inventario
-    // Solo mandamos ItemCode + Quantity
-    const DocumentLines = lines.map((l) => ({
-      ItemCode: String(l.itemCode).trim(),
-      Quantity: Number(l.qty || 0),
-    }));
+    const cardCode = String(req.body?.cardCode || "").trim();
+    const comments = String(req.body?.comments || "").trim();
+    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
 
+    if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
+    if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
+
+    const DocumentLines = lines
+      .map((l) => ({
+        ItemCode: String(l.itemCode || "").trim(),
+        Quantity: Number(l.qty || 0),
+      }))
+      .filter((x) => x.ItemCode && x.Quantity > 0);
+
+    if (!DocumentLines.length) {
+      return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
+    }
+
+    const today = new Date();
+    const docDate = today.toISOString().slice(0, 10); // YYYY-MM-DD
+
+    // ✅ IMPORTANTE: NO seteamos PriceListNum
+    // SAP usará automáticamente la lista de precios del cliente (CardCode)
     const payload = {
-      CardCode: cc,
-      Comments: comments ? String(comments) : "",
+      CardCode: cardCode,
+      DocDate: docDate,
+      DocDueDate: docDate,
+      Comments: comments
+        ? `[WEB PEDIDOS] ${comments}`
+        : "[WEB PEDIDOS] Cotización mercaderista",
+      JournalMemo: "Cotización web mercaderistas",
       DocumentLines,
     };
 
-    const r = await slFetch(`/Quotations`, {
+    const created = await slFetch(`/Quotations`, {
       method: "POST",
       body: JSON.stringify(payload),
     });
 
-    await audit("QUOTE_CREATED", req, req.user, {
-      cardCode: cc,
-      docEntry: r?.DocEntry,
-      docNum: r?.DocNum,
-      linesCount: DocumentLines.length,
+    return res.json({
+      ok: true,
+      message: "Cotización creada",
+      docEntry: created.DocEntry,
+      docNum: created.DocNum,
     });
-
-    return res.json({ ok: true, docEntry: r.DocEntry, docNum: r.DocNum });
   } catch (err) {
+    console.error("❌ /api/sap/quote error:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
+
 
 /* ========= START ========= */
 const PORT = process.env.PORT || 10000;
