@@ -391,60 +391,49 @@ app.post("/api/sap/quote", async (req, res) => {
 
     const cardCode = String(req.body?.cardCode || "").trim();
     const comments = String(req.body?.comments || "").trim();
-    const paymentMethod = String(req.body?.paymentMethod || "CONTRA_ENTREGA").trim();
     const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
 
     if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
     if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
 
-    // price list number (si lo quieres setear en el documento)
-    const priceListNo = await getPriceListNoByName(SAP_PRICE_LIST);
-
-    // construir lineas SAP
-    const DocumentLines = lines.map((l) => ({
-      ItemCode: String(l.itemCode || "").trim(),
-      Quantity: Number(l.qty || 0),
-    })).filter(x => x.ItemCode && x.Quantity > 0);
+    const DocumentLines = lines
+      .map((l) => ({
+        ItemCode: String(l.itemCode || "").trim(),
+        Quantity: Number(l.qty || 0),
+      }))
+      .filter((x) => x.ItemCode && x.Quantity > 0);
 
     if (!DocumentLines.length) {
       return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
     }
 
-    // fechas
     const today = new Date();
-    const docDate = today.toISOString().slice(0,10); // YYYY-MM-DD
+    const docDate = today.toISOString().slice(0, 10); // YYYY-MM-DD
 
-    // payload quotation
+    // ✅ IMPORTANTE: NO seteamos PriceListNum
+    // SAP usará automáticamente la lista de precios del cliente (CardCode)
     const payload = {
       CardCode: cardCode,
       DocDate: docDate,
       DocDueDate: docDate,
-      Comments: comments ? `[WEB PEDIDOS] ${comments}` : "[WEB PEDIDOS] Cotización mercaderista",
+      Comments: comments
+        ? `[WEB PEDIDOS] ${comments}`
+        : "[WEB PEDIDOS] Cotización mercaderista",
       JournalMemo: "Cotización web mercaderistas",
       DocumentLines,
     };
-
-    // si se encontró lista de precio
-    if (priceListNo !== null) {
-      payload.PriceListNum = Number(priceListNo);
-    }
-
-    // opcional: marcar método de pago en un campo de usuario (si existe en tu SAP)
-    // payload.U_PaymentMethod = paymentMethod;
 
     const created = await slFetch(`/Quotations`, {
       method: "POST",
       body: JSON.stringify(payload),
     });
 
-    // normalmente SAP devuelve DocEntry y DocNum
     return res.json({
       ok: true,
       message: "Cotización creada",
       docEntry: created.DocEntry,
       docNum: created.DocNum,
     });
-
   } catch (err) {
     console.error("❌ /api/sap/quote error:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
