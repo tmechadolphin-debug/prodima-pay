@@ -330,6 +330,132 @@ Dirección: ${customer.dir}`,
   }
 });
 
+// Cache en memoria (super rápido)
+const ITEMS_CACHE = new Map(); // code => { data, ts }
+const CACHE_TTL_MS = 60 * 1000; // 60s (ajústalo)
+
+function getCache(code) {
+  const hit = ITEMS_CACHE.get(code);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > CACHE_TTL_MS) return null;
+  return hit.data;
+}
+
+function setCache(code, data) {
+  ITEMS_CACHE.set(code, { data, ts: Date.now() });
+}
+
+/* ========= Endpoint Batch =========
+GET /api/sap/items?codes=0110,0105,0124
+*/
+app.get("/api/sap/items", async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP." });
+    }
+
+    const codesRaw = String(req.query.codes || "").trim();
+    if (!codesRaw) return res.status(400).json({ ok: false, message: "codes vacío." });
+
+    const codes = codesRaw
+      .split(",")
+      .map((c) => c.trim())
+      .filter(Boolean)
+      .slice(0, 50); // límite
+
+    // ✅ Responde usando cache primero
+    const out = {};
+    const missing = [];
+
+    for (const code of codes) {
+      const cached = getCache(code);
+      if (cached) out[code] = cached;
+      else missing.push(code);
+    }
+
+    // Si todo está en cache, listo
+    if (!missing.length) return res.json({ ok: true, items: out });
+
+    // ✅ 1) traer datos base Items en paralelo
+    const itemsBasic = await Promise.all(
+      missing.map(async (code) => {
+        const item = await slFetch(
+          `/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,SalesUnit,InventoryItem`
+        );
+        return item;
+      })
+    );
+
+    // ✅ 2) PrecioListNo una vez
+    const priceListNo = await getPriceListNoByName(SAP_PRICE_LIST);
+
+    // ✅ 3) Stock por bodega en paralelo
+    const warehouses = await Promise.all(
+      missing.map(async (code) => {
+        try {
+          const whRes = await slFetch(
+            `/ItemWarehouseInfoCollection?$select=ItemCode,WarehouseCode,OnHand,Committed&$filter=ItemCode eq '${code}' and WarehouseCode eq '${SAP_WAREHOUSE}'`
+          );
+          return whRes?.value?.[0] || null;
+        } catch {
+          return null;
+        }
+      })
+    );
+
+    // ✅ 4) Precios en paralelo
+    const prices = await Promise.all(
+      missing.map(async (code) => {
+        if (priceListNo === null) return null;
+
+        try {
+          const pRes = await slFetch(
+            `/ItemPrices?$select=ItemCode,PriceList,Price&$filter=ItemCode eq '${code}' and PriceList eq ${priceListNo}`
+          );
+          return pRes?.value?.[0]?.Price != null ? Number(pRes.value[0].Price) : null;
+        } catch {
+          return null;
+        }
+      })
+    );
+
+    // ✅ Construir respuesta + guardar cache
+    for (let i = 0; i < missing.length; i++) {
+      const code = missing[i];
+      const item = itemsBasic[i];
+      const wh = warehouses[i];
+      const price = prices[i];
+
+      const onHand = wh?.OnHand ?? null;
+      const committed = wh?.Committed ?? 0;
+      const available = onHand !== null ? Number(onHand) - Number(committed) : null;
+
+      const final = {
+        code,
+        name: item?.ItemName || null,
+        unit: item?.SalesUnit || null,
+        priceList: SAP_PRICE_LIST,
+        priceListNo,
+        price,
+        stock: {
+          onHand,
+          committed,
+          available,
+          hasStock: available !== null ? available > 0 : null,
+        },
+      };
+
+      out[code] = final;
+      setCache(code, final);
+    }
+
+    return res.json({ ok: true, items: out });
+  } catch (err) {
+    console.error("❌ batch items error:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
 
 /* ========= START ========= */
 const PORT = process.env.PORT || 10000;
