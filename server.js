@@ -21,7 +21,7 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const ADMIN_USER = process.env.ADMIN_USER || "PRODIMA";
 const ADMIN_PASS = process.env.ADMIN_PASS || "ADMINISTRADOR";
-const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_ME_PLEASE";
+const JWT_SECRET = process.env.JWT_SECRET || "Panama!2025#";
 
 /* ========= CORS =========
    IMPORTANTE: permitir Authorization para el login de mercaderistas
