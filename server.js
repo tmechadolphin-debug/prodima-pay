@@ -328,6 +328,130 @@ app.get("/api/sap/items", async (req, res) => {
   }
 });
 
+/* =========================================================
+   ✅ CLIENTE: trae info del Business Partner
+   GET /api/sap/customer/C12345
+========================================================= */
+app.get("/api/sap/customer/:code", async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
+
+    const code = String(req.params.code || "").trim();
+    if (!code) return res.status(400).json({ ok: false, message: "CardCode vacío." });
+
+    // BusinessPartners('Cxxxx')
+    const bp = await slFetch(
+      `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Phone1,Phone2,EmailAddress,Address,City,Country,ZipCode`
+    );
+
+    // armamos una dirección bonita
+    const addrParts = [
+      bp.Address,
+      bp.City,
+      bp.ZipCode,
+      bp.Country
+    ].filter(Boolean).join(", ");
+
+    return res.json({
+      ok: true,
+      customer: {
+        CardCode: bp.CardCode,
+        CardName: bp.CardName,
+        Phone1: bp.Phone1,
+        Phone2: bp.Phone2,
+        EmailAddress: bp.EmailAddress,
+        Address: addrParts || bp.Address || "",
+      },
+    });
+  } catch (err) {
+    console.error("❌ /api/sap/customer error:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+
+/* =========================================================
+   ✅ CREAR COTIZACIÓN (Quotation) en SAP
+   POST /api/sap/quote
+   body:
+   {
+     "cardCode":"C12345",
+     "comments":"...",
+     "paymentMethod":"CONTRA_ENTREGA",
+     "lines":[ {"itemCode":"0110","qty":2}, ... ]
+   }
+========================================================= */
+app.post("/api/sap/quote", async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
+
+    const cardCode = String(req.body?.cardCode || "").trim();
+    const comments = String(req.body?.comments || "").trim();
+    const paymentMethod = String(req.body?.paymentMethod || "CONTRA_ENTREGA").trim();
+    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
+
+    if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
+    if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
+
+    // price list number (si lo quieres setear en el documento)
+    const priceListNo = await getPriceListNoByName(SAP_PRICE_LIST);
+
+    // construir lineas SAP
+    const DocumentLines = lines.map((l) => ({
+      ItemCode: String(l.itemCode || "").trim(),
+      Quantity: Number(l.qty || 0),
+    })).filter(x => x.ItemCode && x.Quantity > 0);
+
+    if (!DocumentLines.length) {
+      return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
+    }
+
+    // fechas
+    const today = new Date();
+    const docDate = today.toISOString().slice(0,10); // YYYY-MM-DD
+
+    // payload quotation
+    const payload = {
+      CardCode: cardCode,
+      DocDate: docDate,
+      DocDueDate: docDate,
+      Comments: comments ? `[WEB PEDIDOS] ${comments}` : "[WEB PEDIDOS] Cotización mercaderista",
+      JournalMemo: "Cotización web mercaderistas",
+      DocumentLines,
+    };
+
+    // si se encontró lista de precio
+    if (priceListNo !== null) {
+      payload.PriceListNum = Number(priceListNo);
+    }
+
+    // opcional: marcar método de pago en un campo de usuario (si existe en tu SAP)
+    // payload.U_PaymentMethod = paymentMethod;
+
+    const created = await slFetch(`/Quotations`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+
+    // normalmente SAP devuelve DocEntry y DocNum
+    return res.json({
+      ok: true,
+      message: "Cotización creada",
+      docEntry: created.DocEntry,
+      docNum: created.DocNum,
+    });
+
+  } catch (err) {
+    console.error("❌ /api/sap/quote error:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+
 /* ========= START ========= */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT));
