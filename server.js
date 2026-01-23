@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
+import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import crypto from "crypto";
 import pg from "pg";
 
 const { Pool } = pg;
@@ -20,74 +20,10 @@ const SAP_PRICE_LIST = process.env.SAP_PRICE_LIST || "Lista Distribuidor";
 const YAPPY_ALIAS = process.env.YAPPY_ALIAS || "@prodimasansae";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
-/* ========= AUTH ========= */
-const AUTH_SECRET = process.env.AUTH_SECRET || "";
-const MERCH_USERS_RAW = process.env.MERCH_USERS || "[]";
-let MERCH_USERS = [];
-try {
-  MERCH_USERS = JSON.parse(MERCH_USERS_RAW);
-} catch {
-  MERCH_USERS = [];
-}
-
-/* ========= DB (Render Postgres) ========= */
+/* ✅ DB (Supabase Postgres) */
 const DATABASE_URL = process.env.DATABASE_URL || "";
-const pool = DATABASE_URL
-  ? new Pool({
-      connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
-    })
-  : null;
-
-async function dbEnsure() {
-  if (!pool) return;
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS audit_events (
-      id SERIAL PRIMARY KEY,
-      type TEXT NOT NULL,
-      username TEXT,
-      fullname TEXT,
-      ip TEXT,
-      user_agent TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      payload JSONB
-    )
-  `);
-}
-
-async function audit(type, req, payload = {}, user = null) {
-  const ip =
-    req.headers["x-forwarded-for"]?.toString()?.split(",")[0]?.trim() ||
-    req.socket?.remoteAddress ||
-    "";
-  const ua = req.headers["user-agent"] || "";
-
-  const username = user?.user || null;
-  const fullname = user?.name || null;
-
-  // Si hay BD → guardar persistente
-  if (pool) {
-    await pool.query(
-      `
-      INSERT INTO audit_events(type, username, fullname, ip, user_agent, payload)
-      VALUES ($1,$2,$3,$4,$5,$6)
-    `,
-      [type, username, fullname, ip, ua, payload]
-    );
-    return;
-  }
-
-  // Fallback si no hay BD
-  console.log("AUDIT:", {
-    type,
-    username,
-    fullname,
-    ip,
-    ua,
-    payload,
-    at: new Date().toISOString(),
-  });
-}
+const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_ME_NOW_SUPER_SECRET";
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 
 /* ========= CORS ========= */
 app.use(
@@ -98,7 +34,40 @@ app.use(
   })
 );
 
-/* ========= Helpers ========= */
+/* ========= DB Pool ========= */
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    })
+  : null;
+
+async function dbQuery(sql, params = []) {
+  if (!pool) throw new Error("DATABASE_URL no configurado en Render.");
+  const r = await pool.query(sql, params);
+  return r;
+}
+
+async function auditLog({ eventType, username = null, req = null, details = {} }) {
+  try {
+    const ip =
+      req?.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+      req?.socket?.remoteAddress ||
+      null;
+
+    const ua = req?.headers["user-agent"] || null;
+
+    await dbQuery(
+      `insert into public.audit_events(event_type, username, ip, user_agent, details)
+       values($1,$2,$3,$4,$5)`,
+      [eventType, username, ip, ua, JSON.stringify(details || {})]
+    );
+  } catch (e) {
+    console.log("⚠️ auditLog falló:", e.message);
+  }
+}
+
+/* ========= Helpers SAP ========= */
 let SL_COOKIE = null;
 let SL_COOKIE_TIME = 0;
 
@@ -177,78 +146,138 @@ async function slFetch(path, options = {}) {
   return json;
 }
 
-/* ========= AUTH Middleware ========= */
-function requireAuth(req, res, next) {
-  try {
-    const h = req.headers.authorization || "";
-    const token = h.startsWith("Bearer ") ? h.slice(7) : "";
-    if (!token) return res.status(401).json({ ok: false, message: "No auth token" });
+/* ========= AUTH ========= */
+function signToken(user) {
+  return jwt.sign(
+    {
+      username: user.username,
+      fullName: user.full_name,
+      uid: user.id,
+    },
+    JWT_SECRET,
+    { expiresIn: "12h" }
+  );
+}
 
-    const decoded = jwt.verify(token, AUTH_SECRET);
-    req.auth = decoded; // { user, name, iat, exp }
+function authRequired(req, res, next) {
+  const h = req.headers.authorization || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : null;
+  if (!token) return res.status(401).json({ ok: false, message: "No autorizado (sin token)." });
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload;
     return next();
   } catch (e) {
-    return res.status(401).json({ ok: false, message: "Token inválido o expirado" });
+    return res.status(401).json({ ok: false, message: "Token inválido o expirado." });
   }
 }
 
-/* ========= HEALTH ========= */
-app.get("/api/health", (req, res) => {
+/* ========= API Health ========= */
+app.get("/api/health", async (req, res) => {
   res.json({
     ok: true,
     message: "✅ PRODIMA API activa",
     yappy: YAPPY_ALIAS,
     warehouse: SAP_WAREHOUSE,
     priceList: SAP_PRICE_LIST,
-    auth: Boolean(AUTH_SECRET && MERCH_USERS.length),
-    db: Boolean(pool),
+    db: pool ? "OK" : "OFF",
   });
 });
 
-/* ========= AUTH Routes ========= */
+/* ========= AUTH: LOGIN ========= */
 app.post("/api/auth/login", async (req, res) => {
   try {
-    if (!AUTH_SECRET) {
-      return res.status(500).json({ ok: false, message: "AUTH_SECRET no configurado" });
+    const username = String(req.body.username || "").trim().toLowerCase();
+    const pin = String(req.body.pin || "").trim();
+
+    if (!username || !pin) {
+      await auditLog({ eventType: "LOGIN_FAIL", username, req, details: { reason: "missing_fields" } });
+      return res.status(400).json({ ok: false, message: "Username y PIN son obligatorios." });
     }
 
-    const user = String(req.body?.user || "").trim().toLowerCase();
-    const pin = String(req.body?.pin || "").trim();
-
-    if (!user || !pin) {
-      return res.status(400).json({ ok: false, message: "user y pin son requeridos" });
-    }
-
-    const found = MERCH_USERS.find(
-      (u) => String(u.user || "").toLowerCase() === user && String(u.pin || "") === pin
+    const r = await dbQuery(
+      `select id, username, full_name, pin_hash, is_active
+       from public.app_users
+       where username=$1`,
+      [username]
     );
-    if (!found) {
-      await audit("login_failed", req, { user });
-      return res.status(401).json({ ok: false, message: "Credenciales incorrectas" });
+
+    if (!r.rows.length) {
+      await auditLog({ eventType: "LOGIN_FAIL", username, req, details: { reason: "user_not_found" } });
+      return res.status(401).json({ ok: false, message: "Credenciales inválidas." });
     }
 
-    const payload = {
-      user: found.user,
-      name: found.name || found.user,
-    };
+    const user = r.rows[0];
+    if (!user.is_active) {
+      await auditLog({ eventType: "LOGIN_FAIL", username, req, details: { reason: "inactive_user" } });
+      return res.status(401).json({ ok: false, message: "Usuario inactivo." });
+    }
 
-    const token = jwt.sign(payload, AUTH_SECRET, { expiresIn: "12h" });
+    const ok = await bcrypt.compare(pin, user.pin_hash);
+    if (!ok) {
+      await auditLog({ eventType: "LOGIN_FAIL", username, req, details: { reason: "bad_pin" } });
+      return res.status(401).json({ ok: false, message: "Credenciales inválidas." });
+    }
 
-    await audit("login", req, { ok: true }, payload);
+    await dbQuery(`update public.app_users set last_login_at=now() where id=$1`, [user.id]);
 
+    await auditLog({ eventType: "LOGIN_SUCCESS", username, req, details: { uid: user.id } });
+
+    const token = signToken(user);
     return res.json({
       ok: true,
       token,
-      user: payload,
-      loginAt: new Date().toISOString(),
+      user: { username: user.username, fullName: user.full_name },
     });
   } catch (err) {
+    console.error("❌ /api/auth/login:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
 
-app.get("/api/auth/me", requireAuth, (req, res) => {
-  res.json({ ok: true, user: req.auth });
+/* ========= ADMIN: CREATE USER ========= */
+app.post("/api/admin/users", async (req, res) => {
+  try {
+    if (!ADMIN_TOKEN) {
+      return res.status(500).json({ ok: false, message: "ADMIN_TOKEN no configurado en Render." });
+    }
+
+    const auth = String(req.headers["x-admin-token"] || "").trim();
+    if (auth !== ADMIN_TOKEN) {
+      return res.status(401).json({ ok: false, message: "No autorizado (admin)." });
+    }
+
+    const username = String(req.body.username || "").trim().toLowerCase();
+    const fullName = String(req.body.fullName || "").trim();
+    const pin = String(req.body.pin || "").trim();
+
+    if (!username || !fullName || !pin) {
+      return res.status(400).json({ ok: false, message: "username, fullName y pin son obligatorios." });
+    }
+
+    const pinHash = await bcrypt.hash(pin, 10);
+
+    const r = await dbQuery(
+      `insert into public.app_users(username, full_name, pin_hash)
+       values($1,$2,$3)
+       on conflict (username) do update set full_name=excluded.full_name, pin_hash=excluded.pin_hash
+       returning id, username, full_name, created_at`,
+      [username, fullName, pinHash]
+    );
+
+    await auditLog({
+      eventType: "ADMIN_CREATE_USER",
+      username: "ADMIN",
+      req,
+      details: { created: username },
+    });
+
+    return res.json({ ok: true, user: r.rows[0] });
+  } catch (err) {
+    console.error("❌ /api/admin/users:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
 });
 
 /* ========= Obtener PriceListNo por nombre ========= */
@@ -273,22 +302,18 @@ async function getPriceListNoByName(name) {
 }
 
 /* =========================================================
-   ✅ SAP Item (protegido)
+   ✅ ITEM (puede ser protegido o público)
 ========================================================= */
-app.get("/api/sap/item/:code", requireAuth, async (req, res) => {
+app.get("/api/sap/item/:code", authRequired, async (req, res) => {
   try {
     if (missingSapEnv()) {
-      return res.status(400).json({
-        ok: false,
-        message: "Faltan variables SAP en Render > Environment",
-      });
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP en Render > Environment" });
     }
 
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
 
     const priceListNo = await getPriceListNoByName(SAP_PRICE_LIST);
-
     const itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
 
     const item = {
@@ -330,90 +355,111 @@ app.get("/api/sap/item/:code", requireAuth, async (req, res) => {
       },
     });
   } catch (err) {
+    console.error("❌ /api/sap/item error:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
 
 /* =========================================================
-   ✅ SAP Customer (protegido)
-   Nota: Ajusta select según tu versión SAP
+   ✅ CUSTOMER (protegido)
 ========================================================= */
-app.get("/api/sap/customer/:cardCode", requireAuth, async (req, res) => {
+app.get("/api/sap/customer/:cardCode", authRequired, async (req, res) => {
   try {
-    const cardCode = String(req.params.cardCode || "").trim();
-    if (!cardCode) return res.status(400).json({ ok: false, message: "CardCode vacío" });
-
-    const c = await slFetch(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName,Phone1,Phone2,Cellular,EmailAddress,Address`);
-
-    return res.json({ ok: true, customer: c });
-  } catch (err) {
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* =========================================================
-   ✅ Crear Cotización en SAP (protegido)
-========================================================= */
-app.post("/api/sap/quote", requireAuth, async (req, res) => {
-  try {
-    const cardCode = String(req.body?.cardCode || "").trim();
-    const comments = String(req.body?.comments || "").trim();
-    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
-
-    if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido" });
-    if (!lines.length) return res.status(400).json({ ok: false, message: "lines vacío" });
-
-    const docLines = lines
-      .map((l) => ({
-        ItemCode: String(l.itemCode || "").trim(),
-        Quantity: Number(l.qty || 0),
-      }))
-      .filter((x) => x.ItemCode && x.Quantity > 0);
-
-    if (!docLines.length) {
-      return res.status(400).json({ ok: false, message: "No hay líneas válidas" });
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP en Render > Environment" });
     }
 
-    // 🔥 Importante: no validamos inventario aquí (son cotizaciones)
-    const payload = {
-      CardCode: cardCode,
-      Comments: `[WEB MERCADERISTA: ${req.auth.user}] ${comments || ""}`.trim(),
-      DocumentLines: docLines,
+    const cardCode = String(req.params.cardCode || "").trim();
+    if (!cardCode) return res.status(400).json({ ok: false, message: "CardCode vacío." });
+
+    const c = await slFetch(`/BusinessPartners('${encodeURIComponent(cardCode)}')`);
+
+    // Campos útiles
+    const customer = {
+      CardCode: c.CardCode,
+      CardName: c.CardName,
+      Phone1: c.Phone1,
+      Phone2: c.Phone2,
+      EmailAddress: c.EmailAddress,
+      Address: c.Address,
     };
 
-    const created = await slFetch("/Quotations", {
+    return res.json({ ok: true, customer });
+  } catch (err) {
+    console.error("❌ /api/sap/customer error:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+/* =========================================================
+   ✅ CREAR COTIZACIÓN (protegido)  ✅ IGNORA INVENTARIO
+========================================================= */
+app.post("/api/sap/quote", authRequired, async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP en Render > Environment" });
+    }
+
+    const cardCode = String(req.body.cardCode || "").trim();
+    const comments = String(req.body.comments || "").trim();
+    const lines = Array.isArray(req.body.lines) ? req.body.lines : [];
+
+    if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode vacío." });
+    if (!lines.length) return res.status(400).json({ ok: false, message: "No hay líneas." });
+
+    // ⚠️ Cotización en SAP: Quotations = /Quotations
+    // Lineas: { ItemCode, Quantity }
+    const doc = {
+      CardCode: cardCode,
+      Comments: comments,
+      DocumentLines: lines.map((l) => ({
+        ItemCode: String(l.itemCode || "").trim(),
+        Quantity: Number(l.qty || 0),
+      })),
+    };
+
+    // ✅ Crear en SAP
+    const created = await slFetch(`/Quotations`, {
       method: "POST",
-      body: JSON.stringify(payload),
+      body: JSON.stringify(doc),
     });
 
-    // SAP normalmente devuelve DocEntry, y se puede consultar DocNum con fetch adicional,
-    // pero muchas veces viene en la respuesta:
-    const docEntry = created?.DocEntry ?? null;
-    const docNum = created?.DocNum ?? null;
+    // Traer DocNum con GET (a veces POST devuelve DocEntry)
+    const docEntry = created?.DocEntry;
+    let docNum = null;
 
-    await audit(
-      "quote_created",
+    if (docEntry != null) {
+      const q = await slFetch(`/Quotations(${docEntry})?$select=DocNum,DocEntry`);
+      docNum = q?.DocNum ?? null;
+    }
+
+    await auditLog({
+      eventType: "CREATE_QUOTE",
+      username: req.user?.username || null,
       req,
-      {
-        cardCode,
-        docEntry,
-        docNum,
-        lines: docLines.length,
-      },
-      req.auth
-    );
+      details: { cardCode, docEntry, docNum, linesCount: lines.length },
+    });
 
-    return res.json({ ok: true, docEntry, docNum, created });
+    return res.json({
+      ok: true,
+      docEntry: docEntry ?? null,
+      docNum: docNum ?? null,
+      created,
+    });
   } catch (err) {
-    await audit("quote_failed", req, { error: err.message }, req.auth);
+    console.error("❌ /api/sap/quote:", err.message);
+
+    await auditLog({
+      eventType: "CREATE_QUOTE_FAIL",
+      username: req.user?.username || null,
+      req,
+      details: { error: err.message },
+    });
+
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
 
 /* ========= START ========= */
 const PORT = process.env.PORT || 10000;
-
-(async () => {
-  await dbEnsure();
-  app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT));
-})();
+app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT));
