@@ -1,24 +1,18 @@
-import dns from "node:dns";
-dns.setDefaultResultOrder("ipv4first");
-
 import express from "express";
 import cors from "cors";
 import pg from "pg";
-const { Pool } = pg;
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // ✅ IMPORTANTE en Render + Supabase
-  max: 5, // pgbouncer + render (mejor poco)
-});
-
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+
+const { Pool } = pg;
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-/* ========= ENV ========= */
+/* =========================================================
+   ✅ ENV
+========================================================= */
+// ---- SAP ----
 const SAP_BASE_URL = process.env.SAP_BASE_URL || "";
 const SAP_COMPANYDB = process.env.SAP_COMPANYDB || "";
 const SAP_USER = process.env.SAP_USER || "";
@@ -26,119 +20,158 @@ const SAP_PASS = process.env.SAP_PASS || "";
 const SAP_WAREHOUSE = process.env.SAP_WAREHOUSE || "01";
 const SAP_PRICE_LIST = process.env.SAP_PRICE_LIST || "Lista Distribuidor";
 
+// ---- Web / CORS ----
 const YAPPY_ALIAS = process.env.YAPPY_ALIAS || "@prodimasansae";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
+// ---- DB Supabase ----
 const DATABASE_URL = process.env.DATABASE_URL || "";
+
+// ---- Admin ----
 const ADMIN_USER = process.env.ADMIN_USER || "PRODIMA";
 const ADMIN_PASS = process.env.ADMIN_PASS || "ADMINISTRADOR";
-const JWT_SECRET = process.env.JWT_SECRET || "Panama!2025#";
+const JWT_SECRET = process.env.JWT_SECRET || "prodima_change_this_secret";
 
-/* ========= CORS =========
-   IMPORTANTE: permitir Authorization para el login de mercaderistas
-*/
+/* =========================================================
+   ✅ CORS
+========================================================= */
 app.use(
   cors({
     origin: CORS_ORIGIN === "*" ? "*" : [CORS_ORIGIN],
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"], // ✅ IMPORTANTE
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-/* ========= DB (Supabase Postgres) ========= */
-const { Pool } = pg;
-const pool = DATABASE_URL
-  ? new Pool({
+/* =========================================================
+   ✅ DB Pool (Supabase)
+   FIX SSL: self-signed certificate chain
+========================================================= */
+let pool = null;
+function hasDb() {
+  return !!DATABASE_URL;
+}
+
+function getPool() {
+  if (!pool) {
+    if (!DATABASE_URL) throw new Error("DATABASE_URL no está configurado.");
+
+    pool = new Pool({
       connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false }, // Supabase requiere SSL
-      max: 3,
-    })
-  : null;
+      ssl: { rejectUnauthorized: false }, // ✅ FIX CERT
+      max: 3, // recomendado con pooler/pgbouncer
+    });
+
+    pool.on("error", (err) => {
+      console.error("❌ DB pool error:", err.message);
+    });
+  }
+  return pool;
+}
 
 async function dbQuery(text, params = []) {
-  if (!pool) throw new Error("DATABASE_URL no está configurado");
-  const r = await pool.query(text, params);
-  return r;
+  const p = getPool();
+  return p.query(text, params);
 }
 
-/* ========= AUDIT ========= */
-function getIP(req) {
-  const xf = req.headers["x-forwarded-for"];
-  if (xf) return String(xf).split(",")[0].trim();
-  return req.socket?.remoteAddress || "";
+/* =========================================================
+   ✅ DB Schema (crear tablas si no existen)
+========================================================= */
+async function ensureSchema() {
+  if (!hasDb()) {
+    console.log("⚠️ DATABASE_URL no configurado (DB deshabilitada)");
+    return;
+  }
+
+  // users: mercaderistas
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS app_users (
+      id BIGSERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      full_name TEXT DEFAULT '',
+      pin_hash TEXT NOT NULL,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // audit events
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS audit_events (
+      id BIGSERIAL PRIMARY KEY,
+      event_type TEXT NOT NULL,
+      actor TEXT DEFAULT '',
+      ip TEXT DEFAULT '',
+      user_agent TEXT DEFAULT '',
+      payload JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  console.log("✅ DB Schema OK (app_users, audit_events)");
 }
 
-async function audit(req, event_type, username = null, meta = {}) {
+async function audit(event_type, req, actor = "", payload = {}) {
+  if (!hasDb()) return;
   try {
-    const ip = getIP(req);
-    const user_agent = String(req.headers["user-agent"] || "");
     await dbQuery(
-      `insert into public.audit_events (event_type, username, ip, user_agent, meta)
-       values ($1, $2, $3, $4, $5::jsonb)`,
-      [event_type, username, ip, user_agent, JSON.stringify(meta || {})]
+      `
+      INSERT INTO audit_events(event_type, actor, ip, user_agent, payload)
+      VALUES ($1,$2,$3,$4,$5)
+      `,
+      [
+        String(event_type || ""),
+        String(actor || ""),
+        String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || ""),
+        String(req.headers["user-agent"] || ""),
+        JSON.stringify(payload || {}),
+      ]
     );
   } catch (e) {
-    // no rompemos el sistema si auditoría falla
-    console.log("⚠️ audit error:", e.message);
+    console.error("⚠️ audit insert error:", e.message);
   }
 }
 
-/* ========= AUTH MERCADERISTAS ========= */
-function signMercToken(username) {
-  return jwt.sign(
-    { typ: "merc", username },
-    JWT_SECRET,
-    { expiresIn: "12h" }
-  );
-}
-
-function authMerc(req, res, next) {
-  try {
-    const header = String(req.headers.authorization || "");
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!token) {
-      return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
-    }
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (!decoded || decoded.typ !== "merc" || !decoded.username) {
-      return res.status(401).json({ ok: false, message: "Token inválido" });
-    }
-    req.mercUser = decoded.username;
-    next();
-  } catch (e) {
-    return res.status(401).json({ ok: false, message: "Token inválido o expirado" });
-  }
-}
-
-/* ========= AUTH ADMIN ========= */
+/* =========================================================
+   ✅ ADMIN AUTH
+========================================================= */
 function signAdminToken() {
   return jwt.sign({ typ: "admin" }, JWT_SECRET, { expiresIn: "2h" });
 }
 
-function authAdmin(req, res, next) {
+function verifyAdmin(req, res, next) {
   try {
-    const header = String(req.headers.authorization || "");
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!token) return res.status(401).json({ ok: false, message: "Falta Bearer token admin" });
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (!decoded || decoded.typ !== "admin") {
-      return res.status(401).json({ ok: false, message: "Token admin inválido" });
+    const auth = String(req.headers.authorization || "");
+    if (!auth.startsWith("Bearer ")) {
+      return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
     }
+
+    const token = auth.replace("Bearer ", "").trim();
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    if (!decoded || decoded.typ !== "admin") {
+      return res.status(403).json({ ok: false, message: "Token inválido" });
+    }
+
+    req.admin = decoded;
     next();
-  } catch {
-    return res.status(401).json({ ok: false, message: "Token admin inválido o expirado" });
+  } catch (e) {
+    return res.status(401).json({ ok: false, message: "Token expirado o inválido" });
   }
 }
 
-/* ========= SAP Helpers ========= */
+/* =========================================================
+   ✅ SAP Helpers (Service Layer Cookie + Cache)
+========================================================= */
 let SL_COOKIE = null;
 let SL_COOKIE_TIME = 0;
 
+/** Cache PriceListNo */
 let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
-const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
+const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000; // 6 horas
 
-const ITEM_CACHE = new Map();
+/** Cache corta items */
+const ITEM_CACHE = new Map(); // code -> { ts, data }
 const ITEM_TTL_MS = 20 * 1000;
 
 function missingSapEnv() {
@@ -196,6 +229,7 @@ async function slFetch(path, options = {}) {
 
   const text = await res.text();
 
+  // Reintento si expiró
   if (res.status === 401 || res.status === 403) {
     SL_COOKIE = null;
     await slLogin();
@@ -216,6 +250,19 @@ async function slFetch(path, options = {}) {
   return json;
 }
 
+/* ========= Health ========= */
+app.get("/api/health", async (req, res) => {
+  res.json({
+    ok: true,
+    message: "✅ PRODIMA API activa",
+    yappy: YAPPY_ALIAS,
+    warehouse: SAP_WAREHOUSE,
+    priceList: SAP_PRICE_LIST,
+    db: hasDb() ? "on" : "off",
+  });
+});
+
+/* ========= PriceListNo cached ========= */
 async function getPriceListNoByNameCached(name) {
   const now = Date.now();
 
@@ -230,6 +277,7 @@ async function getPriceListNoByNameCached(name) {
   const safe = name.replace(/'/g, "''");
   let no = null;
 
+  // Intento A
   try {
     const r1 = await slFetch(
       `/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`
@@ -237,6 +285,7 @@ async function getPriceListNoByNameCached(name) {
     if (r1?.value?.length) no = r1.value[0].PriceListNo;
   } catch {}
 
+  // Intento B
   if (no === null) {
     try {
       const r2 = await slFetch(
@@ -250,6 +299,7 @@ async function getPriceListNoByNameCached(name) {
   return no;
 }
 
+/* ========= Build Item Response ========= */
 function buildItemResponse(itemFull, code, priceListNo) {
   const item = {
     ItemCode: itemFull.ItemCode ?? code,
@@ -258,6 +308,7 @@ function buildItemResponse(itemFull, code, priceListNo) {
     InventoryItem: itemFull.InventoryItem ?? null,
   };
 
+  // Precio
   let price = null;
   if (priceListNo !== null && Array.isArray(itemFull.ItemPrices)) {
     const p = itemFull.ItemPrices.find(
@@ -266,6 +317,7 @@ function buildItemResponse(itemFull, code, priceListNo) {
     if (p && p.Price != null) price = Number(p.Price);
   }
 
+  // Stock
   let wh = null;
   if (Array.isArray(itemFull.ItemWarehouseInfoCollection)) {
     wh = itemFull.ItemWarehouseInfoCollection.find(
@@ -290,10 +342,13 @@ function buildItemResponse(itemFull, code, priceListNo) {
   };
 }
 
+/* ========= Get one item cached ========= */
 async function getOneItem(code, priceListNo) {
   const now = Date.now();
   const cached = ITEM_CACHE.get(code);
-  if (cached && now - cached.ts < ITEM_TTL_MS) return cached.data;
+  if (cached && now - cached.ts < ITEM_TTL_MS) {
+    return cached.data;
+  }
 
   let itemFull;
   try {
@@ -310,179 +365,7 @@ async function getOneItem(code, priceListNo) {
 }
 
 /* =========================================================
-   HEALTH
-========================================================= */
-app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    message: "✅ PRODIMA API activa",
-    yappy: YAPPY_ALIAS,
-    warehouse: SAP_WAREHOUSE,
-    priceList: SAP_PRICE_LIST,
-    db: !!DATABASE_URL,
-  });
-});
-
-/* =========================================================
-   ✅ ADMIN LOGIN (usuario fijo PRODIMA / ADMINISTRADOR)
-   POST /api/admin/login
-   body: { "user":"PRODIMA", "pass":"ADMINISTRADOR" }
-========================================================= */
-app.post("/api/admin/login", async (req, res) => {
-  try {
-    const user = String(req.body?.user || "");
-    const pass = String(req.body?.pass || "");
-
-    if (user !== ADMIN_USER || pass !== ADMIN_PASS) {
-      await audit(req, "ADMIN_LOGIN_FAIL", user, {});
-      return res.status(401).json({ ok: false, message: "Credenciales admin inválidas" });
-    }
-
-    await audit(req, "ADMIN_LOGIN_OK", user, {});
-    const token = signAdminToken();
-    return res.json({ ok: true, token });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   ✅ ADMIN: LISTAR USUARIOS
-   GET /api/admin/users
-========================================================= */
-app.get("/api/admin/users", authAdmin, async (req, res) => {
-  try {
-    const r = await dbQuery(
-      `select id, username, full_name, is_active, created_at
-       from public.merc_users
-       order by created_at desc`
-    );
-    return res.json({ ok: true, users: r.rows });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   ✅ ADMIN: CREAR USUARIO MERCADERISTA
-   POST /api/admin/users
-   body: { "username":"mer01", "fullName":"Mercaderista 01", "pin":"1234" }
-========================================================= */
-app.post("/api/admin/users", authAdmin, async (req, res) => {
-  try {
-    const username = String(req.body?.username || "").trim().toLowerCase();
-    const fullName = String(req.body?.fullName || "").trim();
-    const pin = String(req.body?.pin || "").trim();
-
-    if (!username || !fullName || !pin) {
-      return res.status(400).json({ ok: false, message: "Faltan campos: username, fullName, pin" });
-    }
-    if (pin.length < 4) {
-      return res.status(400).json({ ok: false, message: "PIN mínimo 4 dígitos" });
-    }
-
-    const pin_hash = await bcrypt.hash(pin, 10);
-
-    await dbQuery(
-      `insert into public.merc_users (username, full_name, pin_hash)
-       values ($1, $2, $3)`,
-      [username, fullName, pin_hash]
-    );
-
-    await audit(req, "ADMIN_CREATE_USER", username, { fullName });
-
-    return res.json({ ok: true, message: "Usuario creado" });
-  } catch (e) {
-    // username duplicado
-    if (String(e.message || "").includes("duplicate key")) {
-      return res.status(409).json({ ok: false, message: "Ese username ya existe" });
-    }
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   ✅ ADMIN: ACTIVAR/DESACTIVAR
-   POST /api/admin/users/:username/toggle
-========================================================= */
-app.post("/api/admin/users/:username/toggle", authAdmin, async (req, res) => {
-  try {
-    const u = String(req.params.username || "").trim().toLowerCase();
-    if (!u) return res.status(400).json({ ok: false, message: "username requerido" });
-
-    const r = await dbQuery(
-      `update public.merc_users
-       set is_active = not is_active
-       where username = $1
-       returning username, is_active`,
-      [u]
-    );
-
-    if (!r.rowCount) return res.status(404).json({ ok: false, message: "No existe ese usuario" });
-
-    await audit(req, "ADMIN_TOGGLE_USER", u, { is_active: r.rows[0].is_active });
-    return res.json({ ok: true, user: r.rows[0] });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   ✅ MERCADERISTA LOGIN
-   POST /api/auth/login
-   body: { "username":"mer01", "pin":"1234" }
-========================================================= */
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const username = String(req.body?.username || "").trim().toLowerCase();
-    const pin = String(req.body?.pin || "").trim();
-
-    if (!username || !pin) {
-      await audit(req, "LOGIN_FAIL", username, { reason: "missing_fields" });
-      return res.status(400).json({ ok: false, message: "username y pin requeridos" });
-    }
-
-    const r = await dbQuery(
-      `select username, full_name, pin_hash, is_active
-       from public.merc_users
-       where username = $1
-       limit 1`,
-      [username]
-    );
-
-    if (!r.rowCount) {
-      await audit(req, "LOGIN_FAIL", username, { reason: "not_found" });
-      return res.status(401).json({ ok: false, message: "Usuario o PIN incorrecto" });
-    }
-
-    const user = r.rows[0];
-    if (!user.is_active) {
-      await audit(req, "LOGIN_FAIL", username, { reason: "inactive" });
-      return res.status(403).json({ ok: false, message: "Usuario inactivo" });
-    }
-
-    const ok = await bcrypt.compare(pin, user.pin_hash);
-    if (!ok) {
-      await audit(req, "LOGIN_FAIL", username, { reason: "bad_pin" });
-      return res.status(401).json({ ok: false, message: "Usuario o PIN incorrecto" });
-    }
-
-    await audit(req, "LOGIN_OK", username, { fullName: user.full_name });
-
-    const token = signMercToken(username);
-
-    return res.json({
-      ok: true,
-      token,
-      user: { username: user.username, fullName: user.full_name },
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   SAP: ITEM
+   ✅ SAP: ITEM
 ========================================================= */
 app.get("/api/sap/item/:code", async (req, res) => {
   try {
@@ -494,7 +377,9 @@ app.get("/api/sap/item/:code", async (req, res) => {
     }
 
     const code = String(req.params.code || "").trim();
-    if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
+    if (!code) {
+      return res.status(400).json({ ok: false, message: "ItemCode vacío." });
+    }
 
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
     const r = await getOneItem(code, priceListNo);
@@ -515,7 +400,7 @@ app.get("/api/sap/item/:code", async (req, res) => {
 });
 
 /* =========================================================
-   SAP: MULTI ITEMS
+   ✅ SAP: MULTI ITEMS (rápido)
 ========================================================= */
 app.get("/api/sap/items", async (req, res) => {
   try {
@@ -531,7 +416,9 @@ app.get("/api/sap/items", async (req, res) => {
       .map((x) => x.trim())
       .filter(Boolean);
 
-    if (!codes.length) return res.status(400).json({ ok: false, message: "codes vacío" });
+    if (!codes.length) {
+      return res.status(400).json({ ok: false, message: "codes vacío" });
+    }
 
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
 
@@ -574,11 +461,13 @@ app.get("/api/sap/items", async (req, res) => {
 });
 
 /* =========================================================
-   SAP: CUSTOMER
+   ✅ SAP: CUSTOMER
 ========================================================= */
 app.get("/api/sap/customer/:code", async (req, res) => {
   try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
 
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "CardCode vacío." });
@@ -587,7 +476,9 @@ app.get("/api/sap/customer/:code", async (req, res) => {
       `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Phone1,Phone2,EmailAddress,Address,City,Country,ZipCode`
     );
 
-    const addrParts = [bp.Address, bp.City, bp.ZipCode, bp.Country].filter(Boolean).join(", ");
+    const addrParts = [bp.Address, bp.City, bp.ZipCode, bp.Country]
+      .filter(Boolean)
+      .join(", ");
 
     return res.json({
       ok: true,
@@ -607,12 +498,13 @@ app.get("/api/sap/customer/:code", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ CREAR COTIZACIÓN (PROTEGIDA POR LOGIN)
-   POST /api/sap/quote
+   ✅ SAP: CREAR COTIZACIÓN
 ========================================================= */
-app.post("/api/sap/quote", authMerc, async (req, res) => {
+app.post("/api/sap/quote", async (req, res) => {
   try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
 
     const cardCode = String(req.body?.cardCode || "").trim();
     const comments = String(req.body?.comments || "").trim();
@@ -635,15 +527,11 @@ app.post("/api/sap/quote", authMerc, async (req, res) => {
     const today = new Date();
     const docDate = today.toISOString().slice(0, 10);
 
-    // ✅ Nota: Cotización = NO valida stock como un Delivery/Invoice
-    // Igual, SAP puede fallar si ItemCode no existe o está inactivo.
     const payload = {
       CardCode: cardCode,
       DocDate: docDate,
       DocDueDate: docDate,
-      Comments: comments
-        ? `[WEB PEDIDOS][${req.mercUser}] ${comments}`
-        : `[WEB PEDIDOS][${req.mercUser}] Cotización mercaderista`,
+      Comments: comments ? `[WEB PEDIDOS] ${comments}` : "[WEB PEDIDOS] Cotización mercaderista",
       JournalMemo: "Cotización web mercaderistas",
       DocumentLines,
     };
@@ -651,13 +539,6 @@ app.post("/api/sap/quote", authMerc, async (req, res) => {
     const created = await slFetch(`/Quotations`, {
       method: "POST",
       body: JSON.stringify(payload),
-    });
-
-    await audit(req, "CREATE_QUOTE", req.mercUser, {
-      cardCode,
-      docEntry: created.DocEntry,
-      docNum: created.DocNum,
-      lines: DocumentLines.length,
     });
 
     return res.json({
@@ -668,11 +549,195 @@ app.post("/api/sap/quote", authMerc, async (req, res) => {
     });
   } catch (err) {
     console.error("❌ /api/sap/quote error:", err.message);
-    await audit(req, "CREATE_QUOTE_FAIL", req.mercUser || null, { error: err.message });
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
 
-/* ========= START ========= */
+/* =========================================================
+   ✅ ADMIN: LOGIN
+   POST /api/admin/login
+   { user:"PRODIMA", pass:"ADMINISTRADOR" }
+========================================================= */
+app.post("/api/admin/login", async (req, res) => {
+  try {
+    const user = String(req.body?.user || "").trim();
+    const pass = String(req.body?.pass || "").trim();
+
+    if (!user || !pass) {
+      return res.status(400).json({ ok: false, message: "user y pass requeridos" });
+    }
+
+    // Comparación normal (case-sensitive)
+    if (user !== ADMIN_USER || pass !== ADMIN_PASS) {
+      await audit("ADMIN_LOGIN_FAIL", req, user, { user });
+      return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
+    }
+
+    const token = signAdminToken();
+    await audit("ADMIN_LOGIN_OK", req, user, { user });
+
+    return res.json({ ok: true, token });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
+   ✅ ADMIN: LIST USERS
+   GET /api/admin/users
+========================================================= */
+app.get("/api/admin/users", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+
+    const r = await dbQuery(`
+      SELECT id, username, full_name, is_active, created_at
+      FROM app_users
+      ORDER BY created_at DESC;
+    `);
+
+    return res.json({ ok: true, users: r.rows || [] });
+  } catch (e) {
+    console.error("❌ users list:", e.message);
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
+   ✅ ADMIN: CREATE USER
+   POST /api/admin/users
+   { username, fullName, pin }
+========================================================= */
+app.post("/api/admin/users", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+
+    const username = String(req.body?.username || "").trim().toLowerCase();
+    const fullName = String(req.body?.fullName || "").trim();
+    const pin = String(req.body?.pin || "").trim();
+
+    if (!username) return res.status(400).json({ ok: false, message: "username requerido" });
+    if (!pin || pin.length < 4) return res.status(400).json({ ok: false, message: "PIN mínimo 4" });
+
+    const pin_hash = await bcrypt.hash(pin, 10);
+
+    const ins = await dbQuery(
+      `
+      INSERT INTO app_users(username, full_name, pin_hash, is_active)
+      VALUES ($1,$2,$3,TRUE)
+      RETURNING id, username, full_name, is_active, created_at;
+      `,
+      [username, fullName, pin_hash]
+    );
+
+    await audit("USER_CREATED", req, "ADMIN", { username, fullName });
+
+    return res.json({ ok: true, user: ins.rows[0] });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes("duplicate key value") || msg.includes("unique")) {
+      return res.status(400).json({ ok: false, message: "Ese username ya existe" });
+    }
+    console.error("❌ user create:", msg);
+    return res.status(500).json({ ok: false, message: msg });
+  }
+});
+
+/* =========================================================
+   ✅ ADMIN: TOGGLE USER ACTIVE
+   PATCH /api/admin/users/:id/toggle
+========================================================= */
+app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+
+    const id = Number(req.params.id || 0);
+    if (!id) return res.status(400).json({ ok: false, message: "id inválido" });
+
+    const r = await dbQuery(
+      `
+      UPDATE app_users
+      SET is_active = NOT is_active
+      WHERE id = $1
+      RETURNING id, username, full_name, is_active, created_at;
+      `,
+      [id]
+    );
+
+    if (!r.rowCount) {
+      return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    }
+
+    await audit("USER_TOGGLE", req, "ADMIN", { id });
+
+    return res.json({ ok: true, user: r.rows[0] });
+  } catch (e) {
+    console.error("❌ user toggle:", e.message);
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
+   ✅ ADMIN: DELETE USER
+   DELETE /api/admin/users/:id
+========================================================= */
+app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+
+    const id = Number(req.params.id || 0);
+    if (!id) return res.status(400).json({ ok: false, message: "id inválido" });
+
+    const r = await dbQuery(
+      `DELETE FROM app_users WHERE id = $1 RETURNING id, username;`,
+      [id]
+    );
+
+    if (!r.rowCount) {
+      return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    }
+
+    await audit("USER_DELETED", req, "ADMIN", { id, username: r.rows[0]?.username });
+
+    return res.json({ ok: true, message: "Usuario eliminado" });
+  } catch (e) {
+    console.error("❌ user delete:", e.message);
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
+   ✅ (Opcional) Endpoint para ver audit
+   GET /api/admin/audit
+========================================================= */
+app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+
+    const r = await dbQuery(`
+      SELECT id, event_type, actor, ip, created_at, payload
+      FROM audit_events
+      ORDER BY created_at DESC
+      LIMIT 200;
+    `);
+
+    return res.json({ ok: true, events: r.rows || [] });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
+   ✅ START
+========================================================= */
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT));
+
+ensureSchema()
+  .then(() => {
+    app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT));
+  })
+  .catch((e) => {
+    console.error("❌ Error creando schema DB:", e.message);
+    // Igual levantamos el server (solo SAP funcionará si DB falla)
+    app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT, "(sin DB)"));
+  });
