@@ -4,6 +4,14 @@ dns.setDefaultResultOrder("ipv4first");
 import express from "express";
 import cors from "cors";
 import pg from "pg";
+const { Pool } = pg;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // ✅ IMPORTANTE en Render + Supabase
+  max: 5, // pgbouncer + render (mejor poco)
+});
+
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
