@@ -1,11 +1,14 @@
 import express from "express";
 import cors from "cors";
+import Stripe from "stripe";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-/* ========= ENV ========= */
-const SAP_BASE_URL = process.env.SAP_BASE_URL || "";
+/* ======================================================
+   ✅ ENV VARIABLES (Render > Environment)
+====================================================== */
+const SAP_BASE_URL = process.env.SAP_BASE_URL || ""; // Ej: https://india.pa2.sap.topmanage.cloud/b1s/v1
 const SAP_COMPANYDB = process.env.SAP_COMPANYDB || "";
 const SAP_USER = process.env.SAP_USER || "";
 const SAP_PASS = process.env.SAP_PASS || "";
@@ -15,7 +18,12 @@ const SAP_PRICE_LIST = process.env.SAP_PRICE_LIST || "Lista Distribuidor";
 const YAPPY_ALIAS = process.env.YAPPY_ALIAS || "@prodimasansae";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
-/* ========= CORS ========= */
+const STRIPE_KEY = process.env.STRIPE_SECRET_KEY || ""; // opcional
+const stripe = STRIPE_KEY ? new Stripe(STRIPE_KEY) : null;
+
+/* ======================================================
+   ✅ CORS
+====================================================== */
 app.use(
   cors({
     origin: CORS_ORIGIN === "*" ? "*" : [CORS_ORIGIN],
@@ -24,9 +32,15 @@ app.use(
   })
 );
 
-/* ========= Helpers ========= */
-let SL_COOKIE = null;
+/* ======================================================
+   ✅ HELPERS SAP SERVICE LAYER
+====================================================== */
+let SL_COOKIE = null; // cookie del service layer
 let SL_COOKIE_TIME = 0;
+
+// Cache simple para PriceListNo (evitar pedirlo cada vez)
+let PRICE_LIST_NO_CACHE = null;
+let PRICE_LIST_NO_CACHE_TIME = 0;
 
 function missingSapEnv() {
   return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
@@ -34,7 +48,7 @@ function missingSapEnv() {
 
 async function slLogin() {
   if (missingSapEnv()) {
-    console.log("⚠️ Faltan variables SAP en Render > Environment");
+    console.log("⚠️ Faltan variables SAP. Revisa Render > Environment.");
     return;
   }
 
@@ -58,17 +72,19 @@ async function slLogin() {
   const setCookie = res.headers.get("set-cookie");
   if (!setCookie) throw new Error("No se recibió cookie del Service Layer.");
 
-  // juntar cookies principales
+  // Guardamos solo lo importante: B1SESSION + ROUTEID (y otras si vinieran)
   SL_COOKIE = setCookie
     .split(",")
     .map((s) => s.split(";")[0])
     .join("; ");
 
   SL_COOKIE_TIME = Date.now();
+
   console.log("✅ Login SAP OK (cookie guardada)");
 }
 
 async function slFetch(path, options = {}) {
+  // refrescar cookie si no existe o expiró (25 minutos)
   if (!SL_COOKIE || Date.now() - SL_COOKIE_TIME > 25 * 60 * 1000) {
     await slLogin();
   }
@@ -84,28 +100,35 @@ async function slFetch(path, options = {}) {
 
   const text = await res.text();
 
-  // Reintento si expiró
+  // si expiró cookie, reintenta 1 vez
   if (res.status === 401 || res.status === 403) {
     SL_COOKIE = null;
     await slLogin();
-    return slFetch(path, options);
-  }
 
-  let json;
-  try {
-    json = text ? JSON.parse(text) : {};
-  } catch {
-    json = { raw: text };
+    const res2 = await fetch(`${SAP_BASE_URL}${path}`, {
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: SL_COOKIE,
+        ...(options.headers || {}),
+      },
+    });
+
+    const text2 = await res2.text();
+    if (!res2.ok) throw new Error(`SAP error ${res2.status}: ${text2}`);
+    return text2 ? JSON.parse(text2) : {};
   }
 
   if (!res.ok) {
     throw new Error(`SAP error ${res.status}: ${text}`);
   }
 
-  return json;
+  return text ? JSON.parse(text) : {};
 }
 
-/* ========= API Health ========= */
+/* ======================================================
+   ✅ HEALTH
+====================================================== */
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
@@ -116,33 +139,51 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-/* ========= Obtener PriceListNo por nombre ========= */
+/* ======================================================
+   ✅ PRICE LIST NO (por nombre)
+====================================================== */
 async function getPriceListNoByName(name) {
-  const safe = name.replace(/'/g, "''");
+  // cache 10 minutos
+  if (
+    PRICE_LIST_NO_CACHE != null &&
+    Date.now() - PRICE_LIST_NO_CACHE_TIME < 10 * 60 * 1000
+  ) {
+    return PRICE_LIST_NO_CACHE;
+  }
 
-  // Intento A: PriceListName
+  const safeName = name.replace(/'/g, "''");
+
+  // Intento 1: PriceListName
   try {
     const r1 = await slFetch(
-      `/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`
+      `/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safeName}'`
     );
-    if (r1?.value?.length) return r1.value[0].PriceListNo;
+    if (r1?.value?.length) {
+      PRICE_LIST_NO_CACHE = r1.value[0].PriceListNo;
+      PRICE_LIST_NO_CACHE_TIME = Date.now();
+      return PRICE_LIST_NO_CACHE;
+    }
   } catch {}
 
-  // Intento B: ListName
+  // Intento 2: ListName
   try {
     const r2 = await slFetch(
-      `/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`
+      `/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safeName}'`
     );
-    if (r2?.value?.length) return r2.value[0].PriceListNo;
+    if (r2?.value?.length) {
+      PRICE_LIST_NO_CACHE = r2.value[0].PriceListNo;
+      PRICE_LIST_NO_CACHE_TIME = Date.now();
+      return PRICE_LIST_NO_CACHE;
+    }
   } catch {}
 
   return null;
 }
 
-/* =========================================================
-   ✅ Endpoint seguro: item + precio lista + stock warehouse
+/* ======================================================
+   ✅ SAP ITEM INDIVIDUAL
    GET /api/sap/item/0110
-========================================================= */
+====================================================== */
 app.get("/api/sap/item/:code", async (req, res) => {
   try {
     if (missingSapEnv()) {
@@ -157,46 +198,49 @@ app.get("/api/sap/item/:code", async (req, res) => {
       return res.status(400).json({ ok: false, message: "ItemCode vacío." });
     }
 
-    // ✅ 1) Buscar el priceListNo
+    // 1) Item básico
+    const item = await slFetch(
+      `/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,SalesUnit,InventoryItem`
+    );
+
+    // 2) Stock por bodega (collection)
+    let wh = null;
+    try {
+      const whRes = await slFetch(
+        `/ItemWarehouseInfoCollection?$select=ItemCode,WarehouseCode,OnHand,InStock,Committed&$filter=ItemCode eq '${code}' and WarehouseCode eq '${SAP_WAREHOUSE}'`
+      );
+      if (whRes?.value?.length) wh = whRes.value[0];
+    } catch {
+      wh = null;
+    }
+
+    // 3) Precio por lista (ItemPrices)
+    let price = null;
     const priceListNo = await getPriceListNoByName(SAP_PRICE_LIST);
 
-    // ✅ 2) Traer el ITEM COMPLETO (la forma más compatible)
-    // Esto normalmente devuelve ItemPrices[] y ItemWarehouseInfoCollection[]
-    const itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
-
-    const item = {
-      ItemCode: itemFull.ItemCode,
-      ItemName: itemFull.ItemName,
-      SalesUnit: itemFull.SalesUnit,
-      InventoryItem: itemFull.InventoryItem,
-    };
-
-    // ✅ 3) Precio desde ItemPrices (si viene)
-    let price = null;
-    if (priceListNo !== null && Array.isArray(itemFull.ItemPrices)) {
-      const p = itemFull.ItemPrices.find(
-        (x) => Number(x.PriceList) === Number(priceListNo)
-      );
-      if (p && p.Price != null) price = Number(p.Price);
+    if (priceListNo !== null) {
+      try {
+        const pRes = await slFetch(
+          `/ItemPrices?$select=ItemCode,PriceList,Price&$filter=ItemCode eq '${code}' and PriceList eq ${priceListNo}`
+        );
+        if (pRes?.value?.length) price = Number(pRes.value[0].Price);
+      } catch {
+        price = null;
+      }
     }
 
-    // ✅ 4) Stock desde ItemWarehouseInfoCollection (si viene)
-    let wh = null;
-    if (Array.isArray(itemFull.ItemWarehouseInfoCollection)) {
-      wh = itemFull.ItemWarehouseInfoCollection.find(
-        (x) => String(x.WarehouseCode) === String(SAP_WAREHOUSE)
-      );
-    }
-
-    const onHand =
-      wh?.InStock ?? wh?.OnHand ?? wh?.QuantityOnStock ?? null;
+    const onHand = wh?.OnHand ?? wh?.InStock ?? null;
     const committed = wh?.Committed ?? 0;
-    const available =
-      onHand !== null ? Number(onHand) - Number(committed) : null;
+    const available = onHand !== null ? Number(onHand) - Number(committed) : null;
 
     return res.json({
       ok: true,
-      item,
+      item: {
+        ItemCode: item.ItemCode,
+        ItemName: item.ItemName,
+        SalesUnit: item.SalesUnit,
+        InventoryItem: item.InventoryItem,
+      },
       warehouse: SAP_WAREHOUSE,
       priceList: SAP_PRICE_LIST,
       priceListNo,
@@ -214,50 +258,12 @@ app.get("/api/sap/item/:code", async (req, res) => {
   }
 });
 
-/* =========================================================
-   ✅ Endpoint para muchos items (para tu página de productos)
+/* ======================================================
+   ✅ SAP ITEMS BATCH (MUY RÁPIDO)
    GET /api/sap/items?codes=0110,0105,0124
-========================================================= */
+   ✅ solo 2-3 llamadas totales a SAP (no 15 o 40)
+====================================================== */
 app.get("/api/sap/items", async (req, res) => {
-  try {
-    const codes = String(req.query.codes || "")
-      .split(",")
-      .map((x) => x.trim())
-      .filter(Boolean);
-
-    if (!codes.length) {
-      return res.status(400).json({ ok: false, message: "codes vacío" });
-    }
-
-    const results = {};
-    for (const c of codes) {
-      try {
-        const r = await (await fetch(
-          `${req.protocol}://${req.get("host")}/api/sap/item/${encodeURIComponent(c)}`
-        )).json();
-        results[c] = r;
-      } catch (e) {
-        results[c] = { ok: false, message: String(e.message || e) };
-      }
-    }
-
-    return res.json({ ok: true, results });
-  } catch (err) {
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* ========= Crear Cotización (Quotation) =========
-   POST /api/sap/quotation
-   Body:
-   {
-     customer: { nombre, tel, mail, dir },
-     items: [{ sku, qty, price }]
-   }
-*/
-const SAP_WEB_CARD_CODE = process.env.SAP_WEB_CARD_CODE || "C00001";
-
-app.post("/api/sap/quotation", async (req, res) => {
   try {
     if (missingSapEnv()) {
       return res.status(400).json({
@@ -266,197 +272,224 @@ app.post("/api/sap/quotation", async (req, res) => {
       });
     }
 
-    const { customer, items } = req.body;
-
-    if (!customer?.nombre || !customer?.tel || !customer?.dir) {
-      return res.status(400).json({ ok: false, message: "Faltan datos del cliente." });
-    }
-
-    if (!items?.length) {
-      return res.status(400).json({ ok: false, message: "Carrito vacío." });
-    }
-
-    // Validación mínima items
-    for (const it of items) {
-      if (!it?.sku || !it?.qty) {
-        return res.status(400).json({ ok: false, message: "Items inválidos." });
-      }
-    }
-
-    // ✅ Armamos el payload SAP Quotation
-    const payload = {
-      CardCode: SAP_WEB_CARD_CODE,
-      DocDate: new Date().toISOString().slice(0, 10),
-      DocDueDate: new Date().toISOString().slice(0, 10),
-      Comments: `Pedido Web - Pago contra entrega
-Cliente: ${customer.nombre}
-Tel: ${customer.tel}
-Correo: ${customer.mail || ""}
-Dirección: ${customer.dir}`,
-
-      DocumentLines: items.map((it) => {
-        const line = {
-          ItemCode: String(it.sku).replace("E-", "").trim(), // si tu SKU viene tipo "E-0110"
-          Quantity: Number(it.qty || 1),
-          WarehouseCode: SAP_WAREHOUSE,
-        };
-
-        // ✅ Si viene price, lo mandamos (opcional)
-        // Si no viene, SAP intenta calcular con lista del BP (depende configuración)
-        if (it.price != null && !isNaN(Number(it.price))) {
-          line.UnitPrice = Number(it.price);
-        }
-
-        return line;
-      }),
-    };
-
-    // ✅ Crear cotización en SAP
-    const sapResult = await slFetch(`/Quotations`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-
-    // SAP normalmente devuelve DocEntry / DocNum
-    return res.json({
-      ok: true,
-      message: "✅ Cotización creada en SAP",
-      docEntry: sapResult.DocEntry,
-      docNum: sapResult.DocNum,
-    });
-  } catch (err) {
-    console.error("❌ /api/sap/quotation error:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-// Cache en memoria (super rápido)
-const ITEMS_CACHE = new Map(); // code => { data, ts }
-const CACHE_TTL_MS = 60 * 1000; // 60s (ajústalo)
-
-function getCache(code) {
-  const hit = ITEMS_CACHE.get(code);
-  if (!hit) return null;
-  if (Date.now() - hit.ts > CACHE_TTL_MS) return null;
-  return hit.data;
-}
-
-function setCache(code, data) {
-  ITEMS_CACHE.set(code, { data, ts: Date.now() });
-}
-
-/* ========= Endpoint Batch =========
-GET /api/sap/items?codes=0110,0105,0124
-*/
-app.get("/api/sap/items", async (req, res) => {
-  try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP." });
-    }
-
     const codesRaw = String(req.query.codes || "").trim();
-    if (!codesRaw) return res.status(400).json({ ok: false, message: "codes vacío." });
+    if (!codesRaw) {
+      return res.status(400).json({ ok: false, message: "Faltan códigos." });
+    }
 
     const codes = codesRaw
       .split(",")
-      .map((c) => c.trim())
+      .map((x) => x.trim())
       .filter(Boolean)
-      .slice(0, 50); // límite
+      .slice(0, 60);
 
-    // ✅ Responde usando cache primero
-    const out = {};
-    const missing = [];
-
-    for (const code of codes) {
-      const cached = getCache(code);
-      if (cached) out[code] = cached;
-      else missing.push(code);
+    if (!codes.length) {
+      return res.status(400).json({ ok: false, message: "Códigos inválidos." });
     }
 
-    // Si todo está en cache, listo
-    if (!missing.length) return res.json({ ok: true, items: out });
+    // OR filter: ItemCode eq '0110' or ItemCode eq '0105'
+    const orFilter = codes.map((c) => `ItemCode eq '${c.replace(/'/g, "''")}'`).join(" or ");
 
-    // ✅ 1) traer datos base Items en paralelo
-    const itemsBasic = await Promise.all(
-      missing.map(async (code) => {
-        const item = await slFetch(
-          `/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,SalesUnit,InventoryItem`
-        );
-        return item;
-      })
-    );
+    // OR para stock con bodega fija
+    const orFilterWarehouse = codes
+      .map((c) => `(ItemCode eq '${c.replace(/'/g, "''")}' and WarehouseCode eq '${SAP_WAREHOUSE}')`)
+      .join(" or ");
 
-    // ✅ 2) PrecioListNo una vez
+    // PriceListNo una sola vez
     const priceListNo = await getPriceListNoByName(SAP_PRICE_LIST);
 
-    // ✅ 3) Stock por bodega en paralelo
-    const warehouses = await Promise.all(
-      missing.map(async (code) => {
-        try {
-          const whRes = await slFetch(
-            `/ItemWarehouseInfoCollection?$select=ItemCode,WarehouseCode,OnHand,Committed&$filter=ItemCode eq '${code}' and WarehouseCode eq '${SAP_WAREHOUSE}'`
-          );
-          return whRes?.value?.[0] || null;
-        } catch {
-          return null;
-        }
-      })
+    // ✅ 1) Items (una llamada)
+    const itemsRes = await slFetch(
+      `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem&$filter=${encodeURIComponent(orFilter)}`
     );
 
-    // ✅ 4) Precios en paralelo
-    const prices = await Promise.all(
-      missing.map(async (code) => {
-        if (priceListNo === null) return null;
-
-        try {
-          const pRes = await slFetch(
-            `/ItemPrices?$select=ItemCode,PriceList,Price&$filter=ItemCode eq '${code}' and PriceList eq ${priceListNo}`
-          );
-          return pRes?.value?.[0]?.Price != null ? Number(pRes.value[0].Price) : null;
-        } catch {
-          return null;
-        }
-      })
+    // ✅ 2) Stock por bodega (una llamada)
+    const stockRes = await slFetch(
+      `/ItemWarehouseInfoCollection?$select=ItemCode,WarehouseCode,OnHand,InStock,Committed&$filter=${encodeURIComponent(
+        orFilterWarehouse
+      )}`
     );
 
-    // ✅ Construir respuesta + guardar cache
-    for (let i = 0; i < missing.length; i++) {
-      const code = missing[i];
-      const item = itemsBasic[i];
-      const wh = warehouses[i];
-      const price = prices[i];
-
-      const onHand = wh?.OnHand ?? null;
-      const committed = wh?.Committed ?? 0;
-      const available = onHand !== null ? Number(onHand) - Number(committed) : null;
-
-      const final = {
-        code,
-        name: item?.ItemName || null,
-        unit: item?.SalesUnit || null,
-        priceList: SAP_PRICE_LIST,
-        priceListNo,
-        price,
-        stock: {
-          onHand,
-          committed,
-          available,
-          hasStock: available !== null ? available > 0 : null,
-        },
-      };
-
-      out[code] = final;
-      setCache(code, final);
+    // ✅ 3) Precios por lista (una llamada)
+    let pricesRes = { value: [] };
+    if (priceListNo != null) {
+      const orFilterPrices = codes.map((c) => `ItemCode eq '${c.replace(/'/g, "''")}'`).join(" or ");
+      pricesRes = await slFetch(
+        `/ItemPrices?$select=ItemCode,PriceList,Price&$filter=PriceList eq ${priceListNo} and (${encodeURIComponent(
+          orFilterPrices
+        )})`
+      );
     }
 
-    return res.json({ ok: true, items: out });
+    // Map base de items
+    const itemsMap = {};
+    (itemsRes?.value || []).forEach((it) => {
+      itemsMap[it.ItemCode] = {
+        code: it.ItemCode,
+        name: it.ItemName,
+        unit: it.SalesUnit || "",
+        inventoryItem: it.InventoryItem,
+        price: null,
+        stock: { onHand: null, committed: 0, available: null, hasStock: null },
+      };
+    });
+
+    // Map stock
+    const stockMap = {};
+    (stockRes?.value || []).forEach((wh) => {
+      stockMap[wh.ItemCode] = wh;
+    });
+
+    // Map precios
+    const priceMap = {};
+    (pricesRes?.value || []).forEach((p) => {
+      // PriceList debería ser el número de lista
+      priceMap[p.ItemCode] = Number(p.Price);
+    });
+
+    // unir todo
+    codes.forEach((code) => {
+      if (!itemsMap[code]) {
+        itemsMap[code] = {
+          code,
+          name: `Producto ${code}`,
+          unit: "",
+          inventoryItem: null,
+          price: null,
+          stock: { onHand: null, committed: 0, available: null, hasStock: null },
+        };
+      }
+
+      const wh = stockMap[code];
+      const onHand = wh?.OnHand ?? wh?.InStock ?? null;
+      const committed = wh?.Committed ?? 0;
+      const available = onHand != null ? Number(onHand) - Number(committed) : null;
+
+      itemsMap[code].price = priceMap[code] ?? null;
+      itemsMap[code].stock = {
+        onHand,
+        committed,
+        available,
+        hasStock: available != null ? available > 0 : null,
+      };
+    });
+
+    return res.json({
+      ok: true,
+      warehouse: SAP_WAREHOUSE,
+      priceList: SAP_PRICE_LIST,
+      priceListNo,
+      items: itemsMap,
+    });
   } catch (err) {
-    console.error("❌ batch items error:", err.message);
+    console.error("❌ /api/sap/items error:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
 
+/* ======================================================
+   ✅ YAPPY ORDER (PAGO CONTRA ENTREGA / VALIDACIÓN)
+====================================================== */
+const yappyOrders = [];
 
-/* ========= START ========= */
+app.post("/api/yappy-order", (req, res) => {
+  try {
+    const order = req.body;
+
+    if (
+      !order?.customer?.nombre ||
+      !order?.customer?.tel ||
+      !order?.customer?.mail ||
+      !order?.customer?.dir
+    ) {
+      return res.status(400).send("Pedido incompleto: faltan datos del cliente.");
+    }
+    if (!order?.items?.length) {
+      return res.status(400).send("Pedido incompleto: carrito vacío.");
+    }
+
+    const orderId = "YP-" + Date.now();
+
+    const payload = {
+      orderId,
+      createdAt: new Date().toISOString(),
+      paymentMethod: "Yappy",
+      yappyAlias: order?.yappyAlias || YAPPY_ALIAS,
+      amount: Number(order.amount || 0),
+      reference: order?.reference || "",
+      comments: order?.comments || "",
+      customer: order.customer,
+      retiroPorTerceros: order?.retiroPorTerceros || null,
+      items: order.items,
+      status: "PENDIENTE_VALIDACION",
+      origin: order?.origin || "",
+    };
+
+    yappyOrders.push(payload);
+    console.log("✅ NUEVO PEDIDO YAPPY:", payload);
+
+    return res.json({ ok: true, orderId });
+  } catch (err) {
+    console.error("❌ Error en /api/yappy-order:", err);
+    return res.status(500).send("Error interno registrando pedido.");
+  }
+});
+
+app.get("/api/yappy-orders", (req, res) => {
+  res.json({ ok: true, count: yappyOrders.length, orders: yappyOrders });
+});
+
+/* ======================================================
+   ✅ STRIPE (OPCIONAL)
+====================================================== */
+app.post("/api/pay/stripe/create-checkout-session", async (req, res) => {
+  try {
+    if (!stripe) {
+      return res
+        .status(400)
+        .send("Stripe no está configurado. Falta STRIPE_SECRET_KEY.");
+    }
+
+    const { customer, items, currency, success_url, cancel_url } = req.body;
+
+    if (!items?.length) {
+      return res.status(400).send("No hay items para pagar.");
+    }
+
+    const line_items = items.map((it) => ({
+      quantity: Number(it.qty || 1),
+      price_data: {
+        currency: currency || "usd",
+        unit_amount: Number(it.unit_amount), // en centavos
+        product_data: {
+          name: `${it.name} (${it.sku})`,
+        },
+      },
+    }));
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+      line_items,
+      customer_email: customer?.mail || undefined,
+      success_url,
+      cancel_url,
+      metadata: {
+        nombre: customer?.nombre || "",
+        telefono: customer?.tel || "",
+        direccion: customer?.dir || "",
+      },
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error("❌ Stripe error:", err.message);
+    res.status(500).send(err.message);
+  }
+});
+
+/* ======================================================
+   ✅ START
+====================================================== */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT));
