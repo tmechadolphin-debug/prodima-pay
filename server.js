@@ -29,8 +29,8 @@ const JWT_SECRET = process.env.JWT_SECRET || "Panama!2025#";
 app.use(
   cors({
     origin: CORS_ORIGIN === "*" ? "*" : [CORS_ORIGIN],
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"], // ✅ IMPORTANTE
   })
 );
 
