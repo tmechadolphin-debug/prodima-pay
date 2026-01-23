@@ -1,64 +1,111 @@
 import express from "express";
 import cors from "cors";
-import Stripe from "stripe";
-import path from "path";
-import { fileURLToPath } from "url";
-
-/**
- * PRODIMA PAY API (Render)
- * - Health
- * - SAP B1 Service Layer: Item (stock + precio por lista)
- * - Yappy: registrar pedido (sin pasarela oficial todavía)
- * - Stripe: opcional (solo si existe STRIPE_SECRET_KEY)
- */
 
 const app = express();
+app.use(express.json({ limit: "2mb" }));
 
-/* ===========================
-   ENV
-=========================== */
-const PORT = process.env.PORT || 3000;
-
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-
-const SAP_BASE_URL   = (process.env.SAP_BASE_URL || "").replace(/\/+$/, ""); // sin trailing /
-const SAP_COMPANYDB  = process.env.SAP_COMPANYDB || "";
-const SAP_USER       = process.env.SAP_USER || "";
-const SAP_PASS       = process.env.SAP_PASS || "";
-const SAP_WAREHOUSE  = process.env.SAP_WAREHOUSE || "01";
+/* ========= ENV ========= */
+const SAP_BASE_URL = process.env.SAP_BASE_URL || "";
+const SAP_COMPANYDB = process.env.SAP_COMPANYDB || "";
+const SAP_USER = process.env.SAP_USER || "";
+const SAP_PASS = process.env.SAP_PASS || "";
+const SAP_WAREHOUSE = process.env.SAP_WAREHOUSE || "01";
 const SAP_PRICE_LIST = process.env.SAP_PRICE_LIST || "Lista Distribuidor";
 
-const YAPPY_ALIAS    = process.env.YAPPY_ALIAS || "@prodimasansae";
+const YAPPY_ALIAS = process.env.YAPPY_ALIAS || "@prodimasansae";
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
-// Stripe opcional
-const STRIPE_KEY = process.env.STRIPE_SECRET_KEY || "";
-const stripe = STRIPE_KEY ? new Stripe(STRIPE_KEY) : null;
-
-/* ===========================
-   MIDDLEWARES
-=========================== */
+/* ========= CORS ========= */
 app.use(
   cors({
-    origin: CORS_ORIGIN === "*" ? "*" : CORS_ORIGIN.split(",").map(s => s.trim()),
+    origin: CORS_ORIGIN === "*" ? "*" : [CORS_ORIGIN],
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type"],
   })
 );
 
-app.use(express.json({ limit: "2mb" }));
+/* ========= Helpers ========= */
+let SL_COOKIE = null;
+let SL_COOKIE_TIME = 0;
 
-/* ===========================
-   STATIC (opcional)
-   - Si en algún momento montas el frontend aquí mismo,
-     Render puede servirlo desde el mismo dominio.
-=========================== */
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-app.use(express.static(__dirname));
+function missingSapEnv() {
+  return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
+}
 
-/* ===========================
-   HEALTH
-=========================== */
+async function slLogin() {
+  if (missingSapEnv()) {
+    console.log("⚠️ Faltan variables SAP en Render > Environment");
+    return;
+  }
+
+  const payload = {
+    CompanyDB: SAP_COMPANYDB,
+    UserName: SAP_USER,
+    Password: SAP_PASS,
+  };
+
+  const res = await fetch(`${SAP_BASE_URL}/Login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Login SAP falló (${res.status}): ${t}`);
+  }
+
+  const setCookie = res.headers.get("set-cookie");
+  if (!setCookie) throw new Error("No se recibió cookie del Service Layer.");
+
+  // juntar cookies principales
+  SL_COOKIE = setCookie
+    .split(",")
+    .map((s) => s.split(";")[0])
+    .join("; ");
+
+  SL_COOKIE_TIME = Date.now();
+  console.log("✅ Login SAP OK (cookie guardada)");
+}
+
+async function slFetch(path, options = {}) {
+  if (!SL_COOKIE || Date.now() - SL_COOKIE_TIME > 25 * 60 * 1000) {
+    await slLogin();
+  }
+
+  const res = await fetch(`${SAP_BASE_URL}${path}`, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: SL_COOKIE,
+      ...(options.headers || {}),
+    },
+  });
+
+  const text = await res.text();
+
+  // Reintento si expiró
+  if (res.status === 401 || res.status === 403) {
+    SL_COOKIE = null;
+    await slLogin();
+    return slFetch(path, options);
+  }
+
+  let json;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    json = { raw: text };
+  }
+
+  if (!res.ok) {
+    throw new Error(`SAP error ${res.status}: ${text}`);
+  }
+
+  return json;
+}
+
+/* ========= API Health ========= */
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
@@ -69,311 +116,137 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-/* ===========================
-   ✅ YAPPY (registro de pedido)
-   Nota: no existe confirmación automática sin API oficial.
-=========================== */
-const yappyOrders = [];
+/* ========= Obtener PriceListNo por nombre ========= */
+async function getPriceListNoByName(name) {
+  const safe = name.replace(/'/g, "''");
 
-app.post("/api/yappy-order", (req, res) => {
+  // Intento A: PriceListName
   try {
-    const order = req.body;
+    const r1 = await slFetch(
+      `/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`
+    );
+    if (r1?.value?.length) return r1.value[0].PriceListNo;
+  } catch {}
 
-    if (!order?.customer?.nombre || !order?.customer?.tel || !order?.customer?.mail || !order?.customer?.dir) {
-      return res.status(400).send("Pedido incompleto: faltan datos del cliente.");
-    }
-    if (!order?.items?.length) {
-      return res.status(400).send("Pedido incompleto: carrito vacío.");
-    }
-    if (!order?.amount || Number(order.amount) <= 0) {
-      return res.status(400).send("Pedido incompleto: monto inválido.");
-    }
+  // Intento B: ListName
+  try {
+    const r2 = await slFetch(
+      `/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`
+    );
+    if (r2?.value?.length) return r2.value[0].PriceListNo;
+  } catch {}
 
-    const orderId = "YP-" + Date.now();
-
-    const payload = {
-      orderId,
-      createdAt: new Date().toISOString(),
-      paymentMethod: "Yappy",
-      yappyAlias: order?.yappyAlias || YAPPY_ALIAS,
-      amount: Number(order.amount),
-      reference: order?.reference || "", // opcional
-      comments: order?.comments || "",
-      customer: order.customer,
-      retiroPorTerceros: order?.retiroPorTerceros || null,
-      items: order.items,
-      status: "PENDIENTE_VALIDACION",
-      origin: order?.origin || "",
-    };
-
-    yappyOrders.push(payload);
-
-    console.log("✅ NUEVO PEDIDO YAPPY:", payload);
-
-    return res.json({ ok: true, orderId });
-  } catch (err) {
-    console.error("❌ Error en /api/yappy-order:", err);
-    return res.status(500).send("Error interno registrando pedido.");
-  }
-});
-
-app.get("/api/yappy-orders", (req, res) => {
-  res.json({ ok: true, count: yappyOrders.length, orders: yappyOrders });
-});
-
-/* ===========================
-   ✅ SAP B1 Service Layer helpers
-   - Mantiene cookie en memoria para no loguearse en cada request
-=========================== */
-
-let sapSession = {
-  cookie: "",
-  createdAt: 0,
-};
-
-let cachedPriceList = {
-  name: "",
-  listNum: null,
-  cachedAt: 0,
-};
-
-// Renueva login cada ~25 min (la sesión suele durar más, pero así es seguro)
-const SAP_SESSION_TTL_MS = 25 * 60 * 1000;
-
-function haveSapEnv() {
-  return Boolean(SAP_BASE_URL && SAP_COMPANYDB && SAP_USER && SAP_PASS);
+  return null;
 }
 
-async function sapLoginIfNeeded() {
-  if (!haveSapEnv()) {
-    throw new Error("Faltan variables SAP (SAP_BASE_URL, SAP_COMPANYDB, SAP_USER, SAP_PASS).");
-  }
-
-  const now = Date.now();
-  if (sapSession.cookie && (now - sapSession.createdAt) < SAP_SESSION_TTL_MS) {
-    return sapSession.cookie;
-  }
-
-  const loginUrl = `${SAP_BASE_URL}/Login`;
-
-  const resp = await fetch(loginUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      CompanyDB: SAP_COMPANYDB,
-      UserName: SAP_USER,
-      Password: SAP_PASS,
-    }),
-  });
-
-  if (!resp.ok) {
-    const t = await resp.text();
-    throw new Error(`SAP login error ${resp.status}: ${t}`);
-  }
-
-  // Node/undici: getSetCookie() devuelve array de Set-Cookie
-  const setCookies = resp.headers.getSetCookie?.() || [];
-  const cookie = setCookies
-    .map((c) => c.split(";")[0])
-    .filter(Boolean)
-    .join("; ");
-
-  if (!cookie) {
-    throw new Error("No se recibieron cookies de SAP (B1SESSION/ROUTEID).");
-  }
-
-  sapSession.cookie = cookie;
-  sapSession.createdAt = now;
-
-  return cookie;
-}
-
-async function sapFetch(pathWithQuery) {
-  const cookie = await sapLoginIfNeeded();
-
-  const url = `${SAP_BASE_URL}${pathWithQuery.startsWith("/") ? "" : "/"}${pathWithQuery}`;
-
-  const resp = await fetch(url, {
-    method: "GET",
-    headers: {
-      "Content-Type": "application/json",
-      "Cookie": cookie,
-    },
-  });
-
-  if (!resp.ok) {
-    const t = await resp.text();
-    throw new Error(`SAP error ${resp.status}: ${t}`);
-  }
-
-  return resp.json();
-}
-
-function escapeODataString(s) {
-  // OData usa comillas simples dentro de '...': duplicar
-  return String(s).replace(/'/g, "''");
-}
-
-async function getPriceListNumByName(listName) {
-  const now = Date.now();
-
-  // cache 1 hora
-  if (
-    cachedPriceList.name === listName &&
-    cachedPriceList.listNum !== null &&
-    (now - cachedPriceList.cachedAt) < (60 * 60 * 1000)
-  ) {
-    return cachedPriceList.listNum;
-  }
-
-  const safeName = escapeODataString(listName);
-  const filter = encodeURIComponent(`ListName eq '${safeName}'`);
-  const data = await sapFetch(`/PriceLists?$select=ListNum,ListName&$filter=${filter}`);
-
-  const row = data?.value?.[0];
-  if (!row) {
-    throw new Error(`No encontré la lista de precios en SAP: "${listName}"`);
-  }
-
-  cachedPriceList = {
-    name: listName,
-    listNum: Number(row.ListNum),
-    cachedAt: now,
-  };
-
-  return cachedPriceList.listNum;
-}
-
-/* ===========================
-   ✅ SAP: Item (precio + stock)
+/* =========================================================
+   ✅ Endpoint seguro: item + precio lista + stock warehouse
    GET /api/sap/item/0110
-=========================== */
+========================================================= */
 app.get("/api/sap/item/:code", async (req, res) => {
   try {
-    if (!haveSapEnv()) {
+    if (missingSapEnv()) {
       return res.status(400).json({
         ok: false,
-        message: "Faltan variables de entorno SAP. Revisa Render > Environment.",
+        message: "Faltan variables SAP en Render > Environment",
       });
     }
 
     const code = String(req.params.code || "").trim();
-    if (!code) return res.status(400).json({ ok: false, message: "ItemCode inválido." });
+    if (!code) {
+      return res.status(400).json({ ok: false, message: "ItemCode vacío." });
+    }
 
-    // 1) Traemos el item completo (SIN $expand) para evitar errores de navegación
-    const item = await sapFetch(`/Items('${encodeURIComponent(code)}')`);
+    // ✅ 1) Buscar el priceListNo
+    const priceListNo = await getPriceListNoByName(SAP_PRICE_LIST);
 
-    // 2) Sacamos precio por lista
+    // ✅ 2) Traer el ITEM COMPLETO (la forma más compatible)
+    // Esto normalmente devuelve ItemPrices[] y ItemWarehouseInfoCollection[]
+    const itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
+
+    const item = {
+      ItemCode: itemFull.ItemCode,
+      ItemName: itemFull.ItemName,
+      SalesUnit: itemFull.SalesUnit,
+      InventoryItem: itemFull.InventoryItem,
+    };
+
+    // ✅ 3) Precio desde ItemPrices (si viene)
     let price = null;
-    try {
-      const listNum = await getPriceListNumByName(SAP_PRICE_LIST);
-
-      if (Array.isArray(item?.ItemPrices)) {
-        const pRow = item.ItemPrices.find((p) => Number(p.PriceList) === Number(listNum));
-        if (pRow && pRow.Price !== undefined) price = Number(pRow.Price);
-      }
-    } catch (e) {
-      // Si falla lista/precio, igual devolvemos item + stock
-      console.warn("⚠️ No pude obtener precio por lista:", e.message);
+    if (priceListNo !== null && Array.isArray(itemFull.ItemPrices)) {
+      const p = itemFull.ItemPrices.find(
+        (x) => Number(x.PriceList) === Number(priceListNo)
+      );
+      if (p && p.Price != null) price = Number(p.Price);
     }
 
-    // 3) Sacamos stock por bodega
-    let stock = null;
-    if (Array.isArray(item?.ItemWarehouseInfoCollection)) {
-      const w = item.ItemWarehouseInfoCollection.find((x) => String(x.WarehouseCode) === String(SAP_WAREHOUSE));
-      if (w) stock = Number(w.InStock ?? w.OnHand ?? w.InStockQuantity ?? 0);
+    // ✅ 4) Stock desde ItemWarehouseInfoCollection (si viene)
+    let wh = null;
+    if (Array.isArray(itemFull.ItemWarehouseInfoCollection)) {
+      wh = itemFull.ItemWarehouseInfoCollection.find(
+        (x) => String(x.WarehouseCode) === String(SAP_WAREHOUSE)
+      );
     }
+
+    const onHand =
+      wh?.InStock ?? wh?.OnHand ?? wh?.QuantityOnStock ?? null;
+    const committed = wh?.Committed ?? 0;
+    const available =
+      onHand !== null ? Number(onHand) - Number(committed) : null;
 
     return res.json({
       ok: true,
-      item: {
-        ItemCode: item.ItemCode,
-        ItemName: item.ItemName,
-        UoMGroupEntry: item.UoMGroupEntry,
-      },
+      item,
       warehouse: SAP_WAREHOUSE,
       priceList: SAP_PRICE_LIST,
+      priceListNo,
       price,
-      stock,
-      raw: {
-        // Campos útiles para debug (puedes eliminar luego)
-        hasItemPrices: Array.isArray(item?.ItemPrices),
-        hasWarehouseInfo: Array.isArray(item?.ItemWarehouseInfoCollection),
+      stock: {
+        onHand,
+        committed,
+        available,
+        hasStock: available !== null ? available > 0 : null,
       },
     });
   } catch (err) {
-    console.error("❌ /api/sap/item/:code", err);
+    console.error("❌ /api/sap/item error:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
 
-/* ===========================
-   ✅ SAP: buscar items por texto (opcional)
-   GET /api/sap/search?q=cloro
-=========================== */
-app.get("/api/sap/search", async (req, res) => {
+/* =========================================================
+   ✅ Endpoint para muchos items (para tu página de productos)
+   GET /api/sap/items?codes=0110,0105,0124
+========================================================= */
+app.get("/api/sap/items", async (req, res) => {
   try {
-    const q = String(req.query.q || "").trim();
-    if (!q) return res.status(400).json({ ok: false, message: "Falta query ?q=" });
+    const codes = String(req.query.codes || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
 
-    // Búsqueda simple por ItemName
-    const safe = escapeODataString(q);
-    const filter = encodeURIComponent(`contains(ItemName,'${safe}')`);
-    const data = await sapFetch(`/Items?$select=ItemCode,ItemName&$filter=${filter}&$top=25`);
+    if (!codes.length) {
+      return res.status(400).json({ ok: false, message: "codes vacío" });
+    }
 
-    return res.json({ ok: true, count: data?.value?.length || 0, items: data?.value || [] });
+    const results = {};
+    for (const c of codes) {
+      try {
+        const r = await (await fetch(
+          `${req.protocol}://${req.get("host")}/api/sap/item/${encodeURIComponent(c)}`
+        )).json();
+        results[c] = r;
+      } catch (e) {
+        results[c] = { ok: false, message: String(e.message || e) };
+      }
+    }
+
+    return res.json({ ok: true, results });
   } catch (err) {
-    console.error("❌ /api/sap/search", err);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
 
-/* ===========================
-   STRIPE (opcional)
-=========================== */
-app.post("/api/pay/stripe/create-checkout-session", async (req, res) => {
-  try {
-    if (!stripe) return res.status(400).send("Stripe no está configurado (falta STRIPE_SECRET_KEY).");
-
-    const { customer, items, currency, success_url, cancel_url } = req.body;
-    if (!items?.length) return res.status(400).send("No hay items para pagar.");
-
-    const line_items = items.map((it) => ({
-      quantity: Number(it.qty || 1),
-      price_data: {
-        currency: currency || "usd",
-        unit_amount: Number(it.unit_amount), // centavos
-        product_data: { name: `${it.name} (${it.sku})` },
-      },
-    }));
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      payment_method_types: ["card"],
-      line_items,
-      customer_email: customer?.mail || undefined,
-      success_url,
-      cancel_url,
-      metadata: {
-        nombre: customer?.nombre || "",
-        telefono: customer?.tel || "",
-        direccion: customer?.dir || "",
-      },
-    });
-
-    res.json({ url: session.url });
-  } catch (err) {
-    console.error("❌ Stripe error:", err);
-    res.status(500).send(err.message);
-  }
-});
-
-/* ===========================
-   START
-=========================== */
-app.listen(PORT, () => {
-  if (!haveSapEnv()) {
-    console.warn("⚠️ Faltan variables de entorno SAP. Revisa Render > Environment.");
-  }
-  console.log("✅ Server listo en puerto", PORT);
-});
+/* ========= START ========= */
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT));
