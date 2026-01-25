@@ -732,6 +732,85 @@ app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
+   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
+   GET /api/admin/quotes?user=&from=&to=&client=
+========================================================= */
+app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
+
+    const fUser = String(req.query.user || "").trim().toLowerCase();
+    const fFrom = String(req.query.from || "").trim(); // YYYY-MM-DD
+    const fTo   = String(req.query.to || "").trim();   // YYYY-MM-DD
+    const fClient = String(req.query.client || "").trim().toLowerCase();
+
+    // Traemos 200 últimos (rápido)
+    // OJO: algunos Service Layer no soportan "contains" en filter, por eso filtramos luego en Node.
+    let sl = await slFetch(
+      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocStatus,DocDate,Comments&$orderby=DocDate desc&$top=200`
+    );
+
+    const rows = Array.isArray(sl?.value) ? sl.value : [];
+
+    // Extraer usuario desde Comments: [user:daniel11]
+    function extractUser(comments = "") {
+      const m = String(comments || "").match(/\[user:([^\]]+)\]/i);
+      return m ? String(m[1]).trim().toLowerCase() : "";
+    }
+
+    // Filtros en Node (por compatibilidad)
+    let out = rows.map(r => {
+      const fecha = String(r.DocDate || "").slice(0,10);
+      const u = extractUser(r.Comments || "");
+      const d = new Date(fecha + "T00:00:00");
+      const mes = d.toLocaleString("es", { month: "long" });
+      const anio = d.getFullYear();
+
+      return {
+        docEntry: r.DocEntry,
+        docNum: r.DocNum,
+        cardCode: r.CardCode,
+        cliente: r.CardName,
+        usuario: u || "--",
+        montoCotizacion: Number(r.DocTotal || 0),
+        montoEntregado: 0, // Cotización normalmente no tiene entregado
+        fecha,
+        estado: r.DocStatus, // O / C
+        mes,
+        anio
+      };
+    });
+
+    // aplicar filtros
+    if (fUser) {
+      out = out.filter(x => String(x.usuario).toLowerCase().includes(fUser));
+    }
+
+    if (fClient) {
+      out = out.filter(x =>
+        String(x.cliente || "").toLowerCase().includes(fClient) ||
+        String(x.cardCode || "").toLowerCase().includes(fClient)
+      );
+    }
+
+    if (fFrom) {
+      out = out.filter(x => String(x.fecha) >= fFrom);
+    }
+    if (fTo) {
+      out = out.filter(x => String(x.fecha) <= fTo);
+    }
+
+    return res.json({ ok: true, quotes: out });
+  } catch (err) {
+    console.error("❌ quotes history:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+
+/* =========================================================
    ✅ START
 ========================================================= */
 const PORT = process.env.PORT || 10000;
