@@ -357,9 +357,9 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const to = String(req.query?.to || "").trim();     // YYYY-MM-DD
     const limit = Math.min(Number(req.query?.limit || 200), 500);
 
-    // ✅ Traer cotizaciones (CardName a veces viene vacío, por eso haremos fallback)
+    // ✅ IMPORTANTE: ahora pedimos CardName también
     const sap = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,DocTotal,DocDate,DocumentStatus,Comments&$orderby=DocDate desc&$top=${limit}`
+      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments&$orderby=DocDate desc&$top=${limit}`
     );
 
     const values = Array.isArray(sap?.value) ? sap.value : [];
@@ -369,7 +369,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       return m ? String(m[1]).trim() : "";
     };
 
-    // ✅ Caché por CardCode para no consultar BP muchas veces
+    // ✅ caché por CardCode
     const bpCache = new Map(); // CardCode -> CardName
 
     async function getBPName(cardCode) {
@@ -380,16 +380,17 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         const bp = await slFetch(
           `/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`
         );
+
         const name = String(bp?.CardName || "").trim();
         bpCache.set(cardCode, name);
         return name;
-      } catch {
+      } catch (e) {
+        console.error("❌ BP lookup fail:", cardCode, e.message);
         bpCache.set(cardCode, "");
         return "";
       }
     }
 
-    // ✅ Convertir a filas
     let rows = [];
 
     for (const q of values) {
@@ -397,14 +398,18 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       const usuario = parseUserFromComments(q.Comments || "");
       const cardCode = String(q.CardCode || "").trim();
 
-      // Estado SAP -> Open/Close
       const estado =
         q.DocumentStatus === "bost_Open" ? "Open" :
         q.DocumentStatus === "bost_Close" ? "Close" :
         String(q.DocumentStatus || "");
 
-      // ✅ CardName fallback
-      const cardName = await getBPName(cardCode);
+      // ✅ 1) intenta CardName directo desde Quotations
+      let cardName = String(q.CardName || "").trim();
+
+      // ✅ 2) si viene vacío => fallback BusinessPartners
+      if (!cardName) {
+        cardName = await getBPName(cardCode);
+      }
 
       // Mes / Año
       let mes = "";
@@ -418,8 +423,14 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       rows.push({
         docEntry: q.DocEntry,
         docNum: q.DocNum,
+
         cardCode,
-        cardName, // ✅ YA VIENE AQUI
+
+        // ✅ nombre en 3 claves (para que el front no falle)
+        cardName,
+        customerName: cardName,
+        nombreCliente: cardName,
+
         montoCotizacion: Number(q.DocTotal || 0),
         montoEntregado: 0,
         fecha: docDate,
@@ -452,6 +463,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
+
 
 
 
