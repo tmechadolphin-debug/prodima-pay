@@ -342,6 +342,96 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
+   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
+   GET /api/admin/quotes?user=&client=&from=&to=&limit=
+========================================================= */
+app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
+
+    // filtros opcionales
+    const userFilter = String(req.query?.user || "").trim().toLowerCase();
+    const clientFilter = String(req.query?.client || "").trim().toLowerCase();
+    const from = String(req.query?.from || "").trim(); // YYYY-MM-DD
+    const to = String(req.query?.to || "").trim();     // YYYY-MM-DD
+    const limit = Math.min(Number(req.query?.limit || 200), 500);
+
+    // Trae cotizaciones desde SAP (últimas 200 por default)
+    const sap = await slFetch(
+      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments&$orderby=DocDate desc&$top=${limit}`
+    );
+
+    const values = Array.isArray(sap?.value) ? sap.value : [];
+
+    const parseUserFromComments = (comments = "") => {
+      const m = String(comments).match(/\[user:([^\]]+)\]/i);
+      return m ? String(m[1]).trim() : "";
+    };
+
+    // Filtrado local (más rápido y sin complicar filtros OData)
+    let rows = values.map((q) => {
+      const docDate = q.DocDate || "";
+      const u = parseUserFromComments(q.Comments || "");
+
+      // Estado SAP -> Open/Close
+      const st =
+        q.DocumentStatus === "bost_Open" ? "Open" :
+        q.DocumentStatus === "bost_Close" ? "Close" :
+        String(q.DocumentStatus || "");
+
+      // Mes / Año
+      let mes = "";
+      let anio = "";
+      try {
+        const d = new Date(docDate);
+        mes = d.toLocaleString("es-PA", { month: "long" });
+        anio = String(d.getFullYear());
+      } catch {}
+
+      return {
+        docEntry: q.DocEntry,
+        docNum: q.DocNum,
+        cardCode: q.CardCode,
+        cardName: q.CardName,
+        montoCotizacion: Number(q.DocTotal || 0),
+        montoEntregado: 0, // (cotización no tiene entregado real; si luego quieres lo calculamos)
+        fecha: docDate,
+        estado: st,
+        mes,
+        anio,
+        usuario: u,
+        comments: q.Comments || ""
+      };
+    });
+
+    // Filtro por usuario (viene del comentario [user:xxx])
+    if (userFilter) {
+      rows = rows.filter(r => String(r.usuario || "").toLowerCase().includes(userFilter));
+    }
+
+    // Filtro por cliente (CardCode o CardName)
+    if (clientFilter) {
+      rows = rows.filter(r =>
+        String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
+        String(r.cardName || "").toLowerCase().includes(clientFilter)
+      );
+    }
+
+    // Filtro por fecha (DocDate viene YYYY-MM-DD)
+    if (from) rows = rows.filter(r => String(r.fecha || "") >= from);
+    if (to) rows = rows.filter(r => String(r.fecha || "") <= to);
+
+    return res.json({ ok: true, quotes: rows });
+  } catch (err) {
+    console.error("❌ /api/admin/quotes:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+
+/* =========================================================
    ✅ ADMIN: LIST USERS
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
