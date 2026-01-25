@@ -342,6 +342,132 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
+   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
+   GET /api/admin/quotes?user=&client=&from=&to=&limit=
+========================================================= */
+app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
+
+    const userFilter = String(req.query?.user || "").trim().toLowerCase();
+    const clientFilter = String(req.query?.client || "").trim().toLowerCase();
+    const from = String(req.query?.from || "").trim(); // YYYY-MM-DD
+    const to = String(req.query?.to || "").trim();     // YYYY-MM-DD
+    const limit = Math.min(Number(req.query?.limit || 200), 500);
+
+    // ✅ IMPORTANTE: ahora pedimos CardName también
+    const sap = await slFetch(
+      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments&$orderby=DocDate desc&$top=${limit}`
+    );
+
+    const values = Array.isArray(sap?.value) ? sap.value : [];
+
+    const parseUserFromComments = (comments = "") => {
+      const m = String(comments).match(/\[user:([^\]]+)\]/i);
+      return m ? String(m[1]).trim() : "";
+    };
+
+    // ✅ caché por CardCode
+    const bpCache = new Map(); // CardCode -> CardName
+
+    async function getBPName(cardCode) {
+      if (!cardCode) return "";
+      if (bpCache.has(cardCode)) return bpCache.get(cardCode);
+
+      try {
+        const bp = await slFetch(
+          `/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`
+        );
+
+        const name = String(bp?.CardName || "").trim();
+        bpCache.set(cardCode, name);
+        return name;
+      } catch (e) {
+        console.error("❌ BP lookup fail:", cardCode, e.message);
+        bpCache.set(cardCode, "");
+        return "";
+      }
+    }
+
+    let rows = [];
+
+    for (const q of values) {
+      const docDate = q.DocDate || "";
+      const usuario = parseUserFromComments(q.Comments || "");
+      const cardCode = String(q.CardCode || "").trim();
+
+      const estado =
+        q.DocumentStatus === "bost_Open" ? "Open" :
+        q.DocumentStatus === "bost_Close" ? "Close" :
+        String(q.DocumentStatus || "");
+
+      // ✅ 1) intenta CardName directo desde Quotations
+      let cardName = String(q.CardName || "").trim();
+
+      // ✅ 2) si viene vacío => fallback BusinessPartners
+      if (!cardName) {
+        cardName = await getBPName(cardCode);
+      }
+
+      // Mes / Año
+      let mes = "";
+      let anio = "";
+      try {
+        const d = new Date(docDate);
+        mes = d.toLocaleString("es-PA", { month: "long" });
+        anio = String(d.getFullYear());
+      } catch {}
+
+      rows.push({
+        docEntry: q.DocEntry,
+        docNum: q.DocNum,
+
+        cardCode,
+
+        // ✅ nombre en 3 claves (para que el front no falle)
+        cardName,
+        customerName: cardName,
+        nombreCliente: cardName,
+
+        montoCotizacion: Number(q.DocTotal || 0),
+        montoEntregado: 0,
+        fecha: docDate,
+        estado,
+        mes,
+        anio,
+        usuario,
+        comments: q.Comments || ""
+      });
+    }
+
+    // ✅ Filtros
+    if (userFilter) {
+      rows = rows.filter(r => String(r.usuario || "").toLowerCase().includes(userFilter));
+    }
+
+    if (clientFilter) {
+      rows = rows.filter(r =>
+        String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
+        String(r.cardName || "").toLowerCase().includes(clientFilter)
+      );
+    }
+
+    if (from) rows = rows.filter(r => String(r.fecha || "") >= from);
+    if (to) rows = rows.filter(r => String(r.fecha || "") <= to);
+
+    return res.json({ ok: true, quotes: rows });
+  } catch (err) {
+    console.error("❌ /api/admin/quotes:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+
+
+
+/* =========================================================
    ✅ ADMIN: LIST USERS
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
