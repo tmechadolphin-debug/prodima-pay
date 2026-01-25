@@ -528,6 +528,8 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     const cardCode = String(req.body?.cardCode || "").trim();
     const comments = String(req.body?.comments || "").trim();
+    const createdBy = String(req.body?.createdBy || req.body?.username || "").trim().toLowerCase();
+
     const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
 
     if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
@@ -561,7 +563,7 @@ const docDate = panamaDateYYYYMMDD();
       CardCode: cardCode,
       DocDate: docDate,
       DocDueDate: docDate,
-      Comments: comments ? `[WEB PEDIDOS] ${comments}` : "[WEB PEDIDOS] Cotización mercaderista",
+      Comments: `[WEB PEDIDOS]${createdBy ? `[user:${createdBy}] ` : " "} ${comments || "Cotización mercaderista"}`,
       JournalMemo: "Cotización web mercaderistas",
       DocumentLines,
     };
