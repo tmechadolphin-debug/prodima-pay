@@ -351,16 +351,15 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
     }
 
-    // filtros opcionales
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
     const from = String(req.query?.from || "").trim(); // YYYY-MM-DD
     const to = String(req.query?.to || "").trim();     // YYYY-MM-DD
     const limit = Math.min(Number(req.query?.limit || 200), 500);
 
-    // Trae cotizaciones desde SAP (últimas 200 por default)
+    // ✅ Traer cotizaciones (CardName a veces viene vacío, por eso haremos fallback)
     const sap = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments&$orderby=DocDate desc&$top=${limit}`
+      `/Quotations?$select=DocEntry,DocNum,CardCode,DocTotal,DocDate,DocumentStatus,Comments&$orderby=DocDate desc&$top=${limit}`
     );
 
     const values = Array.isArray(sap?.value) ? sap.value : [];
@@ -370,16 +369,42 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       return m ? String(m[1]).trim() : "";
     };
 
-    // Filtrado local (más rápido y sin complicar filtros OData)
-    let rows = values.map((q) => {
+    // ✅ Caché por CardCode para no consultar BP muchas veces
+    const bpCache = new Map(); // CardCode -> CardName
+
+    async function getBPName(cardCode) {
+      if (!cardCode) return "";
+      if (bpCache.has(cardCode)) return bpCache.get(cardCode);
+
+      try {
+        const bp = await slFetch(
+          `/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`
+        );
+        const name = String(bp?.CardName || "").trim();
+        bpCache.set(cardCode, name);
+        return name;
+      } catch {
+        bpCache.set(cardCode, "");
+        return "";
+      }
+    }
+
+    // ✅ Convertir a filas
+    let rows = [];
+
+    for (const q of values) {
       const docDate = q.DocDate || "";
-      const u = parseUserFromComments(q.Comments || "");
+      const usuario = parseUserFromComments(q.Comments || "");
+      const cardCode = String(q.CardCode || "").trim();
 
       // Estado SAP -> Open/Close
-      const st =
+      const estado =
         q.DocumentStatus === "bost_Open" ? "Open" :
         q.DocumentStatus === "bost_Close" ? "Close" :
         String(q.DocumentStatus || "");
+
+      // ✅ CardName fallback
+      const cardName = await getBPName(cardCode);
 
       // Mes / Año
       let mes = "";
@@ -390,28 +415,27 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         anio = String(d.getFullYear());
       } catch {}
 
-      return {
+      rows.push({
         docEntry: q.DocEntry,
         docNum: q.DocNum,
-        cardCode: q.CardCode,
-        cardName: q.CardName,
+        cardCode,
+        cardName, // ✅ YA VIENE AQUI
         montoCotizacion: Number(q.DocTotal || 0),
-        montoEntregado: 0, // (cotización no tiene entregado real; si luego quieres lo calculamos)
+        montoEntregado: 0,
         fecha: docDate,
-        estado: st,
+        estado,
         mes,
         anio,
-        usuario: u,
+        usuario,
         comments: q.Comments || ""
-      };
-    });
+      });
+    }
 
-    // Filtro por usuario (viene del comentario [user:xxx])
+    // ✅ Filtros
     if (userFilter) {
       rows = rows.filter(r => String(r.usuario || "").toLowerCase().includes(userFilter));
     }
 
-    // Filtro por cliente (CardCode o CardName)
     if (clientFilter) {
       rows = rows.filter(r =>
         String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
@@ -419,7 +443,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       );
     }
 
-    // Filtro por fecha (DocDate viene YYYY-MM-DD)
     if (from) rows = rows.filter(r => String(r.fecha || "") >= from);
     if (to) rows = rows.filter(r => String(r.fecha || "") <= to);
 
@@ -429,6 +452,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
+
 
 
 /* =========================================================
