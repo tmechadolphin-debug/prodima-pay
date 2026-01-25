@@ -544,8 +544,18 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
     }
 
-    const today = new Date();
-    const docDate = today.toISOString().slice(0, 10);
+function panamaDateYYYYMMDD() {
+  // ✅ devuelve YYYY-MM-DD usando hora de Panamá (no UTC)
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Panama",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+const docDate = panamaDateYYYYMMDD();
+
 
     const payload = {
       CardCode: cardCode,
