@@ -4,23 +4,13 @@ import pg from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import multer from "multer";
-
-/* ✅ ADD: Adjuntos */
 import fs from "fs";
 import path from "path";
-import crypto from "crypto";
 
 const { Pool } = pg;
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
-const uploadFiles = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    files: 5,
-    fileSize: 10 * 1024 * 1024,
-  },
-});
 
 /* =========================================================
    ✅ ENV
@@ -32,6 +22,10 @@ const SAP_USER = process.env.SAP_USER || "";
 const SAP_PASS = process.env.SAP_PASS || "";
 const SAP_WAREHOUSE = process.env.SAP_WAREHOUSE || "01";
 const SAP_PRICE_LIST = process.env.SAP_PRICE_LIST || "Lista Distribuidor";
+
+// ✅ Carpeta REAL para guardar archivos (debe existir / tener permisos)
+const SAP_ATTACH_DIR =
+  process.env.SAP_ATTACH_DIR || "\\\\APPSERVER\\Documentos SAP\\Attachments\\";
 
 // ---- Web / CORS ----
 const YAPPY_ALIAS = process.env.YAPPY_ALIAS || "@prodimasansae";
@@ -49,16 +43,6 @@ const JWT_SECRET = process.env.JWT_SECRET || "prodima_change_this_secret";
 // Panamá es -05:00 => -300 minutos
 const TZ_OFFSET_MIN = Number(process.env.TZ_OFFSET_MIN || -300);
 
-/* ✅ ADD: Carpeta de Adjuntos */
-const ATTACHMENTS_DIR = process.env.ATTACHMENTS_DIR || "C:\\Documentos SAP\\Attachments";
-/*
-  ✅ Esta ruta es la que SAP Service Layer debe poder leer.
-  - Si SAP y el AppServer ven la misma carpeta local, puede ser igual a ATTACHMENTS_DIR.
-  - Si SAP necesita ver un share, ponlo aquí:
-    \\pa2filevault1.pa2.tmcloud.local\su-india-shared\C7357449_PRDMA_PRD\Attachments
-*/
-const ATTACHMENTS_SOURCE_PATH = process.env.ATTACHMENTS_SOURCE_PATH || ATTACHMENTS_DIR;
-
 /* =========================================================
    ✅ CORS
 ========================================================= */
@@ -70,6 +54,48 @@ app.use(
   })
 );
 app.options("*", cors());
+
+/* =========================================================
+   ✅ Upload (multer)
+   - guardamos en memoria, luego lo escribimos donde toca
+========================================================= */
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    files: 5,
+    fileSize: 10 * 1024 * 1024, // 10MB por archivo
+  },
+});
+
+/* =========================================================
+   ✅ Utilidades de archivos
+========================================================= */
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function safeBaseName(originalName = "") {
+  // evita caracteres raros para Windows
+  const base = String(originalName)
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, "_")
+    .slice(0, 120);
+
+  return base || "archivo";
+}
+
+function uniqueName(baseName) {
+  const stamp = Date.now();
+  const rnd = Math.random().toString(16).slice(2, 8);
+  return `${baseName}_${stamp}_${rnd}`;
+}
+
+function getExt(originalName = "") {
+  const ext = path.extname(String(originalName)).replace(".", "").toLowerCase();
+  return ext || "dat";
+}
 
 /* =========================================================
    ✅ DB Pool (Supabase)
@@ -88,7 +114,7 @@ function getPool() {
     pool = new Pool({
       connectionString: DATABASE_URL,
       ssl: { rejectUnauthorized: false }, // ✅ FIX CERT
-      max: 3, // recomendado con pooler/pgbouncer
+      max: 3,
     });
 
     pool.on("error", (err) => {
@@ -167,7 +193,6 @@ function signAdminToken() {
 }
 
 function signUserToken(user) {
-  // token mercaderista
   return jwt.sign(
     { typ: "user", uid: user.id, username: user.username },
     JWT_SECRET,
@@ -179,9 +204,7 @@ function verifyAdmin(req, res, next) {
   try {
     const auth = String(req.headers.authorization || "");
     if (!auth.startsWith("Bearer ")) {
-      return res
-        .status(401)
-        .json({ ok: false, message: "Falta Authorization Bearer token" });
+      return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
     }
 
     const token = auth.replace("Bearer ", "").trim();
@@ -202,9 +225,7 @@ function verifyUser(req, res, next) {
   try {
     const auth = String(req.headers.authorization || "");
     if (!auth.startsWith("Bearer ")) {
-      return res
-        .status(401)
-        .json({ ok: false, message: "Falta Authorization Bearer token" });
+      return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
     }
 
     const token = auth.replace("Bearer ", "").trim();
@@ -230,7 +251,7 @@ let SL_COOKIE_TIME = 0;
 let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
 const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
 
-const ITEM_CACHE = new Map(); // code -> { ts, data }
+const ITEM_CACHE = new Map();
 const ITEM_TTL_MS = 20 * 1000;
 
 function missingSapEnv() {
@@ -272,12 +293,12 @@ async function slLogin() {
   console.log("✅ Login SAP OK (cookie guardada)");
 }
 
-async function slFetch(path, options = {}) {
+async function slFetch(pathReq, options = {}) {
   if (!SL_COOKIE || Date.now() - SL_COOKIE_TIME > 25 * 60 * 1000) {
     await slLogin();
   }
 
-  const res = await fetch(`${SAP_BASE_URL}${path}`, {
+  const res = await fetch(`${SAP_BASE_URL}${pathReq}`, {
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -288,11 +309,10 @@ async function slFetch(path, options = {}) {
 
   const text = await res.text();
 
-  // Reintento si expiró
   if (res.status === 401 || res.status === 403) {
     SL_COOKIE = null;
     await slLogin();
-    return slFetch(path, options);
+    return slFetch(pathReq, options);
   }
 
   let json;
@@ -317,7 +337,7 @@ function getDateISOInOffset(offsetMinutes = -300) {
   const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
   const localMs = utcMs + offsetMinutes * 60000;
   const local = new Date(localMs);
-  return local.toISOString().slice(0, 10); // YYYY-MM-DD
+  return local.toISOString().slice(0, 10);
 }
 
 /* =========================================================
@@ -331,11 +351,12 @@ app.get("/api/health", async (req, res) => {
     warehouse: SAP_WAREHOUSE,
     priceList: SAP_PRICE_LIST,
     db: hasDb() ? "on" : "off",
+    attachDir: SAP_ATTACH_DIR,
   });
 });
 
 /* =========================================================
-   ✅ ADMIN: LOGIN
+   ✅ ADMIN LOGIN
 ========================================================= */
 app.post("/api/admin/login", async (req, res) => {
   try {
@@ -371,8 +392,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
-    const from = String(req.query?.from || "").trim(); // YYYY-MM-DD
-    const to = String(req.query?.to || "").trim();     // YYYY-MM-DD
+    const from = String(req.query?.from || "").trim();
+    const to = String(req.query?.to || "").trim();
     const limit = Math.min(Number(req.query?.limit || 200), 500);
 
     const sap = await slFetch(
@@ -386,7 +407,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       return m ? String(m[1]).trim() : "";
     };
 
-    const bpCache = new Map(); // CardCode -> CardName
+    const bpCache = new Map();
 
     async function getBPName(cardCode) {
       if (!cardCode) return "";
@@ -415,9 +436,11 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       const cardCode = String(q.CardCode || "").trim();
 
       const estado =
-        q.DocumentStatus === "bost_Open" ? "Open" :
-        q.DocumentStatus === "bost_Close" ? "Close" :
-        String(q.DocumentStatus || "");
+        q.DocumentStatus === "bost_Open"
+          ? "Open"
+          : q.DocumentStatus === "bost_Close"
+          ? "Close"
+          : String(q.DocumentStatus || "");
 
       let cardName = String(q.CardName || "").trim();
       if (!cardName) {
@@ -446,23 +469,24 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         mes,
         anio,
         usuario,
-        comments: q.Comments || ""
+        comments: q.Comments || "",
       });
     }
 
     if (userFilter) {
-      rows = rows.filter(r => String(r.usuario || "").toLowerCase().includes(userFilter));
+      rows = rows.filter((r) => String(r.usuario || "").toLowerCase().includes(userFilter));
     }
 
     if (clientFilter) {
-      rows = rows.filter(r =>
-        String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
-        String(r.cardName || "").toLowerCase().includes(clientFilter)
+      rows = rows.filter(
+        (r) =>
+          String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
+          String(r.cardName || "").toLowerCase().includes(clientFilter)
       );
     }
 
-    if (from) rows = rows.filter(r => String(r.fecha || "") >= from);
-    if (to) rows = rows.filter(r => String(r.fecha || "") <= to);
+    if (from) rows = rows.filter((r) => String(r.fecha || "") >= from);
+    if (to) rows = rows.filter((r) => String(r.fecha || "") <= to);
 
     return res.json({ ok: true, quotes: rows });
   } catch (err) {
@@ -539,10 +563,7 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
     const id = Number(req.params.id || 0);
     if (!id) return res.status(400).json({ ok: false, message: "id inválido" });
 
-    const r = await dbQuery(
-      `DELETE FROM app_users WHERE id = $1 RETURNING id, username;`,
-      [id]
-    );
+    const r = await dbQuery(`DELETE FROM app_users WHERE id = $1 RETURNING id, username;`, [id]);
 
     if (!r.rowCount) {
       return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
@@ -558,7 +579,7 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: TOGGLE ACTIVO (opcional)
+   ✅ ADMIN: TOGGLE ACTIVO
 ========================================================= */
 app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
   try {
@@ -591,7 +612,7 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: AUDIT (opcional)
+   ✅ ADMIN: AUDIT
 ========================================================= */
 app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
   try {
@@ -673,92 +694,10 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ MERCADERISTAS: ME (opcional)
+   ✅ MERCADERISTAS: ME
 ========================================================= */
 app.get("/api/auth/me", verifyUser, async (req, res) => {
   return res.json({ ok: true, user: req.user });
-});
-
-/* =========================================================
-   ✅ ADD: UPLOAD ADJUNTOS (Multipart)
-   POST /api/attachments/upload
-   FormData: files[]
-   Response: { ok:true, files:[{fileName,fileExtension,sourcePath}] }
-========================================================= */
-function ensureDir(p) {
-  try {
-    fs.mkdirSync(p, { recursive: true });
-  } catch {}
-}
-
-function safeBaseName(original) {
-  // quita caracteres raros para SAP/Windows
-  const base = path.parse(original).name || "archivo";
-  return base.replace(/[^a-zA-Z0-9_\- ]/g, "_").slice(0, 60) || "archivo";
-}
-
-function safeExt(original) {
-  let ext = (path.extname(original || "") || "").replace(".", "").toLowerCase();
-  if (!ext) ext = "dat";
-  // SAP suele tolerar pdf/jpg/png, etc.
-  ext = ext.replace(/[^a-z0-9]/g, "");
-  return ext.slice(0, 10) || "dat";
-}
-
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB
-    files: 5,
-  },
-});
-
-app.post("/api/attachments/upload", verifyUser, upload.array("files", 5), async (req, res) => {
-  try {
-    ensureDir(ATTACHMENTS_DIR);
-
-    const files = Array.isArray(req.files) ? req.files : [];
-    if (!files.length) {
-      return res.status(400).json({ ok: false, message: "No se recibieron archivos." });
-    }
-
-    const saved = [];
-
-    for (const f of files) {
-      const base = safeBaseName(f.originalname);
-      const ext = safeExt(f.originalname);
-
-      const rand = crypto.randomBytes(4).toString("hex");
-      const finalBase = `${base}_${Date.now()}_${rand}`; // nombre único
-      const finalName = `${finalBase}.${ext}`;
-
-      const diskPath = path.join(ATTACHMENTS_DIR, finalName);
-
-      fs.writeFileSync(diskPath, f.buffer);
-
-      // ⚠️ IMPORTANTE:
-      // SAP Attachments2 separa FileName y FileExtension.
-      // FileName debe ir SIN extensión.
-      saved.push({
-        fileName: finalBase,
-        fileExtension: ext,
-        sourcePath: ATTACHMENTS_SOURCE_PATH,
-        originalName: f.originalname,
-        bytes: Number(f.size || 0),
-      });
-    }
-
-    await audit("ATTACHMENTS_UPLOADED", req, req.user?.username || "unknown", {
-      count: saved.length,
-      dir: ATTACHMENTS_DIR,
-      sourcePath: ATTACHMENTS_SOURCE_PATH,
-    });
-
-    return res.json({ ok: true, files: saved });
-  } catch (e) {
-    console.error("❌ /api/attachments/upload:", e.message);
-    return res.status(500).json({ ok: false, message: e.message });
-  }
 });
 
 /* =========================================================
@@ -858,13 +797,11 @@ async function getOneItem(code, priceListNo) {
 }
 
 /* =========================================================
-   ✅ SAP: ITEM (1)
+   ✅ SAP: ITEM
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
@@ -888,22 +825,18 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: MULTI ITEMS (rápido)
+   ✅ SAP: MULTI ITEMS
 ========================================================= */
 app.get("/api/sap/items", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
     const codes = String(req.query.codes || "")
       .split(",")
       .map((x) => x.trim())
       .filter(Boolean);
 
-    if (!codes.length) {
-      return res.status(400).json({ ok: false, message: "codes vacío" });
-    }
+    if (!codes.length) return res.status(400).json({ ok: false, message: "codes vacío" });
 
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
 
@@ -950,9 +883,7 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
 ========================================================= */
 app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "CardCode vacío." });
@@ -983,133 +914,176 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADD: Crear AttachmentEntry en SAP (Attachments2)
+   ✅ SAP: CREAR ATTACHMENTENTRY (Attachments2)
+   - Recibe info de archivos guardados en la carpeta de SAP
 ========================================================= */
-async function createSapAttachmentEntry(filesMeta = []) {
-  if (!Array.isArray(filesMeta) || !filesMeta.length) return null;
+async function createSapAttachmentEntry(savedFiles = []) {
+  // savedFiles: [{dir, baseNameNoExt, ext}]
+  if (!savedFiles.length) return null;
 
-  // Armamos líneas de Attachments2
-  const lines = filesMeta
-    .map((f) => ({
-      SourcePath: String(f.sourcePath || ATTACHMENTS_SOURCE_PATH || "").trim(),
-      FileName: String(f.fileName || "").trim(), // SIN extensión
-      FileExtension: String(f.fileExtension || "").trim(), // ej: pdf, jpg
-    }))
-    .filter((x) => x.SourcePath && x.FileName && x.FileExtension);
-
-  if (!lines.length) return null;
+  const lines = savedFiles.map((f) => ({
+    SourcePath: String(f.dir || ""),
+    FileName: String(f.baseNameNoExt || ""),
+    FileExtension: String(f.ext || ""),
+  }));
 
   const payload = {
     Attachments2_Lines: lines,
   };
 
-  // SAP SL entity: /Attachments2
+  // Esto crea el AttachmentEntry en SAP
   const created = await slFetch(`/Attachments2`, {
     method: "POST",
     body: JSON.stringify(payload),
   });
 
-  // Normalmente devuelve AbsoluteEntry
+  // Service Layer normalmente devuelve AbsoluteEntry
   const entry = created?.AbsoluteEntry ?? created?.AttachmentEntry ?? null;
   return entry;
 }
 
 /* =========================================================
-   ✅ SAP: CREAR COTIZACIÓN
-   ✅ FIX fecha futura (Panamá)
-   ✅ Guarda usuario creador en Comments
-   ✅ ADD: AttachmentEntry si vienen archivos
+   ✅ SAP: CREAR COTIZACIÓN (con adjuntos en ANEXOS)
+   ✅ ahora soporta:
+   - JSON normal (sin archivos)
+   - multipart/form-data (con archivos)
 ========================================================= */
-app.post("/api/sap/quote", verifyUser, upload.array("files", 5), async (req, res) => {
-  try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
-
-    // ✅ ahora funciona tanto con JSON como con multipart
-    const cardCode = String(req.body?.cardCode || "").trim();
-    const comments = String(req.body?.comments || "").trim();
-
-    // ✅ líneas vienen como string si es multipart
-    let lines = [];
+app.post(
+  "/api/sap/quote",
+  verifyUser,
+  upload.array("files", 5),
+  async (req, res) => {
     try {
-      if (typeof req.body?.lines === "string") {
-        lines = JSON.parse(req.body.lines || "[]");
-      } else if (Array.isArray(req.body?.lines)) {
-        lines = req.body.lines;
+      if (missingSapEnv()) {
+        return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
       }
-    } catch {
-      lines = [];
+
+      // ✅ Puede venir JSON o multipart
+      const isMultipart = String(req.headers["content-type"] || "").includes("multipart/form-data");
+
+      let cardCode = "";
+      let comments = "";
+      let lines = [];
+
+      if (isMultipart) {
+        cardCode = String(req.body?.cardCode || "").trim();
+        comments = String(req.body?.comments || "").trim();
+
+        // lines viene como JSON string
+        try {
+          lines = JSON.parse(req.body?.lines || "[]");
+        } catch {
+          lines = [];
+        }
+      } else {
+        cardCode = String(req.body?.cardCode || "").trim();
+        comments = String(req.body?.comments || "").trim();
+        lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
+      }
+
+      if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
+      if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
+
+      const DocumentLines = lines
+        .map((l) => ({
+          ItemCode: String(l.itemCode || "").trim(),
+          Quantity: Number(l.qty || 0),
+        }))
+        .filter((x) => x.ItemCode && x.Quantity > 0);
+
+      if (!DocumentLines.length) {
+        return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
+      }
+
+      // ✅ Fecha segura para SAP (Panamá)
+      const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
+
+      const creator = req.user?.username || "unknown";
+
+      // ✅ Comentario guardando el usuario creador
+      const sapComments = [
+        `[WEB PEDIDOS]`,
+        `[user:${creator}]`,
+        comments ? comments : "Cotización mercaderista",
+      ].join(" ");
+
+      /* =====================================================
+         ✅ 1) Guardar archivos físicamente en la carpeta SAP
+      ====================================================== */
+      let savedFiles = [];
+      const incomingFiles = Array.isArray(req.files) ? req.files : [];
+
+      if (incomingFiles.length) {
+        // crea carpeta si no existe
+        ensureDir(SAP_ATTACH_DIR);
+
+        for (const file of incomingFiles) {
+          const ext = getExt(file.originalname);
+          const base = safeBaseName(path.basename(file.originalname, path.extname(file.originalname)));
+          const unique = uniqueName(base);
+
+          const fileFullName = `${unique}.${ext}`;
+          const fullPath = path.join(SAP_ATTACH_DIR, fileFullName);
+
+          // escribe el archivo
+          fs.writeFileSync(fullPath, file.buffer);
+
+          savedFiles.push({
+            dir: SAP_ATTACH_DIR,
+            baseNameNoExt: unique,
+            ext,
+          });
+        }
+      }
+
+      /* =====================================================
+         ✅ 2) Crear AttachmentEntry en SAP (Attachments2)
+      ====================================================== */
+      let attachmentEntry = null;
+      if (savedFiles.length) {
+        attachmentEntry = await createSapAttachmentEntry(savedFiles);
+      }
+
+      /* =====================================================
+         ✅ 3) Crear cotización en SAP con AttachmentEntry
+      ====================================================== */
+      const payload = {
+        CardCode: cardCode,
+        DocDate: docDate,
+        DocDueDate: docDate,
+        Comments: sapComments,
+        JournalMemo: "Cotización web mercaderistas",
+        DocumentLines,
+        ...(attachmentEntry ? { AttachmentEntry: attachmentEntry } : {}),
+      };
+
+      const created = await slFetch(`/Quotations`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+
+      await audit("QUOTE_CREATED", req, creator, {
+        cardCode,
+        lines: DocumentLines.length,
+        docDate,
+        attachmentEntry: attachmentEntry || null,
+        files: savedFiles.length,
+      });
+
+      return res.json({
+        ok: true,
+        message: "Cotización creada",
+        docEntry: created.DocEntry,
+        docNum: created.DocNum,
+        attachmentEntry: attachmentEntry || null,
+        filesSaved: savedFiles.length,
+      });
+    } catch (err) {
+      console.error("❌ /api/sap/quote:", err.message);
+      return res.status(500).json({ ok: false, message: err.message });
     }
-
-    if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
-    if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
-
-    const DocumentLines = lines
-      .map((l) => ({
-        ItemCode: String(l.itemCode || "").trim(),
-        Quantity: Number(l.qty || 0),
-      }))
-      .filter((x) => x.ItemCode && x.Quantity > 0);
-
-    if (!DocumentLines.length) {
-      return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
-    }
-
-    // ✅ Fecha segura para SAP (Panamá)
-    const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
-    const creator = req.user?.username || "unknown";
-
-    const sapComments = [
-      `[WEB PEDIDOS]`,
-      `[user:${creator}]`,
-      comments ? comments : "Cotización mercaderista",
-    ].join(" ");
-
-    const payload = {
-      CardCode: cardCode,
-      DocDate: docDate,
-      DocDueDate: docDate,
-      Comments: sapComments,
-      JournalMemo: "Cotización web mercaderistas",
-      DocumentLines,
-    };
-
-    const created = await slFetch(`/Quotations`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-
-    // ✅ Adjuntos (ya llegan aquí)
-    const files = Array.isArray(req.files) ? req.files : [];
-    console.log("📎 Adjuntos recibidos:", files.map(f => ({
-      field: f.fieldname,
-      name: f.originalname,
-      size: f.size,
-      type: f.mimetype
-    })));
-
-    await audit("QUOTE_CREATED", req, creator, {
-      cardCode,
-      lines: DocumentLines.length,
-      docDate,
-      attachments: files.length,
-      fileNames: files.map(f => f.originalname)
-    });
-
-    return res.json({
-      ok: true,
-      message: "Cotización creada",
-      docEntry: created.DocEntry,
-      docNum: created.DocNum,
-      attachmentsReceived: files.length
-    });
-  } catch (err) {
-    console.error("❌ /api/sap/quote:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
   }
-});
-
+);
 
 /* =========================================================
    ✅ START
@@ -1122,6 +1096,5 @@ ensureSchema()
   })
   .catch((e) => {
     console.error("❌ Error creando schema DB:", e.message);
-    // Igual levantamos el server (solo SAP funcionará si DB falla)
     app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT, "(sin DB)"));
   });
