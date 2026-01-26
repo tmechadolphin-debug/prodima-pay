@@ -5,7 +5,6 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
 /* ✅ ADD: Adjuntos */
-import multer from "multer";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
