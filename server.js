@@ -14,7 +14,13 @@ const { Pool } = pg;
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
-
+const upload = multer({
+  storage: multer.memoryStorage(), // ✅ no guarda en disco
+  limits: {
+    files: 5,
+    fileSize: 10 * 1024 * 1024, // 10MB por archivo
+  },
+});
 /* =========================================================
    ✅ ENV
 ========================================================= */
@@ -1013,18 +1019,27 @@ async function createSapAttachmentEntry(filesMeta = []) {
    ✅ Guarda usuario creador en Comments
    ✅ ADD: AttachmentEntry si vienen archivos
 ========================================================= */
-app.post("/api/sap/quote", verifyUser, async (req, res) => {
+app.post("/api/sap/quote", verifyUser, upload.array("files", 5), async (req, res) => {
   try {
     if (missingSapEnv()) {
       return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
     }
 
+    // ✅ ahora funciona tanto con JSON como con multipart
     const cardCode = String(req.body?.cardCode || "").trim();
     const comments = String(req.body?.comments || "").trim();
-    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
 
-    /* ✅ ADD: attachments */
-    const attachments = Array.isArray(req.body?.attachments) ? req.body.attachments : [];
+    // ✅ líneas vienen como string si es multipart
+    let lines = [];
+    try {
+      if (typeof req.body?.lines === "string") {
+        lines = JSON.parse(req.body.lines || "[]");
+      } else if (Array.isArray(req.body?.lines)) {
+        lines = req.body.lines;
+      }
+    } catch {
+      lines = [];
+    }
 
     if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
     if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
@@ -1040,8 +1055,8 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
     }
 
+    // ✅ Fecha segura para SAP (Panamá)
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
-
     const creator = req.user?.username || "unknown";
 
     const sapComments = [
@@ -1050,18 +1065,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       comments ? comments : "Cotización mercaderista",
     ].join(" ");
 
-    /* ✅ ADD: si vienen adjuntos, creamos AttachmentEntry */
-    let AttachmentEntry = null;
-    if (attachments.length) {
-      try {
-        AttachmentEntry = await createSapAttachmentEntry(attachments);
-      } catch (e) {
-        console.error("❌ AttachmentEntry fail:", e.message);
-        // Si falla attachments, NO matamos la cotización: simplemente continúa sin adjunto
-        AttachmentEntry = null;
-      }
-    }
-
     const payload = {
       CardCode: cardCode,
       DocDate: docDate,
@@ -1069,7 +1072,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       Comments: sapComments,
       JournalMemo: "Cotización web mercaderistas",
       DocumentLines,
-      ...(AttachmentEntry ? { AttachmentEntry } : {}),
     };
 
     const created = await slFetch(`/Quotations`, {
@@ -1077,11 +1079,21 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       body: JSON.stringify(payload),
     });
 
+    // ✅ Adjuntos (ya llegan aquí)
+    const files = Array.isArray(req.files) ? req.files : [];
+    console.log("📎 Adjuntos recibidos:", files.map(f => ({
+      field: f.fieldname,
+      name: f.originalname,
+      size: f.size,
+      type: f.mimetype
+    })));
+
     await audit("QUOTE_CREATED", req, creator, {
       cardCode,
       lines: DocumentLines.length,
       docDate,
-      AttachmentEntry,
+      attachments: files.length,
+      fileNames: files.map(f => f.originalname)
     });
 
     return res.json({
@@ -1089,13 +1101,14 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       message: "Cotización creada",
       docEntry: created.DocEntry,
       docNum: created.DocNum,
-      attachmentEntry: AttachmentEntry,
+      attachmentsReceived: files.length
     });
   } catch (err) {
     console.error("❌ /api/sap/quote:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
+
 
 /* =========================================================
    ✅ START
