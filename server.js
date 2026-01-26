@@ -3,6 +3,7 @@ import cors from "cors";
 import pg from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import multer from "multer";
 
 /* ✅ ADD: Adjuntos */
 import fs from "fs";
@@ -13,13 +14,14 @@ const { Pool } = pg;
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
-const upload = multer({
-  storage: multer.memoryStorage(), // ✅ no guarda en disco
+const uploadFiles = multer({
+  storage: multer.memoryStorage(),
   limits: {
     files: 5,
-    fileSize: 10 * 1024 * 1024, // 10MB por archivo
+    fileSize: 10 * 1024 * 1024,
   },
 });
+
 /* =========================================================
    ✅ ENV
 ========================================================= */
