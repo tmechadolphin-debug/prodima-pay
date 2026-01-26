@@ -341,60 +341,6 @@ app.post("/api/admin/login", async (req, res) => {
   }
 });
 
-/* =========================================
-   Adjuntos
-========================================= */
-const FILES = [];
-
-function renderFiles(){
-  const box = document.getElementById("filesList");
-  if(!FILES.length){
-    box.style.display = "none";
-    box.innerHTML = "";
-    return;
-  }
-  box.style.display = "block";
-
-  box.innerHTML = `
-    <b>📎 Archivos adjuntos:</b><br/>
-    ${FILES.map((f, i)=> `
-      • ${f.name} (${Math.round(f.size/1024)} KB)
-      <button type="button" class="btn btn-outline" style="height:26px;border-radius:10px;padding:0 8px;font-size:11px;margin-left:8px"
-        onclick="removeFile(${i})">Quitar</button>
-    `).join("<br/>")}
-  `;
-}
-
-window.removeFile = function(idx){
-  FILES.splice(idx, 1);
-  renderFiles();
-};
-
-document.getElementById("files").addEventListener("change", (e)=>{
-  const incoming = Array.from(e.target.files || []);
-
-  // ✅ límites recomendados
-  const MAX_FILES = 5;
-  const MAX_MB_EACH = 10;
-
-  for(const f of incoming){
-    if(FILES.length >= MAX_FILES){
-      showToast(`Máximo ${MAX_FILES} archivos.`, "bad");
-      break;
-    }
-    if(f.size > MAX_MB_EACH * 1024 * 1024){
-      showToast(`Archivo muy grande (${f.name}). Máx ${MAX_MB_EACH}MB`, "bad");
-      continue;
-    }
-    FILES.push(f);
-  }
-
-  // resetea input para permitir volver a elegir el mismo archivo
-  e.target.value = "";
-  renderFiles();
-});
-
-
 /* =========================================================
    ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
    GET /api/admin/quotes?user=&client=&from=&to=&limit=
