@@ -1,13 +1,23 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import pg from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import multer from "multer";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
 
 const { Pool } = pg;
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+
+// ✅ JSON normal (para endpoints normales)
+app.use(express.json({ limit: "10mb" }));
 
 /* =========================================================
    ✅ ENV
@@ -19,6 +29,10 @@ const SAP_USER = process.env.SAP_USER || "";
 const SAP_PASS = process.env.SAP_PASS || "";
 const SAP_WAREHOUSE = process.env.SAP_WAREHOUSE || "01";
 const SAP_PRICE_LIST = process.env.SAP_PRICE_LIST || "Lista Distribuidor";
+
+// ✅ Path donde se guardan archivos para anexos reales SAP
+const SAP_ATTACH_PATH =
+  process.env.SAP_ATTACH_PATH || "C:\\Documentos SAP\\Attachments";
 
 // ---- Web / CORS ----
 const YAPPY_ALIAS = process.env.YAPPY_ALIAS || "@prodimasansae";
@@ -50,7 +64,6 @@ app.options("*", cors());
 
 /* =========================================================
    ✅ DB Pool (Supabase)
-   FIX SSL: self-signed certificate chain
 ========================================================= */
 let pool = null;
 
@@ -64,8 +77,8 @@ function getPool() {
 
     pool = new Pool({
       connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false }, // ✅ FIX CERT
-      max: 3, // recomendado con pooler/pgbouncer
+      ssl: { rejectUnauthorized: false },
+      max: 3,
     });
 
     pool.on("error", (err) => {
@@ -81,7 +94,7 @@ async function dbQuery(text, params = []) {
 }
 
 /* =========================================================
-   ✅ DB Schema (crear tablas si no existen)
+   ✅ DB Schema
 ========================================================= */
 async function ensureSchema() {
   if (!hasDb()) {
@@ -144,7 +157,6 @@ function signAdminToken() {
 }
 
 function signUserToken(user) {
-  // token mercaderista
   return jwt.sign(
     { typ: "user", uid: user.id, username: user.username },
     JWT_SECRET,
@@ -207,7 +219,7 @@ let SL_COOKIE_TIME = 0;
 let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
 const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
 
-const ITEM_CACHE = new Map(); // code -> { ts, data }
+const ITEM_CACHE = new Map();
 const ITEM_TTL_MS = 20 * 1000;
 
 function missingSapEnv() {
@@ -216,7 +228,7 @@ function missingSapEnv() {
 
 async function slLogin() {
   if (missingSapEnv()) {
-    console.log("⚠️ Faltan variables SAP en Render > Environment");
+    console.log("⚠️ Faltan variables SAP en Environment");
     return;
   }
 
@@ -265,7 +277,6 @@ async function slFetch(path, options = {}) {
 
   const text = await res.text();
 
-  // Reintento si expiró
   if (res.status === 401 || res.status === 403) {
     SL_COOKIE = null;
     await slLogin();
@@ -287,20 +298,18 @@ async function slFetch(path, options = {}) {
 }
 
 /* =========================================================
-   ✅ FIX FECHA SAP (evitar fecha futura)
-   - Usamos hora Panamá (-05:00) para que no quede "mañana" en SAP
+   ✅ FECHA SAP FIX (Panamá)
 ========================================================= */
 function getDateISOInOffset(offsetMinutes = -300) {
-  // offsetMinutes ejemplo: -300 (Panamá)
   const now = new Date();
   const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
   const localMs = utcMs + offsetMinutes * 60000;
   const local = new Date(localMs);
-  return local.toISOString().slice(0, 10); // YYYY-MM-DD
+  return local.toISOString().slice(0, 10);
 }
 
 /* =========================================================
-   ✅ Health
+   ✅ HEALTH
 ========================================================= */
 app.get("/api/health", async (req, res) => {
   res.json({
@@ -310,13 +319,12 @@ app.get("/api/health", async (req, res) => {
     warehouse: SAP_WAREHOUSE,
     priceList: SAP_PRICE_LIST,
     db: hasDb() ? "on" : "off",
+    attachPath: SAP_ATTACH_PATH,
   });
 });
 
 /* =========================================================
    ✅ ADMIN: LOGIN
-   POST /api/admin/login
-   { user:"PRODIMA", pass:"ADMINISTRADOR" }
 ========================================================= */
 app.post("/api/admin/login", async (req, res) => {
   try {
@@ -343,7 +351,7 @@ app.post("/api/admin/login", async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
-   GET /api/admin/quotes?user=&client=&from=&to=&limit=
+   GET /api/admin/quotes?user=&client=&from=&to=&top=&skip=
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -353,13 +361,24 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
-    const from = String(req.query?.from || "").trim(); // YYYY-MM-DD
-    const to = String(req.query?.to || "").trim();     // YYYY-MM-DD
-    const limit = Math.min(Number(req.query?.limit || 200), 500);
 
-    // ✅ IMPORTANTE: ahora pedimos CardName también
+    const from = String(req.query?.from || "").trim();
+    const to = String(req.query?.to || "").trim();
+
+    const top = Math.min(Number(req.query?.top || req.query?.limit || 200), 500);
+    const skip = Math.max(Number(req.query?.skip || 0), 0);
+
+    const filterParts = [];
+    if (from) filterParts.push(`DocDate ge '${from}'`);
+    if (to) filterParts.push(`DocDate le '${to}'`);
+
+    const sapFilter = filterParts.length
+      ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
+      : "";
+
     const sap = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments&$orderby=DocDate desc&$top=${limit}`
+      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments` +
+        `&$orderby=DocDate desc&$top=${top}&$skip=${skip}${sapFilter}`
     );
 
     const values = Array.isArray(sap?.value) ? sap.value : [];
@@ -369,53 +388,28 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       return m ? String(m[1]).trim() : "";
     };
 
-    // ✅ caché por CardCode
-    const bpCache = new Map(); // CardCode -> CardName
-
-    async function getBPName(cardCode) {
-      if (!cardCode) return "";
-      if (bpCache.has(cardCode)) return bpCache.get(cardCode);
-
-      try {
-        const bp = await slFetch(
-          `/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`
-        );
-
-        const name = String(bp?.CardName || "").trim();
-        bpCache.set(cardCode, name);
-        return name;
-      } catch (e) {
-        console.error("❌ BP lookup fail:", cardCode, e.message);
-        bpCache.set(cardCode, "");
-        return "";
-      }
-    }
-
     let rows = [];
 
     for (const q of values) {
-      const docDate = q.DocDate || "";
+      const rawDate = String(q.DocDate || "");
+      const fechaISO = rawDate.slice(0, 10);
+
       const usuario = parseUserFromComments(q.Comments || "");
       const cardCode = String(q.CardCode || "").trim();
 
       const estado =
-        q.DocumentStatus === "bost_Open" ? "Open" :
-        q.DocumentStatus === "bost_Close" ? "Close" :
-        String(q.DocumentStatus || "");
+        q.DocumentStatus === "bost_Open"
+          ? "Open"
+          : q.DocumentStatus === "bost_Close"
+          ? "Close"
+          : String(q.DocumentStatus || "");
 
-      // ✅ 1) intenta CardName directo desde Quotations
-      let cardName = String(q.CardName || "").trim();
+      const cardName = String(q.CardName || "").trim();
 
-      // ✅ 2) si viene vacío => fallback BusinessPartners
-      if (!cardName) {
-        cardName = await getBPName(cardCode);
-      }
-
-      // Mes / Año
       let mes = "";
       let anio = "";
       try {
-        const d = new Date(docDate);
+        const d = new Date(fechaISO);
         mes = d.toLocaleString("es-PA", { month: "long" });
         anio = String(d.getFullYear());
       } catch {}
@@ -423,56 +417,55 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       rows.push({
         docEntry: q.DocEntry,
         docNum: q.DocNum,
-
         cardCode,
-
-        // ✅ nombre en 3 claves (para que el front no falle)
         cardName,
         customerName: cardName,
         nombreCliente: cardName,
-
         montoCotizacion: Number(q.DocTotal || 0),
         montoEntregado: 0,
-        fecha: docDate,
+        fecha: fechaISO,
         estado,
         mes,
         anio,
         usuario,
-        comments: q.Comments || ""
+        comments: q.Comments || "",
       });
     }
 
-    // ✅ Filtros
     if (userFilter) {
-      rows = rows.filter(r => String(r.usuario || "").toLowerCase().includes(userFilter));
-    }
-
-    if (clientFilter) {
-      rows = rows.filter(r =>
-        String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
-        String(r.cardName || "").toLowerCase().includes(clientFilter)
+      rows = rows.filter((r) =>
+        String(r.usuario || "").toLowerCase().includes(userFilter)
       );
     }
 
-    if (from) rows = rows.filter(r => String(r.fecha || "") >= from);
-    if (to) rows = rows.filter(r => String(r.fecha || "") <= to);
+    if (clientFilter) {
+      rows = rows.filter(
+        (r) =>
+          String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
+          String(r.cardName || "").toLowerCase().includes(clientFilter)
+      );
+    }
 
-    return res.json({ ok: true, quotes: rows });
+    return res.json({
+      ok: true,
+      top,
+      skip,
+      count: rows.length,
+      quotes: rows,
+    });
   } catch (err) {
     console.error("❌ /api/admin/quotes:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
 
-
-
-
 /* =========================================================
    ✅ ADMIN: LIST USERS
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+    if (!hasDb())
+      return res.status(500).json({ ok: false, message: "DB no configurada" });
 
     const r = await dbQuery(`
       SELECT id, username, full_name, is_active, created_at
@@ -492,14 +485,17 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
 ========================================================= */
 app.post("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+    if (!hasDb())
+      return res.status(500).json({ ok: false, message: "DB no configurada" });
 
     const username = String(req.body?.username || "").trim().toLowerCase();
     const fullName = String(req.body?.fullName || req.body?.full_name || "").trim();
     const pin = String(req.body?.pin || "").trim();
 
-    if (!username) return res.status(400).json({ ok: false, message: "username requerido" });
-    if (!pin || pin.length < 4) return res.status(400).json({ ok: false, message: "PIN mínimo 4" });
+    if (!username)
+      return res.status(400).json({ ok: false, message: "username requerido" });
+    if (!pin || pin.length < 4)
+      return res.status(400).json({ ok: false, message: "PIN mínimo 4" });
 
     const pin_hash = await bcrypt.hash(pin, 10);
 
@@ -530,15 +526,15 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
 ========================================================= */
 app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
   try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+    if (!hasDb())
+      return res.status(500).json({ ok: false, message: "DB no configurada" });
 
     const id = Number(req.params.id || 0);
     if (!id) return res.status(400).json({ ok: false, message: "id inválido" });
 
-    const r = await dbQuery(
-      `DELETE FROM app_users WHERE id = $1 RETURNING id, username;`,
-      [id]
-    );
+    const r = await dbQuery(`DELETE FROM app_users WHERE id = $1 RETURNING id, username;`, [
+      id,
+    ]);
 
     if (!r.rowCount) {
       return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
@@ -558,7 +554,8 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
 ========================================================= */
 app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
   try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+    if (!hasDb())
+      return res.status(500).json({ ok: false, message: "DB no configurada" });
 
     const id = Number(req.params.id || 0);
     if (!id) return res.status(400).json({ ok: false, message: "id inválido" });
@@ -587,29 +584,7 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: AUDIT (opcional)
-========================================================= */
-app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
-
-    const r = await dbQuery(`
-      SELECT id, event_type, actor, ip, created_at, payload
-      FROM audit_events
-      ORDER BY created_at DESC
-      LIMIT 200;
-    `);
-
-    return res.json({ ok: true, events: r.rows || [] });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   ✅ MERCADERISTAS: LOGIN (MUY IMPORTANTE ✅)
-   POST /api/auth/login
-   { username, pin }
+   ✅ MERCADERISTAS: LOGIN
 ========================================================= */
 app.post("/api/auth/login", async (req, res) => {
   try {
@@ -670,9 +645,6 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-/* =========================================================
-   ✅ MERCADERISTAS: ME (opcional)
-========================================================= */
 app.get("/api/auth/me", verifyUser, async (req, res) => {
   return res.json({ ok: true, user: req.user });
 });
@@ -694,7 +666,6 @@ async function getPriceListNoByNameCached(name) {
   const safe = name.replace(/'/g, "''");
   let no = null;
 
-  // Intento A
   try {
     const r1 = await slFetch(
       `/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`
@@ -702,7 +673,6 @@ async function getPriceListNoByNameCached(name) {
     if (r1?.value?.length) no = r1.value[0].PriceListNo;
   } catch {}
 
-  // Intento B
   if (no === null) {
     try {
       const r2 = await slFetch(
@@ -724,14 +694,12 @@ function buildItemResponse(itemFull, code, priceListNo) {
     InventoryItem: itemFull.InventoryItem ?? null,
   };
 
-  // Precio
   let price = null;
   if (priceListNo !== null && Array.isArray(itemFull.ItemPrices)) {
     const p = itemFull.ItemPrices.find((x) => Number(x.PriceList) === Number(priceListNo));
     if (p && p.Price != null) price = Number(p.Price);
   }
 
-  // Stock
   let wh = null;
   if (Array.isArray(itemFull.ItemWarehouseInfoCollection)) {
     wh = itemFull.ItemWarehouseInfoCollection.find(
@@ -808,65 +776,6 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: MULTI ITEMS (rápido)
-   GET /api/sap/items?codes=001,002,003
-========================================================= */
-app.get("/api/sap/items", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
-
-    const codes = String(req.query.codes || "")
-      .split(",")
-      .map((x) => x.trim())
-      .filter(Boolean);
-
-    if (!codes.length) {
-      return res.status(400).json({ ok: false, message: "codes vacío" });
-    }
-
-    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
-
-    const CONCURRENCY = 5;
-    const items = {};
-    let i = 0;
-
-    async function worker() {
-      while (i < codes.length) {
-        const idx = i++;
-        const code = codes[idx];
-        try {
-          const r = await getOneItem(code, priceListNo);
-          items[code] = {
-            ok: true,
-            name: r.item.ItemName,
-            unit: r.item.SalesUnit,
-            price: r.price,
-            stock: r.stock,
-          };
-        } catch (e) {
-          items[code] = { ok: false, message: String(e.message || e) };
-        }
-      }
-    }
-
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-
-    return res.json({
-      ok: true,
-      warehouse: SAP_WAREHOUSE,
-      priceList: SAP_PRICE_LIST,
-      priceListNo,
-      items,
-    });
-  } catch (err) {
-    console.error("❌ /api/sap/items:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* =========================================================
    ✅ SAP: CUSTOMER
 ========================================================= */
 app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
@@ -904,9 +813,79 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: CREAR COTIZACIÓN
-   ✅ FIX fecha futura (Panamá)
-   ✅ Guarda usuario creador en Comments
+   ✅ ATTACHMENTS (MULTER + SAP Attachments2)
+========================================================= */
+function ensureDirSync(dir) {
+  try {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    console.error("❌ No se pudo crear carpeta attach:", dir, e.message);
+  }
+}
+
+ensureDirSync(SAP_ATTACH_PATH);
+
+// ✅ Config Multer (guardado en disco)
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    ensureDirSync(SAP_ATTACH_PATH);
+    cb(null, SAP_ATTACH_PATH);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname || "");
+    const base = path
+      .basename(file.originalname || "archivo", ext)
+      .replace(/[^\w\-]+/g, "_")
+      .slice(0, 60);
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    cb(null, `${base}_${stamp}${ext}`);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB por archivo
+});
+
+// ✅ Crea entry de anexos en SAP (Attachments2)
+async function createSapAttachmentEntry(files) {
+  // files: [{ filename, path }]
+  if (!files || !files.length) return null;
+
+  const lines = files.map((f) => {
+    const ext = path.extname(f.filename).replace(".", "").toLowerCase();
+    const base = path.basename(f.filename, path.extname(f.filename));
+
+    return {
+      FileName: base,
+      FileExtension: ext,
+      SourcePath: SAP_ATTACH_PATH, // ✅ carpeta en servidor
+    };
+  });
+
+  // SAP espera Attachments2_Lines
+  const payload = {
+    Attachments2_Lines: lines,
+  };
+
+  const created = await slFetch(`/Attachments2`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+  // Normalmente retorna AbsoluteEntry
+  const entry = created?.AbsoluteEntry ?? created?.AttachmentEntry ?? null;
+
+  if (!entry) {
+    console.log("⚠️ SAP Attachments2 creado pero no vino AbsoluteEntry, respuesta:", created);
+  }
+
+  return entry;
+}
+
+/* =========================================================
+   ✅ SAP: CREAR COTIZACIÓN (JSON normal sin archivos)
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
@@ -932,13 +911,9 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
     }
 
-    // ✅ Fecha segura para SAP (Panamá)
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
-
     const creator = req.user?.username || "unknown";
 
-    // ✅ Comentario guardando el usuario creador
-    // (SAP B1 muestra Comments tal cual)
     const sapComments = [
       `[WEB PEDIDOS]`,
       `[user:${creator}]`,
@@ -963,6 +938,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       cardCode,
       lines: DocumentLines.length,
       docDate,
+      attachments: 0,
     });
 
     return res.json({
@@ -978,6 +954,109 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
+   ✅ SAP: CREAR COTIZACIÓN + ARCHIVOS (MULTIPART)
+   POST /api/sap/quote-multipart
+   FormData:
+     - cardCode: "C01133"
+     - comments: "...."
+     - lines: JSON string
+     - files: (1..n)
+========================================================= */
+app.post(
+  "/api/sap/quote-multipart",
+  verifyUser,
+  upload.array("files", 10),
+  async (req, res) => {
+    try {
+      if (missingSapEnv()) {
+        return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+      }
+
+      const cardCode = String(req.body?.cardCode || "").trim();
+      const comments = String(req.body?.comments || "").trim();
+      const linesRaw = String(req.body?.lines || "[]");
+
+      let lines = [];
+      try {
+        lines = JSON.parse(linesRaw);
+      } catch {
+        lines = [];
+      }
+
+      if (!cardCode)
+        return res.status(400).json({ ok: false, message: "cardCode requerido." });
+      if (!Array.isArray(lines) || !lines.length)
+        return res.status(400).json({ ok: false, message: "lines requerido." });
+
+      const DocumentLines = lines
+        .map((l) => ({
+          ItemCode: String(l.itemCode || "").trim(),
+          Quantity: Number(l.qty || 0),
+        }))
+        .filter((x) => x.ItemCode && x.Quantity > 0);
+
+      if (!DocumentLines.length) {
+        return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
+      }
+
+      const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
+      const creator = req.user?.username || "unknown";
+
+      const sapComments = [
+        `[WEB PEDIDOS]`,
+        `[user:${creator}]`,
+        comments ? comments : "Cotización mercaderista",
+      ].join(" ");
+
+      // ✅ 1) Archivos guardados en servidor
+      const files = Array.isArray(req.files) ? req.files : [];
+      let attachmentEntry = null;
+
+      // ✅ 2) Crear Attachments2 en SAP
+      if (files.length) {
+        attachmentEntry = await createSapAttachmentEntry(files);
+      }
+
+      // ✅ 3) Crear quotation con AttachmentEntry
+      const payload = {
+        CardCode: cardCode,
+        DocDate: docDate,
+        DocDueDate: docDate,
+        Comments: sapComments,
+        JournalMemo: "Cotización web mercaderistas",
+        DocumentLines,
+        ...(attachmentEntry ? { AttachmentEntry: Number(attachmentEntry) } : {}),
+      };
+
+      const created = await slFetch(`/Quotations`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+
+      await audit("QUOTE_CREATED", req, creator, {
+        cardCode,
+        lines: DocumentLines.length,
+        docDate,
+        attachments: files.length,
+        attachmentEntry: attachmentEntry || null,
+      });
+
+      return res.json({
+        ok: true,
+        message: "Cotización creada con anexos",
+        docEntry: created.DocEntry,
+        docNum: created.DocNum,
+        attachmentEntry: attachmentEntry || null,
+        filesSaved: files.map((f) => f.filename),
+      });
+    } catch (err) {
+      console.error("❌ /api/sap/quote-multipart:", err.message);
+      return res.status(500).json({ ok: false, message: err.message });
+    }
+  }
+);
+
+/* =========================================================
    ✅ START
 ========================================================= */
 const PORT = process.env.PORT || 10000;
@@ -988,6 +1067,5 @@ ensureSchema()
   })
   .catch((e) => {
     console.error("❌ Error creando schema DB:", e.message);
-    // Igual levantamos el server (solo SAP funcionará si DB falla)
     app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT, "(sin DB)"));
   });
