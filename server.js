@@ -3,9 +3,12 @@ import cors from "cors";
 import pg from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+
+/* ✅ ADD: Adjuntos */
 import multer from "multer";
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 
 const { Pool } = pg;
 
@@ -23,10 +26,6 @@ const SAP_PASS = process.env.SAP_PASS || "";
 const SAP_WAREHOUSE = process.env.SAP_WAREHOUSE || "01";
 const SAP_PRICE_LIST = process.env.SAP_PRICE_LIST || "Lista Distribuidor";
 
-// ✅ Carpeta REAL para guardar archivos (debe existir / tener permisos)
-const SAP_ATTACH_DIR =
-  process.env.SAP_ATTACH_DIR || "\\\\APPSERVER\\Documentos SAP\\Attachments\\";
-
 // ---- Web / CORS ----
 const YAPPY_ALIAS = process.env.YAPPY_ALIAS || "@prodimasansae";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
@@ -43,6 +42,10 @@ const JWT_SECRET = process.env.JWT_SECRET || "prodima_change_this_secret";
 // Panamá es -05:00 => -300 minutos
 const TZ_OFFSET_MIN = Number(process.env.TZ_OFFSET_MIN || -300);
 
+/* ✅ ADD: Carpeta real de attachments en APPSERVER */
+const SAP_ATTACHMENTS_DIR =
+  process.env.SAP_ATTACHMENTS_DIR || "C:\\Documentos SAP\\Attachments";
+
 /* =========================================================
    ✅ CORS
 ========================================================= */
@@ -54,48 +57,6 @@ app.use(
   })
 );
 app.options("*", cors());
-
-/* =========================================================
-   ✅ Upload (multer)
-   - guardamos en memoria, luego lo escribimos donde toca
-========================================================= */
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    files: 5,
-    fileSize: 10 * 1024 * 1024, // 10MB por archivo
-  },
-});
-
-/* =========================================================
-   ✅ Utilidades de archivos
-========================================================= */
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-}
-
-function safeBaseName(originalName = "") {
-  // evita caracteres raros para Windows
-  const base = String(originalName)
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
-    .replace(/\s+/g, "_")
-    .slice(0, 120);
-
-  return base || "archivo";
-}
-
-function uniqueName(baseName) {
-  const stamp = Date.now();
-  const rnd = Math.random().toString(16).slice(2, 8);
-  return `${baseName}_${stamp}_${rnd}`;
-}
-
-function getExt(originalName = "") {
-  const ext = path.extname(String(originalName)).replace(".", "").toLowerCase();
-  return ext || "dat";
-}
 
 /* =========================================================
    ✅ DB Pool (Supabase)
@@ -114,7 +75,7 @@ function getPool() {
     pool = new Pool({
       connectionString: DATABASE_URL,
       ssl: { rejectUnauthorized: false }, // ✅ FIX CERT
-      max: 3,
+      max: 3, // recomendado con pooler/pgbouncer
     });
 
     pool.on("error", (err) => {
@@ -193,6 +154,7 @@ function signAdminToken() {
 }
 
 function signUserToken(user) {
+  // token mercaderista
   return jwt.sign(
     { typ: "user", uid: user.id, username: user.username },
     JWT_SECRET,
@@ -204,7 +166,9 @@ function verifyAdmin(req, res, next) {
   try {
     const auth = String(req.headers.authorization || "");
     if (!auth.startsWith("Bearer ")) {
-      return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
+      return res
+        .status(401)
+        .json({ ok: false, message: "Falta Authorization Bearer token" });
     }
 
     const token = auth.replace("Bearer ", "").trim();
@@ -225,7 +189,9 @@ function verifyUser(req, res, next) {
   try {
     const auth = String(req.headers.authorization || "");
     if (!auth.startsWith("Bearer ")) {
-      return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
+      return res
+        .status(401)
+        .json({ ok: false, message: "Falta Authorization Bearer token" });
     }
 
     const token = auth.replace("Bearer ", "").trim();
@@ -251,7 +217,7 @@ let SL_COOKIE_TIME = 0;
 let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
 const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
 
-const ITEM_CACHE = new Map();
+const ITEM_CACHE = new Map(); // code -> { ts, data }
 const ITEM_TTL_MS = 20 * 1000;
 
 function missingSapEnv() {
@@ -293,12 +259,12 @@ async function slLogin() {
   console.log("✅ Login SAP OK (cookie guardada)");
 }
 
-async function slFetch(pathReq, options = {}) {
+async function slFetch(path2, options = {}) {
   if (!SL_COOKIE || Date.now() - SL_COOKIE_TIME > 25 * 60 * 1000) {
     await slLogin();
   }
 
-  const res = await fetch(`${SAP_BASE_URL}${pathReq}`, {
+  const res = await fetch(`${SAP_BASE_URL}${path2}`, {
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -309,10 +275,11 @@ async function slFetch(pathReq, options = {}) {
 
   const text = await res.text();
 
+  // Reintento si expiró
   if (res.status === 401 || res.status === 403) {
     SL_COOKIE = null;
     await slLogin();
-    return slFetch(pathReq, options);
+    return slFetch(path2, options);
   }
 
   let json;
@@ -337,7 +304,122 @@ function getDateISOInOffset(offsetMinutes = -300) {
   const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
   const localMs = utcMs + offsetMinutes * 60000;
   const local = new Date(localMs);
-  return local.toISOString().slice(0, 10);
+  return local.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+/* =========================================================
+   ✅ ADD: Multer + helper Adjuntos
+========================================================= */
+const uploadFiles = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    files: 5,
+    fileSize: 10 * 1024 * 1024, // 10MB cada archivo
+  },
+});
+
+function ensureDirExists(dir) {
+  try {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  } catch (e) {
+    console.error("❌ No pude crear carpeta adjuntos:", dir, e.message);
+    throw new Error("No se pudo preparar carpeta de adjuntos en el servidor.");
+  }
+}
+
+function sanitizeBaseName(name) {
+  // quita extensión y caracteres raros
+  const base = String(name || "archivo")
+    .replace(/\.[^/.]+$/, "")
+    .replace(/[^\w\-]+/g, "_")
+    .replace(/_+/g, "_")
+    .slice(0, 60);
+
+  return base || "archivo";
+}
+
+function getExt(filename, mimetype) {
+  let ext = "";
+  try {
+    ext = path.extname(String(filename || "")).replace(".", "").toLowerCase();
+  } catch {
+    ext = "";
+  }
+
+  // fallback básico si no hay ext
+  if (!ext) {
+    if (String(mimetype || "").includes("pdf")) ext = "pdf";
+    else if (String(mimetype || "").includes("png")) ext = "png";
+    else if (String(mimetype || "").includes("jpeg")) ext = "jpg";
+    else if (String(mimetype || "").includes("jpg")) ext = "jpg";
+  }
+
+  // normaliza jpeg
+  if (ext === "jpeg") ext = "jpg";
+  return ext || "bin";
+}
+
+async function saveIncomingFilesToSapFolder(files = []) {
+  if (!files.length) return [];
+
+  if (process.platform !== "win32") {
+    // Para que no falle si alguna vez se ejecuta fuera de Windows
+    throw new Error(
+      "Adjuntos requieren Windows (APPSERVER). Este servidor no es Windows."
+    );
+  }
+
+  ensureDirExists(SAP_ATTACHMENTS_DIR);
+
+  const saved = [];
+
+  for (const f of files) {
+    const ext = getExt(f.originalname, f.mimetype);
+    const base = sanitizeBaseName(f.originalname);
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const rnd = crypto.randomBytes(4).toString("hex");
+
+    const fileNameOnly = `${stamp}-${base}-${rnd}`; // SIN extensión
+    const finalName = `${fileNameOnly}.${ext}`;
+
+    const fullPath = path.join(SAP_ATTACHMENTS_DIR, finalName);
+
+    fs.writeFileSync(fullPath, f.buffer);
+
+    saved.push({
+      baseName: fileNameOnly,
+      ext,
+      fullName: finalName,
+      fullPath,
+    });
+  }
+
+  return saved;
+}
+
+async function createSapAttachments2(savedFiles = []) {
+  if (!savedFiles.length) return null;
+
+  // SAP espera SourcePath local en el servidor de Service Layer (Windows)
+  const attPayload = {
+    Attachments2_Lines: savedFiles.map((x) => ({
+      FileName: x.baseName, // SIN extensión
+      FileExtension: x.ext, // sin punto
+      SourcePath: SAP_ATTACHMENTS_DIR, // ✅ LOCAL
+    })),
+  };
+
+  const created = await slFetch(`/Attachments2`, {
+    method: "POST",
+    body: JSON.stringify(attPayload),
+  });
+
+  // SAP devuelve AbsoluteEntry
+  const entry = created?.AbsoluteEntry ?? created?.AttachmentEntry ?? null;
+  return entry != null ? Number(entry) : null;
 }
 
 /* =========================================================
@@ -351,12 +433,13 @@ app.get("/api/health", async (req, res) => {
     warehouse: SAP_WAREHOUSE,
     priceList: SAP_PRICE_LIST,
     db: hasDb() ? "on" : "off",
-    attachDir: SAP_ATTACH_DIR,
+    attachmentsDir: SAP_ATTACHMENTS_DIR,
+    platform: process.platform,
   });
 });
 
 /* =========================================================
-   ✅ ADMIN LOGIN
+   ✅ ADMIN: LOGIN
 ========================================================= */
 app.post("/api/admin/login", async (req, res) => {
   try {
@@ -392,8 +475,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
-    const from = String(req.query?.from || "").trim();
-    const to = String(req.query?.to || "").trim();
+    const from = String(req.query?.from || "").trim(); // YYYY-MM-DD
+    const to = String(req.query?.to || "").trim();     // YYYY-MM-DD
     const limit = Math.min(Number(req.query?.limit || 200), 500);
 
     const sap = await slFetch(
@@ -407,7 +490,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       return m ? String(m[1]).trim() : "";
     };
 
-    const bpCache = new Map();
+    const bpCache = new Map(); // CardCode -> CardName
 
     async function getBPName(cardCode) {
       if (!cardCode) return "";
@@ -436,11 +519,9 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       const cardCode = String(q.CardCode || "").trim();
 
       const estado =
-        q.DocumentStatus === "bost_Open"
-          ? "Open"
-          : q.DocumentStatus === "bost_Close"
-          ? "Close"
-          : String(q.DocumentStatus || "");
+        q.DocumentStatus === "bost_Open" ? "Open" :
+        q.DocumentStatus === "bost_Close" ? "Close" :
+        String(q.DocumentStatus || "");
 
       let cardName = String(q.CardName || "").trim();
       if (!cardName) {
@@ -469,24 +550,23 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         mes,
         anio,
         usuario,
-        comments: q.Comments || "",
+        comments: q.Comments || ""
       });
     }
 
     if (userFilter) {
-      rows = rows.filter((r) => String(r.usuario || "").toLowerCase().includes(userFilter));
+      rows = rows.filter(r => String(r.usuario || "").toLowerCase().includes(userFilter));
     }
 
     if (clientFilter) {
-      rows = rows.filter(
-        (r) =>
-          String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
-          String(r.cardName || "").toLowerCase().includes(clientFilter)
+      rows = rows.filter(r =>
+        String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
+        String(r.cardName || "").toLowerCase().includes(clientFilter)
       );
     }
 
-    if (from) rows = rows.filter((r) => String(r.fecha || "") >= from);
-    if (to) rows = rows.filter((r) => String(r.fecha || "") <= to);
+    if (from) rows = rows.filter(r => String(r.fecha || "") >= from);
+    if (to) rows = rows.filter(r => String(r.fecha || "") <= to);
 
     return res.json({ ok: true, quotes: rows });
   } catch (err) {
@@ -563,7 +643,10 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
     const id = Number(req.params.id || 0);
     if (!id) return res.status(400).json({ ok: false, message: "id inválido" });
 
-    const r = await dbQuery(`DELETE FROM app_users WHERE id = $1 RETURNING id, username;`, [id]);
+    const r = await dbQuery(
+      `DELETE FROM app_users WHERE id = $1 RETURNING id, username;`,
+      [id]
+    );
 
     if (!r.rowCount) {
       return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
@@ -693,9 +776,6 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-/* =========================================================
-   ✅ MERCADERISTAS: ME
-========================================================= */
 app.get("/api/auth/me", verifyUser, async (req, res) => {
   return res.json({ ok: true, user: req.user });
 });
@@ -797,11 +877,13 @@ async function getOneItem(code, priceListNo) {
 }
 
 /* =========================================================
-   ✅ SAP: ITEM
+   ✅ SAP: ITEM (1)
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
 
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
@@ -825,18 +907,22 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: MULTI ITEMS
+   ✅ SAP: MULTI ITEMS (rápido)
 ========================================================= */
 app.get("/api/sap/items", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
 
     const codes = String(req.query.codes || "")
       .split(",")
       .map((x) => x.trim())
       .filter(Boolean);
 
-    if (!codes.length) return res.status(400).json({ ok: false, message: "codes vacío" });
+    if (!codes.length) {
+      return res.status(400).json({ ok: false, message: "codes vacío" });
+    }
 
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
 
@@ -883,7 +969,9 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
 ========================================================= */
 app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
 
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "CardCode vacío." });
@@ -914,72 +1002,46 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: CREAR ATTACHMENTENTRY (Attachments2)
-   - Recibe info de archivos guardados en la carpeta de SAP
-========================================================= */
-async function createSapAttachmentEntry(savedFiles = []) {
-  // savedFiles: [{dir, baseNameNoExt, ext}]
-  if (!savedFiles.length) return null;
-
-  const lines = savedFiles.map((f) => ({
-    SourcePath: String(f.dir || ""),
-    FileName: String(f.baseNameNoExt || ""),
-    FileExtension: String(f.ext || ""),
-  }));
-
-  const payload = {
-    Attachments2_Lines: lines,
-  };
-
-  // Esto crea el AttachmentEntry en SAP
-  const created = await slFetch(`/Attachments2`, {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-
-  // Service Layer normalmente devuelve AbsoluteEntry
-  const entry = created?.AbsoluteEntry ?? created?.AttachmentEntry ?? null;
-  return entry;
-}
-
-/* =========================================================
-   ✅ SAP: CREAR COTIZACIÓN (con adjuntos en ANEXOS)
-   ✅ ahora soporta:
-   - JSON normal (sin archivos)
-   - multipart/form-data (con archivos)
+   ✅ SAP: CREAR COTIZACIÓN
+   ✅ FIX fecha futura (Panamá)
+   ✅ Guarda usuario creador en Comments
+   ✅ ADD: Adjuntos reales (Attachments2 + AttachmentEntry)
 ========================================================= */
 app.post(
   "/api/sap/quote",
   verifyUser,
-  upload.array("files", 5),
+  uploadFiles.array("files", 5), // ✅ acepta multipart con "files"
   async (req, res) => {
     try {
       if (missingSapEnv()) {
         return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
       }
 
-      // ✅ Puede venir JSON o multipart
-      const isMultipart = String(req.headers["content-type"] || "").includes("multipart/form-data");
+      // ✅ Soportar JSON normal + multipart
+      // multipart: req.body.* son strings
+      // JSON: req.body.* ya viene bien
 
-      let cardCode = "";
-      let comments = "";
-      let lines = [];
-
-      if (isMultipart) {
-        cardCode = String(req.body?.cardCode || "").trim();
-        comments = String(req.body?.comments || "").trim();
-
-        // lines viene como JSON string
+      // Si el front manda un objeto "payload" JSON string
+      let body = req.body || {};
+      if (body && typeof body.payload === "string") {
         try {
-          lines = JSON.parse(req.body?.lines || "[]");
-        } catch {
-          lines = [];
-        }
-      } else {
-        cardCode = String(req.body?.cardCode || "").trim();
-        comments = String(req.body?.comments || "").trim();
-        lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
+          body = JSON.parse(body.payload);
+        } catch {}
       }
+
+      const cardCode = String(body?.cardCode || req.body?.cardCode || "").trim();
+      const comments = String(body?.comments || req.body?.comments || "").trim();
+
+      let linesRaw = body?.lines ?? req.body?.lines ?? [];
+      if (typeof linesRaw === "string") {
+        try {
+          linesRaw = JSON.parse(linesRaw);
+        } catch {
+          linesRaw = [];
+        }
+      }
+
+      const lines = Array.isArray(linesRaw) ? linesRaw : [];
 
       if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
       if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
@@ -1000,53 +1062,24 @@ app.post(
 
       const creator = req.user?.username || "unknown";
 
-      // ✅ Comentario guardando el usuario creador
       const sapComments = [
         `[WEB PEDIDOS]`,
         `[user:${creator}]`,
         comments ? comments : "Cotización mercaderista",
       ].join(" ");
 
-      /* =====================================================
-         ✅ 1) Guardar archivos físicamente en la carpeta SAP
-      ====================================================== */
-      let savedFiles = [];
+      // ✅ Adjuntos: si vienen archivos, guardarlos y crear Attachments2
       const incomingFiles = Array.isArray(req.files) ? req.files : [];
+      let attachmentEntry = null;
 
       if (incomingFiles.length) {
-        // crea carpeta si no existe
-        ensureDir(SAP_ATTACH_DIR);
+        // 1) Guardar en carpeta real del servidor SAP
+        const saved = await saveIncomingFilesToSapFolder(incomingFiles);
 
-        for (const file of incomingFiles) {
-          const ext = getExt(file.originalname);
-          const base = safeBaseName(path.basename(file.originalname, path.extname(file.originalname)));
-          const unique = uniqueName(base);
-
-          const fileFullName = `${unique}.${ext}`;
-          const fullPath = path.join(SAP_ATTACH_DIR, fileFullName);
-
-          // escribe el archivo
-          fs.writeFileSync(fullPath, file.buffer);
-
-          savedFiles.push({
-            dir: SAP_ATTACH_DIR,
-            baseNameNoExt: unique,
-            ext,
-          });
-        }
+        // 2) Crear en SAP Attachments2
+        attachmentEntry = await createSapAttachments2(saved);
       }
 
-      /* =====================================================
-         ✅ 2) Crear AttachmentEntry en SAP (Attachments2)
-      ====================================================== */
-      let attachmentEntry = null;
-      if (savedFiles.length) {
-        attachmentEntry = await createSapAttachmentEntry(savedFiles);
-      }
-
-      /* =====================================================
-         ✅ 3) Crear cotización en SAP con AttachmentEntry
-      ====================================================== */
       const payload = {
         CardCode: cardCode,
         DocDate: docDate,
@@ -1066,8 +1099,8 @@ app.post(
         cardCode,
         lines: DocumentLines.length,
         docDate,
-        attachmentEntry: attachmentEntry || null,
-        files: savedFiles.length,
+        attachments: incomingFiles.length,
+        attachmentEntry,
       });
 
       return res.json({
@@ -1075,8 +1108,8 @@ app.post(
         message: "Cotización creada",
         docEntry: created.DocEntry,
         docNum: created.DocNum,
-        attachmentEntry: attachmentEntry || null,
-        filesSaved: savedFiles.length,
+        attachmentEntry,
+        attachments: incomingFiles.length,
       });
     } catch (err) {
       console.error("❌ /api/sap/quote:", err.message);
