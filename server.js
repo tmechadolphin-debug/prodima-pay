@@ -788,6 +788,36 @@ function getPriceFromPriceList(itemFull, priceListNo){
   return (Number.isFinite(price) ? price : null);
 }
 
+function getSalesUomFactor(itemFull){
+  const salesUnit = String(itemFull?.SalesUnit || "").trim().toLowerCase();
+  const coll = itemFull?.ItemUnitOfMeasurementCollection;
+
+  if(!Array.isArray(coll)) return null;
+
+  // intenta matchear por UoMCode (si viene)
+  let row = null;
+
+  if(salesUnit){
+    row = coll.find(x => {
+      const uomCode = String(x?.UoMCode || x?.UnitOfMeasurementCode || "").trim().toLowerCase();
+      return uomCode && uomCode === salesUnit;
+    }) || null;
+  }
+
+  // si no encontró por nombre, intenta por tipo "Sales"
+  if(!row){
+    row = coll.find(x => {
+      const t = String(x?.UoMType || "").toLowerCase();
+      return t.includes("sales"); // suele venir iut_Sales o similar
+    }) || null;
+  }
+
+  const baseQty = row?.BaseQuantity ?? row?.BaseQty ?? null;
+  const n = Number(baseQty);
+
+  return (Number.isFinite(n) && n > 0) ? n : null;
+}
+
 
 function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   const item = {
@@ -797,11 +827,18 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
     InventoryItem: itemFull.InventoryItem ?? null,
   };
 
-  // ✅ Precio EXACTO de SAP (lista de precios) = precio de caja
-  const price = getPriceFromPriceList(itemFull, priceListNo);
+  // Precio que devuelve SAP por lista (muchas veces es UoM base)
+  const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
 
-  // ✅ Stock por almacén (si viene en ItemWarehouseInfoCollection)
-  // OJO: esto no convierte unidades; solo toma existencias del almacén.
+  // Factor de UoM de ventas (Caja) desde SAP
+  const factorCaja = getSalesUomFactor(itemFull);
+
+  // ✅ Precio que quieres mostrar (igual que SAP Client)
+  const priceCaja = (priceUnit != null && factorCaja != null)
+    ? (priceUnit * factorCaja)
+    : priceUnit;
+
+  // Stock por almacén
   let warehouseRow = null;
   if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
     warehouseRow = itemFull.ItemWarehouseInfoCollection.find(w =>
@@ -820,7 +857,10 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
 
   return {
     item,
-    price,              // ✅ este es el que debes mostrar en la web
+    // 👇 devuelve ambos por si quieres ver debug en frontend
+    price: priceCaja,        // ✅ este debe ser el que muestras en la web
+    priceUnit,
+    factorCaja,
     stock: {
       warehouse: warehouseCode,
       onHand: Number.isFinite(onHand) ? onHand : null,
@@ -831,6 +871,7 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
     }
   };
 }
+
 
 
 async function getOneItem(code, priceListNo, warehouseCode) {
@@ -844,8 +885,9 @@ async function getOneItem(code, priceListNo, warehouseCode) {
   let itemFull;
   try {
     itemFull = await slFetch(
-      `/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection`
-    );
+  `/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection,ItemUnitOfMeasurementCollection`
+);
+
   } catch {
     itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
   }
