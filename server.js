@@ -78,10 +78,17 @@ function provinceToWarehouse(province) {
     return "500";
 
   // 300
-  if (p === "panamá" || p === "panama" || p === "panamá oeste" || p === "panama oeste" || p === "colón" || p === "colon")
+  if (
+    p === "panamá" ||
+    p === "panama" ||
+    p === "panamá oeste" ||
+    p === "panama oeste" ||
+    p === "colón" ||
+    p === "colon"
+  )
     return "300";
 
-  // ✅ no estaba en tu lista, lo asigno a 300 por cercanía (puedes cambiarlo luego)
+  // ✅ Darién (no estaba en tu lista)
   if (p === "darién" || p === "darien") return "300";
 
   // fallback
@@ -105,7 +112,7 @@ function getPool() {
     pool = new Pool({
       connectionString: DATABASE_URL,
       ssl: { rejectUnauthorized: false }, // ✅ FIX CERT
-      max: 3, // recomendado con pooler/pgbouncer
+      max: 3,
     });
 
     pool.on("error", (err) => {
@@ -136,11 +143,8 @@ async function ensureSchema() {
       full_name TEXT DEFAULT '',
       pin_hash TEXT NOT NULL,
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
-
-      -- ✅ NUEVO: ubicación + bodega
       province TEXT DEFAULT '',
       warehouse_code TEXT DEFAULT '',
-
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
@@ -157,7 +161,6 @@ async function ensureSchema() {
     );
   `);
 
-  // ✅ Si tu tabla ya existía antes, agregamos columnas si faltan
   try {
     await dbQuery(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS province TEXT DEFAULT '';`);
     await dbQuery(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS warehouse_code TEXT DEFAULT '';`);
@@ -197,7 +200,6 @@ function signAdminToken() {
 }
 
 function signUserToken(user) {
-  // ✅ token mercaderista con bodega y provincia
   return jwt.sign(
     {
       typ: "user",
@@ -216,9 +218,7 @@ function verifyAdmin(req, res, next) {
   try {
     const auth = String(req.headers.authorization || "");
     if (!auth.startsWith("Bearer ")) {
-      return res
-        .status(401)
-        .json({ ok: false, message: "Falta Authorization Bearer token" });
+      return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
     }
 
     const token = auth.replace("Bearer ", "").trim();
@@ -239,9 +239,7 @@ function verifyUser(req, res, next) {
   try {
     const auth = String(req.headers.authorization || "");
     if (!auth.startsWith("Bearer ")) {
-      return res
-        .status(401)
-        .json({ ok: false, message: "Falta Authorization Bearer token" });
+      return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
     }
 
     const token = auth.replace("Bearer ", "").trim();
@@ -267,7 +265,7 @@ let SL_COOKIE_TIME = 0;
 let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
 const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
 
-const ITEM_CACHE = new Map(); // key -> { ts, data }
+const ITEM_CACHE = new Map();
 const ITEM_TTL_MS = 20 * 1000;
 
 function missingSapEnv() {
@@ -513,7 +511,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: LIST USERS (con provincia + bodega)
+   ✅ ADMIN: LIST USERS
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
@@ -549,7 +547,6 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
     if (!username) return res.status(400).json({ ok: false, message: "username requerido" });
     if (!pin || pin.length < 4) return res.status(400).json({ ok: false, message: "PIN mínimo 4" });
 
-    // ✅ si no viene warehouse, se calcula por provincia
     if (!warehouse_code) {
       warehouse_code = provinceToWarehouse(province);
     }
@@ -588,10 +585,7 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
     const id = Number(req.params.id || 0);
     if (!id) return res.status(400).json({ ok: false, message: "id inválido" });
 
-    const r = await dbQuery(
-      `DELETE FROM app_users WHERE id = $1 RETURNING id, username;`,
-      [id]
-    );
+    const r = await dbQuery(`DELETE FROM app_users WHERE id = $1 RETURNING id, username;`, [id]);
 
     if (!r.rowCount) {
       return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
@@ -640,7 +634,7 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: AUDIT (opcional)
+   ✅ ADMIN: AUDIT
 ========================================================= */
 app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
   try {
@@ -703,7 +697,6 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
     }
 
-    // ✅ si no tiene bodega guardada, autocompletamos por provincia
     let wh = String(user.warehouse_code || "").trim();
     if (!wh) {
       wh = provinceToWarehouse(user.province || "");
@@ -714,7 +707,11 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     const token = signUserToken(user);
-    await audit("USER_LOGIN_OK", req, username, { username, province: user.province, warehouse_code: user.warehouse_code });
+    await audit("USER_LOGIN_OK", req, username, {
+      username,
+      province: user.province,
+      warehouse_code: user.warehouse_code
+    });
 
     return res.json({
       ok: true,
@@ -734,7 +731,7 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ MERCADERISTAS: ME (opcional)
+   ✅ MERCADERISTAS: ME
 ========================================================= */
 app.get("/api/auth/me", verifyUser, async (req, res) => {
   return res.json({ ok: true, user: req.user });
@@ -777,7 +774,7 @@ async function getPriceListNoByNameCached(name) {
   return no;
 }
 
-function getPriceFromPriceList(itemFull, priceListNo){
+function getPriceFromPriceList(itemFull, priceListNo) {
   const listNo = Number(priceListNo);
 
   const row = Array.isArray(itemFull?.ItemPrices)
@@ -788,36 +785,58 @@ function getPriceFromPriceList(itemFull, priceListNo){
   return (Number.isFinite(price) ? price : null);
 }
 
-function getSalesUomFactor(itemFull){
-  const salesUnit = String(itemFull?.SalesUnit || "").trim().toLowerCase();
+/* =========================================================
+   ✅ FIX REAL: Factor UoM de VENTAS (Caja)
+   - Tu error era: no expand + match incorrecto por SalesUnit
+========================================================= */
+function getSalesUomFactor(itemFull) {
+  // 1) Fallbacks directos si tu SL los trae (según setup)
+  const directFields = [
+    itemFull?.SalesItemsPerUnit,
+    itemFull?.SalesQtyPerPackUnit,
+    itemFull?.SalesQtyPerPackage,
+    itemFull?.SalesPackagingUnit,
+  ];
+
+  for (const v of directFields) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+
+  // 2) Colección UoM (requiere $expand en muchos SL)
   const coll = itemFull?.ItemUnitOfMeasurementCollection;
+  if (!Array.isArray(coll) || !coll.length) return null;
 
-  if(!Array.isArray(coll)) return null;
+  // Busca UoM de ventas
+  let row =
+    coll.find(x => String(x?.UoMType || "").toLowerCase().includes("sales")) ||
+    coll.find(x => String(x?.UoMType || "").toLowerCase().includes("iut_sales")) ||
+    null;
 
-  // intenta matchear por UoMCode (si viene)
-  let row = null;
-
-  if(salesUnit){
-    row = coll.find(x => {
-      const uomCode = String(x?.UoMCode || x?.UnitOfMeasurementCode || "").trim().toLowerCase();
-      return uomCode && uomCode === salesUnit;
-    }) || null;
+  // Si no encontró, intenta al menos la primera con BaseQuantity > 1
+  if (!row) {
+    row = coll.find(x => Number(x?.BaseQuantity) > 1) || null;
   }
 
-  // si no encontró por nombre, intenta por tipo "Sales"
-  if(!row){
-    row = coll.find(x => {
-      const t = String(x?.UoMType || "").toLowerCase();
-      return t.includes("sales"); // suele venir iut_Sales o similar
-    }) || null;
-  }
+  if (!row) return null;
 
   const baseQty = row?.BaseQuantity ?? row?.BaseQty ?? null;
-  const n = Number(baseQty);
+  const altQty = row?.AlternateQuantity ?? row?.AltQty ?? row?.AlternativeQuantity ?? null;
 
-  return (Number.isFinite(n) && n > 0) ? n : null;
+  const b = Number(baseQty);
+  const a = Number(altQty);
+
+  // Si trae ambos, la conversión real es Base/Alt
+  if (Number.isFinite(b) && b > 0 && Number.isFinite(a) && a > 0) {
+    const f = b / a;
+    return (Number.isFinite(f) && f > 0) ? f : null;
+  }
+
+  // Si trae solo BaseQuantity (común), úsalo
+  if (Number.isFinite(b) && b > 0) return b;
+
+  return null;
 }
-
 
 function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   const item = {
@@ -827,18 +846,15 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
     InventoryItem: itemFull.InventoryItem ?? null,
   };
 
-  // Precio que devuelve SAP por lista (muchas veces es UoM base)
   const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
-
-  // Factor de UoM de ventas (Caja) desde SAP
   const factorCaja = getSalesUomFactor(itemFull);
 
-  // ✅ Precio que quieres mostrar (igual que SAP Client)
-  const priceCaja = (priceUnit != null && factorCaja != null)
-    ? (priceUnit * factorCaja)
-    : priceUnit;
+  // ✅ Si hay factor, lo aplica. Si no hay factor, deja unitario.
+  const priceCaja =
+    (priceUnit != null && factorCaja != null)
+      ? (priceUnit * factorCaja)
+      : priceUnit;
 
-  // Stock por almacén
   let warehouseRow = null;
   if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
     warehouseRow = itemFull.ItemWarehouseInfoCollection.find(w =>
@@ -857,8 +873,7 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
 
   return {
     item,
-    // 👇 devuelve ambos por si quieres ver debug en frontend
-    price: priceCaja,        // ✅ este debe ser el que muestras en la web
+    price: priceCaja,
     priceUnit,
     factorCaja,
     stock: {
@@ -872,8 +887,6 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   };
 }
 
-
-
 async function getOneItem(code, priceListNo, warehouseCode) {
   const now = Date.now();
   const key = `${code}::${warehouseCode}::${priceListNo}`;
@@ -883,13 +896,25 @@ async function getOneItem(code, priceListNo, warehouseCode) {
   }
 
   let itemFull;
+
+  // ✅ AQUÍ estaba la otra parte del problema: falta $expand
+  // (Muchos Service Layer no devuelven ItemUnitOfMeasurementCollection sin expand)
   try {
     itemFull = await slFetch(
-  `/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection,ItemUnitOfMeasurementCollection`
-);
-
-  } catch {
-    itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
+      `/Items('${encodeURIComponent(code)}')` +
+      `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection` +
+      `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
+    );
+  } catch (e1) {
+    try {
+      // fallback 1: sin select, pero expand
+      itemFull = await slFetch(
+        `/Items('${encodeURIComponent(code)}')?$expand=ItemUnitOfMeasurementCollection`
+      );
+    } catch (e2) {
+      // fallback 2: total
+      itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
+    }
   }
 
   const data = buildItemResponse(itemFull, code, priceListNo, warehouseCode);
@@ -898,7 +923,7 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 }
 
 /* =========================================================
-   ✅ SAP: ITEM (1)  (warehouse dinámico)
+   ✅ SAP: ITEM (warehouse dinámico)
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -914,19 +939,21 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
     const r = await getOneItem(code, priceListNo, warehouseCode);
 
- const priceCaja = Number(r.price ?? 0);
+    const priceCaja = Number(r.price ?? 0);
 
-return res.json({
-  ok: true,
-  item: r.item,
-  warehouse: warehouseCode,
-  priceList: SAP_PRICE_LIST,
-  priceListNo,
-  price: priceCaja,        // ✅ ahora debe ser Caja
-  priceCaja: priceCaja,    // ✅ alias claro para UI
-  uom: "Caja",             // ✅ fuerza visual (opcional)
-  stock: r.stock,
-});
+    return res.json({
+      ok: true,
+      item: r.item,
+      warehouse: warehouseCode,
+      priceList: SAP_PRICE_LIST,
+      priceListNo,
+      price: priceCaja,
+      // Debug útil para confirmar si te llegó factor
+      priceUnit: r.priceUnit,
+      factorCaja: r.factorCaja,
+      uom: r.item?.SalesUnit || "Caja",
+      stock: r.stock,
+    });
 
   } catch (err) {
     console.error("❌ /api/sap/item:", err.message);
@@ -953,7 +980,6 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
     }
 
     const warehouseCode = getWarehouseFromReq(req);
-
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
 
     const CONCURRENCY = 5;
@@ -969,8 +995,10 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
           items[code] = {
             ok: true,
             name: r.item.ItemName,
-            unit: r.item.SalesUnit,
-            price: r.price,
+            unit: r.item.SalesUnit,     // Caja
+            price: r.price,             // Caja (si factor existe)
+            priceUnit: r.priceUnit,
+            factorCaja: r.factorCaja,
             stock: r.stock,
           };
         } catch (e) {
@@ -1033,7 +1061,6 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ SAP: CREAR COTIZACIÓN
-   ✅ Ahora usa WarehouseCode por usuario
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
@@ -1054,7 +1081,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       .map((l) => ({
         ItemCode: String(l.itemCode || "").trim(),
         Quantity: Number(l.qty || 0),
-        WarehouseCode: warehouseCode, // ✅ aquí está lo importante
+        WarehouseCode: warehouseCode,
       }))
       .filter((x) => x.ItemCode && x.Quantity > 0);
 
