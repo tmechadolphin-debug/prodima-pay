@@ -777,6 +777,18 @@ async function getPriceListNoByNameCached(name) {
   return no;
 }
 
+function getPriceFromPriceList(itemFull, priceListNo){
+  const listNo = Number(priceListNo);
+
+  const row = Array.isArray(itemFull?.ItemPrices)
+    ? itemFull.ItemPrices.find(p => Number(p?.PriceList) === listNo)
+    : null;
+
+  const price = (row && row.Price != null) ? Number(row.Price) : null;
+  return (Number.isFinite(price) ? price : null);
+}
+
+
 function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   const item = {
     ItemCode: itemFull.ItemCode ?? code,
@@ -785,39 +797,45 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
     InventoryItem: itemFull.InventoryItem ?? null,
   };
 
-  let price = null;
-  if (priceListNo !== null && Array.isArray(itemFull.ItemPrices)) {
-    const p = itemFull.ItemPrices.find((x) => Number(x.PriceList) === Number(priceListNo));
-    if (p && p.Price != null) price = Number(p.Price);
+  // ✅ Precio EXACTO de SAP (lista de precios) = precio de caja
+  const price = getPriceFromPriceList(itemFull, priceListNo);
+
+  // ✅ Stock por almacén (si viene en ItemWarehouseInfoCollection)
+  // OJO: esto no convierte unidades; solo toma existencias del almacén.
+  let warehouseRow = null;
+  if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
+    warehouseRow = itemFull.ItemWarehouseInfoCollection.find(w =>
+      String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
+    ) || null;
   }
 
-  let wh = null;
-  if (Array.isArray(itemFull.ItemWarehouseInfoCollection)) {
-    wh = itemFull.ItemWarehouseInfoCollection.find(
-      (x) => String(x.WarehouseCode) === String(warehouseCode)
-    );
-  }
+  const onHand = (warehouseRow?.InStock != null) ? Number(warehouseRow.InStock) : null;
+  const committed = (warehouseRow?.Committed != null) ? Number(warehouseRow.Committed) : null;
+  const ordered = (warehouseRow?.Ordered != null) ? Number(warehouseRow.Ordered) : null;
 
-  const onHand = wh?.InStock ?? wh?.OnHand ?? wh?.QuantityOnStock ?? null;
-  const committed = wh?.Committed ?? 0;
-  const available = onHand !== null ? Number(onHand) - Number(committed) : null;
+  let available = null;
+  if (Number.isFinite(onHand) && Number.isFinite(committed)) {
+    available = onHand - committed;
+  }
 
   return {
-    ok: true,
     item,
-    price,
+    price,              // ✅ este es el que debes mostrar en la web
     stock: {
-      onHand,
-      committed,
-      available,
-      hasStock: available !== null ? available > 0 : null,
-    },
+      warehouse: warehouseCode,
+      onHand: Number.isFinite(onHand) ? onHand : null,
+      committed: Number.isFinite(committed) ? committed : null,
+      ordered: Number.isFinite(ordered) ? ordered : null,
+      available: Number.isFinite(available) ? available : null,
+      hasStock: (available != null) ? (available > 0) : null,
+    }
   };
 }
 
+
 async function getOneItem(code, priceListNo, warehouseCode) {
   const now = Date.now();
-  const key = `${code}::${warehouseCode}`;
+  const key = `${code}::${warehouseCode}::${priceListNo}`;
   const cached = ITEM_CACHE.get(key);
   if (cached && now - cached.ts < ITEM_TTL_MS) {
     return cached.data;
@@ -854,15 +872,20 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
     const r = await getOneItem(code, priceListNo, warehouseCode);
 
-    return res.json({
-      ok: true,
-      item: r.item,
-      warehouse: warehouseCode,
-      priceList: SAP_PRICE_LIST,
-      priceListNo,
-      price: r.price,
-      stock: r.stock,
-    });
+ const priceCaja = Number(r.price ?? 0);
+
+return res.json({
+  ok: true,
+  item: r.item,
+  warehouse: warehouseCode,
+  priceList: SAP_PRICE_LIST,
+  priceListNo,
+  price: priceCaja,        // ✅ ahora debe ser Caja
+  priceCaja: priceCaja,    // ✅ alias claro para UI
+  uom: "Caja",             // ✅ fuerza visual (opcional)
+  stock: r.stock,
+});
+
   } catch (err) {
     console.error("❌ /api/sap/item:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
