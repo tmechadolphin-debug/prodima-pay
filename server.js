@@ -1327,15 +1327,24 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ START
+   ✅ START (NO BLOQUEAR EL BOOT EN RENDER)
 ========================================================= */
 const PORT = process.env.PORT || 10000;
 
-ensureSchema()
-  .then(() => {
-    app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT));
-  })
-  .catch((e) => {
-    console.error("❌ Error creando schema DB:", e.message);
-    app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT, "(sin DB)"));
-  });
+app.listen(PORT, () => {
+  console.log("✅ Server listo en puerto", PORT);
+
+  // ✅ Corre schema async (no bloquea el deploy)
+  ensureSchema()
+    .then(() => console.log("✅ ensureSchema terminado"))
+    .catch((e) => console.error("❌ ensureSchema error:", e.message));
+});
+
+// ✅ opcional pero útil para ver fallos en Render
+process.on("unhandledRejection", (err) => {
+  console.error("❌ UnhandledRejection:", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("❌ UncaughtException:", err);
+});
+
