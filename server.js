@@ -1012,6 +1012,67 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
   }
 });
 
+/* =========================================================
+   ✅ SAP: SEARCH ITEMS (autocomplete artículos)
+   GET /api/sap/items/search?q=011&top=20
+   o  /api/sap/items/search?q=salsa&top=20
+========================================================= */
+app.get("/api/sap/items/search", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
+
+    const q = String(req.query?.q || "").trim();
+    const top = Math.min(Math.max(Number(req.query?.top || 20), 5), 50);
+
+    // (cardCode viene desde el HTML, pero aquí no es obligatorio para buscar sugerencias)
+    // const cardCode = String(req.query?.cardCode || "").trim();
+
+    if (q.length < 2) {
+      return res.json({ ok: true, results: [] });
+    }
+
+    // OData: escapamos comillas simples
+    const safe = q.replace(/'/g, "''");
+
+    // Intento 1: contains (muchos Service Layer lo soportan)
+    let r;
+    try {
+      r = await slFetch(
+        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem` +
+        `&$filter=contains(ItemCode,'${safe}') or contains(ItemName,'${safe}')` +
+        `&$orderby=ItemName asc&$top=${top}`
+      );
+    } catch (e) {
+      // Fallback: substringof (cuando contains no existe)
+      r = await slFetch(
+        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem` +
+        `&$filter=substringof('${safe}',ItemCode) or substringof('${safe}',ItemName)` +
+        `&$orderby=ItemName asc&$top=${top}`
+      );
+    }
+
+    const values = Array.isArray(r?.value) ? r.value : [];
+
+    const results = values
+      .map(x => ({
+        ItemCode: x.ItemCode,
+        ItemName: x.ItemName,
+        SalesUnit: x.SalesUnit || "",
+        InventoryItem: x.InventoryItem ?? null,
+      }))
+      .filter(x => x.ItemCode);
+
+    return res.json({ ok: true, q, results });
+
+  } catch (err) {
+    console.error("❌ /api/sap/items/search:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+
 
 /* =========================================================
    ✅ SAP: MULTI ITEMS (warehouse dinámico)
