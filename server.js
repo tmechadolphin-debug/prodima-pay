@@ -1,1410 +1,1474 @@
-import express from "express";
-import cors from "cors";
-import pg from "pg";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex,nofollow,noarchive" />
+  <title>Prodima · Pedidos Mercaderistas</title>
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800;900&display=swap" rel="stylesheet">
 
-const { Pool } = pg;
-
-const app = express();
-app.use(express.json({ limit: "2mb" }));
-
-/* =========================================================
-   ✅ ENV
-========================================================= */
-// ---- SAP ----
-const SAP_BASE_URL = process.env.SAP_BASE_URL || "";
-const SAP_COMPANYDB = process.env.SAP_COMPANYDB || "";
-const SAP_USER = process.env.SAP_USER || "";
-const SAP_PASS = process.env.SAP_PASS || "";
-
-// ⚠️ DEFAULT WAREHOUSE (fallback si usuario no tiene)
-const SAP_WAREHOUSE = process.env.SAP_WAREHOUSE || "300";
-
-// Default (solo se usa si NO se pasa cardCode o si no se puede leer la lista del BP)
-const SAP_PRICE_LIST = process.env.SAP_PRICE_LIST || "Lista 02 Res. Com. Ind. Analitic";
-
-// ✅ Solo bodegas permitidas para inventario (para ventas)
-const ALLOWED_STOCK_WH = (process.env.ALLOWED_STOCK_WH || "200,300,500")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-const SEARCH_WH_ONLY = String(process.env.SEARCH_WH_ONLY || "300").trim();
-
-
-// ✅ (Opcional) Solo grupos de PRODUCTO TERMINADO (ItemsGroupCode)
-// Si lo dejas vacío, NO filtra por grupo.
-const FINISHED_GROUP_CODES = (process.env.FINISHED_GROUP_CODES || "")
-  .split(",")
-  .map((s) => Number(String(s).trim()))
-  .filter((n) => Number.isFinite(n));
-
-// ---- Web / CORS ----
-const YAPPY_ALIAS = process.env.YAPPY_ALIAS || "@prodimasansae";
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-
-// ---- DB Supabase ----
-const DATABASE_URL = process.env.DATABASE_URL || "";
-
-// ---- Admin ----
-const ADMIN_USER = process.env.ADMIN_USER || "PRODIMA";
-const ADMIN_PASS = process.env.ADMIN_PASS || "ADMINISTRADOR";
-const JWT_SECRET = process.env.JWT_SECRET || "prodima_change_this_secret";
-
-// ---- Timezone Fix (para fecha SAP) ----
-const TZ_OFFSET_MIN = Number(process.env.TZ_OFFSET_MIN || -300);
-
-/* =========================================================
-   ✅ CORS
-========================================================= */
-app.use(
-  cors({
-    origin: CORS_ORIGIN === "*" ? "*" : [CORS_ORIGIN],
-    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
-app.options("*", cors());
-
-/* =========================================================
-   ✅ Provincias + Bodegas (Auto)
-========================================================= */
-const PROVINCES = [
-  "Bocas del Toro",
-  "Chiriquí",
-  "Coclé",
-  "Colón",
-  "Darién",
-  "Herrera",
-  "Los Santos",
-  "Panamá",
-  "Panamá Oeste",
-  "Veraguas",
-];
-
-function provinceToWarehouse(province) {
-  const p = String(province || "").trim().toLowerCase();
-
-  // 200
-  if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
-
-  // 500
-  if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera")
-    return "500";
-
-  // 300
-  if (
-    p === "panamá" ||
-    p === "panama" ||
-    p === "panamá oeste" ||
-    p === "panama oeste" ||
-    p === "colón" ||
-    p === "colon"
-  )
-    return "300";
-
-  // Darién -> 300
-  if (p === "darién" || p === "darien") return "300";
-
-  return SAP_WAREHOUSE || "01";
-}
-
-/* =========================================================
-   ✅ DB Pool (Supabase)
-========================================================= */
-let pool = null;
-
-function hasDb() {
-  return !!DATABASE_URL;
-}
-
-function getPool() {
-  if (!pool) {
-    if (!DATABASE_URL) throw new Error("DATABASE_URL no está configurado.");
-
-    pool = new Pool({
-      connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
-      max: 3,
-    });
-
-    pool.on("error", (err) => {
-      console.error("❌ DB pool error:", err.message);
-    });
-  }
-  return pool;
-}
-
-async function dbQuery(text, params = []) {
-  const p = getPool();
-  return p.query(text, params);
-}
-
-/* =========================================================
-   ✅ DB Schema
-========================================================= */
-async function ensureSchema() {
-  if (!hasDb()) {
-    console.log("⚠️ DATABASE_URL no configurado (DB deshabilitada)");
-    return;
-  }
-
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS app_users (
-      id BIGSERIAL PRIMARY KEY,
-      username TEXT UNIQUE NOT NULL,
-      full_name TEXT DEFAULT '',
-      pin_hash TEXT NOT NULL,
-      is_active BOOLEAN NOT NULL DEFAULT TRUE,
-      province TEXT DEFAULT '',
-      warehouse_code TEXT DEFAULT '',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS audit_events (
-      id BIGSERIAL PRIMARY KEY,
-      event_type TEXT NOT NULL,
-      actor TEXT DEFAULT '',
-      ip TEXT DEFAULT '',
-      user_agent TEXT DEFAULT '',
-      payload JSONB DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  try {
-    await dbQuery(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS province TEXT DEFAULT '';`);
-    await dbQuery(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS warehouse_code TEXT DEFAULT '';`);
-  } catch (e) {
-    console.log("⚠️ ALTER TABLE app_users:", e.message);
-  }
-
-  console.log("✅ DB Schema OK (app_users, audit_events) + province/warehouse_code");
-}
-
-async function audit(event_type, req, actor = "", payload = {}) {
-  if (!hasDb()) return;
-  try {
-    await dbQuery(
-      `
-      INSERT INTO audit_events(event_type, actor, ip, user_agent, payload)
-      VALUES ($1,$2,$3,$4,$5)
-      `,
-      [
-        String(event_type || ""),
-        String(actor || ""),
-        String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || ""),
-        String(req.headers["user-agent"] || ""),
-        JSON.stringify(payload || {}),
-      ]
-    );
-  } catch (e) {
-    console.error("⚠️ audit insert error:", e.message);
-  }
-}
-
-/* =========================================================
-   ✅ JWT Helpers
-========================================================= */
-function signAdminToken() {
-  return jwt.sign({ typ: "admin" }, JWT_SECRET, { expiresIn: "2h" });
-}
-
-function signUserToken(user) {
-  return jwt.sign(
-    {
-      typ: "user",
-      uid: user.id,
-      username: user.username,
-      full_name: user.full_name || "",
-      province: user.province || "",
-      warehouse_code: user.warehouse_code || "",
-    },
-    JWT_SECRET,
-    { expiresIn: "30d" }
-  );
-}
-
-function verifyAdmin(req, res, next) {
-  try {
-    const auth = String(req.headers.authorization || "");
-    if (!auth.startsWith("Bearer ")) {
-      return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
+  <style>
+    :root{
+      --brand:#c31b1c;
+      --brand-dark:#8f1214;
+      --accent:#ffbf24;
+      --accent-dark:#f29a00;
+      --ink:#222;
+      --muted:#666;
+      --bd:#e6e8ec;
+      --bg:#fff7e8;
+      --ok:#0c8c6a;
+      --bad:#c31b1c;
+      --card:#ffffff;
+      --shadow: 0 18px 50px rgba(0,0,0,.10);
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{
+      font-family:'Montserrat',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      color:var(--ink);
+      background:linear-gradient(120deg,#fff3db 0%, #ffffff 55%, #fff3db 100%);
+      min-height:100vh;
+      touch-action: manipulation; /* ayuda a evitar zoom raro por doble tap */
     }
 
-    const token = auth.replace("Bearer ", "").trim();
-    const decoded = jwt.verify(token, JWT_SECRET);
+    .topbar{
+      background:linear-gradient(90deg,var(--brand) 0%, #e0341d 45%, var(--accent) 100%);
+      color:#fff;
+      padding:12px 16px;
+      font-weight:900;
+      letter-spacing:.3px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+    }
+    .topbar .left{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+    .topbar small{
+      opacity:.95;
+      font-weight:800;
+    }
+    .pillStatus{
+      background:#fff;
+      color:#7b1a01;
+      border:1px solid #ffd27f;
+      border-radius:999px;
+      padding:6px 10px;
+      font-size:12px;
+      font-weight:900;
+      box-shadow:0 10px 18px rgba(0,0,0,.06);
+      white-space:nowrap;
+    }
+    .pillStatus.ok{ color:#0c8c6a; border-color:#b7f0db; }
+    .pillStatus.bad{ color:#b30000; border-color:#ffd27f; }
 
-    if (!decoded || decoded.typ !== "admin") {
-      return res.status(403).json({ ok: false, message: "Token inválido" });
+    .wrap{max-width:1200px;margin:18px auto 50px;padding:0 16px}
+
+    .hero{
+      background:
+        radial-gradient(1000px 420px at 20% -10%, rgba(255,191,36,.55), transparent 60%),
+        radial-gradient(900px 420px at 95% 0%, rgba(195,21,28,.22), transparent 62%),
+        #fff;
+      border:1px solid #f3d6a5;
+      border-radius:22px;
+      box-shadow: var(--shadow);
+      padding:18px 18px 14px;
+    }
+    .hero h1{
+      font-size:24px;
+      font-weight:900;
+      color:var(--brand);
+      margin-bottom:4px;
+    }
+    .hero p{
+      color:#6a3b1b;
+      font-weight:700;
+      font-size:13px;
+      line-height:1.35;
+      max-width:900px;
     }
 
-    req.admin = decoded;
-    next();
-  } catch (e) {
-    return res.status(401).json({ ok: false, message: "Token expirado o inválido" });
-  }
-}
-
-function verifyUser(req, res, next) {
-  try {
-    const auth = String(req.headers.authorization || "");
-    if (!auth.startsWith("Bearer ")) {
-      return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
+    .grid{
+      display:grid;
+      grid-template-columns: 1.1fr .9fr;
+      gap:18px;
+      margin-top:18px;
+    }
+    @media (max-width:1050px){
+      .grid{grid-template-columns:1fr}
     }
 
-    const token = auth.replace("Bearer ", "").trim();
-    const decoded = jwt.verify(token, JWT_SECRET);
+    .card{
+      background:var(--card);
+      border:1px solid #f3d6a5;
+      border-radius:18px;
+      box-shadow: var(--shadow);
+      overflow:hidden;
+    }
+    .card-h{
+      background:linear-gradient(90deg, rgba(195,21,28,.08), rgba(255,191,36,.25));
+      border-bottom:1px solid #f3d6a5;
+      padding:12px 14px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+    }
+    .card-h strong{
+      color:var(--brand);
+      font-weight:900;
+      letter-spacing:.2px;
+    }
+    .badge{
+      background:#fff;
+      border:1px solid #ffd27f;
+      color:#7b1a01;
+      font-weight:900;
+      border-radius:999px;
+      padding:6px 10px;
+      font-size:12px;
+      box-shadow:0 10px 18px rgba(0,0,0,.06);
+      white-space:nowrap;
+    }
+    .card-b{padding:14px}
 
-    if (!decoded || decoded.typ !== "user") {
-      return res.status(403).json({ ok: false, message: "Token inválido" });
+    .row{display:grid;grid-template-columns: 1fr 1fr; gap:10px}
+    @media (max-width:560px){ .row{grid-template-columns:1fr} }
+
+    label{
+      display:block;
+      font-weight:900;
+      color:#6a3b1b;
+      font-size:12px;
+      margin-bottom:6px;
+      letter-spacing:.2px;
+    }
+    .input{
+      width:100%;
+      height:42px;
+      border-radius:14px;
+      border:1px solid #ffd27f;
+      padding:0 12px;
+      outline:none;
+      background:#fffdf6;
+      font-weight:800;
+      color:#2b1c16;
+      font-size:16px; /* evita zoom iOS por inputs pequeños */
+    }
+    .input::placeholder{color:#c08a40;font-weight:700}
+
+    .btn{
+      height:42px;
+      border-radius:14px;
+      font-weight:900;
+      border:0;
+      cursor:pointer;
+      padding:0 14px;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:8px;
+      letter-spacing:.2px;
+      font-size:14px;
+    }
+    .btn-primary{
+      background:linear-gradient(90deg,var(--brand) 0%, var(--accent) 100%);
+      color:#fff;
+      box-shadow:0 12px 22px rgba(195,21,28,.25);
+    }
+    .btn-outline{
+      background:#fff;
+      color:var(--brand);
+      border:1px solid #ffd27f;
+    }
+    .btn-danger{
+      background:linear-gradient(90deg,#a40b0d 0%, #ff7a00 100%);
+      color:#fff;
+    }
+    .btn:disabled{opacity:.6;cursor:not-allowed}
+
+    .note{
+      margin-top:10px;
+      background:#fff7e8;
+      border:1px dashed #f3c776;
+      border-radius:14px;
+      padding:10px 12px;
+      color:#70421c;
+      font-weight:700;
+      font-size:12px;
+      line-height:1.35;
     }
 
-    req.user = decoded;
-    next();
-  } catch (e) {
-    return res.status(401).json({ ok: false, message: "Token expirado o inválido" });
-  }
-}
-
-/* =========================================================
-   ✅ SAP Helpers (Service Layer Cookie + Cache)
-========================================================= */
-let SL_COOKIE = null;
-let SL_COOKIE_TIME = 0;
-
-let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
-const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
-
-const BP_PL_CACHE = new Map(); // cardCode -> { ts, priceListNo }
-const BP_PL_TTL_MS = 30 * 60 * 1000;
-
-const ITEM_CACHE = new Map();
-const ITEM_TTL_MS = 20 * 1000;
-
-function missingSapEnv() {
-  return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
-}
-
-async function slLogin() {
-  if (missingSapEnv()) {
-    console.log("⚠️ Faltan variables SAP en Render > Environment");
-    return;
-  }
-
-  const payload = {
-    CompanyDB: SAP_COMPANYDB,
-    UserName: SAP_USER,
-    Password: SAP_PASS,
-  };
-
-  const res = await fetch(`${SAP_BASE_URL}/Login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`Login SAP falló (${res.status}): ${t}`);
-  }
-
-  const setCookie = res.headers.get("set-cookie");
-  if (!setCookie) throw new Error("No se recibió cookie del Service Layer.");
-
-  SL_COOKIE = setCookie
-    .split(",")
-    .map((s) => s.split(";")[0])
-    .join("; ");
-
-  SL_COOKIE_TIME = Date.now();
-  console.log("✅ Login SAP OK (cookie guardada)");
-}
-
-async function slFetch(path, options = {}) {
-  if (!SL_COOKIE || Date.now() - SL_COOKIE_TIME > 25 * 60 * 1000) {
-    await slLogin();
-  }
-
-  const res = await fetch(`${SAP_BASE_URL}${path}`, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      Cookie: SL_COOKIE,
-      ...(options.headers || {}),
-    },
-  });
-
-  const text = await res.text();
-
-  if (res.status === 401 || res.status === 403) {
-    SL_COOKIE = null;
-    await slLogin();
-    return slFetch(path, options);
-  }
-
-  let json;
-  try {
-    json = text ? JSON.parse(text) : {};
-  } catch {
-    json = { raw: text };
-  }
-
-  if (!res.ok) {
-    throw new Error(`SAP error ${res.status}: ${text}`);
-  }
-
-  return json;
-}
-
-/* =========================================================
-   ✅ FIX FECHA SAP
-========================================================= */
-function getDateISOInOffset(offsetMinutes = -300) {
-  const now = new Date();
-  const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
-  const localMs = utcMs + offsetMinutes * 60000;
-  const local = new Date(localMs);
-  return local.toISOString().slice(0, 10);
-}
-
-/* =========================================================
-   ✅ Warehouse (por usuario) + solo permitidas
-========================================================= */
-function isAllowedWarehouse(wh) {
-  const w = String(wh || "").trim();
-  return ALLOWED_STOCK_WH.includes(w);
-}
-
-function getWarehouseFromReq(req) {
-  const wh = String(req.user?.warehouse_code || "").trim();
-  return wh || SAP_WAREHOUSE || "01";
-}
-
-function getSafeWarehouseFromReq(req) {
-  const wh = getWarehouseFromReq(req);
-  if (isAllowedWarehouse(wh)) return wh;
-  return ALLOWED_STOCK_WH[0] || wh; // cae a la primera permitida
-}
-
-const ALLOWED_WAREHOUSES = ["200", "300", "500"];
-
-// Cache corto para no re-consultar warehouses en cada tecla
-const ITEM_WH_CACHE = new Map(); // key: itemCode -> { ts, data }
-const ITEM_WH_TTL_MS = 30 * 1000;
-
-function getWarehouseScopeForUser(req) {
-  const userWh = String(getWarehouseFromReq(req) || "").trim();
-  // Si el usuario tiene 200/300/500, filtramos SOLO esa (lo que tú pediste "por usuario")
-  if (ALLOWED_WAREHOUSES.includes(userWh)) return [userWh];
-  // Si no, fallback a las permitidas
-  return [...ALLOWED_WAREHOUSES];
-}
-
-async function getWarehouseInfoForItemCached(itemCode) {
-  const now = Date.now();
-  const key = String(itemCode || "").trim();
-  if (!key) return [];
-
-  const cached = ITEM_WH_CACHE.get(key);
-  if (cached && now - cached.ts < ITEM_WH_TTL_MS) return cached.data;
-
-  let item;
-  try {
-    // liviano: solo bodegas y cantidades
-    item = await slFetch(
-      `/Items('${encodeURIComponent(key)}')?$select=ItemCode&$expand=ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`
-    );
-  } catch (e) {
-    // fallback si tu SL no soporta expand (raro, pero por si acaso)
-    item = await slFetch(`/Items('${encodeURIComponent(key)}')`);
-  }
-
-  const rows = Array.isArray(item?.ItemWarehouseInfoCollection)
-    ? item.ItemWarehouseInfoCollection
-    : [];
-
-  ITEM_WH_CACHE.set(key, { ts: now, data: rows });
-  return rows;
-}
-
-function summarizeWarehouses(rows, scopeList) {
-  const scope = new Set((scopeList || []).map(String));
-  let onHand = 0, committed = 0, ordered = 0;
-
-  for (const w of (rows || [])) {
-    const wh = String(w?.WarehouseCode || "").trim();
-    if (!scope.has(wh)) continue;
-
-    const a = Number(w?.InStock);
-    const c = Number(w?.Committed);
-    const o = Number(w?.Ordered);
-
-    if (Number.isFinite(a)) onHand += a;
-    if (Number.isFinite(c)) committed += c;
-    if (Number.isFinite(o)) ordered += o;
-  }
-
-  const available = onHand - committed;
-
-  return {
-    onHand: Number.isFinite(onHand) ? onHand : null,
-    committed: Number.isFinite(committed) ? committed : null,
-    ordered: Number.isFinite(ordered) ? ordered : null,
-    available: Number.isFinite(available) ? available : null,
-    hasStock: Number.isFinite(available) ? (available > 0) : null,
-  };
-}
-
-/* =========================================================
-   ✅ Health
-========================================================= */
-app.get("/api/health", async (req, res) => {
-  res.json({
-    ok: true,
-    message: "✅ PRODIMA API activa",
-    yappy: YAPPY_ALIAS,
-    warehouse_default: SAP_WAREHOUSE,
-    allowedWarehouses: ALLOWED_STOCK_WH,
-    priceList: SAP_PRICE_LIST,
-    db: hasDb() ? "on" : "off",
-  });
-});
-
-/* =========================================================
-   ✅ ADMIN: LOGIN
-========================================================= */
-app.post("/api/admin/login", async (req, res) => {
-  try {
-    const user = String(req.body?.user || "").trim();
-    const pass = String(req.body?.pass || "").trim();
-
-    if (!user || !pass) {
-      return res.status(400).json({ ok: false, message: "user y pass requeridos" });
+    .clientBox{
+      margin-top:12px;
+      border:1px solid #f3d6a5;
+      border-radius:16px;
+      padding:12px;
+      background:linear-gradient(180deg,#fffef8 0%, #fff7e8 100%);
+    }
+    .clientBox .title{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      margin-bottom:8px;
+    }
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:6px 10px;
+      border-radius:999px;
+      font-size:12px;
+      font-weight:900;
+      border:1px solid #ffd27f;
+      background:#fff;
+      color:#7b1a01;
     }
 
-    if (user !== ADMIN_USER || pass !== ADMIN_PASS) {
-      await audit("ADMIN_LOGIN_FAIL", req, user, { user });
-      return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
+    .kv{
+      display:grid;
+      grid-template-columns: 140px 1fr;
+      gap:6px 10px;
+      font-size:12px;
+      align-items:center;
+    }
+    .k{color:#7a4a1a;font-weight:900}
+    .v{color:#2b1c16;font-weight:800}
+
+    table{
+      width:100%;
+      border-collapse:separate;
+      border-spacing:0;
+      overflow:hidden;
+      border:1px solid #f3d6a5;
+      border-radius:16px;
+    }
+    thead th{
+      text-align:left;
+      padding:10px 10px;
+      font-size:12px;
+      color:#6a3b1b;
+      font-weight:900;
+      background:linear-gradient(90deg, rgba(195,21,28,.06), rgba(255,191,36,.20));
+      border-bottom:1px solid #f3d6a5;
+    }
+    tbody td{
+      padding:10px 10px;
+      border-bottom:1px dashed #f3d6a5;
+      vertical-align:middle;
+      background:#fff;
+      font-size:12px;
+      font-weight:800;
+      color:#2b1c16;
+    }
+    tbody tr:last-child td{border-bottom:0}
+
+    .t-input{
+      width:100%;
+      height:38px;
+      border-radius:12px;
+      border:1px solid #ffd27f;
+      background:#fffdf6;
+      padding:0 10px;
+      outline:none;
+      font-weight:900;
+      font-size:16px; /* evita zoom iOS */
+    }
+    .small{font-size:11px;color:#7a4a1a;font-weight:900}
+    .muted{color:#777;font-weight:800}
+
+    .stock-ok{color:var(--ok)}
+    .stock-bad{color:var(--bad)}
+
+    .footerActions{
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      align-items:center;
+      justify-content:space-between;
+      margin-top:12px;
+    }
+    .totals{
+      background:#fff;
+      border:1px solid #ffd27f;
+      border-radius:16px;
+      padding:10px 12px;
+      display:flex;
+      gap:16px;
+      align-items:center;
+      flex-wrap:wrap;
+      font-weight:900;
+      color:#6a3b1b;
+    }
+    .totals span{
+      color:#111;
+      font-weight:900;
     }
 
-    const token = signAdminToken();
-    await audit("ADMIN_LOGIN_OK", req, user, { user });
+    .toast{
+      position:fixed;
+      right:18px;
+      bottom:18px;
+      background:#111;
+      color:#fff;
+      padding:12px 14px;
+      border-radius:14px;
+      box-shadow:0 20px 50px rgba(0,0,0,.25);
+      display:none;
+      max-width:420px;
+      z-index:999;
+      font-weight:800;
+      line-height:1.35;
+    }
+    .toast.ok{background:linear-gradient(90deg,#0c8c6a,#1bb88a)}
+    .toast.bad{background:linear-gradient(90deg,#a40b0d,#ff7a00)}
+    .copy{
+      text-align:center;
+      margin-top:16px;
+      color:#7a4a1a;
+      font-weight:800;
+      font-size:12px;
+      opacity:.95;
+    }
 
-    return res.json({ ok: true, token });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
+    /* MODAL LOGIN */
+    .overlay{
+      position:fixed; inset:0;
+      background:rgba(0,0,0,.55);
+      display:none;
+      align-items:center; justify-content:center;
+      padding:18px;
+      z-index:1000;
+    }
+    .modal{
+      width:min(520px, 96vw);
+      background:#fff;
+      border:1px solid #f3d6a5;
+      border-radius:18px;
+      box-shadow:0 30px 80px rgba(0,0,0,.28);
+      overflow:hidden;
+    }
+    .modal-h{
+      padding:12px 14px;
+      background:linear-gradient(90deg,var(--brand) 0%, var(--accent) 100%);
+      color:#fff;
+      font-weight:900;
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+    }
+    .modal-b{ padding:14px; }
+    .modal-b .row2{
+      display:grid; grid-template-columns:1fr 1fr; gap:10px;
+    }
+    @media (max-width:560px){ .modal-b .row2{ grid-template-columns:1fr; } }
+    .modal-f{
+      padding:14px;
+      display:flex;
+      justify-content:flex-end;
+      gap:10px;
+      border-top:1px solid #f3d6a5;
+      background:#fffef8;
+    }
+    .chip{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      padding:5px 10px;
+      border-radius:999px;
+      font-size:11px;
+      font-weight:900;
+      border:1px solid #ffd27f;
+      background:#fff;
+      color:#7b1a01;
+      white-space:nowrap;
+    }
+    .chip.ok{border-color:#b7f0db;color:#0c8c6a}
+    .chip.bad{border-color:#ffd27f;color:#b30000}
 
-/* =========================================================
-   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
-========================================================= */
-app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    /* PC: mantiene igual */
+    @media (min-width: 1025px){
+      body{ zoom: 1; }
+    }
 
-    const userFilter = String(req.query?.user || "").trim().toLowerCase();
-    const clientFilter = String(req.query?.client || "").trim().toLowerCase();
-    const from = String(req.query?.from || "").trim();
-    const to = String(req.query?.to || "").trim();
-    const limit = Math.min(Number(req.query?.limit || 200), 500);
-
-    const sap = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments&$orderby=DocDate desc&$top=${limit}`
-    );
-
-    const values = Array.isArray(sap?.value) ? sap.value : [];
-
-    const parseUserFromComments = (comments = "") => {
-      const m = String(comments).match(/\[user:([^\]]+)\]/i);
-      return m ? String(m[1]).trim() : "";
-    };
-
-    const bpCache = new Map();
-    async function getBPName(cardCode) {
-      if (!cardCode) return "";
-      if (bpCache.has(cardCode)) return bpCache.get(cardCode);
-      try {
-        const bp = await slFetch(
-          `/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`
-        );
-        const name = String(bp?.CardName || "").trim();
-        bpCache.set(cardCode, name);
-        return name;
-      } catch (e) {
-        bpCache.set(cardCode, "");
-        return "";
+    /* TELÉFONO: agrandar UI */
+    @media (max-width: 600px){
+      html{
+        font-size: 18px;
+        -webkit-text-size-adjust: 100%;
       }
+      body{
+        transform: scale(1.18);
+        transform-origin: top left;
+        width: calc(100% / 1.18);
+      }
+      .input, .btn{
+        height: 52px;
+        border-radius: 16px;
+        font-size: 16px;
+      }
+      .wrap{ padding: 0 10px; }
+      .tableWrap, table{ overflow-x: auto; display:block; }
     }
 
-    let rows = [];
-    for (const q of values) {
-      const docDate = q.DocDate || "";
-      const usuario = parseUserFromComments(q.Comments || "");
-      const cardCode = String(q.CardCode || "").trim();
-
-      const estado =
-        q.DocumentStatus === "bost_Open"
-          ? "Open"
-          : q.DocumentStatus === "bost_Close"
-          ? "Close"
-          : String(q.DocumentStatus || "");
-
-      let cardName = String(q.CardName || "").trim();
-      if (!cardName) cardName = await getBPName(cardCode);
-
-      let mes = "";
-      let anio = "";
-      try {
-        const d = new Date(docDate);
-        mes = d.toLocaleString("es-PA", { month: "long" });
-        anio = String(d.getFullYear());
-      } catch {}
-
-      rows.push({
-        docEntry: q.DocEntry,
-        docNum: q.DocNum,
-        cardCode,
-        cardName,
-        customerName: cardName,
-        nombreCliente: cardName,
-        montoCotizacion: Number(q.DocTotal || 0),
-        montoEntregado: 0,
-        fecha: docDate,
-        estado,
-        mes,
-        anio,
-        usuario,
-        comments: q.Comments || "",
-      });
+    /* ✅ Sugerencias (dropdown propio móvil/PC) */
+    .suggestWrap{
+      display:none;
+      position:relative;
+      margin-top:6px;
     }
-
-    if (userFilter) rows = rows.filter((r) => String(r.usuario || "").toLowerCase().includes(userFilter));
-    if (clientFilter) {
-      rows = rows.filter(
-        (r) =>
-          String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
-          String(r.cardName || "").toLowerCase().includes(clientFilter)
-      );
+    .sugBox{
+      background:#fff;
+      border:1px solid #ffd27f;
+      border-radius:14px;
+      box-shadow:0 18px 50px rgba(0,0,0,.12);
+      overflow:hidden;
+      max-height:260px;
+      overflow-y:auto;
     }
-    if (from) rows = rows.filter((r) => String(r.fecha || "") >= from);
-    if (to) rows = rows.filter((r) => String(r.fecha || "") <= to);
-
-    return res.json({ ok: true, quotes: rows });
-  } catch (err) {
-    console.error("❌ /api/admin/quotes:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* =========================================================
-   ✅ ADMIN: LIST USERS
-========================================================= */
-app.get("/api/admin/users", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
-
-    const r = await dbQuery(`
-      SELECT id, username, full_name, is_active, province, warehouse_code, created_at
-      FROM app_users
-      ORDER BY created_at DESC;
-    `);
-
-    return res.json({ ok: true, users: r.rows || [] });
-  } catch (e) {
-    console.error("❌ users list:", e.message);
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   ✅ ADMIN: CREATE USER
-========================================================= */
-app.post("/api/admin/users", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
-
-    const username = String(req.body?.username || "").trim().toLowerCase();
-    const fullName = String(req.body?.fullName || req.body?.full_name || "").trim();
-    const pin = String(req.body?.pin || "").trim();
-
-    const province = String(req.body?.province || "").trim();
-    let warehouse_code = String(req.body?.warehouse_code || "").trim();
-
-    if (!username) return res.status(400).json({ ok: false, message: "username requerido" });
-    if (!pin || pin.length < 4) return res.status(400).json({ ok: false, message: "PIN mínimo 4" });
-
-    if (!warehouse_code) warehouse_code = provinceToWarehouse(province);
-
-    const pin_hash = await bcrypt.hash(pin, 10);
-
-    const ins = await dbQuery(
-      `
-      INSERT INTO app_users(username, full_name, pin_hash, is_active, province, warehouse_code)
-      VALUES ($1,$2,$3,TRUE,$4,$5)
-      RETURNING id, username, full_name, is_active, province, warehouse_code, created_at;
-      `,
-      [username, fullName, pin_hash, province, warehouse_code]
-    );
-
-    await audit("USER_CREATED", req, "ADMIN", { username, fullName, province, warehouse_code });
-
-    return res.json({ ok: true, user: ins.rows[0] });
-  } catch (e) {
-    const msg = String(e.message || e);
-    if (msg.includes("duplicate key value") || msg.includes("unique")) {
-      return res.status(400).json({ ok: false, message: "Ese username ya existe" });
+    .sugItem{
+      padding:10px 12px;
+      font-weight:800;
+      font-size:13px;
+      border-bottom:1px dashed #f3d6a5;
+      cursor:pointer;
     }
-    console.error("❌ user create:", msg);
-    return res.status(500).json({ ok: false, message: msg });
-  }
-});
+    .sugItem:last-child{border-bottom:0}
+    .sugItem:active{background:#fff3db}
+    .sugCode{font-weight:900;color:#c31b1c}
+    .sugName{color:#2b1c16}
+    .sugMini{margin-top:4px;font-size:11px;color:#777;font-weight:800}
 
-/* =========================================================
-   ✅ ADMIN: DELETE USER
-========================================================= */
-app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+  </style>
+</head>
 
-    const id = Number(req.params.id || 0);
-    if (!id) return res.status(400).json({ ok: false, message: "id inválido" });
+<body>
 
-    const r = await dbQuery(`DELETE FROM app_users WHERE id = $1 RETURNING id, username;`, [id]);
+  <div class="topbar">
+    <div class="left">
+      <div>📦 PRODIMA · Pedidos Mercaderistas</div>
+      <span class="pillStatus bad" id="apiStatus">API: verificando...</span>
+      <span class="pillStatus bad" id="loginStatus">Login: no</span>
+    </div>
 
-    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <small>uso interno · no público</small>
+      <button class="btn btn-outline" id="btnLogout" type="button" style="display:none;height:34px;border-radius:12px;padding:0 10px;font-size:12px">
+        🚪 Salir
+      </button>
+    </div>
+  </div>
 
-    await audit("USER_DELETED", req, "ADMIN", { id, username: r.rows[0]?.username });
+  <div class="wrap">
+    <section class="hero">
+      <h1>Crear cotización (SAP)</h1>
+      <p>
+        ✅ Ingresa el <b>código de cliente</b> o escribe el <b>nombre</b> (ej: “Ricamar”) para autocompletar.
+        <br/>
+        ✅ Agrega productos por <b>código de artículo</b> o <b>descripción</b> y cantidad.
+      </p>
+      <div class="note">
+        ⚡ Tip: cliente por <b>código</b> (C01133) o <b>nombre</b> (Importadora Ricamar).
+        <br/>
+        ⚡ Tip: artículos por <b>código</b> (0110) o <b>texto</b> (Low salsa china).
+      </div>
+    </section>
 
-    return res.json({ ok: true, message: "Usuario eliminado" });
-  } catch (e) {
-    console.error("❌ user delete:", e.message);
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
+    <div class="grid">
 
-/* =========================================================
-   ✅ ADMIN: TOGGLE ACTIVO
-========================================================= */
-app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+      <!-- CLIENTE -->
+      <section class="card">
+        <div class="card-h">
+          <strong>1) Cliente</strong>
+          <span class="badge" id="whoami">Usuario: --</span>
+        </div>
+        <div class="card-b">
 
-    const id = Number(req.params.id || 0);
-    if (!id) return res.status(400).json({ ok: false, message: "id inválido" });
+          <div class="row">
+            <div>
+              <label for="cardCode">Código o nombre de cliente (SAP)</label>
+              <input id="cardCode" class="input" list="clientList" placeholder="Ej: C01133 o Ricamar" />
+              <datalist id="clientList"></datalist>
 
-    const r = await dbQuery(
-      `
-      UPDATE app_users
-      SET is_active = NOT is_active
-      WHERE id = $1
-      RETURNING id, username, full_name, is_active, province, warehouse_code, created_at;
-      `,
-      [id]
-    );
+              <!-- dropdown móvil/extra -->
+              <div id="clientSuggest" class="suggestWrap"></div>
 
-    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+              <div class="small muted" style="margin-top:6px" id="clientHint">
+                Escribe 2+ letras para ver sugerencias.
+              </div>
 
-    await audit("USER_TOGGLE", req, "ADMIN", { id });
+              <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px">
+                <button class="btn btn-primary" id="btnLoadClient" type="button">🔎 Buscar cliente</button>
+                <button class="btn btn-outline" id="btnClearClient" type="button">🧹 Limpiar</button>
+              </div>
 
-    return res.json({ ok: true, user: r.rows[0] });
-  } catch (e) {
-    console.error("❌ user toggle:", e.message);
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
+              <div id="clientBox" class="clientBox" style="display:none">
+                <div class="title">
+                  <div class="pill">👤 Cliente cargado</div>
+                  <div class="pill" id="clientCredit">💳 OK</div>
+                </div>
 
-/* =========================================================
-   ✅ ADMIN: AUDIT
-========================================================= */
-app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+                <div class="kv">
+                  <div class="k">Código</div><div class="v" id="c_code">--</div>
+                  <div class="k">Nombre</div><div class="v" id="c_name">--</div>
+                  <div class="k">Teléfono</div><div class="v" id="c_phone">--</div>
+                  <div class="k">Email</div><div class="v" id="c_email">--</div>
+                  <div class="k">Dirección</div><div class="v" id="c_addr">--</div>
+                </div>
+              </div>
+            </div>
+            <div></div>
+          </div>
 
-    const r = await dbQuery(`
-      SELECT id, event_type, actor, ip, created_at, payload
-      FROM audit_events
-      ORDER BY created_at DESC
-      LIMIT 200;
-    `);
+        </div>
+      </section>
 
-    return res.json({ ok: true, events: r.rows || [] });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
+      <!-- CONFIRMACIÓN -->
+      <section class="card">
+        <div class="card-h">
+          <strong>3) Confirmación</strong>
+          <span class="badge">Cotizar: Ingreso en SAP</span>
+        </div>
+        <div class="card-b">
 
-/* =========================================================
-   ✅ MERCADERISTAS: LOGIN
-========================================================= */
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+          <label for="comments">Comentarios / Nota (opcional)</label>
+          <input id="comments" class="input" placeholder="Ej: Entregar martes / Observaciones..." />
 
-    const username = String(req.body?.username || "").trim().toLowerCase();
-    const pin = String(req.body?.pin || "").trim();
+          <label style="margin-top:12px">Adjuntos (foto o PDF)</label>
+          <input id="files" class="input" type="file" multiple accept="image/*,application/pdf" capture="environment"/>
+          <div id="filesList" class="note" style="display:none;margin-top:10px"></div>
 
-    if (!username || !pin) return res.status(400).json({ ok: false, message: "username y pin requeridos" });
+          <div class="footerActions">
+            <div class="totals">
+              Total líneas: <span id="t_lines">0</span>
+              Total unidades: <span id="t_qty">0</span>
+              Total estimado: <span id="t_total">$ 0.00</span>
+            </div>
 
-    const r = await dbQuery(
-      `
-      SELECT id, username, full_name, pin_hash, is_active, province, warehouse_code
-      FROM app_users
-      WHERE username = $1
-      LIMIT 1;
-      `,
-      [username]
-    );
+            <div style="display:flex;gap:10px;flex-wrap:wrap">
+              <button id="btnAddRow" class="btn btn-outline" type="button">➕ Agregar línea</button>
+              <button id="btnCreateQuote" class="btn btn-primary" type="button">✅ Crear cotización</button>
+            </div>
+          </div>
 
-    if (!r.rowCount) {
-      await audit("USER_LOGIN_FAIL", req, username, { username, reason: "not_found" });
-      return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
-    }
+          <div class="note" style="margin-top:12px">
+            🧾 Esto crea una <b>cotización</b> en SAP. Inventario en rojo NO bloquea la cotización.
+          </div>
 
-    const user = r.rows[0];
+        </div>
+      </section>
 
-    if (!user.is_active) {
-      await audit("USER_LOGIN_FAIL", req, username, { username, reason: "inactive" });
-      return res.status(401).json({ ok: false, message: "Usuario desactivado" });
-    }
+    </div>
 
-    const okPin = await bcrypt.compare(pin, user.pin_hash);
-    if (!okPin) {
-      await audit("USER_LOGIN_FAIL", req, username, { username, reason: "bad_pin" });
-      return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
-    }
+    <!-- PRODUCTOS -->
+    <section class="card" style="margin-top:18px">
+      <div class="card-h">
+        <strong>2) Productos</strong>
+        <span class="badge">Agrega ItemCode o Descripción + Cantidad</span>
+      </div>
+      <div class="card-b">
 
-    let wh = String(user.warehouse_code || "").trim();
-    if (!wh) {
-      wh = provinceToWarehouse(user.province || "");
-      try {
-        await dbQuery(`UPDATE app_users SET warehouse_code=$1 WHERE id=$2`, [wh, user.id]);
-        user.warehouse_code = wh;
-      } catch {}
-    }
+        <table>
+          <thead>
+            <tr>
+              <th style="width:190px">Código / Búsqueda</th>
+              <th>Descripción</th>
+              <th style="width:110px">Precio</th>
+              <th style="width:130px">Disponible</th>
+              <th style="width:110px">Cantidad</th>
+              <th style="width:110px">Subtotal</th>
+              <th style="width:86px">Acción</th>
+            </tr>
+          </thead>
+          <tbody id="linesBody"></tbody>
+        </table>
 
-    const token = signUserToken(user);
-    await audit("USER_LOGIN_OK", req, username, { username, province: user.province, warehouse_code: user.warehouse_code });
+        <div class="note" style="margin-top:12px">
+          ✅ Si sale <b>Sin stock</b>, igual puedes cotizar. Es informativo.
+        </div>
 
-    return res.json({
-      ok: true,
-      token,
-      user: {
-        id: user.id,
-        username: user.username,
-        full_name: user.full_name || "",
-        province: user.province || "",
-        warehouse_code: user.warehouse_code || "",
-      },
-    });
-  } catch (e) {
-    console.error("❌ /api/auth/login:", e.message);
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
+      </div>
+    </section>
 
-/* =========================================================
-   ✅ MERCADERISTAS: ME
-========================================================= */
-app.get("/api/auth/me", verifyUser, async (req, res) => {
-  return res.json({ ok: true, user: req.user });
-});
+    <div class="copy">©️ 2026 PRODIMA · Pedidos internos</div>
+  </div>
 
-/* =========================================================
-   ✅ PriceListNo cached (por nombre)
-========================================================= */
-async function getPriceListNoByNameCached(name) {
-  const now = Date.now();
+  <div id="toast" class="toast"></div>
 
-  if (
-    PRICE_LIST_CACHE.name === name &&
-    PRICE_LIST_CACHE.no !== null &&
-    now - PRICE_LIST_CACHE.ts < PRICE_LIST_TTL_MS
-  ) {
-    return PRICE_LIST_CACHE.no;
-  }
+  <!-- LOGIN MODAL -->
+  <div class="overlay" id="overlay">
+    <div class="modal">
+      <div class="modal-h">
+        <div>🔐 Login Mercaderista</div>
+        <div class="chip bad" id="loginState">🔒 Bloqueado</div>
+      </div>
 
-  const safe = name.replace(/'/g, "''");
-  let no = null;
+      <div class="modal-b">
+        <div class="row2">
+          <div>
+            <label for="mUser">Usuario</label>
+            <input id="mUser" class="input" placeholder="Ej: vane15" autocomplete="username"/>
+          </div>
+          <div>
+            <label for="mPin">PIN</label>
+            <input id="mPin" class="input" type="password" placeholder="Ej: 1234" autocomplete="current-password"/>
+          </div>
+        </div>
+        <div class="note" style="margin-top:10px">
+          ✅ Debes iniciar sesión para enviar cotizaciones.
+        </div>
+      </div>
 
-  try {
-    const r1 = await slFetch(`/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`);
-    if (r1?.value?.length) no = r1.value[0].PriceListNo;
-  } catch {}
+      <div class="modal-f">
+        <button class="btn btn-primary" id="btnLogin" type="button">Entrar</button>
+      </div>
+    </div>
+  </div>
 
-  if (no === null) {
-    try {
-      const r2 = await slFetch(`/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`);
-      if (r2?.value?.length) no = r2.value[0].PriceListNo;
-    } catch {}
-  }
+<script>
+/* =========================================
+   ✅ CONFIG API (Render backend)
+========================================= */
+const API_BASE = "https://prodima-pay.onrender.com";
 
-  PRICE_LIST_CACHE = { name, no, ts: now };
-  return no;
+/* =========================================
+   AUTH TOKEN (Mercaderistas)
+========================================= */
+const TOKEN_KEY = "prodima_merc_token";
+const USER_KEY  = "prodima_merc_user";
+
+function getToken(){ return localStorage.getItem(TOKEN_KEY) || ""; }
+function setToken(t){ localStorage.setItem(TOKEN_KEY, t); }
+function clearToken(){ localStorage.removeItem(TOKEN_KEY); }
+
+function setUser(u){ localStorage.setItem(USER_KEY, JSON.stringify(u || {})); }
+function getUser(){
+  try{ return JSON.parse(localStorage.getItem(USER_KEY) || "{}"); }
+  catch{ return {}; }
 }
+function clearUser(){ localStorage.removeItem(USER_KEY); }
 
-/* =========================================================
-   ✅ PriceListNo por cliente (BusinessPartner.PriceListNum)
-========================================================= */
-async function getPriceListNoForCardCodeCached(cardCode) {
-  const cc = String(cardCode || "").trim();
-  if (!cc) return null;
-
-  const now = Date.now();
-  const cached = BP_PL_CACHE.get(cc);
-  if (cached && now - cached.ts < BP_PL_TTL_MS) return cached.priceListNo;
-
-  try {
-    const bp = await slFetch(
-      `/BusinessPartners('${encodeURIComponent(cc)}')?$select=CardCode,CardName,PriceListNum`
-    );
-    const pl = bp?.PriceListNum ?? null;
-    const n = Number(pl);
-    const priceListNo = Number.isFinite(n) ? n : null;
-    BP_PL_CACHE.set(cc, { ts: now, priceListNo });
-    return priceListNo;
-  } catch {
-    BP_PL_CACHE.set(cc, { ts: now, priceListNo: null });
-    return null;
-  }
-}
-
-function getPriceFromPriceList(itemFull, priceListNo) {
-  const listNo = Number(priceListNo);
-
-  const row = Array.isArray(itemFull?.ItemPrices)
-    ? itemFull.ItemPrices.find((p) => Number(p?.PriceList) === listNo)
-    : null;
-
-  const price = row && row.Price != null ? Number(row.Price) : null;
-  return Number.isFinite(price) ? price : null;
-}
-
-/* =========================================================
-   ✅ Factor UoM ventas (Caja)
-========================================================= */
-function getSalesUomFactor(itemFull) {
-  const directFields = [
-    itemFull?.SalesItemsPerUnit,
-    itemFull?.SalesQtyPerPackUnit,
-    itemFull?.SalesQtyPerPackage,
-    itemFull?.SalesPackagingUnit,
-  ];
-
-  for (const v of directFields) {
-    const n = Number(v);
-    if (Number.isFinite(n) && n > 0) return n;
-  }
-
-  const coll = itemFull?.ItemUnitOfMeasurementCollection;
-  if (!Array.isArray(coll) || !coll.length) return null;
-
-  let row =
-    coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("sales")) ||
-    coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("iut_sales")) ||
-    null;
-
-  if (!row) row = coll.find((x) => Number(x?.BaseQuantity) > 1) || null;
-  if (!row) return null;
-
-  const baseQty = row?.BaseQuantity ?? row?.BaseQty ?? null;
-  const altQty = row?.AlternateQuantity ?? row?.AltQty ?? row?.AlternativeQuantity ?? null;
-
-  const b = Number(baseQty);
-  const a = Number(altQty);
-
-  if (Number.isFinite(b) && b > 0 && Number.isFinite(a) && a > 0) {
-    const f = b / a;
-    return Number.isFinite(f) && f > 0 ? f : null;
-  }
-
-  if (Number.isFinite(b) && b > 0) return b;
-  return null;
-}
-
-/* =========================================================
-   ✅ Filtros de "Producto Vendible" / Grupo terminado
-========================================================= */
-function isSalesInventoryItem(it) {
-  const inv = String(it?.InventoryItem || "").toLowerCase(); // tYES/tNO
-  const sal = String(it?.SalesItem || "").toLowerCase(); // tYES/tNO
-  return inv.includes("yes") && sal.includes("yes");
-}
-
-function isFinishedGroup(it) {
-  if (!FINISHED_GROUP_CODES.length) return true;
-  const g = Number(it?.ItemsGroupCode);
-  return FINISHED_GROUP_CODES.includes(g);
-}
-
-/* =========================================================
-   ✅ buildItemResponse
-========================================================= */
-function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
-  const item = {
-    ItemCode: itemFull.ItemCode ?? code,
-    ItemName: itemFull.ItemName ?? `Producto ${code}`,
-    SalesUnit: itemFull.SalesUnit ?? "",
-    InventoryItem: itemFull.InventoryItem ?? null,
-    SalesItem: itemFull.SalesItem ?? null,
-    ItemsGroupCode: itemFull.ItemsGroupCode ?? null,
-  };
-
-  const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
-  const factorCaja = getSalesUomFactor(itemFull);
-
-  const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
-
-  let warehouseRow = null;
-  if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
-    warehouseRow =
-      itemFull.ItemWarehouseInfoCollection.find(
-        (w) => String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
-      ) || null;
-  }
-
-  const onHand = warehouseRow?.InStock != null ? Number(warehouseRow.InStock) : null;
-  const committed = warehouseRow?.Committed != null ? Number(warehouseRow.Committed) : null;
-  const ordered = warehouseRow?.Ordered != null ? Number(warehouseRow.Ordered) : null;
-
-  let available = null;
-  if (Number.isFinite(onHand) && Number.isFinite(committed)) available = onHand - committed;
-
+function authHeaders(){
+  const t = getToken();
   return {
-    item,
-    price: priceCaja,
-    priceUnit,
-    factorCaja,
-    stock: {
-      warehouse: warehouseCode,
-      onHand: Number.isFinite(onHand) ? onHand : null,
-      committed: Number.isFinite(committed) ? committed : null,
-      ordered: Number.isFinite(ordered) ? ordered : null,
-      available: Number.isFinite(available) ? available : null,
-      hasStock: available != null ? available > 0 : null,
-    },
+    "Content-Type":"application/json",
+    ...(t ? {"Authorization":"Bearer " + t} : {})
   };
 }
 
-async function getOneItem(code, priceListNo, warehouseCode) {
-  const now = Date.now();
-  const key = `${code}::${warehouseCode}::${priceListNo}`;
-  const cached = ITEM_CACHE.get(key);
-  if (cached && now - cached.ts < ITEM_TTL_MS) return cached.data;
+/* =========================================
+   UI Helpers
+========================================= */
+function showToast(msg, type="ok"){
+  const t = document.getElementById("toast");
+  t.className = "toast " + (type==="ok" ? "ok" : "bad");
+  t.textContent = msg;
+  t.style.display = "block";
+  setTimeout(()=> t.style.display = "none", 4500);
+}
+function money(n){
+  if(n == null || Number.isNaN(Number(n))) return "--";
+  return "$ " + Number(n).toFixed(2);
+}
+function safeStr(x){
+  if(x == null) return "--";
+  const s = String(x).trim();
+  return s ? s : "--";
+}
 
-  let itemFull;
+function setApiStatus(ok){
+  const el = document.getElementById("apiStatus");
+  el.className = "pillStatus " + (ok ? "ok" : "bad");
+  el.textContent = ok ? "API: OK ✅" : "API: ERROR";
+}
+function setLoginStatus(ok){
+  const el = document.getElementById("loginStatus");
+  el.className = "pillStatus " + (ok ? "ok" : "bad");
+  el.textContent = ok ? "Login: sí ✅" : "Login: no";
+}
 
-  // ✅ Importante: expand UoM collection
-  try {
-    itemFull = await slFetch(
-      `/Items('${encodeURIComponent(code)}')` +
-        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,SalesItem,ItemsGroupCode,ItemPrices,ItemWarehouseInfoCollection` +
-        `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
-    );
-  } catch (e1) {
-    try {
-      itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')?$expand=ItemUnitOfMeasurementCollection`);
-    } catch (e2) {
-      itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
-    }
-  }
+/* =========================================
+   API Calls
+========================================= */
+async function apiHealth(){
+  const res = await fetch(`${API_BASE}/api/health`);
+  const data = await res.json().catch(()=>({}));
+  return { ok: res.ok && data.ok, data };
+}
 
-  const data = buildItemResponse(itemFull, code, priceListNo, warehouseCode);
-  ITEM_CACHE.set(key, { ts: now, data });
+async function apiMercLogin(username, pin){
+  const res = await fetch(`${API_BASE}/api/auth/login`, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ username, pin })
+  });
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok || !data.ok) throw new Error(data?.message || "Credenciales inválidas");
   return data;
 }
 
-/* =========================================================
-   ✅ SAP: ITEM (1) + price list por cliente (cardCode)
-========================================================= */
-app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const code = String(req.params.code || "").trim();
-    if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
-
-    const warehouseCode = getSafeWarehouseFromReq(req);
-
-    // ✅ si viene cardCode, usar lista del BP
-    const cardCode = String(req.query?.cardCode || "").trim();
-    let priceListNo = await getPriceListNoForCardCodeCached(cardCode);
-
-    if (priceListNo == null) {
-      priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
-    }
-
-    const r = await getOneItem(code, priceListNo, warehouseCode);
-
-    return res.json({
-      ok: true,
-      item: r.item,
-      warehouse: warehouseCode,
-      priceList: cardCode ? "BP.PriceListNum" : SAP_PRICE_LIST,
-      priceListNo,
-      price: Number(r.price ?? 0),
-      priceUnit: r.priceUnit,
-      factorCaja: r.factorCaja,
-      uom: r.item?.SalesUnit || "Caja",
-      stock: r.stock,
-    });
-  } catch (err) {
-    console.error("❌ /api/sap/item:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* =========================================================
-   ✅ SAP: SEARCH CUSTOMERS (autocomplete)
-   GET /api/sap/customers/search?q=ricamar&top=20
-========================================================= */
-app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const q = String(req.query?.q || "").trim();
-    const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
-
-    if (q.length < 2) return res.json({ ok: true, results: [] });
-
-    const safe = q.replace(/'/g, "''");
-
-    let r;
-    try {
-      r = await slFetch(
-        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=contains(CardName,'${safe}') or contains(CardCode,'${safe}')&$orderby=CardName asc&$top=${top}`
-      );
-    } catch {
-      r = await slFetch(
-        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=substringof('${safe}',CardName) or substringof('${safe}',CardCode)&$orderby=CardName asc&$top=${top}`
-      );
-    }
-
-    const values = Array.isArray(r?.value) ? r.value : [];
-
-    return res.json({
-      ok: true,
-      q,
-      results: values.map((x) => ({
-        CardCode: x.CardCode,
-        CardName: x.CardName,
-        Phone1: x.Phone1 || "",
-        EmailAddress: x.EmailAddress || "",
-      })),
-    });
-  } catch (err) {
-    console.error("❌ /api/sap/customers/search:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* =========================================================
-   ✅ SAP: SEARCH ITEMS (autocomplete) FILTRADO POR BODEGA
-   GET /api/sap/items/search?q=salsa&top=20
-
-   - Primero busca en /Items (rápido)
-   - Luego filtra por bodegas permitidas (200/300/500) o la del usuario
-   - Así NO te salen etiquetas, envases, etc (si no existen en esas bodegas)
-========================================================= */
-app.get("/api/sap/items/search", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
-
-    const q = String(req.query?.q || "").trim();
-    const top = Math.min(Math.max(Number(req.query?.top || 20), 5), 50);
-
-    if (q.length < 2) return res.json({ ok: true, results: [] });
-
-    const safe = q.replace(/'/g, "''");
-
-    // 1) Búsqueda liviana en maestro de Items
-    let r;
-    try {
-      r = await slFetch(
-        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Frozen` +
-          `&$filter=(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))` +
-          `&$orderby=ItemName asc&$top=${top}`
-      );
-    } catch (e) {
-      r = await slFetch(
-        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Frozen` +
-          `&$filter=(substringof('${safe}',ItemCode) or substringof('${safe}',ItemName))` +
-          `&$orderby=ItemName asc&$top=${top}`
-      );
-    }
-
-    const values = Array.isArray(r?.value) ? r.value : [];
-
-    // 2) Filtrado básico: inventariable y no congelado
-    const candidates = values
-      .filter((it) => it?.InventoryItem !== false)
-      .filter((it) => String(it?.Frozen || "").toLowerCase() !== "t")
-      .map((it) => ({
-        ItemCode: String(it.ItemCode || "").trim(),
-        ItemName: String(it.ItemName || "").trim(),
-        SalesUnit: String(it.SalesUnit || "").trim(),
-      }))
-      .filter((x) => x.ItemCode && x.ItemName)
-      .slice(0, top);
-
-    // 3) ✅ FILTRO por bodegas permitidas / por usuario
-// ✅ SOLO sugerencias de la bodega 300
-const scopeList = [SEARCH_WH_ONLY || "300"];
-const scopeSet = new Set(scopeList);
-
-
-
-    // Concurrencia para no pegarle duro al SL
-    const CONCURRENCY = 6;
-    const out = [];
-    let idx = 0;
-
-    async function worker() {
-      while (idx < candidates.length) {
-        const i = idx++;
-        const it = candidates[i];
-
-        try {
-          const rows = await getWarehouseInfoForItemCached(it.ItemCode);
-
-          // ✅ Regla clave:
-          // "el item debe EXISTIR en la(s) bodega(s) del scope"
-          const existsInScope = Array.isArray(rows) && rows.some(w =>
-            scopeSet.has(String(w?.WarehouseCode || "").trim())
-          );
-
-          if (!existsInScope) continue;
-
-          // (Opcional) si quieres además mostrar disponible total del scope:
-          const stock = summarizeWarehouses(rows, scopeList);
-
-          out.push({
-            ...it,
-            // opcional: para ordenar o mostrar
-            stockAvailable: stock.available,
-            stockHas: stock.hasStock,
-          });
-        } catch (e) {
-          // si falla un item, lo ignoramos para no romper autocomplete
-          continue;
-        }
-      }
-    }
-
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-
-    // (Opcional) ordena: primero los que tienen stock
-    out.sort((a, b) => {
-      const ah = a.stockHas ? 1 : 0;
-      const bh = b.stockHas ? 1 : 0;
-      if (bh !== ah) return bh - ah;
-      const av = Number(a.stockAvailable || 0);
-      const bv = Number(b.stockAvailable || 0);
-      return bv - av;
-    });
-
-    return res.json({
-      ok: true,
-      q,
-      scope: scopeList, // para debug
-      results: out.slice(0, top).map(x => ({
-        ItemCode: x.ItemCode,
-        ItemName: x.ItemName,
-        SalesUnit: x.SalesUnit,
-      })),
-    });
-  } catch (err) {
-    console.error("❌ /api/sap/items/search:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* =========================================================
-   ✅ SAP: MULTI ITEMS
-========================================================= */
-app.get("/api/sap/items", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const codes = String(req.query.codes || "")
-      .split(",")
-      .map((x) => x.trim())
-      .filter(Boolean);
-
-    if (!codes.length) return res.status(400).json({ ok: false, message: "codes vacío" });
-
-    const warehouseCode = getSafeWarehouseFromReq(req);
-    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
-
-    const CONCURRENCY = 5;
-    const items = {};
-    let i = 0;
-
-    async function worker() {
-      while (i < codes.length) {
-        const idx = i++;
-        const code = codes[idx];
-
-        try {
-          const r = await getOneItem(code, priceListNo, warehouseCode);
-          items[code] = {
-            ok: true,
-            name: r.item.ItemName,
-            unit: r.item.SalesUnit,
-            price: r.price,
-            priceUnit: r.priceUnit,
-            factorCaja: r.factorCaja,
-            stock: r.stock,
-          };
-        } catch (e) {
-          items[code] = { ok: false, message: String(e.message || e) };
-        }
-      }
-    }
-
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-
-    return res.json({
-      ok: true,
-      warehouse: warehouseCode,
-      priceList: SAP_PRICE_LIST,
-      priceListNo,
-      items,
-    });
-  } catch (err) {
-    console.error("❌ /api/sap/items:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* =========================================================
-   ✅ SAP: CUSTOMER (detalle)
-========================================================= */
-app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const code = String(req.params.code || "").trim();
-    if (!code) return res.status(400).json({ ok: false, message: "CardCode vacío." });
-
-    const bp = await slFetch(
-      `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Phone1,Phone2,EmailAddress,Address,City,Country,ZipCode,PriceListNum`
-    );
-
-    const addrParts = [bp.Address, bp.City, bp.ZipCode, bp.Country].filter(Boolean).join(", ");
-
-    return res.json({
-      ok: true,
-      customer: {
-        CardCode: bp.CardCode,
-        CardName: bp.CardName,
-        Phone1: bp.Phone1,
-        Phone2: bp.Phone2,
-        EmailAddress: bp.EmailAddress,
-        Address: addrParts || bp.Address || "",
-        PriceListNum: bp.PriceListNum ?? null,
-      },
-    });
-  } catch (err) {
-    console.error("❌ /api/sap/customer:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* =========================================================
-   ✅ SAP: CREAR COTIZACIÓN
-========================================================= */
-app.post("/api/sap/quote", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const cardCode = String(req.body?.cardCode || "").trim();
-    const comments = String(req.body?.comments || "").trim();
-    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
-
-    if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
-    if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
-
-    const warehouseCode = getSafeWarehouseFromReq(req);
-
-    const DocumentLines = lines
-      .map((l) => ({
-        ItemCode: String(l.itemCode || "").trim(),
-        Quantity: Number(l.qty || 0),
-        WarehouseCode: warehouseCode,
-      }))
-      .filter((x) => x.ItemCode && x.Quantity > 0);
-
-    if (!DocumentLines.length) {
-      return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
-    }
-
-    const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
-
-    const creator = req.user?.username || "unknown";
-    const province = String(req.user?.province || "").trim();
-
-    const sapComments = [
-      `[WEB PEDIDOS]`,
-      `[user:${creator}]`,
-      province ? `[prov:${province}]` : "",
-      warehouseCode ? `[wh:${warehouseCode}]` : "",
-      comments ? comments : "Cotización mercaderista",
-    ]
-      .filter(Boolean)
-      .join(" ");
-
-    const payload = {
-      CardCode: cardCode,
-      DocDate: docDate,
-      DocDueDate: docDate,
-      Comments: sapComments,
-      JournalMemo: "Cotización web mercaderistas",
-      DocumentLines,
-    };
-
-    const created = await slFetch(`/Quotations`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-
-    await audit("QUOTE_CREATED", req, creator, {
-      cardCode,
-      lines: DocumentLines.length,
-      docDate,
-      province,
-      warehouseCode,
-    });
-
-    return res.json({
-      ok: true,
-      message: "Cotización creada",
-      docEntry: created.DocEntry,
-      docNum: created.DocNum,
-      warehouse: warehouseCode,
-    });
-  } catch (err) {
-    console.error("❌ /api/sap/quote:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* =========================================================
-   ✅ START
-========================================================= */
-const PORT = process.env.PORT || 10000;
-
-ensureSchema()
-  .then(() => {
-    app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT));
-  })
-  .catch((e) => {
-    console.error("❌ Error creando schema DB:", e.message);
-    app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT, "(sin DB)"));
+async function apiGetCustomer(cardCode){
+  const res = await fetch(`${API_BASE}/api/sap/customer/${encodeURIComponent(cardCode)}`, {
+    headers: authHeaders()
   });
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok || !data.ok) throw new Error(data?.message || "No se pudo cargar cliente");
+  return data;
+}
+
+async function apiSearchCustomers(q){
+  const res = await fetch(`${API_BASE}/api/sap/customers/search?q=${encodeURIComponent(q)}&top=20`, {
+    headers: authHeaders()
+  });
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok || !data.ok) throw new Error(data?.message || "No se pudo buscar clientes");
+  return Array.isArray(data.results) ? data.results : [];
+}
+
+async function apiGetItem(itemCode, cardCode){
+  const qs = cardCode ? `?cardCode=${encodeURIComponent(cardCode)}` : "";
+  const res = await fetch(`${API_BASE}/api/sap/item/${encodeURIComponent(itemCode)}${qs}`, {
+    headers: authHeaders()
+  });
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok || !data.ok) throw new Error(data?.message || "No se pudo cargar item");
+  return data;
+}
+
+/* ✅ NUEVO: buscar artículos por código o descripción
+   Requiere endpoint backend:
+   GET /api/sap/items/search?q=...&top=...
+   -> { ok:true, results:[{ItemCode, ItemName, SalesUnit}] }
+*/
+async function apiSearchItems(q){
+  const res = await fetch(`${API_BASE}/api/sap/items/search?q=${encodeURIComponent(q)}&top=20`, {
+    headers: authHeaders()
+  });
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok || !data.ok) throw new Error(data?.message || "No se pudo buscar artículos");
+  return Array.isArray(data.results) ? data.results : [];
+}
+
+async function apiCreateQuote(payload){
+  const u = getUser();
+  const createdBy = String(u?.username || "").trim().toLowerCase();
+
+  const res = await fetch(`${API_BASE}/api/sap/quote`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({ ...payload, createdBy })
+  });
+
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok || !data.ok) throw new Error(data?.message || "No se pudo crear cotización");
+  return data;
+}
+
+/* =========================================
+   State
+========================================= */
+let CLIENT = null;
+const LINES = [];
+let lineSeq = 1;
+
+/* =========================================
+   Cliente Autocomplete
+========================================= */
+let clientSearchTimer = null;
+
+function renderClientOptions(list){
+  const dl = document.getElementById("clientList");
+  dl.innerHTML = (list || []).map(r=>{
+    const code = String(r.CardCode || "").trim();
+    const name = String(r.CardName || "").trim();
+    if(!code) return "";
+    return `<option value="${code}">${name}</option>`;
+  }).join("");
+}
+
+document.getElementById("cardCode").addEventListener("input", (e)=>{
+  const q = String(e.target.value || "").trim();
+  clearTimeout(clientSearchTimer);
+
+  clientSearchTimer = setTimeout(async ()=>{
+    if(!getToken()) return;
+    if(q.length < 2) return;
+
+    try{
+      const results = await apiSearchCustomers(q);
+      renderClientOptions(results);
+      const hint = document.getElementById("clientHint");
+      if(hint) hint.textContent = results.length ? `Sugerencias: ${results.length}` : "Sin sugerencias.";
+    }catch(err){
+      console.log(err.message || err);
+    }
+  }, 250);
+});
+
+document.getElementById("cardCode").addEventListener("keydown", (e)=>{
+  if(e.key === "Enter"){
+    e.preventDefault();
+    loadClient();
+  }
+});
+
+/* =========================================
+   Adjuntos
+========================================= */
+const FILES = [];
+
+function renderFiles(){
+  const box = document.getElementById("filesList");
+  if(!FILES.length){
+    box.style.display = "none";
+    box.innerHTML = "";
+    return;
+  }
+  box.style.display = "block";
+
+  box.innerHTML = `
+    <b>📎 Archivos adjuntos:</b><br/>
+    ${FILES.map((f, i)=> `
+      • ${f.name} (${Math.round(f.size/1024)} KB)
+      <button type="button" class="btn btn-outline" style="height:26px;border-radius:10px;padding:0 8px;font-size:11px;margin-left:8px"
+        onclick="removeFile(${i})">Quitar</button>
+    `).join("<br/>")}
+  `;
+}
+
+window.removeFile = function(idx){
+  FILES.splice(idx, 1);
+  renderFiles();
+};
+
+document.getElementById("files").addEventListener("change", (e)=>{
+  const incoming = Array.from(e.target.files || []);
+
+  const MAX_FILES = 5;
+  const MAX_MB_EACH = 10;
+
+  for(const f of incoming){
+    if(FILES.length >= MAX_FILES){
+      showToast(`Máximo ${MAX_FILES} archivos.`, "bad");
+      break;
+    }
+    if(f.size > MAX_MB_EACH * 1024 * 1024){
+      showToast(`Archivo muy grande (${f.name}). Máx ${MAX_MB_EACH}MB`, "bad");
+      continue;
+    }
+    FILES.push(f);
+  }
+
+  e.target.value = "";
+  renderFiles();
+});
+
+/* =========================================
+   Totals + Render
+========================================= */
+function calcTotals(){
+  const lines = LINES.filter(l => l.itemCode && Number(l.qty) > 0);
+  const totalLines = lines.length;
+  const totalQty = lines.reduce((a,b)=> a + Number(b.qty||0), 0);
+  const total = lines.reduce((a,b)=> a + (Number(b.qty||0) * (Number(b.price)||0)), 0);
+
+  document.getElementById("t_lines").textContent = String(totalLines);
+  document.getElementById("t_qty").textContent = String(totalQty);
+  document.getElementById("t_total").textContent = money(total);
+}
+
+/* =========================================
+   ✅ Items Suggest (global)
+========================================= */
+const ITEM_SUGGEST_CACHE = new Map(); // q -> results
+async function getItemSuggestions(q){
+  const key = q.toLowerCase();
+  if(ITEM_SUGGEST_CACHE.has(key)) return ITEM_SUGGEST_CACHE.get(key);
+  const res = await apiSearchItems(q);
+  ITEM_SUGGEST_CACHE.set(key, res);
+  return res;
+}
+
+function hideSuggest(wrap){
+  if(!wrap) return;
+  wrap.style.display = "none";
+  wrap.innerHTML = "";
+}
+
+function showSuggest(wrap, list, onPick){
+  if(!wrap) return;
+  if(!list || !list.length){
+    hideSuggest(wrap);
+    return;
+  }
+
+  wrap.innerHTML = `
+    <div class="sugBox">
+      ${list.slice(0,20).map(it => `
+        <div class="sugItem" data-code="${it.ItemCode}">
+          <div><span class="sugCode">${it.ItemCode}</span> — <span class="sugName">${it.ItemName || ""}</span></div>
+          <div class="sugMini">${it.SalesUnit ? ("Unidad: " + it.SalesUnit) : ""}</div>
+        </div>
+      `).join("")}
+    </div>
+  `;
+  wrap.style.display = "block";
+
+  wrap.querySelectorAll(".sugItem").forEach(el=>{
+    el.addEventListener("click", ()=>{
+      const code = el.getAttribute("data-code");
+      if(code) onPick(code);
+    });
+  });
+}
+
+/* =========================================
+   Lines UI
+========================================= */
+function renderLines(){
+  const tbody = document.getElementById("linesBody");
+  tbody.innerHTML = LINES.map(l => {
+    const price = l.price;
+    const avail = l.available;
+
+    const stockClass = (avail == null) ? "" : (avail > 0 ? "stock-ok" : "stock-bad");
+    const stockText  = (avail == null) ? "<span class='muted'>--</span>" : `<span class="${stockClass}">${avail}</span>`;
+    const sub = (l.qty && l.price != null) ? money(Number(l.qty) * Number(l.price)) : "--";
+
+    return `
+      <tr data-id="${l.id}">
+        <td>
+          <input class="t-input js-itemInput" placeholder="Ej: 0110 o Low salsa..." value="${l.itemCodeRaw||l.itemCode||""}" data-field="itemCode" />
+          <div class="small muted" style="margin-top:6px">${l.unit ? ("Unidad: " + l.unit) : ""}</div>
+
+          <!-- dropdown sugerencias por línea -->
+          <div class="suggestWrap js-itemSuggest"></div>
+        </td>
+        <td>
+          <div style="font-weight:900">${l.name ? l.name : "<span class='muted'>Escribe el código o descripción...</span>"}</div>
+          <div class="small muted" style="margin-top:4px">${l.err ? ("⚠️ " + l.err) : ""}</div>
+        </td>
+        <td><span style="font-weight:900">${money(price)}</span></td>
+        <td>${stockText}</td>
+        <td>
+          <input class="t-input" style="text-align:center" type="number" min="0" step="1" value="${l.qty||""}" data-field="qty" />
+        </td>
+        <td><span style="font-weight:900">${sub}</span></td>
+        <td>
+          <button class="btn btn-danger" style="height:38px;border-radius:12px;padding:0 10px" data-action="remove" type="button">🗑️</button>
+        </td>
+      </tr>
+    `;
+  }).join("");
+
+  // item input live suggestions
+  tbody.querySelectorAll("tr").forEach(tr=>{
+    const id = Number(tr.dataset.id);
+    const inp = tr.querySelector(".js-itemInput");
+    const wrap = tr.querySelector(".js-itemSuggest");
+
+    let tmr = null;
+    let last = [];
+
+    function doHide(){ hideSuggest(wrap); }
+    function doPick(code){
+      doHide();
+      inp.value = code;
+      onItemCodeChanged(id, code);
+    }
+
+    if(inp){
+      inp.addEventListener("input", (e)=>{
+        const q = String(e.target.value||"").trim();
+        const line = LINES.find(x=>x.id===id);
+        if(line) line.itemCodeRaw = q;
+
+        clearTimeout(tmr);
+
+        if(!getToken() || q.length < 2){
+          doHide();
+          return;
+        }
+
+        tmr = setTimeout(async ()=>{
+          try{
+            last = await getItemSuggestions(q);
+            showSuggest(wrap, last, doPick);
+          }catch{
+            doHide();
+          }
+        }, 220);
+      });
+
+      // Enter: si hay sugerencia toma la primera, si no intenta directo
+      inp.addEventListener("keydown", async (e)=>{
+        if(e.key === "Enter"){
+          e.preventDefault();
+          const q = String(inp.value||"").trim();
+          if(q.length < 1) return;
+
+          try{
+            if(last && last.length){
+              doPick(last[0].ItemCode);
+            }else{
+              // intenta resolver por búsqueda (por si todavía no llegó)
+              const rs = await getItemSuggestions(q);
+              if(rs.length) doPick(rs[0].ItemCode);
+              else await onItemCodeChanged(id, q); // caerá a validación
+            }
+          }catch{
+            await onItemCodeChanged(id, q);
+          }
+        }
+        if(e.key === "Escape"){
+          doHide();
+        }
+      });
+
+      // blur: oculta con delay pequeño para permitir click en lista
+      inp.addEventListener("blur", ()=>{
+        setTimeout(()=> doHide(), 180);
+      });
+      inp.addEventListener("focus", ()=>{
+        // si ya hay texto y last resultados, re-muestra
+        const q = String(inp.value||"").trim();
+        if(q.length >= 2 && last && last.length){
+          showSuggest(wrap, last, doPick);
+        }
+      });
+    }
+  });
+
+  // qty input
+  tbody.querySelectorAll("input[data-field='qty']").forEach(inp=>{
+    inp.addEventListener("input", (e)=>{
+      const tr = e.target.closest("tr");
+      const id = Number(tr.dataset.id);
+      const qty = Number(e.target.value||0);
+      const line = LINES.find(x=>x.id===id);
+      if(line){
+        line.qty = qty;
+      }
+      calcTotals();
+      renderLines();
+    });
+  });
+
+  // remove
+  tbody.querySelectorAll("button[data-action='remove']").forEach(btn=>{
+    btn.addEventListener("click", (e)=>{
+      const tr = e.target.closest("tr");
+      const id = Number(tr.dataset.id);
+      const idx = LINES.findIndex(x=>x.id===id);
+      if(idx>=0){
+        LINES.splice(idx,1);
+        renderLines();
+        calcTotals();
+      }
+    });
+  });
+}
+
+async function onItemCodeChanged(lineId, raw){
+  const line = LINES.find(x=>x.id===lineId);
+  if(!line) return;
+
+  const codeOrText = String(raw||"").trim();
+
+  line.itemCodeRaw = codeOrText;
+  line.itemCode = "";
+  line.name = "";
+  line.price = null;
+  line.available = null;
+  line.unit = "";
+  line.err = "";
+
+  renderLines();
+
+  if(!codeOrText){
+    calcTotals();
+    return;
+  }
+
+  try{
+    if(!getToken()) throw new Error("Debes iniciar sesión.");
+    if(!CLIENT?.CardCode) throw new Error("Selecciona un cliente primero.");
+
+    // ✅ Si no parece ItemCode, lo resolvemos por búsqueda y usamos el ItemCode real
+    const looksLikeItemCode = /^[A-Za-z0-9._-]+$/.test(codeOrText);
+    let itemCode = codeOrText;
+
+    if(!looksLikeItemCode){
+      const results = await apiSearchItems(codeOrText);
+      if(!results.length) throw new Error("No encontré artículos con esa descripción.");
+      itemCode = results[0].ItemCode;
+    }
+
+    const cardCode = CLIENT?.CardCode || "";
+    const r = await apiGetItem(itemCode, cardCode);
+
+    line.itemCode = itemCode;
+    line.name = r?.item?.ItemName || `Producto ${itemCode}`;
+    line.price = (r?.price != null) ? Number(r.price) : null;
+    line.available = (r?.stock?.available != null) ? Number(r.stock.available) : null;
+    line.unit = r?.item?.SalesUnit || r?.uom || "";
+    line.err = "";
+
+    if(line.available != null && line.available <= 0){
+      line.err = "Sin stock (solo informativo, puedes cotizar).";
+    }
+  }catch(err){
+    line.err = String(err.message || err);
+  }
+
+  renderLines();
+  calcTotals();
+}
+
+/* =========================================
+   Cliente
+========================================= */
+function clearClient(){
+  CLIENT = null;
+  document.getElementById("clientBox").style.display = "none";
+  document.getElementById("c_code").textContent = "--";
+  document.getElementById("c_name").textContent = "--";
+  document.getElementById("c_phone").textContent = "--";
+  document.getElementById("c_email").textContent = "--";
+  document.getElementById("c_addr").textContent = "--";
+  document.getElementById("clientCredit").textContent = "💳 OK";
+}
+
+function extractCardCodeFromInput(raw){
+  const s = String(raw || "").trim();
+  const m = s.match(/\(([^)]+)\)\s*$/);
+  if(m && m[1]) return String(m[1]).trim();
+  return s;
+}
+
+async function loadClient(){
+  if(!getToken()){
+    showToast("Debes iniciar sesión primero.", "bad");
+    openLogin();
+    return;
+  }
+
+  const raw = String(document.getElementById("cardCode").value||"").trim();
+  const code = extractCardCodeFromInput(raw);
+
+  if(!code){
+    showToast("Escribe el código o nombre del cliente.", "bad");
+    return;
+  }
+
+  try{
+    let cardCode = code;
+
+    if(code.length >= 2 && !/^[A-Za-z0-9]+$/.test(code)){
+      const results = await apiSearchCustomers(code);
+      if(results.length){
+        cardCode = results[0].CardCode;
+        document.getElementById("cardCode").value = cardCode;
+      }
+    }
+
+    const r = await apiGetCustomer(cardCode);
+    CLIENT = r.customer;
+
+    document.getElementById("clientBox").style.display = "block";
+    document.getElementById("c_code").textContent = safeStr(CLIENT.CardCode);
+    document.getElementById("c_name").textContent = safeStr(CLIENT.CardName);
+    document.getElementById("c_phone").textContent = safeStr(CLIENT.Phone1 || CLIENT.Phone2);
+    document.getElementById("c_email").textContent = safeStr(CLIENT.EmailAddress);
+    document.getElementById("c_addr").textContent = safeStr(CLIENT.Address);
+
+    showToast("Cliente cargado correctamente ✅", "ok");
+  }catch(err){
+    clearClient();
+    showToast("No pude cargar el cliente: " + (err.message||err), "bad");
+  }
+}
+
+/* =========================================
+   Crear cotización
+========================================= */
+async function createQuote(){
+  if(!getToken()){
+    showToast("Debes iniciar sesión para cotizar.", "bad");
+    openLogin();
+    return;
+  }
+
+  if(!CLIENT || !CLIENT.CardCode){
+    showToast("Primero selecciona un cliente.", "bad");
+    return;
+  }
+
+  const lines = LINES
+    .filter(l => l.itemCode && Number(l.qty) > 0)
+    .map(l => ({ itemCode: l.itemCode, qty: Number(l.qty) }));
+
+  if(!lines.length){
+    showToast("Agrega al menos 1 producto con cantidad.", "bad");
+    return;
+  }
+
+  const comments = String(document.getElementById("comments").value||"").trim();
+
+  const payload = {
+    cardCode: CLIENT.CardCode,
+    comments,
+    paymentMethod: "CONTRA_ENTREGA",
+    lines
+  };
+
+  const btn = document.getElementById("btnCreateQuote");
+  btn.disabled = true;
+  btn.textContent = "⏳ Creando cotización...";
+
+  try{
+    const r = await apiCreateQuote(payload);
+    showToast(`✅ Cotización creada: #${r.docNum} (DocEntry ${r.docEntry})`, "ok");
+  }catch(err){
+    showToast("Error creando cotización: " + (err.message||err), "bad");
+  }finally{
+    btn.disabled = false;
+    btn.textContent = "✅ Crear cotización";
+  }
+}
+
+/* =========================================
+   Login Mercaderista
+========================================= */
+function openLogin(){
+  document.getElementById("overlay").style.display = "flex";
+  document.getElementById("loginState").textContent = "🔒 Bloqueado";
+  document.getElementById("loginState").className = "chip bad";
+}
+function closeLogin(){
+  document.getElementById("overlay").style.display = "none";
+}
+
+async function doLogin(){
+  const username = String(document.getElementById("mUser").value||"").trim().toLowerCase();
+  const pin = String(document.getElementById("mPin").value||"").trim();
+
+  if(!username){ showToast("Escribe tu usuario.", "bad"); return; }
+  if(!pin){ showToast("Escribe tu PIN.", "bad"); return; }
+
+  const btn = document.getElementById("btnLogin");
+  btn.disabled = true;
+  btn.textContent = "⏳ Entrando...";
+
+  try{
+    const r = await apiMercLogin(username, pin);
+    setToken(r.token);
+    setUser(r.user || { username });
+
+    document.getElementById("loginState").textContent = "✅ Acceso OK";
+    document.getElementById("loginState").className = "chip ok";
+
+    closeLogin();
+    setLoginStatus(true);
+    document.getElementById("btnLogout").style.display = "inline-flex";
+
+    const u = getUser();
+    document.getElementById("whoami").textContent = "Usuario: " + (u.full_name || u.username || "--");
+
+    showToast("✅ Sesión iniciada", "ok");
+  }catch(err){
+    document.getElementById("loginState").textContent = "⛔ Login falló";
+    document.getElementById("loginState").className = "chip bad";
+    showToast(err.message || err, "bad");
+  }finally{
+    btn.disabled = false;
+    btn.textContent = "Entrar";
+  }
+}
+
+function doLogout(){
+  clearToken();
+  clearUser();
+  setLoginStatus(false);
+  document.getElementById("btnLogout").style.display = "none";
+  document.getElementById("whoami").textContent = "Usuario: --";
+  showToast("Sesión cerrada.", "ok");
+  openLogin();
+}
+
+/* =========================================
+   Init
+========================================= */
+function addRow(){
+  LINES.push({
+    id: lineSeq++,
+    itemCode:"",
+    itemCodeRaw:"",
+    name:"",
+    price:null,
+    available:null,
+    unit:"",
+    qty:"",
+    err:""
+  });
+  renderLines();
+  calcTotals();
+}
+
+(async function init(){
+  try{
+    const r = await apiHealth();
+    setApiStatus(r.ok);
+  }catch{
+    setApiStatus(false);
+  }
+
+  addRow(); addRow();
+
+  document.getElementById("btnAddRow").addEventListener("click", addRow);
+  document.getElementById("btnLoadClient").addEventListener("click", loadClient);
+  document.getElementById("btnClearClient").addEventListener("click", ()=>{
+    document.getElementById("cardCode").value = "";
+    const dl = document.getElementById("clientList");
+    dl.innerHTML = "";
+    const hint = document.getElementById("clientHint");
+    if(hint) hint.textContent = "Escribe 2+ letras para ver sugerencias.";
+    clearClient();
+  });
+  document.getElementById("btnCreateQuote").addEventListener("click", createQuote);
+
+  document.getElementById("btnLogin").addEventListener("click", doLogin);
+  document.getElementById("mPin").addEventListener("keydown", (e)=>{
+    if(e.key === "Enter") doLogin();
+  });
+
+  document.getElementById("btnLogout").addEventListener("click", doLogout);
+
+  if(getToken()){
+    setLoginStatus(true);
+    document.getElementById("btnLogout").style.display = "inline-flex";
+    const u = getUser();
+    document.getElementById("whoami").textContent = "Usuario: " + (u.full_name || u.username || "--");
+  }else{
+    setLoginStatus(false);
+    openLogin();
+  }
+})();
+
+/* =========================================
+   ✅ Cliente Suggest Móvil (mantengo lo que ya te funcionó)
+========================================= */
+(function enableMobileClientSuggest(){
+  const input = document.getElementById("cardCode");
+  const dl = document.getElementById("clientList");
+  const wrap = document.getElementById("clientSuggest");
+
+  if(!input || !dl || !wrap) return;
+
+  const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+    || (navigator.maxTouchPoints && navigator.maxTouchPoints > 1);
+
+  let timer = null;
+  let lastResults = [];
+
+  function hideMobileBox(){
+    wrap.style.display = "none";
+    wrap.innerHTML = "";
+  }
+
+  function showMobileBox(customers){
+    if(!IS_MOBILE) return;
+    if(!customers || !customers.length){
+      hideMobileBox();
+      return;
+    }
+
+    const html = `
+      <div class="sugBox">
+        ${customers.slice(0,20).map(c => `
+          <div class="sugItem" data-code="${c.CardCode}">
+            <div><span class="sugCode">${c.CardCode}</span> — <span class="sugName">${c.CardName}</span></div>
+          </div>
+        `).join("")}
+      </div>
+    `;
+
+    wrap.innerHTML = html;
+    wrap.style.display = "block";
+
+    wrap.querySelectorAll(".sugItem").forEach(el=>{
+      el.addEventListener("click", ()=>{
+        const code = el.getAttribute("data-code");
+        input.value = code;
+        hideMobileBox();
+        const btn = document.getElementById("btnLoadClient");
+        if(btn) btn.click();
+      });
+    });
+  }
+
+  async function doSearch(q){
+    try{
+      const results = await apiSearchCustomers(q);
+      lastResults = Array.isArray(results) ? results : [];
+
+      dl.innerHTML = lastResults.map(r =>
+        `<option value="${r.CardCode}">${r.CardName}</option>`
+      ).join("");
+
+      showMobileBox(lastResults);
+
+    }catch(e){
+      dl.innerHTML = "";
+      hideMobileBox();
+      console.log(e.message || e);
+    }
+  }
+
+  input.addEventListener("input", (e)=>{
+    const q = String(e.target.value || "").trim();
+    clearTimeout(timer);
+
+    if(q.length < 2){
+      dl.innerHTML = "";
+      hideMobileBox();
+      return;
+    }
+
+    timer = setTimeout(()=> doSearch(q), 220);
+  });
+
+  document.addEventListener("click", (e)=>{
+    if(!IS_MOBILE) return;
+    if(e.target === input) return;
+    if(wrap.contains(e.target)) return;
+    hideMobileBox();
+  });
+
+  const btnLoad = document.getElementById("btnLoadClient");
+  if(btnLoad){
+    btnLoad.addEventListener("click", async ()=>{
+      const v = String(input.value||"").trim();
+      if(!v) return;
+      if(/^C\d+/i.test(v)) return;
+
+      try{
+        const results = lastResults.length ? lastResults : await apiSearchCustomers(v);
+        if(results && results.length){
+          input.value = results[0].CardCode;
+          hideMobileBox();
+        }
+      }catch{}
+    }, true);
+  }
+})();
+</script>
+
+</body>
+</html>
