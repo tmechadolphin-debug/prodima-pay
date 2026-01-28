@@ -387,6 +387,75 @@ function getSafeWarehouseFromReq(req) {
   return ALLOWED_STOCK_WH[0] || wh; // cae a la primera permitida
 }
 
+const ALLOWED_WAREHOUSES = ["200", "300", "500"];
+
+// Cache corto para no re-consultar warehouses en cada tecla
+const ITEM_WH_CACHE = new Map(); // key: itemCode -> { ts, data }
+const ITEM_WH_TTL_MS = 30 * 1000;
+
+function getWarehouseScopeForUser(req) {
+  const userWh = String(getWarehouseFromReq(req) || "").trim();
+  // Si el usuario tiene 200/300/500, filtramos SOLO esa (lo que tú pediste "por usuario")
+  if (ALLOWED_WAREHOUSES.includes(userWh)) return [userWh];
+  // Si no, fallback a las permitidas
+  return [...ALLOWED_WAREHOUSES];
+}
+
+async function getWarehouseInfoForItemCached(itemCode) {
+  const now = Date.now();
+  const key = String(itemCode || "").trim();
+  if (!key) return [];
+
+  const cached = ITEM_WH_CACHE.get(key);
+  if (cached && now - cached.ts < ITEM_WH_TTL_MS) return cached.data;
+
+  let item;
+  try {
+    // liviano: solo bodegas y cantidades
+    item = await slFetch(
+      `/Items('${encodeURIComponent(key)}')?$select=ItemCode&$expand=ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`
+    );
+  } catch (e) {
+    // fallback si tu SL no soporta expand (raro, pero por si acaso)
+    item = await slFetch(`/Items('${encodeURIComponent(key)}')`);
+  }
+
+  const rows = Array.isArray(item?.ItemWarehouseInfoCollection)
+    ? item.ItemWarehouseInfoCollection
+    : [];
+
+  ITEM_WH_CACHE.set(key, { ts: now, data: rows });
+  return rows;
+}
+
+function summarizeWarehouses(rows, scopeList) {
+  const scope = new Set((scopeList || []).map(String));
+  let onHand = 0, committed = 0, ordered = 0;
+
+  for (const w of (rows || [])) {
+    const wh = String(w?.WarehouseCode || "").trim();
+    if (!scope.has(wh)) continue;
+
+    const a = Number(w?.InStock);
+    const c = Number(w?.Committed);
+    const o = Number(w?.Ordered);
+
+    if (Number.isFinite(a)) onHand += a;
+    if (Number.isFinite(c)) committed += c;
+    if (Number.isFinite(o)) ordered += o;
+  }
+
+  const available = onHand - committed;
+
+  return {
+    onHand: Number.isFinite(onHand) ? onHand : null,
+    committed: Number.isFinite(committed) ? committed : null,
+    ordered: Number.isFinite(ordered) ? ordered : null,
+    available: Number.isFinite(available) ? available : null,
+    hasStock: Number.isFinite(available) ? (available > 0) : null,
+  };
+}
+
 /* =========================================================
    ✅ Health
 ========================================================= */
@@ -1031,10 +1100,10 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: SEARCH ITEMS (autocomplete)
+   ✅ SAP: SEARCH ITEMS (autocomplete) FILTRADO POR BODEGA
    GET /api/sap/items/search?q=salsa&top=20
-   - NO depende de ItemWarehouseInfoCollection (en listados suele no venir)
-   - Stock real se ve al seleccionar (usando /api/sap/item/:code)
+   - Filtra resultados a SOLO bodegas permitidas (200/300/500)
+   - O SOLO la bodega del usuario si es 200/300/500
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
@@ -1044,53 +1113,96 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const q = String(req.query?.q || "").trim();
     const top = Math.min(Math.max(Number(req.query?.top || 20), 5), 50);
-
     if (q.length < 2) return res.json({ ok: true, results: [] });
 
     const safe = q.replace(/'/g, "''");
 
+    // ✅ Scope por usuario (lo que pediste: por bodega del usuario)
+    const scopeWarehouses = [...ALLOWED_WAREHOUSES];
+
     let r;
     try {
-      // ✅ Query liviana (lo más compatible)
       r = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Frozen` +
-          `&$filter=(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))` +
-          `&$orderby=ItemName asc&$top=${top}`
+        `&$filter=(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))` +
+        `&$orderby=ItemName asc&$top=${top}`
       );
-    } catch (e) {
-      // fallback substringof
+    } catch {
       r = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Frozen` +
-          `&$filter=(substringof('${safe}',ItemCode) or substringof('${safe}',ItemName))` +
-          `&$orderby=ItemName asc&$top=${top}`
+        `&$filter=(substringof('${safe}',ItemCode) or substringof('${safe}',ItemName))` +
+        `&$orderby=ItemName asc&$top=${top}`
       );
     }
 
     const values = Array.isArray(r?.value) ? r.value : [];
 
-    // ✅ Filtra “no inventariables” y congelados si aplica
-    const results = values
-      .filter((it) => it?.InventoryItem !== false) // si viene null/true, lo deja
+    // 1) filtros base (inventariable + no congelado)
+    const base = values
+      .filter((it) => it?.InventoryItem !== false)
       .filter((it) => String(it?.Frozen || "").toLowerCase() !== "t")
       .map((it) => ({
         ItemCode: String(it.ItemCode || "").trim(),
         ItemName: String(it.ItemName || "").trim(),
         SalesUnit: String(it.SalesUnit || "").trim(),
       }))
-      .filter((x) => x.ItemCode && x.ItemName)
-      .slice(0, top);
+      .filter((x) => x.ItemCode && x.ItemName);
+
+    // 2) ✅ Ahora filtramos por bodegas (200/300/500 o la del usuario)
+    //    Como SL no permite filtrar Items por almacén en una sola query confiable,
+    //    hacemos "2do paso" por cada item (top 20), con concurrencia controlada.
+    const CONCURRENCY = 6;
+    let idx = 0;
+    const out = [];
+
+    async function worker() {
+      while (idx < base.length) {
+        const i = idx++;
+        const it = base[i];
+
+        try {
+          const whRows = await getWarehouseInfoForItemCached(it.ItemCode);
+
+          // ¿tiene al menos un row en bodegas scope?
+          const hasInScope = whRows.some(w =>
+            scopeWarehouses.includes(String(w?.WarehouseCode || "").trim())
+          );
+
+          if (!hasInScope) continue;
+
+          const sum = summarizeWarehouses(whRows, scopeWarehouses);
+
+          out.push({
+            ...it,
+            warehouseScope: scopeWarehouses.join(","),
+            available: sum.available,     // ✅ SOLO scope
+            hasStock: sum.hasStock,
+          });
+        } catch (e) {
+          // si falla el lookup del item, lo omitimos para no romper sugerencias
+          continue;
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+    // orden final
+    out.sort((a, b) => a.ItemName.localeCompare(b.ItemName, "es"));
 
     return res.json({
       ok: true,
       q,
-      warehouse: getWarehouseFromReq(req), // informativo
-      results,
+      warehouseScope: scopeWarehouses,
+      results: out.slice(0, top),
     });
+
   } catch (err) {
     console.error("❌ /api/sap/items/search:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
+
 
 /* =========================================================
    ✅ SAP: MULTI ITEMS
