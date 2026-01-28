@@ -30,6 +30,9 @@ const ALLOWED_STOCK_WH = (process.env.ALLOWED_STOCK_WH || "200,300,500")
   .map((s) => s.trim())
   .filter(Boolean);
 
+const SEARCH_WH_ONLY = String(process.env.SEARCH_WH_ONLY || "300").trim();
+
+
 // ✅ (Opcional) Solo grupos de PRODUCTO TERMINADO (ItemsGroupCode)
 // Si lo dejas vacío, NO filtra por grupo.
 const FINISHED_GROUP_CODES = (process.env.FINISHED_GROUP_CODES || "")
@@ -1152,8 +1155,9 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     // 3) ✅ FILTRO por bodegas permitidas / por usuario
 // ✅ SOLO sugerencias de la bodega 300
-const scopeList = ["300"];
+const scopeList = [SEARCH_WH_ONLY || "300"];
 const scopeSet = new Set(scopeList);
+
 
 
     // Concurrencia para no pegarle duro al SL
