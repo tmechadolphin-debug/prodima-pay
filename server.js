@@ -22,12 +22,12 @@ const SAP_PASS = process.env.SAP_PASS || "";
 const SAP_WAREHOUSE = process.env.SAP_WAREHOUSE || "01";
 
 // Lista default (fallback). OJO: si mandas cardCode desde el HTML,
-// usaremos la lista del cliente (BusinessPartner.PriceListNum) cuando exista.
+// podemos usar la lista del cliente (BusinessPartner.PriceListNum) cuando exista.
 const SAP_PRICE_LIST =
   process.env.SAP_PRICE_LIST || "Lista 02 Res. Com. Ind. Analitic";
 
-// ✅ Solo bodegas permitidas para INVENTARIO (ventas)
-const ALLOWED_STOCK_WH = (process.env.ALLOWED_STOCK_WH || "200,300,500")
+// ✅ Solo bodegas de VENTAS permitidas (por usuario)
+const SALES_WAREHOUSES = (process.env.SALES_WAREHOUSES || "200,300,500")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -83,13 +83,7 @@ function provinceToWarehouse(province) {
   if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
 
   // 500
-  if (
-    p === "veraguas" ||
-    p === "coclé" ||
-    p === "cocle" ||
-    p === "los santos" ||
-    p === "herrera"
-  )
+  if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera")
     return "500";
 
   // 300
@@ -103,11 +97,12 @@ function provinceToWarehouse(province) {
   )
     return "300";
 
-  // ✅ Darién (no estaba en tu lista)
+  // ✅ Darién
   if (p === "darién" || p === "darien") return "300";
 
-  // fallback
-  return SAP_WAREHOUSE || "01";
+  // fallback (si alguien tiene provincia rara)
+  // pero intentamos mantenerlo dentro de ventas
+  return "300";
 }
 
 /* =========================================================
@@ -178,9 +173,7 @@ async function ensureSchema() {
 
   try {
     await dbQuery(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS province TEXT DEFAULT '';`);
-    await dbQuery(
-      `ALTER TABLE app_users ADD COLUMN IF NOT EXISTS warehouse_code TEXT DEFAULT '';`
-    );
+    await dbQuery(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS warehouse_code TEXT DEFAULT '';`);
   } catch (e) {
     console.log("⚠️ ALTER TABLE app_users:", e.message);
   }
@@ -282,11 +275,8 @@ let SL_COOKIE_TIME = 0;
 let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
 const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
 
-const ITEM_CACHE = new Map(); // key -> { ts, data }
+const ITEM_CACHE = new Map();
 const ITEM_TTL_MS = 20 * 1000;
-
-const BP_PRICELIST_CACHE = new Map(); // cardCode -> {ts, no}
-const BP_PRICELIST_TTL_MS = 6 * 60 * 60 * 1000;
 
 function missingSapEnv() {
   return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
@@ -375,59 +365,25 @@ function getDateISOInOffset(offsetMinutes = -300) {
 }
 
 /* =========================================================
-   ✅ Helper: warehouse por usuario (SOLO para cotizar)
+   ✅ Helper: warehouse por usuario (SOLO 200/300/500)
 ========================================================= */
-const ALLOWED_STOCK_WH = (process.env.ALLOWED_STOCK_WH || "200,300,500")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
+function normalizeWh(x) {
+  const w = String(x || "").trim();
+  return w;
 }
 
-function isAllowedWh(code){
-  const w = String(code || "").trim();
-  return ALLOWED_STOCK_WH.includes(w);
-}
+function getWarehouseFromReq(req) {
+  const whUser = normalizeWh(req.user?.warehouse_code);
 
-function sumStockAllowed(itemFull){
-  const coll = Array.isArray(itemFull?.ItemWarehouseInfoCollection)
-    ? itemFull.ItemWarehouseInfoCollection
-    : [];
+  // ✅ si el user tiene 200/300/500 lo usamos
+  if (whUser && SALES_WAREHOUSES.includes(whUser)) return whUser;
 
-  const rows = coll.filter(w => isAllowedWh(w?.WarehouseCode));
+  // ✅ si viene vacío, tratamos por provincia
+  const byProv = provinceToWarehouse(req.user?.province || "");
+  if (byProv && SALES_WAREHOUSES.includes(byProv)) return byProv;
 
-  let onHand = 0, committed = 0, ordered = 0;
-  let any = false;
-
-  for (const w of rows){
-    const oh = Number(w?.InStock);
-    const cm = Number(w?.Committed);
-    const or = Number(w?.Ordered);
-
-    if (Number.isFinite(oh)) { onHand += oh; any = true; }
-    if (Number.isFinite(cm)) committed += cm;
-    if (Number.isFinite(or)) ordered += or;
-  }
-
-  const available = any ? (onHand - committed) : null;
-
-  return {
-    allowedWarehouses: [...ALLOWED_STOCK_WH],
-    byWarehouse: rows.map(w => ({
-      warehouse: String(w.WarehouseCode || "").trim(),
-      onHand: Number.isFinite(Number(w.InStock)) ? Number(w.InStock) : null,
-      committed: Number.isFinite(Number(w.Committed)) ? Number(w.Committed) : null,
-      ordered: Number.isFinite(Number(w.Ordered)) ? Number(w.Ordered) : null,
-      available:
-        Number.isFinite(Number(w.InStock)) && Number.isFinite(Number(w.Committed))
-          ? Number(w.InStock) - Number(w.Committed)
-          : null
-    })),
-    onHand: any ? onHand : null,
-    committed: any ? committed : null,
-    ordered: any ? ordered : null,
-    available: Number.isFinite(available) ? available : null,
-    hasStock: (available != null) ? (available > 0) : null
-  };
+  // ✅ fallback final: primera bodega de ventas o SAP_WAREHOUSE si lo forzaste
+  return SALES_WAREHOUSES[0] || SAP_WAREHOUSE || "01";
 }
 
 /* =========================================================
@@ -439,8 +395,8 @@ app.get("/api/health", async (req, res) => {
     message: "✅ PRODIMA API activa",
     yappy: YAPPY_ALIAS,
     warehouse_default: SAP_WAREHOUSE,
+    sales_warehouses: SALES_WAREHOUSES,
     priceList: SAP_PRICE_LIST,
-    allowed_stock_wh: ALLOWED_STOCK_WH,
     db: hasDb() ? "on" : "off",
   });
 });
@@ -525,16 +481,12 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       const cardCode = String(q.CardCode || "").trim();
 
       const estado =
-        q.DocumentStatus === "bost_Open"
-          ? "Open"
-          : q.DocumentStatus === "bost_Close"
-          ? "Close"
-          : String(q.DocumentStatus || "");
+        q.DocumentStatus === "bost_Open" ? "Open" :
+        q.DocumentStatus === "bost_Close" ? "Close" :
+        String(q.DocumentStatus || "");
 
       let cardName = String(q.CardName || "").trim();
-      if (!cardName) {
-        cardName = await getBPName(cardCode);
-      }
+      if (!cardName) cardName = await getBPName(cardCode);
 
       let mes = "";
       let anio = "";
@@ -558,23 +510,21 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         mes,
         anio,
         usuario,
-        comments: q.Comments || "",
+        comments: q.Comments || ""
       });
     }
 
-    if (userFilter)
-      rows = rows.filter((r) => String(r.usuario || "").toLowerCase().includes(userFilter));
+    if (userFilter) rows = rows.filter(r => String(r.usuario || "").toLowerCase().includes(userFilter));
 
     if (clientFilter) {
-      rows = rows.filter(
-        (r) =>
-          String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
-          String(r.cardName || "").toLowerCase().includes(clientFilter)
+      rows = rows.filter(r =>
+        String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
+        String(r.cardName || "").toLowerCase().includes(clientFilter)
       );
     }
 
-    if (from) rows = rows.filter((r) => String(r.fecha || "") >= from);
-    if (to) rows = rows.filter((r) => String(r.fecha || "") <= to);
+    if (from) rows = rows.filter(r => String(r.fecha || "") >= from);
+    if (to) rows = rows.filter(r => String(r.fecha || "") <= to);
 
     return res.json({ ok: true, quotes: rows });
   } catch (err) {
@@ -624,6 +574,11 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
       warehouse_code = provinceToWarehouse(province);
     }
 
+    // ✅ fuerza que sea solo 200/300/500
+    if (!SALES_WAREHOUSES.includes(warehouse_code)) {
+      warehouse_code = provinceToWarehouse(province);
+    }
+
     const pin_hash = await bcrypt.hash(pin, 10);
 
     const ins = await dbQuery(
@@ -658,9 +613,7 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
     const id = Number(req.params.id || 0);
     if (!id) return res.status(400).json({ ok: false, message: "id inválido" });
 
-    const r = await dbQuery(`DELETE FROM app_users WHERE id = $1 RETURNING id, username;`, [
-      id,
-    ]);
+    const r = await dbQuery(`DELETE FROM app_users WHERE id = $1 RETURNING id, username;`, [id]);
 
     if (!r.rowCount) {
       return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
@@ -773,7 +726,7 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     let wh = String(user.warehouse_code || "").trim();
-    if (!wh) {
+    if (!wh || !SALES_WAREHOUSES.includes(wh)) {
       wh = provinceToWarehouse(user.province || "");
       try {
         await dbQuery(`UPDATE app_users SET warehouse_code=$1 WHERE id=$2`, [wh, user.id]);
@@ -785,7 +738,7 @@ app.post("/api/auth/login", async (req, res) => {
     await audit("USER_LOGIN_OK", req, username, {
       username,
       province: user.province,
-      warehouse_code: user.warehouse_code,
+      warehouse_code: user.warehouse_code
     });
 
     return res.json({
@@ -813,7 +766,7 @@ app.get("/api/auth/me", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ PriceListNo cached por NOMBRE (fallback)
+   ✅ PriceListNo cached
 ========================================================= */
 async function getPriceListNoByNameCached(name) {
   const now = Date.now();
@@ -849,65 +802,21 @@ async function getPriceListNoByNameCached(name) {
   return no;
 }
 
-/* =========================================================
-   ✅ PriceListNo por CLIENTE (BusinessPartners.PriceListNum)
-   - si no existe, fallback a SAP_PRICE_LIST (por nombre)
-========================================================= */
-async function getPriceListNoByCardCodeCached(cardCode) {
-  const cc = String(cardCode || "").trim();
-  if (!cc) return null;
-
-  const now = Date.now();
-  const cached = BP_PRICELIST_CACHE.get(cc);
-  if (cached && now - cached.ts < BP_PRICELIST_TTL_MS) {
-    return cached.no;
-  }
-
-  try {
-    const bp = await slFetch(
-      `/BusinessPartners('${encodeURIComponent(cc)}')?$select=CardCode,CardName,PriceListNum`
-    );
-
-    const n = Number(bp?.PriceListNum);
-    const no = Number.isFinite(n) ? n : null;
-
-    BP_PRICELIST_CACHE.set(cc, { ts: now, no });
-    return no;
-  } catch (e) {
-    // si el BP no existe o no permite, cachea null para no spamear
-    BP_PRICELIST_CACHE.set(cc, { ts: now, no: null });
-    return null;
-  }
-}
-
-async function resolvePriceListNo(cardCode) {
-  // 1) por cliente
-  const byClient = await getPriceListNoByCardCodeCached(cardCode);
-  if (byClient != null) return byClient;
-
-  // 2) fallback por nombre (env)
-  return await getPriceListNoByNameCached(SAP_PRICE_LIST);
-}
-
-/* =========================================================
-   ✅ Precio desde ItemPrices por lista
-========================================================= */
 function getPriceFromPriceList(itemFull, priceListNo) {
   const listNo = Number(priceListNo);
 
   const row = Array.isArray(itemFull?.ItemPrices)
-    ? itemFull.ItemPrices.find((p) => Number(p?.PriceList) === listNo)
+    ? itemFull.ItemPrices.find(p => Number(p?.PriceList) === listNo)
     : null;
 
-  const price = row && row.Price != null ? Number(row.Price) : null;
-  return Number.isFinite(price) ? price : null;
+  const price = (row && row.Price != null) ? Number(row.Price) : null;
+  return (Number.isFinite(price) ? price : null);
 }
 
 /* =========================================================
    ✅ FIX REAL: Factor UoM de VENTAS (Caja)
 ========================================================= */
 function getSalesUomFactor(itemFull) {
-  // 1) Fallbacks directos si tu SL los trae (según setup)
   const directFields = [
     itemFull?.SalesItemsPerUnit,
     itemFull?.SalesQtyPerPackUnit,
@@ -920,76 +829,35 @@ function getSalesUomFactor(itemFull) {
     if (Number.isFinite(n) && n > 0) return n;
   }
 
-  // 2) Colección UoM (requiere $expand en muchos SL)
   const coll = itemFull?.ItemUnitOfMeasurementCollection;
   if (!Array.isArray(coll) || !coll.length) return null;
 
-  // Busca UoM de ventas
   let row =
-    coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("sales")) ||
-    coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("iut_sales")) ||
+    coll.find(x => String(x?.UoMType || "").toLowerCase().includes("sales")) ||
+    coll.find(x => String(x?.UoMType || "").toLowerCase().includes("iut_sales")) ||
     null;
 
-  // Si no encontró, intenta al menos la primera con BaseQuantity > 1
   if (!row) {
-    row = coll.find((x) => Number(x?.BaseQuantity) > 1) || null;
+    row = coll.find(x => Number(x?.BaseQuantity) > 1) || null;
   }
   if (!row) return null;
 
   const baseQty = row?.BaseQuantity ?? row?.BaseQty ?? null;
-  const altQty =
-    row?.AlternateQuantity ?? row?.AltQty ?? row?.AlternativeQuantity ?? null;
+  const altQty = row?.AlternateQuantity ?? row?.AltQty ?? row?.AlternativeQuantity ?? null;
 
   const b = Number(baseQty);
   const a = Number(altQty);
 
-  // Si trae ambos, la conversión real es Base/Alt
   if (Number.isFinite(b) && b > 0 && Number.isFinite(a) && a > 0) {
     const f = b / a;
-    return Number.isFinite(f) && f > 0 ? f : null;
+    return (Number.isFinite(f) && f > 0) ? f : null;
   }
 
-  // Si trae solo BaseQuantity (común), úsalo
   if (Number.isFinite(b) && b > 0) return b;
-
   return null;
 }
 
-/* =========================================================
-   ✅ Stock: solo bodegas 200/300/500 (evita MP, merma, etc)
-========================================================= */
-function filterWarehouses(itemFull, allowed = ALLOWED_STOCK_WH) {
-  const coll = Array.isArray(itemFull?.ItemWarehouseInfoCollection)
-    ? itemFull.ItemWarehouseInfoCollection
-    : [];
-
-  const allowedSet = new Set((allowed || []).map((x) => String(x).trim()));
-  return coll.filter((w) => allowedSet.has(String(w?.WarehouseCode || "").trim()));
-}
-
-function calcAvailableFromRow(w) {
-  const onHand = w?.InStock != null ? Number(w.InStock) : null;
-  const committed = w?.Committed != null ? Number(w.Committed) : null;
-  const ordered = w?.Ordered != null ? Number(w.Ordered) : null;
-
-  let available = null;
-  if (Number.isFinite(onHand) && Number.isFinite(committed)) {
-    available = onHand - committed;
-  }
-
-  return {
-    warehouse: String(w?.WarehouseCode || "").trim(),
-    onHand: Number.isFinite(onHand) ? onHand : null,
-    committed: Number.isFinite(committed) ? committed : null,
-    ordered: Number.isFinite(ordered) ? ordered : null,
-    available: Number.isFinite(available) ? available : null,
-  };
-}
-
-/* =========================================================
-   ✅ Build item response (precio caja + stock filtrado)
-========================================================= */
-function buildItemResponse(itemFull, code, priceListNo) {
+function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   const item = {
     ItemCode: itemFull.ItemCode ?? code,
     ItemName: itemFull.ItemName ?? `Producto ${code}`,
@@ -1001,17 +869,26 @@ function buildItemResponse(itemFull, code, priceListNo) {
   const factorCaja = getSalesUomFactor(itemFull);
 
   const priceCaja =
-    priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
+    (priceUnit != null && factorCaja != null)
+      ? (priceUnit * factorCaja)
+      : priceUnit;
 
-  // ✅ SOLO bodegas permitidas para inventario
-  const rowsAllowed = filterWarehouses(itemFull, ALLOWED_STOCK_WH);
-  const byWarehouse = rowsAllowed.map(calcAvailableFromRow);
+  let warehouseRow = null;
+  if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
+    warehouseRow =
+      itemFull.ItemWarehouseInfoCollection.find(w =>
+        String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
+      ) || null;
+  }
 
-  // total disponible sumando 200+300+500
-  const totalAvailable = byWarehouse.reduce(
-    (acc, r) => acc + (Number(r.available) || 0),
-    0
-  );
+  const onHand = (warehouseRow?.InStock != null) ? Number(warehouseRow.InStock) : null;
+  const committed = (warehouseRow?.Committed != null) ? Number(warehouseRow.Committed) : null;
+  const ordered = (warehouseRow?.Ordered != null) ? Number(warehouseRow.Ordered) : null;
+
+  let available = null;
+  if (Number.isFinite(onHand) && Number.isFinite(committed)) {
+    available = onHand - committed;
+  }
 
   return {
     item,
@@ -1019,20 +896,19 @@ function buildItemResponse(itemFull, code, priceListNo) {
     priceUnit,
     factorCaja,
     stock: {
-      allowedWarehouses: ALLOWED_STOCK_WH,
-      byWarehouse, // [{warehouse,onHand,committed,ordered,available}, ...]
-      available: totalAvailable,
-      hasStock: totalAvailable > 0,
-    },
+      warehouse: warehouseCode,
+      onHand: Number.isFinite(onHand) ? onHand : null,
+      committed: Number.isFinite(committed) ? committed : null,
+      ordered: Number.isFinite(ordered) ? ordered : null,
+      available: Number.isFinite(available) ? available : null,
+      hasStock: (available != null) ? (available > 0) : null,
+    }
   };
 }
 
-/* =========================================================
-   ✅ Get one item (cache + $expand)
-========================================================= */
-async function getOneItem(code, priceListNo) {
+async function getOneItem(code, priceListNo, warehouseCode) {
   const now = Date.now();
-  const key = `${code}::${priceListNo}`;
+  const key = `${code}::${warehouseCode}::${priceListNo}`;
   const cached = ITEM_CACHE.get(key);
   if (cached && now - cached.ts < ITEM_TTL_MS) {
     return cached.data;
@@ -1043,8 +919,8 @@ async function getOneItem(code, priceListNo) {
   try {
     itemFull = await slFetch(
       `/Items('${encodeURIComponent(code)}')` +
-        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection` +
-        `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
+      `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection` +
+      `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
     );
   } catch (e1) {
     try {
@@ -1056,14 +932,13 @@ async function getOneItem(code, priceListNo) {
     }
   }
 
-  const data = buildItemResponse(itemFull, code, priceListNo);
+  const data = buildItemResponse(itemFull, code, priceListNo, warehouseCode);
   ITEM_CACHE.set(key, { ts: now, data });
   return data;
 }
 
 /* =========================================================
-   ✅ SAP: ITEM (precio por lista del cliente si se manda cardCode)
-   GET /api/sap/item/0110?cardCode=C01133
+   ✅ SAP: ITEM (warehouse del usuario)
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -1074,23 +949,26 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
 
-    const cardCode = String(req.query?.cardCode || "").trim();
-    const priceListNo = await resolvePriceListNo(cardCode);
+    const warehouseCode = getWarehouseFromReq(req);
 
-    const r = await getOneItem(code, priceListNo);
+    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
+    const r = await getOneItem(code, priceListNo, warehouseCode);
+
     const priceCaja = Number(r.price ?? 0);
 
     return res.json({
       ok: true,
       item: r.item,
-      priceList: cardCode ? "BP.PriceListNum" : SAP_PRICE_LIST,
+      warehouse: warehouseCode,
+      priceList: SAP_PRICE_LIST,
       priceListNo,
       price: priceCaja,
       priceUnit: r.priceUnit,
       factorCaja: r.factorCaja,
       uom: r.item?.SalesUnit || "Caja",
-      stock: r.stock, // ✅ disponible suma solo 200/300/500
+      stock: r.stock,
     });
+
   } catch (err) {
     console.error("❌ /api/sap/item:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
@@ -1098,14 +976,9 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: SEARCH ITEMS (autocomplete por código o descripción)
-   GET /api/sap/items/search?q=011&top=20
+   ✅ SAP: SEARCH ITEMS (autocomplete) ✅✅✅
+   Filtra SOLO items que existan en la bodega del usuario (200/300/500)
    GET /api/sap/items/search?q=salsa&top=20
-========================================================= */
-/* =========================================================
-   ✅ SAP: SEARCH ITEMS (autocomplete)
-   GET /api/sap/items/search?q=salsa&top=20
-   Devuelve SOLO items con presencia/stock en bodegas 200/300/500
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
@@ -1115,11 +988,12 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const q = String(req.query?.q || "").trim();
     const top = Math.min(Math.max(Number(req.query?.top || 20), 5), 50);
-
     if (q.length < 2) return res.json({ ok: true, results: [] });
 
+    const warehouseCode = getWarehouseFromReq(req);
     const safe = q.replace(/'/g, "''");
 
+    // Pedimos colección de bodegas para poder filtrar por la bodega del user
     let r;
     try {
       r = await slFetch(
@@ -1139,33 +1013,54 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const values = Array.isArray(r?.value) ? r.value : [];
 
-    // ✅ filtra: solo ítems que existan en 200/300/500 (y opcional: con stock >0)
-    const filtered = values.filter(it => {
-      const s = sumStockAllowed(it);
-      // si quieres mostrar SOLO los que tengan stock:
-      return s.available != null && s.available > 0;
-      // si quieres mostrar aunque estén en 200/300/500 con 0 stock:
-      // return s.onHand != null; 
-    });
+    // ✅ filtro: solo los que tengan registro en la bodega del usuario
+    // y opcional: que no sea “puro cero” (para evitar materias primas / merma)
+    const results = values
+      .map((it) => {
+        const whRow = Array.isArray(it?.ItemWarehouseInfoCollection)
+          ? it.ItemWarehouseInfoCollection.find(w =>
+              String(w?.WarehouseCode || "").trim() === String(warehouseCode).trim()
+            )
+          : null;
 
-    const results = filtered.map(it => {
-      const s = sumStockAllowed(it);
-      return {
-        ItemCode: it.ItemCode,
-        ItemName: it.ItemName,
-        SalesUnit: it.SalesUnit || "",
-        available: s.available,
-        onHand: s.onHand
-      };
-    });
+        if (!whRow) return null;
 
-    return res.json({ ok: true, q, results });
+        const onHand = Number(whRow?.InStock);
+        const committed = Number(whRow?.Committed);
+        const ordered = Number(whRow?.Ordered);
+
+        const hasAny =
+          (Number.isFinite(onHand) && onHand !== 0) ||
+          (Number.isFinite(committed) && committed !== 0) ||
+          (Number.isFinite(ordered) && ordered !== 0);
+
+        // ✅ clave: evita listar artículos que “existen” pero son 0/0/0 (típico de MP/merma)
+        if (!hasAny) return null;
+
+        const available =
+          Number.isFinite(onHand) && Number.isFinite(committed)
+            ? (onHand - committed)
+            : null;
+
+        return {
+          ItemCode: it.ItemCode,
+          ItemName: it.ItemName,
+          SalesUnit: it.SalesUnit || "",
+          warehouse: warehouseCode,
+          onHand: Number.isFinite(onHand) ? onHand : null,
+          available: Number.isFinite(available) ? available : null,
+        };
+      })
+      .filter(Boolean)
+      .slice(0, top);
+
+    return res.json({ ok: true, q, warehouse: warehouseCode, results });
+
   } catch (err) {
     console.error("❌ /api/sap/items/search:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
-
 
 /* =========================================================
    ✅ SAP: SEARCH CUSTOMERS (autocomplete)
@@ -1189,20 +1084,17 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
     let r;
     try {
       r = await slFetch(
-        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress` +
-          `&$filter=contains(CardName,'${safe}') or contains(CardCode,'${safe}')` +
-          `&$orderby=CardName asc&$top=${top}`
+        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=contains(CardName,'${safe}') or contains(CardCode,'${safe}')&$orderby=CardName asc&$top=${top}`
       );
     } catch (e) {
       r = await slFetch(
-        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress` +
-          `&$filter=substringof('${safe}',CardName) or substringof('${safe}',CardCode)` +
-          `&$orderby=CardName asc&$top=${top}`
+        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=substringof('${safe}',CardName) or substringof('${safe}',CardCode)&$orderby=CardName asc&$top=${top}`
       );
     }
 
     const values = Array.isArray(r?.value) ? r.value : [];
-    const results = values.map((x) => ({
+
+    const results = values.map(x => ({
       CardCode: x.CardCode,
       CardName: x.CardName,
       Phone1: x.Phone1 || "",
@@ -1210,6 +1102,7 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
     }));
 
     return res.json({ ok: true, q, results });
+
   } catch (err) {
     console.error("❌ /api/sap/customers/search:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
@@ -1217,7 +1110,7 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: MULTI ITEMS
+   ✅ SAP: MULTI ITEMS (warehouse del usuario)
 ========================================================= */
 app.get("/api/sap/items", verifyUser, async (req, res) => {
   try {
@@ -1234,8 +1127,8 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
       return res.status(400).json({ ok: false, message: "codes vacío" });
     }
 
-    const cardCode = String(req.query?.cardCode || "").trim();
-    const priceListNo = await resolvePriceListNo(cardCode);
+    const warehouseCode = getWarehouseFromReq(req);
+    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
 
     const CONCURRENCY = 5;
     const items = {};
@@ -1246,7 +1139,7 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
         const idx = i++;
         const code = codes[idx];
         try {
-          const r = await getOneItem(code, priceListNo);
+          const r = await getOneItem(code, priceListNo, warehouseCode);
           items[code] = {
             ok: true,
             name: r.item.ItemName,
@@ -1254,7 +1147,7 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
             price: r.price,
             priceUnit: r.priceUnit,
             factorCaja: r.factorCaja,
-            stock: r.stock, // ✅ stock disponible solo 200/300/500
+            stock: r.stock,
           };
         } catch (e) {
           items[code] = { ok: false, message: String(e.message || e) };
@@ -1266,7 +1159,8 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
 
     return res.json({
       ok: true,
-      priceList: cardCode ? "BP.PriceListNum" : SAP_PRICE_LIST,
+      warehouse: warehouseCode,
+      priceList: SAP_PRICE_LIST,
       priceListNo,
       items,
     });
@@ -1289,7 +1183,9 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
     if (!code) return res.status(400).json({ ok: false, message: "CardCode vacío." });
 
     const bp = await slFetch(
-      `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Phone1,Phone2,EmailAddress,Address,City,Country,ZipCode,PriceListNum`
+      `/BusinessPartners('${encodeURIComponent(
+        code
+      )}')?$select=CardCode,CardName,Phone1,Phone2,EmailAddress,Address,City,Country,ZipCode`
     );
 
     const addrParts = [bp.Address, bp.City, bp.ZipCode, bp.Country].filter(Boolean).join(", ");
@@ -1303,7 +1199,6 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
         Phone2: bp.Phone2,
         EmailAddress: bp.EmailAddress,
         Address: addrParts || bp.Address || "",
-        PriceListNum: bp.PriceListNum ?? null,
       },
     });
   } catch (err) {
@@ -1314,7 +1209,6 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ SAP: CREAR COTIZACIÓN
-   - aquí SÍ usamos la bodega del usuario (200/300/500 según provincia)
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
@@ -1329,7 +1223,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
     if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
 
-    const warehouseCode = const ALLOWED_STOCK(req);
+    const warehouseCode = getWarehouseFromReq(req);
 
     const DocumentLines = lines
       .map((l) => ({
@@ -1354,9 +1248,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       province ? `[prov:${province}]` : "",
       warehouseCode ? `[wh:${warehouseCode}]` : "",
       comments ? comments : "Cotización mercaderista",
-    ]
-      .filter(Boolean)
-      .join(" ");
+    ].filter(Boolean).join(" ");
 
     const payload = {
       CardCode: cardCode,
@@ -1394,24 +1286,15 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ START (NO BLOQUEAR EL BOOT EN RENDER)
+   ✅ START
 ========================================================= */
 const PORT = process.env.PORT || 10000;
 
-app.listen(PORT, () => {
-  console.log("✅ Server listo en puerto", PORT);
-
-  // ✅ Corre schema async (no bloquea el deploy)
-  ensureSchema()
-    .then(() => console.log("✅ ensureSchema terminado"))
-    .catch((e) => console.error("❌ ensureSchema error:", e.message));
-});
-
-// ✅ opcional pero útil para ver fallos en Render
-process.on("unhandledRejection", (err) => {
-  console.error("❌ UnhandledRejection:", err);
-});
-process.on("uncaughtException", (err) => {
-  console.error("❌ UncaughtException:", err);
-});
-
+ensureSchema()
+  .then(() => {
+    app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT));
+  })
+  .catch((e) => {
+    console.error("❌ Error creando schema DB:", e.message);
+    app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT, "(sin DB)"));
+  });
