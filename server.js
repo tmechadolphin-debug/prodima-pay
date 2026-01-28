@@ -1031,97 +1031,61 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: SEARCH ITEMS (autocomplete artículos)
+   ✅ SAP: SEARCH ITEMS (autocomplete)
    GET /api/sap/items/search?q=salsa&top=20
-   - Filtra:
-     ✅ SalesItem=tYES
-     ✅ InventoryItem=tYES
-     ✅ (opcional) ItemsGroupCode en FINISHED_GROUP_CODES
-     ✅ que exista en la bodega del usuario (200/300/500)
+   - NO depende de ItemWarehouseInfoCollection (en listados suele no venir)
+   - Stock real se ve al seleccionar (usando /api/sap/item/:code)
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
 
     const q = String(req.query?.q || "").trim();
-    const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
+    const top = Math.min(Math.max(Number(req.query?.top || 20), 5), 50);
 
     if (q.length < 2) return res.json({ ok: true, results: [] });
 
-    const wh = getSafeWarehouseFromReq(req);
     const safe = q.replace(/'/g, "''");
 
-    // 1) Candidatos rápidos
     let r;
-    const topCandidates = Math.min(top * 3, 120);
-
     try {
+      // ✅ Query liviana (lo más compatible)
       r = await slFetch(
-        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem,SalesItem,ItemsGroupCode` +
-          `&$filter=(contains(ItemName,'${safe}') or contains(ItemCode,'${safe}'))` +
-          `&$orderby=ItemName asc&$top=${topCandidates}`
+        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Frozen` +
+          `&$filter=(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))` +
+          `&$orderby=ItemName asc&$top=${top}`
       );
-    } catch {
+    } catch (e) {
+      // fallback substringof
       r = await slFetch(
-        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem,SalesItem,ItemsGroupCode` +
-          `&$filter=(substringof('${safe}',ItemName) or substringof('${safe}',ItemCode))` +
-          `&$orderby=ItemName asc&$top=${topCandidates}`
+        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Frozen` +
+          `&$filter=(substringof('${safe}',ItemCode) or substringof('${safe}',ItemName))` +
+          `&$orderby=ItemName asc&$top=${top}`
       );
     }
 
     const values = Array.isArray(r?.value) ? r.value : [];
 
-    // 2) Filtrado vendible + grupo terminado (si aplica)
-    const filtered = values.filter(isSalesInventoryItem).filter(isFinishedGroup).slice(0, topCandidates);
+    // ✅ Filtra “no inventariables” y congelados si aplica
+    const results = values
+      .filter((it) => it?.InventoryItem !== false) // si viene null/true, lo deja
+      .filter((it) => String(it?.Frozen || "").toLowerCase() !== "t")
+      .map((it) => ({
+        ItemCode: String(it.ItemCode || "").trim(),
+        ItemName: String(it.ItemName || "").trim(),
+        SalesUnit: String(it.SalesUnit || "").trim(),
+      }))
+      .filter((x) => x.ItemCode && x.ItemName)
+      .slice(0, top);
 
-    // 3) Filtrar por bodega (solo items que EXISTAN en la bodega del usuario)
-    const CONCURRENCY = 6;
-    let idx = 0;
-    const out = [];
-
-    async function worker() {
-      while (idx < filtered.length) {
-        const i = idx++;
-        const it = filtered[i];
-        const code = String(it.ItemCode || "").trim();
-        if (!code) continue;
-
-        try {
-          const full = await slFetch(
-            `/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,SalesUnit,ItemWarehouseInfoCollection` +
-              `&$expand=ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`
-          );
-
-          const rows = Array.isArray(full?.ItemWarehouseInfoCollection) ? full.ItemWarehouseInfoCollection : [];
-          const row = rows.find((w) => String(w?.WarehouseCode || "").trim() === wh) || null;
-          if (!row) continue; // ✅ si no existe en esa bodega, NO lo mostramos
-
-          const onHand = Number(row?.InStock ?? NaN);
-          const committed = Number(row?.Committed ?? NaN);
-          const available =
-            Number.isFinite(onHand) && Number.isFinite(committed) ? onHand - committed : null;
-
-          // ✅ Si quieres SOLO con stock > 0, descomenta:
-          // if (available == null || available <= 0) continue;
-
-          out.push({
-            ItemCode: full.ItemCode,
-            ItemName: full.ItemName,
-            SalesUnit: full.SalesUnit || "",
-            warehouse: wh,
-            available: Number.isFinite(available) ? available : null,
-          });
-
-          if (out.length >= top) return;
-        } catch {
-          // silencioso
-        }
-      }
-    }
-
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-
-    return res.json({ ok: true, q, warehouse: wh, results: out.slice(0, top) });
+    return res.json({
+      ok: true,
+      q,
+      warehouse: getWarehouseFromReq(req), // informativo
+      results,
+    });
   } catch (err) {
     console.error("❌ /api/sap/items/search:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
