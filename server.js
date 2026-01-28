@@ -1072,6 +1072,58 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   }
 });
 
+/* =========================================================
+   ✅ SAP: SEARCH ITEMS (autocomplete por código o descripción)
+   GET /api/sap/items/search?q=011&top=20
+   GET /api/sap/items/search?q=salsa&top=20
+========================================================= */
+app.get("/api/sap/items/search", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
+
+    const q = String(req.query?.q || "").trim();
+    const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
+
+    if (q.length < 2) {
+      return res.json({ ok: true, results: [] });
+    }
+
+    const safe = q.replace(/'/g, "''");
+
+    // Intenta contains, si falla usa substringof (según versión/SL)
+    let r;
+    try {
+      r = await slFetch(
+        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem` +
+        `&$filter=contains(ItemName,'${safe}') or contains(ItemCode,'${safe}')` +
+        `&$orderby=ItemName asc&$top=${top}`
+      );
+    } catch (e) {
+      r = await slFetch(
+        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem` +
+        `&$filter=substringof('${safe}',ItemName) or substringof('${safe}',ItemCode)` +
+        `&$orderby=ItemName asc&$top=${top}`
+      );
+    }
+
+    const values = Array.isArray(r?.value) ? r.value : [];
+    const results = values
+      .filter(x => x?.ItemCode)
+      .map(x => ({
+        ItemCode: x.ItemCode,
+        ItemName: x.ItemName || "",
+        SalesUnit: x.SalesUnit || "",
+        InventoryItem: x.InventoryItem ?? null
+      }));
+
+    return res.json({ ok: true, q, results });
+  } catch (err) {
+    console.error("❌ /api/sap/items/search:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
 
 
 /* =========================================================
