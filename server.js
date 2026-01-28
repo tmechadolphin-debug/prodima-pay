@@ -511,6 +511,134 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
+   ✅ ADMIN: DASHBOARD (resumen visual)
+   GET /api/admin/dashboard?from=2026-01-01&to=2026-01-31
+========================================================= */
+app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
+
+    const from = String(req.query?.from || "").trim();
+    const to   = String(req.query?.to || "").trim();
+    const limit = Math.min(Number(req.query?.limit || 500), 1000);
+
+    // Trae cotizaciones (igual que /api/admin/quotes pero más “crudo” para agregación)
+    const sap = await slFetch(
+      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments&$orderby=DocDate desc&$top=${limit}`
+    );
+    let values = Array.isArray(sap?.value) ? sap.value : [];
+
+    // filtros por fecha si vienen
+    if (from) values = values.filter(x => String(x.DocDate || "") >= from);
+    if (to)   values = values.filter(x => String(x.DocDate || "") <= to);
+
+    const parseUserFromComments = (comments = "") => {
+      const m = String(comments).match(/\[user:([^\]]+)\]/i);
+      return m ? String(m[1]).trim().toLowerCase() : "";
+    };
+    const parseWhFromComments = (comments = "") => {
+      const m = String(comments).match(/\[wh:([^\]]+)\]/i);
+      return m ? String(m[1]).trim() : "";
+    };
+
+    // helpers
+    const by = (map, key, inc = 1) => map.set(key, (map.get(key) || 0) + inc);
+    const byMoney = (map, key, amt) => map.set(key, (map.get(key) || 0) + (Number(amt) || 0));
+
+    let totalCount = 0;
+    let totalAmount = 0;
+
+    const byUserCount = new Map();
+    const byUserAmount = new Map();
+    const byMonthCount = new Map();
+    const byMonthAmount = new Map();
+    const byWhCount = new Map();
+    const byWhAmount = new Map();
+    const topClients = new Map();
+
+    for (const q of values) {
+      const docTotal = Number(q.DocTotal || 0);
+      const docDate = String(q.DocDate || "");
+      const user = parseUserFromComments(q.Comments || "") || "sin_user";
+      const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
+      const cardName = String(q.CardName || q.CardCode || "sin_cliente").trim();
+      const month = docDate ? docDate.slice(0, 7) : "sin_mes"; // YYYY-MM
+
+      totalCount += 1;
+      totalAmount += docTotal;
+
+      by(byUserCount, user, 1);
+      byMoney(byUserAmount, user, docTotal);
+
+      by(byMonthCount, month, 1);
+      byMoney(byMonthAmount, month, docTotal);
+
+      by(byWhCount, wh, 1);
+      byMoney(byWhAmount, wh, docTotal);
+
+      byMoney(topClients, cardName, docTotal);
+    }
+
+    // ordenar helpers
+    const mapToSorted = (m, take = 10, money = false) =>
+      Array.from(m.entries())
+        .map(([k, v]) => ({ key: k, value: v }))
+        .sort((a, b) => (money ? b.value - a.value : b.value - a.value))
+        .slice(0, take);
+
+    const mapToSeries = (m, money = false) =>
+      Array.from(m.entries())
+        .map(([k, v]) => ({ key: k, value: v }))
+        .sort((a, b) => String(a.key).localeCompare(String(b.key))); // meses ordenados
+
+    // (Opcional) métricas DB: logins últimos 7 días desde audit_events
+    let logins7d = null;
+    if (hasDb()) {
+      try {
+        const r = await dbQuery(
+          `
+          SELECT actor, COUNT(*)::int as count
+          FROM audit_events
+          WHERE event_type = 'USER_LOGIN_OK'
+            AND created_at >= NOW() - INTERVAL '7 days'
+          GROUP BY actor
+          ORDER BY count DESC
+          LIMIT 20;
+          `
+        );
+        logins7d = r.rows || [];
+      } catch {}
+    }
+
+    return res.json({
+      ok: true,
+      range: { from: from || null, to: to || null, limit },
+      totals: { count: totalCount, amount: totalAmount },
+      byUser: {
+        count: mapToSorted(byUserCount, 50, false),
+        amount: mapToSorted(byUserAmount, 50, true),
+      },
+      byMonth: {
+        count: mapToSeries(byMonthCount, false),
+        amount: mapToSeries(byMonthAmount, true),
+      },
+      byWarehouse: {
+        count: mapToSorted(byWhCount, 20, false),
+        amount: mapToSorted(byWhAmount, 20, true),
+      },
+      topClients: mapToSorted(topClients, 20, true),
+      logins7d
+    });
+  } catch (err) {
+    console.error("❌ /api/admin/dashboard:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+
+/* =========================================================
    ✅ ADMIN: LIST USERS
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
