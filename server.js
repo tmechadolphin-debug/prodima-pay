@@ -1102,8 +1102,10 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
 /* =========================================================
    ✅ SAP: SEARCH ITEMS (autocomplete) FILTRADO POR BODEGA
    GET /api/sap/items/search?q=salsa&top=20
-   - Filtra resultados a SOLO bodegas permitidas (200/300/500)
-   - O SOLO la bodega del usuario si es 200/300/500
+
+   - Primero busca en /Items (rápido)
+   - Luego filtra por bodegas permitidas (200/300/500) o la del usuario
+   - Así NO te salen etiquetas, envases, etc (si no existen en esas bodegas)
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
@@ -1113,32 +1115,31 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const q = String(req.query?.q || "").trim();
     const top = Math.min(Math.max(Number(req.query?.top || 20), 5), 50);
+
     if (q.length < 2) return res.json({ ok: true, results: [] });
 
     const safe = q.replace(/'/g, "''");
 
-    // ✅ Scope por usuario (lo que pediste: por bodega del usuario)
-    const scopeWarehouses = [...ALLOWED_WAREHOUSES];
-
+    // 1) Búsqueda liviana en maestro de Items
     let r;
     try {
       r = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Frozen` +
-        `&$filter=(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))` +
-        `&$orderby=ItemName asc&$top=${top}`
+          `&$filter=(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))` +
+          `&$orderby=ItemName asc&$top=${top}`
       );
-    } catch {
+    } catch (e) {
       r = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Frozen` +
-        `&$filter=(substringof('${safe}',ItemCode) or substringof('${safe}',ItemName))` +
-        `&$orderby=ItemName asc&$top=${top}`
+          `&$filter=(substringof('${safe}',ItemCode) or substringof('${safe}',ItemName))` +
+          `&$orderby=ItemName asc&$top=${top}`
       );
     }
 
     const values = Array.isArray(r?.value) ? r.value : [];
 
-    // 1) filtros base (inventariable + no congelado)
-    const base = values
+    // 2) Filtrado básico: inventariable y no congelado
+    const candidates = values
       .filter((it) => it?.InventoryItem !== false)
       .filter((it) => String(it?.Frozen || "").toLowerCase() !== "t")
       .map((it) => ({
@@ -1146,40 +1147,45 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
         ItemName: String(it.ItemName || "").trim(),
         SalesUnit: String(it.SalesUnit || "").trim(),
       }))
-      .filter((x) => x.ItemCode && x.ItemName);
+      .filter((x) => x.ItemCode && x.ItemName)
+      .slice(0, top);
 
-    // 2) ✅ Ahora filtramos por bodegas (200/300/500 o la del usuario)
-    //    Como SL no permite filtrar Items por almacén en una sola query confiable,
-    //    hacemos "2do paso" por cada item (top 20), con concurrencia controlada.
+    // 3) ✅ FILTRO por bodegas permitidas / por usuario
+    const scopeList = getWarehouseScopeForUser(req); // <- usa tu helper
+    const scopeSet = new Set(scopeList.map(String));
+
+    // Concurrencia para no pegarle duro al SL
     const CONCURRENCY = 6;
-    let idx = 0;
     const out = [];
+    let idx = 0;
 
     async function worker() {
-      while (idx < base.length) {
+      while (idx < candidates.length) {
         const i = idx++;
-        const it = base[i];
+        const it = candidates[i];
 
         try {
-          const whRows = await getWarehouseInfoForItemCached(it.ItemCode);
+          const rows = await getWarehouseInfoForItemCached(it.ItemCode);
 
-          // ¿tiene al menos un row en bodegas scope?
-          const hasInScope = whRows.some(w =>
-            scopeWarehouses.includes(String(w?.WarehouseCode || "").trim())
+          // ✅ Regla clave:
+          // "el item debe EXISTIR en la(s) bodega(s) del scope"
+          const existsInScope = Array.isArray(rows) && rows.some(w =>
+            scopeSet.has(String(w?.WarehouseCode || "").trim())
           );
 
-          if (!hasInScope) continue;
+          if (!existsInScope) continue;
 
-          const sum = summarizeWarehouses(whRows, scopeWarehouses);
+          // (Opcional) si quieres además mostrar disponible total del scope:
+          const stock = summarizeWarehouses(rows, scopeList);
 
           out.push({
             ...it,
-            warehouseScope: scopeWarehouses.join(","),
-            available: sum.available,     // ✅ SOLO scope
-            hasStock: sum.hasStock,
+            // opcional: para ordenar o mostrar
+            stockAvailable: stock.available,
+            stockHas: stock.hasStock,
           });
         } catch (e) {
-          // si falla el lookup del item, lo omitimos para no romper sugerencias
+          // si falla un item, lo ignoramos para no romper autocomplete
           continue;
         }
       }
@@ -1187,22 +1193,31 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
-    // orden final
-    out.sort((a, b) => a.ItemName.localeCompare(b.ItemName, "es"));
+    // (Opcional) ordena: primero los que tienen stock
+    out.sort((a, b) => {
+      const ah = a.stockHas ? 1 : 0;
+      const bh = b.stockHas ? 1 : 0;
+      if (bh !== ah) return bh - ah;
+      const av = Number(a.stockAvailable || 0);
+      const bv = Number(b.stockAvailable || 0);
+      return bv - av;
+    });
 
     return res.json({
       ok: true,
       q,
-      warehouseScope: scopeWarehouses,
-      results: out.slice(0, top),
+      scope: scopeList, // para debug
+      results: out.slice(0, top).map(x => ({
+        ItemCode: x.ItemCode,
+        ItemName: x.ItemName,
+        SalesUnit: x.SalesUnit,
+      })),
     });
-
   } catch (err) {
     console.error("❌ /api/sap/items/search:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
-
 
 /* =========================================================
    ✅ SAP: MULTI ITEMS
