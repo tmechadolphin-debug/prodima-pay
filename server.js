@@ -976,9 +976,10 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: SEARCH ITEMS (autocomplete) ✅✅✅
-   Filtra SOLO items que existan en la bodega del usuario (200/300/500)
+   ✅ SAP: SEARCH ITEMS (autocomplete)
    GET /api/sap/items/search?q=salsa&top=20
+   - NO depende de ItemWarehouseInfoCollection (en listados suele no venir)
+   - Stock real se ve al seleccionar (usando /api/sap/item/:code)
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
@@ -988,74 +989,48 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const q = String(req.query?.q || "").trim();
     const top = Math.min(Math.max(Number(req.query?.top || 20), 5), 50);
+
     if (q.length < 2) return res.json({ ok: true, results: [] });
 
-    const warehouseCode = getWarehouseFromReq(req);
     const safe = q.replace(/'/g, "''");
 
-    // Pedimos colección de bodegas para poder filtrar por la bodega del user
     let r;
     try {
+      // ✅ Query liviana (lo más compatible)
       r = await slFetch(
-        `/Items?$select=ItemCode,ItemName,SalesUnit,ItemWarehouseInfoCollection` +
-        `&$filter=contains(ItemCode,'${safe}') or contains(ItemName,'${safe}')` +
-        `&$orderby=ItemName asc&$top=${top}` +
-        `&$expand=ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`
+        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Frozen` +
+          `&$filter=(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))` +
+          `&$orderby=ItemName asc&$top=${top}`
       );
     } catch (e) {
+      // fallback substringof
       r = await slFetch(
-        `/Items?$select=ItemCode,ItemName,SalesUnit,ItemWarehouseInfoCollection` +
-        `&$filter=substringof('${safe}',ItemCode) or substringof('${safe}',ItemName)` +
-        `&$orderby=ItemName asc&$top=${top}` +
-        `&$expand=ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`
+        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Frozen` +
+          `&$filter=(substringof('${safe}',ItemCode) or substringof('${safe}',ItemName))` +
+          `&$orderby=ItemName asc&$top=${top}`
       );
     }
 
     const values = Array.isArray(r?.value) ? r.value : [];
 
-    // ✅ filtro: solo los que tengan registro en la bodega del usuario
-    // y opcional: que no sea “puro cero” (para evitar materias primas / merma)
+    // ✅ Filtra “no inventariables” y congelados si aplica
     const results = values
-      .map((it) => {
-        const whRow = Array.isArray(it?.ItemWarehouseInfoCollection)
-          ? it.ItemWarehouseInfoCollection.find(w =>
-              String(w?.WarehouseCode || "").trim() === String(warehouseCode).trim()
-            )
-          : null;
-
-        if (!whRow) return null;
-
-        const onHand = Number(whRow?.InStock);
-        const committed = Number(whRow?.Committed);
-        const ordered = Number(whRow?.Ordered);
-
-        const hasAny =
-          (Number.isFinite(onHand) && onHand !== 0) ||
-          (Number.isFinite(committed) && committed !== 0) ||
-          (Number.isFinite(ordered) && ordered !== 0);
-
-        // ✅ clave: evita listar artículos que “existen” pero son 0/0/0 (típico de MP/merma)
-        if (!hasAny) return null;
-
-        const available =
-          Number.isFinite(onHand) && Number.isFinite(committed)
-            ? (onHand - committed)
-            : null;
-
-        return {
-          ItemCode: it.ItemCode,
-          ItemName: it.ItemName,
-          SalesUnit: it.SalesUnit || "",
-          warehouse: warehouseCode,
-          onHand: Number.isFinite(onHand) ? onHand : null,
-          available: Number.isFinite(available) ? available : null,
-        };
-      })
-      .filter(Boolean)
+      .filter((it) => it?.InventoryItem !== false) // si viene null/true, lo deja
+      .filter((it) => String(it?.Frozen || "").toLowerCase() !== "t")
+      .map((it) => ({
+        ItemCode: String(it.ItemCode || "").trim(),
+        ItemName: String(it.ItemName || "").trim(),
+        SalesUnit: String(it.SalesUnit || "").trim(),
+      }))
+      .filter((x) => x.ItemCode && x.ItemName)
       .slice(0, top);
 
-    return res.json({ ok: true, q, warehouse: warehouseCode, results });
-
+    return res.json({
+      ok: true,
+      q,
+      warehouse: getWarehouseFromReq(req), // informativo
+      results,
+    });
   } catch (err) {
     console.error("❌ /api/sap/items/search:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
