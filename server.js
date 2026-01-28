@@ -1151,8 +1151,10 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
       .slice(0, top);
 
     // 3) ✅ FILTRO por bodegas permitidas / por usuario
-    const scopeList = getWarehouseScopeForUser(req); // <- usa tu helper
-    const scopeSet = new Set(scopeList.map(String));
+// ✅ SOLO sugerencias de la bodega 300
+const scopeList = ["300"];
+const scopeSet = new Set(scopeList);
+
 
     // Concurrencia para no pegarle duro al SL
     const CONCURRENCY = 6;
