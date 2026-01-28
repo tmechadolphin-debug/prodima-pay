@@ -377,9 +377,57 @@ function getDateISOInOffset(offsetMinutes = -300) {
 /* =========================================================
    ✅ Helper: warehouse por usuario (SOLO para cotizar)
 ========================================================= */
-function getWarehouseFromReq(req) {
-  const wh = String(req.user?.warehouse_code || "").trim();
-  return wh || SAP_WAREHOUSE || "01";
+const ALLOWED_STOCK_WH = (process.env.ALLOWED_STOCK_WH || "200,300,500")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+}
+
+function isAllowedWh(code){
+  const w = String(code || "").trim();
+  return ALLOWED_STOCK_WH.includes(w);
+}
+
+function sumStockAllowed(itemFull){
+  const coll = Array.isArray(itemFull?.ItemWarehouseInfoCollection)
+    ? itemFull.ItemWarehouseInfoCollection
+    : [];
+
+  const rows = coll.filter(w => isAllowedWh(w?.WarehouseCode));
+
+  let onHand = 0, committed = 0, ordered = 0;
+  let any = false;
+
+  for (const w of rows){
+    const oh = Number(w?.InStock);
+    const cm = Number(w?.Committed);
+    const or = Number(w?.Ordered);
+
+    if (Number.isFinite(oh)) { onHand += oh; any = true; }
+    if (Number.isFinite(cm)) committed += cm;
+    if (Number.isFinite(or)) ordered += or;
+  }
+
+  const available = any ? (onHand - committed) : null;
+
+  return {
+    allowedWarehouses: [...ALLOWED_STOCK_WH],
+    byWarehouse: rows.map(w => ({
+      warehouse: String(w.WarehouseCode || "").trim(),
+      onHand: Number.isFinite(Number(w.InStock)) ? Number(w.InStock) : null,
+      committed: Number.isFinite(Number(w.Committed)) ? Number(w.Committed) : null,
+      ordered: Number.isFinite(Number(w.Ordered)) ? Number(w.Ordered) : null,
+      available:
+        Number.isFinite(Number(w.InStock)) && Number.isFinite(Number(w.Committed))
+          ? Number(w.InStock) - Number(w.Committed)
+          : null
+    })),
+    onHand: any ? onHand : null,
+    committed: any ? committed : null,
+    ordered: any ? ordered : null,
+    available: Number.isFinite(available) ? available : null,
+    hasStock: (available != null) ? (available > 0) : null
+  };
 }
 
 /* =========================================================
@@ -1054,6 +1102,11 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
    GET /api/sap/items/search?q=011&top=20
    GET /api/sap/items/search?q=salsa&top=20
 ========================================================= */
+/* =========================================================
+   ✅ SAP: SEARCH ITEMS (autocomplete)
+   GET /api/sap/items/search?q=salsa&top=20
+   Devuelve SOLO items con presencia/stock en bodegas 200/300/500
+========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
     if (missingSapEnv()) {
@@ -1061,37 +1114,50 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
     }
 
     const q = String(req.query?.q || "").trim();
-    const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
+    const top = Math.min(Math.max(Number(req.query?.top || 20), 5), 50);
 
-    if (q.length < 2) {
-      return res.json({ ok: true, results: [] });
-    }
+    if (q.length < 2) return res.json({ ok: true, results: [] });
 
     const safe = q.replace(/'/g, "''");
 
     let r;
     try {
       r = await slFetch(
-        `/Items?$select=ItemCode,ItemName,SalesUnit` +
-          `&$filter=contains(ItemName,'${safe}') or contains(ItemCode,'${safe}')` +
-          `&$orderby=ItemName asc&$top=${top}`
+        `/Items?$select=ItemCode,ItemName,SalesUnit,ItemWarehouseInfoCollection` +
+        `&$filter=contains(ItemCode,'${safe}') or contains(ItemName,'${safe}')` +
+        `&$orderby=ItemName asc&$top=${top}` +
+        `&$expand=ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`
       );
     } catch (e) {
       r = await slFetch(
-        `/Items?$select=ItemCode,ItemName,SalesUnit` +
-          `&$filter=substringof('${safe}',ItemName) or substringof('${safe}',ItemCode)` +
-          `&$orderby=ItemName asc&$top=${top}`
+        `/Items?$select=ItemCode,ItemName,SalesUnit,ItemWarehouseInfoCollection` +
+        `&$filter=substringof('${safe}',ItemCode) or substringof('${safe}',ItemName)` +
+        `&$orderby=ItemName asc&$top=${top}` +
+        `&$expand=ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`
       );
     }
 
     const values = Array.isArray(r?.value) ? r.value : [];
-    const results = values
-      .map((x) => ({
-        ItemCode: x.ItemCode,
-        ItemName: x.ItemName,
-        SalesUnit: x.SalesUnit || "",
-      }))
-      .filter((x) => x.ItemCode);
+
+    // ✅ filtra: solo ítems que existan en 200/300/500 (y opcional: con stock >0)
+    const filtered = values.filter(it => {
+      const s = sumStockAllowed(it);
+      // si quieres mostrar SOLO los que tengan stock:
+      return s.available != null && s.available > 0;
+      // si quieres mostrar aunque estén en 200/300/500 con 0 stock:
+      // return s.onHand != null; 
+    });
+
+    const results = filtered.map(it => {
+      const s = sumStockAllowed(it);
+      return {
+        ItemCode: it.ItemCode,
+        ItemName: it.ItemName,
+        SalesUnit: it.SalesUnit || "",
+        available: s.available,
+        onHand: s.onHand
+      };
+    });
 
     return res.json({ ok: true, q, results });
   } catch (err) {
@@ -1099,6 +1165,7 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
+
 
 /* =========================================================
    ✅ SAP: SEARCH CUSTOMERS (autocomplete)
@@ -1262,7 +1329,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
     if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
 
-    const warehouseCode = getWarehouseFromReq(req);
+    const warehouseCode = const ALLOWED_STOCK(req);
 
     const DocumentLines = lines
       .map((l) => ({
