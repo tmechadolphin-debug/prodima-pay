@@ -19,7 +19,7 @@ const SAP_USER = process.env.SAP_USER || "";
 const SAP_PASS = process.env.SAP_PASS || "";
 
 // ⚠️ DEFAULT WAREHOUSE (fallback si usuario no tiene)
-const SAP_WAREHOUSE = process.env.SAP_WAREHOUSE || "01";
+const SAP_WAREHOUSE = process.env.SAP_WAREHOUSE || "300";
 
 // Lista default (fallback). OJO: si mandas cardCode desde el HTML,
 // podemos usar la lista del cliente (BusinessPartner.PriceListNum) cuando exista.
@@ -383,7 +383,7 @@ function getWarehouseFromReq(req) {
   if (byProv && SALES_WAREHOUSES.includes(byProv)) return byProv;
 
   // ✅ fallback final: primera bodega de ventas o SAP_WAREHOUSE si lo forzaste
-  return SALES_WAREHOUSES[0] || SAP_WAREHOUSE || "01";
+  return SALES_WAREHOUSES[0] || SAP_WAREHOUSE || "300";
 }
 
 /* =========================================================
