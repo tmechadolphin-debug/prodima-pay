@@ -451,7 +451,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     let rows = [];
 
     for (const q of values) {
-      const docDate = q.DocDate || "";
+      const docDate = String(q.DocDate || "").slice(0, 10); // ✅ deja YYYY-MM-DD
       const usuario = parseUserFromComments(q.Comments || "");
       const cardCode = String(q.CardCode || "").trim();
 
