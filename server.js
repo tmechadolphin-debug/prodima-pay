@@ -537,10 +537,19 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+    if (!hasDb()) {
+      return res.status(500).json({ ok: false, message: "DB no configurada" });
+    }
 
     const r = await dbQuery(`
-      SELECT id, username, full_name, is_active, created_at
+      SELECT
+        id,
+        username,
+        full_name,
+        is_active,
+        province,
+        warehouse_code,
+        created_at
       FROM app_users
       ORDER BY created_at DESC;
     `);
@@ -551,6 +560,7 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
     return res.status(500).json({ ok: false, message: e.message });
   }
 });
+
 
 /* =========================================================
    ✅ ADMIN: DASHBOARD (KPIs + agrupaciones)
