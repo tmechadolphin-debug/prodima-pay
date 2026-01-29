@@ -1112,6 +1112,241 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
+   ✅ ADMIN: DASHBOARD
+   - incluye bodega en dataset
+   - OMITE canceladas (no las contabiliza)
+========================================================= */
+app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
+
+    const scope = String(req.query?.scope || "created").trim().toLowerCase(); // created | all
+    const fromQ = String(req.query?.from || "").trim();
+    const toQ = String(req.query?.to || "").trim();
+
+    const DEFAULT_FROM = "2020-01-01";
+    const from = fromQ || DEFAULT_FROM;
+    const to = toQ || "";
+
+    const PAGE_SIZE = Math.min(Math.max(Number(req.query?.top || 500), 50), 500);
+    const MAX_PAGES = Math.min(Math.max(Number(req.query?.maxPages || 20), 1), 60);
+
+    // ✅ scope=created -> solo usuarios existentes en app_users
+    let allowedUsersSet = null;
+    if (scope === "created") {
+      if (!hasDb()) {
+        allowedUsersSet = new Set();
+      } else {
+        const r = await dbQuery(`SELECT username FROM app_users;`);
+        allowedUsersSet = new Set(
+          (r.rows || [])
+            .map((x) => String(x.username || "").trim().toLowerCase())
+            .filter(Boolean)
+        );
+      }
+    }
+
+    const filterParts = [];
+    if (from) filterParts.push(`DocDate ge '${from}'`);
+    if (to) filterParts.push(`DocDate le '${to}'`);
+
+    const sapFilter = filterParts.length
+      ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
+      : "";
+
+    // ✅ Traemos CancelStatus y Cancelled (por compat)
+    const SELECT =
+      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Cancelled,Comments`;
+
+    let all = [];
+    let skip = 0;
+
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const sap = await slFetch(
+        `/Quotations?$select=${SELECT}` +
+          `&$orderby=DocDate desc&$top=${PAGE_SIZE}&$skip=${skip}${sapFilter}`
+      );
+
+      const values = Array.isArray(sap?.value) ? sap.value : [];
+      if (!values.length) break;
+
+      for (const q of values) {
+        const rawDate = String(q.DocDate || "");
+        const fechaISO = rawDate.slice(0, 10);
+
+        const usuario = parseUserFromComments(q.Comments || "");
+        const usuarioKey = String(usuario || "").trim().toLowerCase();
+
+        if (allowedUsersSet && scope === "created") {
+          if (!usuarioKey || !allowedUsersSet.has(usuarioKey)) continue;
+        }
+
+        const cardCode = String(q.CardCode || "").trim();
+        const cardName = String(q.CardName || "").trim();
+
+        // ✅ bodega desde comments
+        const warehouse = parseWhFromComments(q.Comments || "") || "sin_wh";
+
+        // ✅ Cancelled robusto
+        const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
+        const cancelledFlag = String(q.Cancelled || "").trim(); // tYES/tNO
+
+        const isCancelled =
+          cancelStatus.toLowerCase() === "csyes" ||
+          cancelStatus.toLowerCase() === "yes" ||
+          cancelStatus.toLowerCase() === "tyes" ||
+          cancelledFlag.toLowerCase() === "tyes" ||
+          cancelledFlag.toLowerCase() === "yes" ||
+          cancelledFlag.toLowerCase() === "y" ||
+          cancelledFlag.toLowerCase() === "true";
+
+        const estado =
+          isCancelled
+            ? "Cancelled"
+            : q.DocumentStatus === "bost_Open"
+            ? "Open"
+            : q.DocumentStatus === "bost_Close"
+            ? "Close"
+            : String(q.DocumentStatus || "");
+
+        let mes = "";
+        let anio = "";
+        try {
+          const d = new Date(fechaISO);
+          mes = d.toLocaleString("es-PA", { month: "long" });
+          anio = String(d.getFullYear());
+        } catch {}
+
+        all.push({
+          docEntry: q.DocEntry,
+          docNum: q.DocNum,
+          cardCode,
+          cardName,
+          montoCotizacion: Number(q.DocTotal || 0),
+          montoEntregado: 0,
+          fecha: fechaISO,
+          estado,
+          isCancelled, // ✅ lo guardamos
+          mes,
+          anio,
+          usuario: usuario || "sin_user",
+          warehouse,
+          bodega: warehouse,
+        });
+      }
+
+      if (from) {
+        const last = values[values.length - 1];
+        const lastDate = String(last?.DocDate || "").slice(0, 10);
+        if (lastDate && lastDate < from) break;
+      }
+
+      skip += PAGE_SIZE;
+    }
+
+    // ✅ CLAVE: OMITIR CANCELADAS EN DASHBOARD (no se cuentan, no se suman, no salen en charts)
+    all = all.filter((r) => !r.isCancelled);
+
+    // --- Agregaciones ---
+    const sumCot = all.reduce((acc, x) => acc + (Number(x.montoCotizacion) || 0), 0);
+    const sumEnt = all.reduce((acc, x) => acc + (Number(x.montoEntregado) || 0), 0);
+    const fillRate = sumCot > 0 ? sumEnt / sumCot : 0;
+
+    function topBy(keyFn, valueFn, n = 10) {
+      const m = new Map();
+      for (const row of all) {
+        const k = keyFn(row);
+        const v = valueFn(row);
+        m.set(k, (m.get(k) || 0) + v);
+      }
+      return [...m.entries()]
+        .map(([k, v]) => ({ key: k, value: v }))
+        .sort((a, b) => b.value - a.value)
+        .slice(0, n);
+    }
+
+    function countBy(keyFn) {
+      const m = new Map();
+      for (const row of all) {
+        const k = keyFn(row);
+        m.set(k, (m.get(k) || 0) + 1);
+      }
+      return [...m.entries()].map(([k, v]) => ({ key: k, count: v }));
+    }
+
+    const topUsuariosMonto = topBy(
+      (r) => String(r.usuario || "sin_user"),
+      (r) => Number(r.montoCotizacion || 0),
+      10
+    ).map((x) => ({ usuario: x.key, monto: x.value }));
+
+    const topClientesMonto = topBy(
+      (r) => String(r.cardName || r.cardCode || "sin_cliente"),
+      (r) => Number(r.montoCotizacion || 0),
+      10
+    ).map((x) => ({ cliente: x.key, monto: x.value }));
+
+    const porBodegaMonto = topBy(
+      (r) => String(r.warehouse || "sin_wh"),
+      (r) => Number(r.montoCotizacion || 0),
+      20
+    ).map((x) => ({ bodega: x.key, monto: x.value }));
+
+    const porDia = topBy(
+      (r) => String(r.fecha || ""),
+      (r) => Number(r.montoCotizacion || 0),
+      400
+    )
+      .map((x) => ({ fecha: x.key, monto: x.value }))
+      .sort((a, b) => a.fecha.localeCompare(b.fecha));
+
+    const porMes = topBy(
+      (r) => String(r.fecha || "").slice(0, 7),
+      (r) => Number(r.montoCotizacion || 0),
+      200
+    )
+      .map((x) => ({ mes: x.key, monto: x.value }))
+      .sort((a, b) => a.mes.localeCompare(b.mes));
+
+    const estados = countBy((r) => String(r.estado || "Unknown"))
+      .map((x) => ({ estado: x.key, cantidad: x.count }))
+      .sort((a, b) => b.cantidad - a.cantidad);
+
+    return res.json({
+      ok: true,
+      scope,
+      from,
+      to: to || null,
+      fetched: all.length,
+      kpis: {
+        totalCotizaciones: all.length,
+        montoCotizado: sumCot,
+        montoEntregado: sumEnt,
+        fillRate,
+      },
+      charts: {
+        topUsuariosMonto,
+        topClientesMonto,
+        porBodegaMonto,
+        porDia,
+        porMes,
+        estados,
+        pieCotVsEnt: {
+          cotizado: sumCot,
+          entregado: sumEnt,
+          fillRate,
+        },
+      },
+    });
+  } catch (err) {
+    console.error("❌ /api/admin/dashboard:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+/* =========================================================
    ✅ SAP: CREAR COTIZACIÓN
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
