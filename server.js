@@ -811,19 +811,17 @@ async function fetchItemAllInOne(code, priceListNo, warehouseCode) {
   let itemFull = await slFetch(pathFiltered);
 
   // Helper: buscar la fila de bodega correcta (como el código viejo)
-  function pickWarehouseRow(full) {
-    const coll = Array.isArray(full?.ItemWarehouseInfoCollection)
-      ? full.ItemWarehouseInfoCollection
-      : [];
+// ✅ Seleccionar la fila correcta de la bodega (NO usar [0])
+function pickWarehouseRow(itemFull, warehouseCode) {
+  if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) return null;
 
-    // ✅ si el filtro interno funcionó, normalmente vendrá 1 sola fila,
-    // pero igual buscamos por código para estar seguros.
-    return (
-      coll.find(
-        (w) => String(w?.WarehouseCode || "").trim() === whTrim
-      ) || null
-    );
-  }
+  return (
+    itemFull.ItemWarehouseInfoCollection.find(
+      (w) => String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
+    ) || null
+  );
+}
+
 
   let wrow = pickWarehouseRow(itemFull);
 
