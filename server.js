@@ -1145,9 +1145,14 @@ function buildItemResponse(itemFull, code, priceListNo) {
   return {
     ok: true,
     item,
-    // ✅ este price lo usas como "precio caja" (tu UI trabaja en caja)
-    priceCaja: price,
+
+    // ✅ IMPORTANTE: precio “tal cual SAP” (si SAP está en caja, esto es caja)
     price,
+
+    // (opcionales por compat, pero iguales)
+    priceCaja: price,
+    priceUnit: price,
+
     stock: {
       onHand,
       committed,
@@ -1156,6 +1161,7 @@ function buildItemResponse(itemFull, code, priceListNo) {
     },
   };
 }
+
 
 async function getOneItem(code, priceListNo) {
   const now = Date.now();
@@ -1167,8 +1173,9 @@ async function getOneItem(code, priceListNo) {
   let itemFull;
   try {
     itemFull = await slFetch(
-      `/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection`
-    );
+  `/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection`
+);
+
   } catch {
     itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
   }
