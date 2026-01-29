@@ -561,6 +561,52 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   }
 });
 
+/* =========================================================
+   ✅ ADMIN: CHANGE USER PIN
+   PATCH /api/admin/users/:id/pin
+   body: { pin }
+========================================================= */
+app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) {
+      return res.status(500).json({ ok: false, message: "DB no configurada" });
+    }
+
+    const id = Number(req.params.id);
+    const pin = String(req.body?.pin || "").trim();
+
+    if (!Number.isFinite(id) || id <= 0) {
+      return res.status(400).json({ ok: false, message: "ID inválido" });
+    }
+    if (!pin || pin.length < 4) {
+      return res.status(400).json({ ok: false, message: "PIN mínimo 4" });
+    }
+
+    // Si guardas PIN en texto plano (no recomendado), descomenta esto y comenta el hash.
+    // const r = await dbQuery(`UPDATE app_users SET pin = $1 WHERE id = $2 RETURNING id, username;`, [pin, id]);
+
+    // ✅ Recomendado: guardar hash
+    const bcrypt = require("bcryptjs");
+    const pin_hash = await bcrypt.hash(pin, 10);
+
+    const r = await dbQuery(
+      `UPDATE app_users
+       SET pin_hash = $1
+       WHERE id = $2
+       RETURNING id, username;`,
+      [pin_hash, id]
+    );
+
+    if (!r.rows || r.rows.length === 0) {
+      return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    }
+
+    return res.json({ ok: true, user: r.rows[0] });
+  } catch (e) {
+    console.error("❌ change pin:", e.message);
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
 
 /* =========================================================
    ✅ ADMIN: DASHBOARD (KPIs + agrupaciones)
