@@ -403,10 +403,9 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP) - FIX REAL
-   - Filtra por fecha en SAP (OData $filter) para traer TODO desde 2020
-   - Paginación real con $skip + $top
-   - Detecta canceladas con campo Canceled (tYES)
+   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
+   - FIX: NO usar propiedad Canceled (da 400 en tu SL)
+   - Detecta canceladas por DocumentStatus que contenga "cancel"
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -416,31 +415,14 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
+    const from = String(req.query?.from || "").trim(); // YYYY-MM-DD
+    const to = String(req.query?.to || "").trim();     // YYYY-MM-DD
+    const limit = Math.min(Number(req.query?.limit || 200), 500);
 
-    // ✅ fechas: default desde 2020 si no mandan nada
-    const from = String(req.query?.from || "2020-01-01").trim(); // YYYY-MM-DD
-    const to = String(req.query?.to || getDateISOInOffset(TZ_OFFSET_MIN)).trim();
-
-    // ✅ paginación
-    const limit = Math.min(Math.max(Number(req.query?.limit || 20), 5), 200); // 5..200
-    const page = Math.max(Number(req.query?.page || 1), 1);
-    const skip = (page - 1) * limit;
-
-    // ✅ OData date filter
-    // (DocDate es YYYY-MM-DD en SAP normalmente)
-    const safeFrom = from.replace(/'/g, "''");
-    const safeTo = to.replace(/'/g, "''");
-
-    const filterParts = [];
-    if (safeFrom) filterParts.push(`DocDate ge '${safeFrom}'`);
-    if (safeTo) filterParts.push(`DocDate le '${safeTo}'`);
-    const dateFilter = filterParts.length ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}` : "";
-
-    // ✅ Trae también Canceled para marcar canceladas correctamente
+    // ✅ IMPORTANTE: NO pedimos "Canceled" porque tu SAP SL devuelve 400
     const sap = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments,Canceled` +
-      `${dateFilter}` +
-      `&$orderby=DocDate desc&$skip=${skip}&$top=${limit}`
+      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments` +
+      `&$orderby=DocDate desc&$top=${limit}`
     );
 
     const values = Array.isArray(sap?.value) ? sap.value : [];
@@ -455,45 +437,46 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       return m ? String(m[1]).trim() : "";
     };
 
-    // (Opcional) cache de BP si CardName viene vacío
+    // ✅ Si SAP no manda CardName en algunos casos, hacemos lookup (cache)
     const bpCache = new Map();
     async function getBPName(cardCode) {
       if (!cardCode) return "";
       if (bpCache.has(cardCode)) return bpCache.get(cardCode);
+
       try {
-        const bp = await slFetch(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`);
+        const bp = await slFetch(
+          `/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`
+        );
         const name = String(bp?.CardName || "").trim();
         bpCache.set(cardCode, name);
         return name;
-      } catch {
+      } catch (e) {
+        console.error("❌ BP lookup fail:", cardCode, e.message);
         bpCache.set(cardCode, "");
         return "";
       }
     }
 
     let rows = [];
-    for (const q of values) {
-      const docDate = q.DocDate || "";
-      const usuario = parseUserFromComments(q.Comments || "");
-      const wh = parseWhFromComments(q.Comments || "");
 
+    for (const q of values) {
+      const docDate = String(q.DocDate || "").trim();
+      const usuario = parseUserFromComments(q.Comments || "");
+      const warehouse = parseWhFromComments(q.Comments || "");
       const cardCode = String(q.CardCode || "").trim();
+
+      // ✅ Estado: detecta canceladas por DocumentStatus
+      const ds = String(q.DocumentStatus || "");
+      const dsLower = ds.toLowerCase();
+
+      const estado =
+        dsLower.includes("cancel") ? "Cancelada" :
+        ds === "bost_Open" ? "Open" :
+        ds === "bost_Close" ? "Close" :
+        ds || "";
 
       let cardName = String(q.CardName || "").trim();
       if (!cardName) cardName = await getBPName(cardCode);
-
-      // ✅ Estado real (Cancelada primero)
-      let estado = "";
-      const canceled = String(q.Canceled || "").toLowerCase(); // tYES / tNO
-      if (canceled === "tyes") {
-        estado = "Cancelada";
-      } else if (q.DocumentStatus === "bost_Open") {
-        estado = "Open";
-      } else if (q.DocumentStatus === "bost_Close") {
-        estado = "Close";
-      } else {
-        estado = String(q.DocumentStatus || "");
-      }
 
       let mes = "";
       let anio = "";
@@ -511,19 +494,21 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         customerName: cardName,
         nombreCliente: cardName,
         montoCotizacion: Number(q.DocTotal || 0),
-        montoEntregado: 0, // si luego lo calculas, aquí lo rellenas
+        montoEntregado: 0, // (si luego lo calculas, aquí va)
         fecha: docDate,
         estado,
         mes,
         anio,
         usuario,
-        warehouse: wh,
+        warehouse,     // ✅ útil para dashboard por bodega
         comments: q.Comments || ""
       });
     }
 
-    // filtros extra (por user/cliente) en Node
-    if (userFilter) rows = rows.filter(r => String(r.usuario || "").toLowerCase().includes(userFilter));
+    // ✅ filtros
+    if (userFilter) {
+      rows = rows.filter(r => String(r.usuario || "").toLowerCase().includes(userFilter));
+    }
 
     if (clientFilter) {
       rows = rows.filter(r =>
@@ -532,15 +517,10 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       );
     }
 
-    return res.json({
-      ok: true,
-      page,
-      limit,
-      from: safeFrom,
-      to: safeTo,
-      quotes: rows
-    });
+    if (from) rows = rows.filter(r => String(r.fecha || "") >= from);
+    if (to) rows = rows.filter(r => String(r.fecha || "") <= to);
 
+    return res.json({ ok: true, quotes: rows });
   } catch (err) {
     console.error("❌ /api/admin/quotes:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
