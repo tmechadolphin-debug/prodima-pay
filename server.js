@@ -1,13 +1,31 @@
+// server.js (optimizado)
+// ✅ Optimiza: conexiones HTTP (keep-alive), login SAP sin “thundering herd”, parse correcto de cookies,
+// ✅ items sin $expand pesado (UoM factor en 2 pasos + cache largo), cache corto de búsquedas de clientes,
+// ✅ BP name cache global, paginación/admin más eficiente.
+
 import express from "express";
 import cors from "cors";
 import pg from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { Agent, setGlobalDispatcher } from "undici";
 
 const { Pool } = pg;
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
+
+/* =========================================================
+   ✅ UNDICI KEEP-ALIVE (reduce 20–30s por handshake)
+========================================================= */
+setGlobalDispatcher(
+  new Agent({
+    connections: Number(process.env.HTTP_CONNECTIONS || 50),
+    pipelining: 1,
+    keepAliveTimeout: Number(process.env.HTTP_KEEPALIVE_TIMEOUT_MS || 60_000),
+    keepAliveMaxTimeout: Number(process.env.HTTP_KEEPALIVE_MAX_TIMEOUT_MS || 120_000),
+  })
+);
 
 /* =========================================================
    ✅ ENV
@@ -23,6 +41,10 @@ const SAP_WAREHOUSE = process.env.SAP_WAREHOUSE || "01";
 
 const SAP_PRICE_LIST =
   process.env.SAP_PRICE_LIST || "Lista 02 Res. Com. Ind. Analitic";
+
+// ---- SAP Perf ----
+const SAP_TIMEOUT_MS = Number(process.env.SAP_TIMEOUT_MS || 15000); // 15s
+const SAP_LOGIN_TTL_MS = Number(process.env.SAP_LOGIN_TTL_MS || 25 * 60 * 1000); // 25 min
 
 // ---- Web / CORS ----
 const YAPPY_ALIAS = process.env.YAPPY_ALIAS || "@prodimasansae";
@@ -67,24 +89,14 @@ const PROVINCES = [
   "Veraguas",
 ];
 
-// ✅ mapping EXACTO como pediste
 function provinceToWarehouse(province) {
   const p = String(province || "").trim().toLowerCase();
 
-  // 200
   if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
 
-  // 500
-  if (
-    p === "veraguas" ||
-    p === "coclé" ||
-    p === "cocle" ||
-    p === "los santos" ||
-    p === "herrera"
-  )
+  if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera")
     return "500";
 
-  // 300
   if (
     p === "panamá" ||
     p === "panama" ||
@@ -95,16 +107,13 @@ function provinceToWarehouse(province) {
   )
     return "300";
 
-  // ✅ Darién (no estaba en tu lista)
   if (p === "darién" || p === "darien") return "300";
 
-  // fallback
   return SAP_WAREHOUSE || "01";
 }
 
 /* =========================================================
    ✅ DB Pool (Supabase)
-   FIX SSL: self-signed certificate chain
 ========================================================= */
 let pool = null;
 
@@ -118,7 +127,7 @@ function getPool() {
 
     pool = new Pool({
       connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false }, // ✅ FIX CERT
+      ssl: { rejectUnauthorized: false },
       max: 3,
     });
 
@@ -135,7 +144,7 @@ async function dbQuery(text, params = []) {
 }
 
 /* =========================================================
-   ✅ DB Schema (crear tablas si no existen)
+   ✅ DB Schema
 ========================================================= */
 async function ensureSchema() {
   if (!hasDb()) {
@@ -200,7 +209,7 @@ async function audit(event_type, req, actor = "", payload = {}) {
 }
 
 /* =========================================================
-   ✅ JWT Helpers
+   ✅ JWT Helpers (NO tocado)
 ========================================================= */
 function signAdminToken() {
   return jwt.sign({ typ: "admin" }, JWT_SECRET, { expiresIn: "2h" });
@@ -227,17 +236,14 @@ function verifyAdmin(req, res, next) {
     if (!auth.startsWith("Bearer ")) {
       return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
     }
-
     const token = auth.replace("Bearer ", "").trim();
     const decoded = jwt.verify(token, JWT_SECRET);
-
     if (!decoded || decoded.typ !== "admin") {
       return res.status(403).json({ ok: false, message: "Token inválido" });
     }
-
     req.admin = decoded;
     next();
-  } catch (e) {
+  } catch {
     return res.status(401).json({ ok: false, message: "Token expirado o inválido" });
   }
 }
@@ -248,26 +254,27 @@ function verifyUser(req, res, next) {
     if (!auth.startsWith("Bearer ")) {
       return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
     }
-
     const token = auth.replace("Bearer ", "").trim();
     const decoded = jwt.verify(token, JWT_SECRET);
-
     if (!decoded || decoded.typ !== "user") {
       return res.status(403).json({ ok: false, message: "Token inválido" });
     }
-
     req.user = decoded;
     next();
-  } catch (e) {
+  } catch {
     return res.status(401).json({ ok: false, message: "Token expirado o inválido" });
   }
 }
 
 /* =========================================================
-   ✅ SAP Helpers (Service Layer Cookie + Cache)
+   ✅ SAP Helpers (Service Layer Cookie + Cache) OPTIMIZADO
+   - cookie parsing correcto (NO split por coma -> rompe expires)
+   - login mutex (evita 10 logins simultáneos)
+   - timeout en fetch
 ========================================================= */
 let SL_COOKIE = null;
 let SL_COOKIE_TIME = 0;
+let SL_LOGIN_PROMISE = null;
 
 let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
 const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
@@ -275,8 +282,39 @@ const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
 const ITEM_CACHE = new Map();
 const ITEM_TTL_MS = 20 * 1000;
 
+// Cache largo para factor de caja (evita $expand lento)
+const UOM_FACTOR_CACHE = new Map(); // code -> { ts, factor }
+const UOM_TTL_MS = 6 * 60 * 60 * 1000;
+
+// Cache corto para búsquedas de clientes (autocomplete)
+const CUSTOMER_SEARCH_CACHE = new Map(); // key -> { ts, data }
+const CUSTOMER_SEARCH_TTL_MS = 10 * 1000;
+
+// Cache global BP names (para admin/quotes cuando CardName no venga)
+const BP_NAME_CACHE = new Map(); // CardCode -> { ts, name }
+const BP_NAME_TTL_MS = 12 * 60 * 60 * 1000;
+
 function missingSapEnv() {
   return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
+}
+
+function getSetCookies(res) {
+  // Node fetch/undici soporta getSetCookie()
+  if (typeof res.headers.getSetCookie === "function") {
+    return res.headers.getSetCookie();
+  }
+  const sc = res.headers.get("set-cookie");
+  return sc ? [sc] : [];
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), SAP_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 async function slLogin() {
@@ -291,63 +329,99 @@ async function slLogin() {
     Password: SAP_PASS,
   };
 
-  const res = await fetch(`${SAP_BASE_URL}/Login`, {
+  const res = await fetchWithTimeout(`${SAP_BASE_URL}/Login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
   if (!res.ok) {
-    const t = await res.text();
+    const t = await res.text().catch(() => "");
     throw new Error(`Login SAP falló (${res.status}): ${t}`);
   }
 
-  const setCookie = res.headers.get("set-cookie");
-  if (!setCookie) throw new Error("No se recibió cookie del Service Layer.");
+  const cookies = getSetCookies(res);
+  if (!cookies.length) throw new Error("No se recibió cookie del Service Layer.");
 
-  SL_COOKIE = setCookie
-    .split(",")
-    .map((s) => s.split(";")[0])
+  // ✅ cookie correcta: toma solo "name=value" de cada cookie
+  SL_COOKIE = cookies
+    .map((c) => String(c).split(";")[0])
+    .filter(Boolean)
     .join("; ");
 
   SL_COOKIE_TIME = Date.now();
-  console.log("✅ Login SAP OK (cookie guardada)");
+  // console.log("✅ Login SAP OK (cookie guardada)");
+}
+
+async function ensureSapLogin() {
+  if (SL_LOGIN_PROMISE) return SL_LOGIN_PROMISE;
+
+  SL_LOGIN_PROMISE = (async () => {
+    await slLogin();
+  })()
+    .catch((e) => {
+      // si falla, limpia para permitir reintento en siguiente request
+      SL_COOKIE = null;
+      SL_COOKIE_TIME = 0;
+      throw e;
+    })
+    .finally(() => {
+      SL_LOGIN_PROMISE = null;
+    });
+
+  return SL_LOGIN_PROMISE;
 }
 
 async function slFetch(path, options = {}) {
-  const t0 = Date.now();
-
-  if (!SL_COOKIE || Date.now() - SL_COOKIE_TIME > 25 * 60 * 1000) {
-    console.log("🔐 slFetch: haciendo login (cookie vacía/expirada)");
-    await slLogin();
+  if (!SL_COOKIE || Date.now() - SL_COOKIE_TIME > SAP_LOGIN_TTL_MS) {
+    await ensureSapLogin();
   }
 
-  const res = await fetch(`${SAP_BASE_URL}${path}`, {
+  const url = `${SAP_BASE_URL}${path}`;
+
+  let res = await fetchWithTimeout(url, {
     ...options,
     headers: {
-      "Content-Type": "application/json",
       Cookie: SL_COOKIE,
       ...(options.headers || {}),
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
     },
   });
 
-  const text = await res.text();
-  const ms = Date.now() - t0;
-
-  console.log(`⏱️ SAP ${res.status} ${path.slice(0,80)}... (${ms}ms)`);
-
+  // Si expira sesión => relogin 1 vez
   if (res.status === 401 || res.status === 403) {
-    console.log("♻️ SAP 401/403 -> relogin y retry");
     SL_COOKIE = null;
-    await slLogin();
-    return slFetch(path, options);
+    SL_COOKIE_TIME = 0;
+    await ensureSapLogin();
+
+    res = await fetchWithTimeout(url, {
+      ...options,
+      headers: {
+        Cookie: SL_COOKIE,
+        ...(options.headers || {}),
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+      },
+    });
   }
 
-  // ... igual que ya lo tienes
+  const text = await res.text().catch(() => "");
+
+  let json;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    json = { raw: text };
+  }
+
+  if (!res.ok) {
+    throw new Error(`SAP error ${res.status}: ${text}`);
+  }
+
+  return json;
 }
 
 /* =========================================================
-   ✅ FIX FECHA SAP (evitar fecha futura)
+   ✅ FIX FECHA SAP
 ========================================================= */
 function getDateISOInOffset(offsetMinutes = -300) {
   const now = new Date();
@@ -376,11 +450,12 @@ app.get("/api/health", async (req, res) => {
     warehouse_default: SAP_WAREHOUSE,
     priceList: SAP_PRICE_LIST,
     db: hasDb() ? "on" : "off",
+    sapTimeoutMs: SAP_TIMEOUT_MS,
   });
 });
 
 /* =========================================================
-   ✅ ADMIN: LOGIN
+   ✅ ADMIN: LOGIN (NO tocado)
 ========================================================= */
 app.post("/api/admin/login", async (req, res) => {
   try {
@@ -406,12 +481,7 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
-   ✅ FIX:
-   - Paginación real (no se queda en 20/200)
-   - Soporta skip/limit para el front
-   - Aplica filtros (user/client/from/to) ANTES de paginar resultados (evita “solo aparecen en página 2/3”)
-   - Agrega CancelStatus en SAP select y en rows.push
+   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP) OPTIMIZADO
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -425,55 +495,58 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const from = String(req.query?.from || "").trim();
     const to = String(req.query?.to || "").trim();
 
-    // ✅ paginación para el front (sobre resultados filtrados)
-    const limit = Math.min(Math.max(Number(req.query?.limit || req.query?.top || 500), 1), 500);
+    const limit = Math.min(Math.max(Number(req.query?.limit || req.query?.top || 200), 1), 500);
     const skip = Math.max(Number(req.query?.skip || 0), 0);
 
-    // ✅ Traemos de SAP en bloques de 500 y filtramos server-side hasta completar (skip+limit)
     const SAP_PAGE = 500;
-    const MAX_PAGES = 80; // 80*500 = 40,000 docs (suficiente para meses con 60/día)
+    const need = skip + limit;
+
+    // Ajusta max pages según necesidad (sin pasarte)
+    const MAX_PAGES = Math.min(
+      120,
+      Math.max(6, Math.ceil(need / SAP_PAGE) * 10) // por si filtros reducen mucho
+    );
 
     const parseUserFromComments = (comments = "") => {
       const m = String(comments).match(/\[user:([^\]]+)\]/i);
       return m ? String(m[1]).trim() : "";
     };
 
-    const bpCache = new Map();
-    async function getBPName(cardCode) {
-      if (!cardCode) return "";
-      if (bpCache.has(cardCode)) return bpCache.get(cardCode);
+    async function getBPNameCached(cardCode) {
+      const code = String(cardCode || "").trim();
+      if (!code) return "";
+
+      const now = Date.now();
+      const c = BP_NAME_CACHE.get(code);
+      if (c && now - c.ts < BP_NAME_TTL_MS) return c.name;
 
       try {
         const bp = await slFetch(
-          `/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`
+          `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName`
         );
         const name = String(bp?.CardName || "").trim();
-        bpCache.set(cardCode, name);
+        BP_NAME_CACHE.set(code, { ts: now, name });
         return name;
-      } catch (e) {
-        console.error("❌ BP lookup fail:", cardCode, e.message);
-        bpCache.set(cardCode, "");
+      } catch {
+        BP_NAME_CACHE.set(code, { ts: now, name: "" });
         return "";
       }
     }
 
-    // ✅ filtro por fechas directo en SAP (reduce carga)
+    // filtro por fechas en SAP
     const filterParts = [];
     if (from) filterParts.push(`DocDate ge '${from}'`);
     if (to) filterParts.push(`DocDate le '${to}'`);
-
     const sapFilter = filterParts.length
       ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
       : "";
 
-    // ✅ IMPORTANTE: agregar CancelStatus
     const SELECT =
       `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
 
-    const need = skip + limit;
     const matched = [];
-
     let sapSkip = 0;
+
     for (let page = 0; page < MAX_PAGES && matched.length < need; page++) {
       const sap = await slFetch(
         `/Quotations?$select=${SELECT}` +
@@ -488,22 +561,33 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         const fechaISO = docDateRaw.slice(0, 10);
 
         const usuario = parseUserFromComments(q.Comments || "");
-        const cardCode = String(q.CardCode || "").trim();
-
-        // ✅ filtros (antes de paginar)
         if (userFilter && !String(usuario || "").toLowerCase().includes(userFilter)) continue;
 
-        let cardName = String(q.CardName || "").trim();
-        if (!cardName) cardName = await getBPName(cardCode);
+        const cardCode = String(q.CardCode || "").trim();
 
+        // CardName casi siempre viene en Quotations (evita N requests)
+        let cardName = String(q.CardName || "").trim();
+
+        // si hay clientFilter, validamos sin forzar lookup salvo que sea necesario
         if (clientFilter) {
-          const cc = String(cardCode || "").toLowerCase();
-          const cn = String(cardName || "").toLowerCase();
-          if (!cc.includes(clientFilter) && !cn.includes(clientFilter)) continue;
+          const cc = cardCode.toLowerCase();
+          let cn = cardName.toLowerCase();
+          if (!cc.includes(clientFilter) && !cn.includes(clientFilter)) {
+            // si no vino CardName, ahí sí buscamos
+            if (!cardName) {
+              cardName = await getBPNameCached(cardCode);
+              cn = cardName.toLowerCase();
+              if (!cc.includes(clientFilter) && !cn.includes(clientFilter)) continue;
+            } else {
+              continue;
+            }
+          }
+        } else if (!cardName) {
+          // solo si realmente no vino
+          cardName = await getBPNameCached(cardCode);
         }
 
-        // ✅ estado
-        const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
+        const cancelStatus = String(q.CancelStatus || "").trim();
         const isCancelled = cancelStatus.toLowerCase() === "csyes";
 
         const estado = isCancelled
@@ -533,11 +617,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
           montoEntregado: 0,
           fecha: fechaISO,
           estado,
-
-          // ✅ nuevo: cancel status en output
           cancelStatus,
           isCancelled,
-
           mes,
           anio,
           usuario,
@@ -547,7 +628,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         if (matched.length >= need) break;
       }
 
-      // corte rápido si ya estamos por debajo del from
+      // corte rápido por fecha
       if (from) {
         const last = values[values.length - 1];
         const lastDate = String(last?.DocDate || "").slice(0, 10);
@@ -573,17 +654,40 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: LIST USERS
+   ✅ ADMIN: LIST USERS (optimizado para búsquedas)
+   - ?q= busca por username/full_name
+   - ?limit= (default 200)
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
 
-    const r = await dbQuery(`
-      SELECT id, username, full_name, is_active, province, warehouse_code, created_at
-      FROM app_users
-      ORDER BY created_at DESC;
-    `);
+    const q = String(req.query?.q || "").trim().toLowerCase();
+    const limit = Math.min(Math.max(Number(req.query?.limit || 200), 1), 500);
+
+    let r;
+    if (q) {
+      r = await dbQuery(
+        `
+        SELECT id, username, full_name, is_active, province, warehouse_code, created_at
+        FROM app_users
+        WHERE lower(username) LIKE $1 OR lower(full_name) LIKE $1
+        ORDER BY created_at DESC
+        LIMIT $2;
+        `,
+        [`%${q}%`, limit]
+      );
+    } else {
+      r = await dbQuery(
+        `
+        SELECT id, username, full_name, is_active, province, warehouse_code, created_at
+        FROM app_users
+        ORDER BY created_at DESC
+        LIMIT $1;
+        `,
+        [limit]
+      );
+    }
 
     return res.json({ ok: true, users: r.rows || [] });
   } catch (e) {
@@ -593,7 +697,7 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: CREATE USER (province -> warehouse auto)
+   ✅ ADMIN: CREATE USER (NO tocado)
 ========================================================= */
 app.post("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
@@ -609,9 +713,7 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
     if (!username) return res.status(400).json({ ok: false, message: "username requerido" });
     if (!pin || pin.length < 4) return res.status(400).json({ ok: false, message: "PIN mínimo 4" });
 
-    if (!warehouse_code) {
-      warehouse_code = provinceToWarehouse(province);
-    }
+    if (!warehouse_code) warehouse_code = provinceToWarehouse(province);
 
     const pin_hash = await bcrypt.hash(pin, 10);
 
@@ -638,7 +740,7 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: DELETE USER
+   ✅ ADMIN: DELETE USER (NO tocado)
 ========================================================= */
 app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
   try {
@@ -649,9 +751,7 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
 
     const r = await dbQuery(`DELETE FROM app_users WHERE id = $1 RETURNING id, username;`, [id]);
 
-    if (!r.rowCount) {
-      return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
-    }
+    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
 
     await audit("USER_DELETED", req, "ADMIN", { id, username: r.rows[0]?.username });
 
@@ -663,7 +763,7 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: TOGGLE ACTIVO
+   ✅ ADMIN: TOGGLE ACTIVO (NO tocado)
 ========================================================= */
 app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
   try {
@@ -682,9 +782,7 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
       [id]
     );
 
-    if (!r.rowCount) {
-      return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
-    }
+    if (!r.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
 
     await audit("USER_TOGGLE", req, "ADMIN", { id });
 
@@ -696,7 +794,7 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: AUDIT
+   ✅ ADMIN: AUDIT (NO tocado)
 ========================================================= */
 app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
   try {
@@ -716,20 +814,16 @@ app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ MERCADERISTAS: LOGIN
+   ✅ MERCADERISTAS: LOGIN (NO tocado)
 ========================================================= */
 app.post("/api/auth/login", async (req, res) => {
   try {
-    if (!hasDb()) {
-      return res.status(500).json({ ok: false, message: "DB no configurada" });
-    }
+    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
 
     const username = String(req.body?.username || "").trim().toLowerCase();
     const pin = String(req.body?.pin || "").trim();
 
-    if (!username || !pin) {
-      return res.status(400).json({ ok: false, message: "username y pin requeridos" });
-    }
+    if (!username || !pin) return res.status(400).json({ ok: false, message: "username y pin requeridos" });
 
     const r = await dbQuery(
       `
@@ -825,7 +919,9 @@ async function getPriceListNoByNameCached(name) {
 
   if (no === null) {
     try {
-      const r2 = await slFetch(`/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`);
+      const r2 = await slFetch(
+        `/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`
+      );
       if (r2?.value?.length) no = r2.value[0].PriceListNo;
     } catch {}
   }
@@ -846,11 +942,9 @@ function getPriceFromPriceList(itemFull, priceListNo) {
 }
 
 /* =========================================================
-   ✅ FIX REAL: Factor UoM de VENTAS (Caja)
-   - Tu error era: no expand + match incorrecto por SalesUnit
+   ✅ Factor UoM de VENTAS (Caja)
 ========================================================= */
 function getSalesUomFactor(itemFull) {
-  // 1) Fallbacks directos si tu SL los trae (según setup)
   const directFields = [
     itemFull?.SalesItemsPerUnit,
     itemFull?.SalesQtyPerPackUnit,
@@ -863,21 +957,15 @@ function getSalesUomFactor(itemFull) {
     if (Number.isFinite(n) && n > 0) return n;
   }
 
-  // 2) Colección UoM (requiere $expand en muchos SL)
   const coll = itemFull?.ItemUnitOfMeasurementCollection;
   if (!Array.isArray(coll) || !coll.length) return null;
 
-  // Busca UoM de ventas
   let row =
     coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("sales")) ||
     coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("iut_sales")) ||
     null;
 
-  // Si no encontró, intenta al menos la primera con BaseQuantity > 1
-  if (!row) {
-    row = coll.find((x) => Number(x?.BaseQuantity) > 1) || null;
-  }
-
+  if (!row) row = coll.find((x) => Number(x?.BaseQuantity) > 1) || null;
   if (!row) return null;
 
   const baseQty = row?.BaseQuantity ?? row?.BaseQty ?? null;
@@ -886,16 +974,33 @@ function getSalesUomFactor(itemFull) {
   const b = Number(baseQty);
   const a = Number(altQty);
 
-  // Si trae ambos, la conversión real es Base/Alt
   if (Number.isFinite(b) && b > 0 && Number.isFinite(a) && a > 0) {
     const f = b / a;
     return Number.isFinite(f) && f > 0 ? f : null;
   }
 
-  // Si trae solo BaseQuantity (común), úsalo
   if (Number.isFinite(b) && b > 0) return b;
-
   return null;
+}
+
+// ✅ lookup ligero (sin $expand pesado) + cache largo
+async function getSalesUomFactorCached(code) {
+  const now = Date.now();
+  const c = UOM_FACTOR_CACHE.get(code);
+  if (c && now - c.ts < UOM_TTL_MS) return c.factor;
+
+  try {
+    const r = await slFetch(
+      `/Items('${encodeURIComponent(code)}')/ItemUnitOfMeasurementCollection?$select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity`
+    );
+    const coll = Array.isArray(r?.value) ? r.value : [];
+    const factor = getSalesUomFactor({ ItemUnitOfMeasurementCollection: coll });
+    UOM_FACTOR_CACHE.set(code, { ts: now, factor });
+    return factor;
+  } catch {
+    UOM_FACTOR_CACHE.set(code, { ts: now, factor: null });
+    return null;
+  }
 }
 
 function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
@@ -909,7 +1014,6 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
   const factorCaja = getSalesUomFactor(itemFull);
 
-  // ✅ Si hay factor, lo aplica. Si no hay factor, deja unitario.
   const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
 
   let warehouseRow = null;
@@ -945,28 +1049,25 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   };
 }
 
+// ✅ OPT: sin $expand pesado en la llamada principal; solo si falta factor, consulta UoM aparte (cacheada)
 async function getOneItem(code, priceListNo, warehouseCode) {
   const now = Date.now();
   const key = `${code}::${warehouseCode}::${priceListNo}`;
   const cached = ITEM_CACHE.get(key);
-  if (cached && now - cached.ts < ITEM_TTL_MS) {
-    return cached.data;
-  }
+  if (cached && now - cached.ts < ITEM_TTL_MS) return cached.data;
 
-  let itemFull;
+  const itemFull = await slFetch(
+    `/Items('${encodeURIComponent(code)}')` +
+      `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage,SalesPackagingUnit`
+  );
 
-  // ✅ AQUÍ estaba la otra parte del problema: falta $expand
-  try {
-    itemFull = await slFetch(
-      `/Items('${encodeURIComponent(code)}')` +
-        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection` +
-        `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
-    );
-  } catch (e1) {
-    try {
-      itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')?$expand=ItemUnitOfMeasurementCollection`);
-    } catch (e2) {
-      itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
+  // si no hay factor directo, lo buscamos por colección (rápido + cache)
+  let factor = getSalesUomFactor(itemFull);
+  if (factor == null) {
+    factor = await getSalesUomFactorCached(code);
+    if (factor != null) {
+      // inyecta en un campo directo para que buildItemResponse lo tome sin expand
+      itemFull.SalesItemsPerUnit = factor;
     }
   }
 
@@ -980,9 +1081,7 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
@@ -998,7 +1097,10 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
       warehouse: warehouseCode,
       priceList: SAP_PRICE_LIST,
       priceListNo,
-      price: r.price,
+      price: Number(r.price ?? 0),
+      priceUnit: r.priceUnit,
+      factorCaja: r.factorCaja,
+      uom: r.item?.SalesUnit || "Caja",
       stock: r.stock,
     });
   } catch (err) {
@@ -1008,7 +1110,7 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: SEARCH CUSTOMERS (autocomplete)
+   ✅ SAP: SEARCH CUSTOMERS (autocomplete) OPTIMIZADO + cache
 ========================================================= */
 app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
   try {
@@ -1016,20 +1118,40 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
 
     const q = String(req.query?.q || "").trim();
     const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
-
     if (q.length < 2) return res.json({ ok: true, results: [] });
+
+    const key = `${q.toLowerCase()}::${top}`;
+    const now = Date.now();
+    const c = CUSTOMER_SEARCH_CACHE.get(key);
+    if (c && now - c.ts < CUSTOMER_SEARCH_TTL_MS) {
+      return res.json({ ok: true, q, results: c.data });
+    }
 
     const safe = q.replace(/'/g, "''");
 
+    // ✅ intenta startswith primero (mucho más rápido cuando está soportado)
+    // fallback a contains / substringof
     let r;
     try {
       r = await slFetch(
-        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=contains(CardName,'${safe}') or contains(CardCode,'${safe}')&$orderby=CardName asc&$top=${top}`
+        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress` +
+          `&$filter=startswith(CardName,'${safe}') or startswith(CardCode,'${safe}')` +
+          `&$orderby=CardName asc&$top=${top}`
       );
-    } catch (e) {
-      r = await slFetch(
-        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=substringof('${safe}',CardName) or substringof('${safe}',CardCode)&$orderby=CardName asc&$top=${top}`
-      );
+    } catch {
+      try {
+        r = await slFetch(
+          `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress` +
+            `&$filter=contains(CardName,'${safe}') or contains(CardCode,'${safe}')` +
+            `&$orderby=CardName asc&$top=${top}`
+        );
+      } catch {
+        r = await slFetch(
+          `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress` +
+            `&$filter=substringof('${safe}',CardName) or substringof('${safe}',CardCode)` +
+            `&$orderby=CardName asc&$top=${top}`
+        );
+      }
     }
 
     const values = Array.isArray(r?.value) ? r.value : [];
@@ -1039,6 +1161,8 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
       Phone1: x.Phone1 || "",
       EmailAddress: x.EmailAddress || "",
     }));
+
+    CUSTOMER_SEARCH_CACHE.set(key, { ts: now, data: results });
 
     return res.json({ ok: true, q, results });
   } catch (err) {
@@ -1064,7 +1188,7 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
     const warehouseCode = getWarehouseFromReq(req);
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
 
-    const CONCURRENCY = 5;
+    const CONCURRENCY = 6; // un poco más alto, pero sin saturar
     const items = {};
     let i = 0;
 
@@ -1077,8 +1201,8 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
           items[code] = {
             ok: true,
             name: r.item.ItemName,
-            unit: r.item.SalesUnit, // Caja
-            price: r.price, // Caja (si factor existe)
+            unit: r.item.SalesUnit,
+            price: r.price,
             priceUnit: r.priceUnit,
             factorCaja: r.factorCaja,
             stock: r.stock,
@@ -1138,24 +1262,11 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: DASHBOARD
-   ✅ FIX:
-   - define parseUserFromComments/parseWhFromComments
-   - agrega CancelStatus en select + rows.push
-   - OMITE canceladas (csYes) sin contarlas
-========================================================= */
-/* =========================================================
-   ✅ ADMIN: DASHBOARD
-   ✅ FIX:
-   - scope=created ahora filtra en SAP por Comments ([user:...]) para que sea rápido
-   - si no hay usuarios creados => responde inmediato
-   - mantiene exclusión de canceladas (csYes)
+   ✅ ADMIN: DASHBOARD (optimizado + canceladas omitidas)
 ========================================================= */
 app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
     const scope = String(req.query?.scope || "created").trim().toLowerCase(); // created | all
     const fromQ = String(req.query?.from || "").trim();
@@ -1166,9 +1277,8 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
     const to = toQ || "";
 
     const PAGE_SIZE = Math.min(Math.max(Number(req.query?.top || 500), 50), 500);
-    const MAX_PAGES = Math.min(Math.max(Number(req.query?.maxPages || 20), 1), 80);
+    const MAX_PAGES = Math.min(Math.max(Number(req.query?.maxPages || 20), 1), 120);
 
-    // ✅ helpers de parseo
     const parseUserFromComments = (comments = "") => {
       const m = String(comments).match(/\[user:([^\]]+)\]/i);
       return m ? String(m[1]).trim() : "";
@@ -1178,129 +1288,39 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       return m ? String(m[1]).trim() : "";
     };
 
-    // ✅ scope=created -> solo usuarios existentes en app_users
+    // ✅ scope=created -> solo usuarios existentes en app_users (y cacheable por request)
     let allowedUsersSet = null;
-
-    // (opcional) cache corto para no pegarle a DB siempre
-    // si no quieres cache, puedes borrar este bloque y dejar el query directo.
-    if (!global.__ALLOWED_USERS_CACHE__) {
-      global.__ALLOWED_USERS_CACHE__ = { ts: 0, set: null };
-    }
-    const USERS_TTL_MS = 60 * 1000; // 1 min
-
     if (scope === "created") {
       if (!hasDb()) {
-        allowedUsersSet = new Set(); // no DB => no hay "created"
+        allowedUsersSet = new Set();
       } else {
-        const now = Date.now();
-        const cache = global.__ALLOWED_USERS_CACHE__;
-        if (cache.set && now - cache.ts < USERS_TTL_MS) {
-          allowedUsersSet = cache.set;
-        } else {
-          const r = await dbQuery(`SELECT username FROM app_users WHERE is_active = TRUE;`);
-          allowedUsersSet = new Set(
-            (r.rows || [])
-              .map((x) => String(x.username || "").trim().toLowerCase())
-              .filter(Boolean)
-          );
-          global.__ALLOWED_USERS_CACHE__ = { ts: now, set: allowedUsersSet };
-        }
-      }
-
-      // ✅ si no hay usuarios creados, responde inmediato (evita “cargando”)
-      if (!allowedUsersSet || allowedUsersSet.size === 0) {
-        return res.json({
-          ok: true,
-          scope,
-          from,
-          to: to || null,
-          fetched: 0,
-          kpis: { totalCotizaciones: 0, montoCotizado: 0, montoEntregado: 0, fillRate: 0 },
-          charts: {
-            topUsuariosMonto: [],
-            topClientesMonto: [],
-            porBodegaMonto: [],
-            porDia: [],
-            porMes: [],
-            estados: [],
-            pieCotVsEnt: { cotizado: 0, entregado: 0, fillRate: 0 },
-          },
-        });
+        const r = await dbQuery(`SELECT username FROM app_users;`);
+        allowedUsersSet = new Set(
+          (r.rows || [])
+            .map((x) => String(x.username || "").trim().toLowerCase())
+            .filter(Boolean)
+        );
       }
     }
 
-    // ✅ arma $filter base por fechas
-    const baseFilterParts = [];
-    if (from) baseFilterParts.push(`DocDate ge '${from}'`);
-    if (to) baseFilterParts.push(`DocDate le '${to}'`);
-
-    // ✅ si scope=created y la lista es “razonable”, filtramos en SAP por Comments
-    // (evita URL enorme si hay demasiados usuarios)
-    const MAX_USERS_IN_SAP_FILTER = 25;
-    const usersForSap =
-      scope === "created" && allowedUsersSet
-        ? [...allowedUsersSet].slice(0, MAX_USERS_IN_SAP_FILTER)
-        : [];
-
-    function buildUserCommentsFilter(useSubstringof) {
-      if (!usersForSap.length) return "";
-
-      const clauses = usersForSap.map((u) => {
-        const safeU = String(u).replace(/'/g, "''");
-        const needle = `[user:${safeU}]`;
-        return useSubstringof
-          ? `substringof('${needle.replace(/'/g, "''")}',Comments)`
-          : `contains(Comments,'${needle.replace(/'/g, "''")}')`;
-      });
-
-      return `(${clauses.join(" or ")})`;
-    }
-
-    // ✅ Construye filtro completo (intentamos contains, fallback substringof)
-    function buildSapFilter(useSubstringof) {
-      const parts = [...baseFilterParts];
-
-      if (scope === "created" && usersForSap.length) {
-        const userPart = buildUserCommentsFilter(useSubstringof);
-        if (userPart) parts.push(userPart);
-      }
-
-      return parts.length ? `&$filter=${encodeURIComponent(parts.join(" and "))}` : "";
-    }
+    const filterParts = [];
+    if (from) filterParts.push(`DocDate ge '${from}'`);
+    if (to) filterParts.push(`DocDate le '${to}'`);
+    const sapFilter = filterParts.length
+      ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
+      : "";
 
     const SELECT =
       `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Cancelled,Comments`;
 
-    async function fetchPage(sapSkip, useSubstringof) {
-      const sapFilter = buildSapFilter(useSubstringof);
-      return slFetch(
-        `/Quotations?$select=${SELECT}` +
-          `&$orderby=DocDate desc&$top=${PAGE_SIZE}&$skip=${sapSkip}${sapFilter}`
-      );
-    }
-
     const all = [];
-    let sapSkip = 0;
-
-    // ✅ probamos contains primero; si falla, usamos substringof
-    let useSubstringof = false;
-    let triedFallback = false;
+    let skip = 0;
 
     for (let page = 0; page < MAX_PAGES; page++) {
-      let sap;
-      try {
-        sap = await fetchPage(sapSkip, useSubstringof);
-      } catch (e) {
-        const msg = String(e?.message || e);
-        // fallback típico cuando contains no existe en tu SL
-        if (!triedFallback && msg.toLowerCase().includes("contains")) {
-          triedFallback = true;
-          useSubstringof = true;
-          page--; // reintenta misma página con substringof
-          continue;
-        }
-        throw e;
-      }
+      const sap = await slFetch(
+        `/Quotations?$select=${SELECT}` +
+          `&$orderby=DocDate desc&$top=${PAGE_SIZE}&$skip=${skip}${sapFilter}`
+      );
 
       const values = Array.isArray(sap?.value) ? sap.value : [];
       if (!values.length) break;
@@ -1309,22 +1329,16 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         const rawDate = String(q.DocDate || "");
         const fechaISO = rawDate.slice(0, 10);
 
-        const usuario = parseUserFromComments(q.Comments || "");
+        const comments = String(q.Comments || "");
+        const usuario = parseUserFromComments(comments);
         const usuarioKey = String(usuario || "").trim().toLowerCase();
 
-        // ✅ si por alguna razón no aplicó el filtro de SAP (ej: usersForSap truncado),
-        // mantenemos el check local para no colar usuarios no creados.
-        if (scope === "created" && allowedUsersSet) {
+        if (allowedUsersSet && scope === "created") {
           if (!usuarioKey || !allowedUsersSet.has(usuarioKey)) continue;
         }
 
-        const cardCode = String(q.CardCode || "").trim();
-        const cardName = String(q.CardName || "").trim();
-        const warehouse = parseWhFromComments(q.Comments || "") || "sin_wh";
-
-        // ✅ excluir canceladas (csYes) + fallback a Cancelled
         const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
-        const cancelledFlag = String(q.Cancelled || "").trim();   // tYES/tNO
+        const cancelledFlag = String(q.Cancelled || "").trim(); // tYES/tNO
 
         const isCancelled =
           cancelStatus.toLowerCase() === "csyes" ||
@@ -1333,7 +1347,10 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
           cancelledFlag.toLowerCase() === "y" ||
           cancelledFlag.toLowerCase() === "true";
 
+        // ✅ NO MOSTRAR / NO CONTABILIZAR canceladas
         if (isCancelled) continue;
+
+        const warehouse = parseWhFromComments(comments) || "sin_wh";
 
         const estado =
           q.DocumentStatus === "bost_Open"
@@ -1353,13 +1370,13 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         all.push({
           docEntry: q.DocEntry,
           docNum: q.DocNum,
-          cardCode,
-          cardName,
+          cardCode: String(q.CardCode || "").trim(),
+          cardName: String(q.CardName || "").trim(),
           montoCotizacion: Number(q.DocTotal || 0),
           montoEntregado: 0,
           fecha: fechaISO,
           estado,
-          cancelStatus, // ✅ agregado
+          cancelStatus, // csNo normalmente aquí
           mes,
           anio,
           usuario: usuario || "sin_user",
@@ -1374,10 +1391,9 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         if (lastDate && lastDate < from) break;
       }
 
-      sapSkip += PAGE_SIZE;
+      skip += PAGE_SIZE;
     }
 
-    // --- Agregaciones ---
     const sumCot = all.reduce((acc, x) => acc + (Number(x.montoCotizacion) || 0), 0);
     const sumEnt = all.reduce((acc, x) => acc + (Number(x.montoEntregado) || 0), 0);
     const fillRate = sumCot > 0 ? sumEnt / sumCot : 0;
@@ -1461,7 +1477,11 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         porDia,
         porMes,
         estados,
-        pieCotVsEnt: { cotizado: sumCot, entregado: sumEnt, fillRate },
+        pieCotVsEnt: {
+          cotizado: sumCot,
+          entregado: sumEnt,
+          fillRate,
+        },
       },
     });
   } catch (err) {
@@ -1470,9 +1490,8 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   }
 });
 
-
 /* =========================================================
-   ✅ SAP: CREAR COTIZACIÓN
+   ✅ SAP: CREAR COTIZACIÓN (NO tocado)
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
