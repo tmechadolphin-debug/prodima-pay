@@ -575,30 +575,28 @@ app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
     const id = Number(req.params.id);
     const pin = String(req.body?.pin || "").trim();
 
-    if (!Number.isFinite(id) || id <= 0) {
+    if (!id || id <= 0) {
       return res.status(400).json({ ok: false, message: "ID inválido" });
     }
     if (!pin || pin.length < 4) {
       return res.status(400).json({ ok: false, message: "PIN mínimo 4" });
     }
 
-    // Si guardas PIN en texto plano (no recomendado), descomenta esto y comenta el hash.
-    // const r = await dbQuery(`UPDATE app_users SET pin = $1 WHERE id = $2 RETURNING id, username;`, [pin, id]);
-
-    // ✅ Recomendado: guardar hash
-    const bcrypt = require("bcryptjs");
+    // ✅ Hash PIN -> pin_hash
     const pin_hash = await bcrypt.hash(pin, 10);
 
     const r = await dbQuery(
-      `UPDATE app_users
-       SET pin_hash = $1
-       WHERE id = $2
-       RETURNING id, username;`,
+      `
+      UPDATE app_users
+      SET pin_hash = $1
+      WHERE id = $2
+      RETURNING id, username, full_name, is_active, province, warehouse_code, created_at;
+      `,
       [pin_hash, id]
     );
 
-    if (!r.rows || r.rows.length === 0) {
-      return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    if (!r.rows?.length) {
+      return res.status(404).json({ ok: false, message: "Usuario no existe" });
     }
 
     return res.json({ ok: true, user: r.rows[0] });
