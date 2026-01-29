@@ -108,6 +108,7 @@ async function dbQuery(text, params = []) {
 
 /* =========================================================
    ✅ DB Schema (crear tablas si no existen)
+   + asegura columnas province/warehouse_code
 ========================================================= */
 async function ensureSchema() {
   if (!hasDb()) {
@@ -122,9 +123,15 @@ async function ensureSchema() {
       full_name TEXT DEFAULT '',
       pin_hash TEXT NOT NULL,
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      province TEXT DEFAULT '',
+      warehouse_code TEXT DEFAULT '',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+
+  // ✅ si ya existía la tabla vieja, aseguramos columnas
+  await dbQuery(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS province TEXT DEFAULT '';`);
+  await dbQuery(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS warehouse_code TEXT DEFAULT '';`);
 
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS audit_events (
@@ -323,9 +330,6 @@ function getDateISOInOffset(offsetMinutes = -300) {
 
 /* =========================================================
    ✅ Helper: crear Attachments2 en SAP
-   - Copia archivos a SAP_ATTACH_PATH
-   - Crea Attachments2
-   - Retorna AbsoluteEntry => se usa en Quotations.AttachmentEntry
 ========================================================= */
 async function createSapAttachmentEntry(files = []) {
   if (!files.length) return null;
@@ -334,14 +338,12 @@ async function createSapAttachmentEntry(files = []) {
     throw new Error("SAP_ATTACH_PATH no configurado. No se puede adjuntar.");
   }
 
-  // ✅ intenta crear carpeta si es local
   try {
     if (!fs.existsSync(SAP_ATTACH_PATH)) {
       fs.mkdirSync(SAP_ATTACH_PATH, { recursive: true });
     }
   } catch (e) {
     console.warn("⚠️ No pude crear/verificar SAP_ATTACH_PATH:", e.message);
-    // igual intentamos copiar, por si es UNC ya existente
   }
 
   const lines = [];
@@ -351,17 +353,16 @@ async function createSapAttachmentEntry(files = []) {
     const ext = path.extname(originalName).replace(".", "").toLowerCase() || "dat";
     const base = path.basename(originalName, path.extname(originalName));
 
-    // ✅ nombre único final
     const safeBase = base.replace(/[^\w\- ]+/g, "").replace(/\s+/g, "_").slice(0, 50);
     const finalName = `${safeBase}_${Date.now()}_${Math.floor(Math.random() * 9999)}.${ext}`;
 
     const dest = path.join(SAP_ATTACH_PATH, finalName);
 
-    // ✅ copia del tmp a carpeta SAP
     fs.copyFileSync(f.path, dest);
 
-    // ✅ limpiamos tmp
-    try { fs.unlinkSync(f.path); } catch {}
+    try {
+      fs.unlinkSync(f.path);
+    } catch {}
 
     lines.push({
       FileName: path.basename(finalName, "." + ext),
@@ -370,7 +371,6 @@ async function createSapAttachmentEntry(files = []) {
     });
   }
 
-  // ✅ Crear Attachments2
   const att = await slFetch(`/Attachments2`, {
     method: "POST",
     body: JSON.stringify({ Attachments2_Lines: lines }),
@@ -380,6 +380,43 @@ async function createSapAttachmentEntry(files = []) {
   if (!absoluteEntry) throw new Error("No se creó AttachmentEntry en SAP.");
 
   return absoluteEntry;
+}
+
+/* =========================================================
+   ✅ Helpers parse tags en Comments
+========================================================= */
+function parseUserFromComments(comments = "") {
+  const m = String(comments).match(/\[user:([^\]]+)\]/i);
+  return m ? String(m[1]).trim() : "";
+}
+
+function parseWhFromComments(comments = "") {
+  const m = String(comments).match(/\[wh:([^\]]+)\]/i);
+  return m ? String(m[1]).trim() : "";
+}
+
+/* =========================================================
+   ✅ Helper: trae meta del usuario (province, warehouse_code)
+========================================================= */
+async function getUserMetaByUsername(username) {
+  if (!hasDb()) return null;
+  const u = String(username || "").trim().toLowerCase();
+  if (!u) return null;
+
+  try {
+    const r = await dbQuery(
+      `
+      SELECT username, full_name, province, warehouse_code, is_active
+      FROM app_users
+      WHERE username = $1
+      LIMIT 1;
+      `,
+      [u]
+    );
+    return r.rows?.[0] || null;
+  } catch {
+    return null;
+  }
 }
 
 /* =========================================================
@@ -425,6 +462,7 @@ app.post("/api/admin/login", async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
+   - incluye Bodega (warehouse) parseada de comments [wh:XXX]
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -449,19 +487,13 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
       : "";
 
-    // ✅ IMPORTANTE: agregar CancelStatus
+    // ✅ incluye CancelStatus + Cancelled (por compat)
     const sap = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments` +
+      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Cancelled,Comments` +
         `&$orderby=DocDate desc&$top=${top}&$skip=${skip}${sapFilter}`
     );
 
     const values = Array.isArray(sap?.value) ? sap.value : [];
-
-    const parseUserFromComments = (comments = "") => {
-      const m = String(comments).match(/\[user:([^\]]+)\]/i);
-      return m ? String(m[1]).trim() : "";
-    };
-
     let rows = [];
 
     for (const q of values) {
@@ -470,13 +502,22 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
       const usuario = parseUserFromComments(q.Comments || "");
       const cardCode = String(q.CardCode || "").trim();
+      const cardName = String(q.CardName || "").trim();
 
-      // ✅ Diferenciar canceladas correctamente
-      const cancelStatus = String(q.CancelStatus || "").trim(); // suele venir csYes/csNo
+      const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
+
+      // ✅ Cancelled robusto (CancelStatus o Cancelled)
+      const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo (típico)
+      const cancelledFlag = String(q.Cancelled || "").trim(); // tYES/tNO (típico)
+
       const isCancelled =
         cancelStatus.toLowerCase() === "csyes" ||
         cancelStatus.toLowerCase() === "yes" ||
-        cancelStatus.toLowerCase() === "tyes";
+        cancelStatus.toLowerCase() === "tyes" ||
+        cancelledFlag.toLowerCase() === "tyes" ||
+        cancelledFlag.toLowerCase() === "yes" ||
+        cancelledFlag.toLowerCase() === "y" ||
+        cancelledFlag.toLowerCase() === "true";
 
       const estado = isCancelled
         ? "Cancelled"
@@ -485,8 +526,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         : q.DocumentStatus === "bost_Close"
         ? "Close"
         : String(q.DocumentStatus || "");
-
-      const cardName = String(q.CardName || "").trim();
 
       let mes = "";
       let anio = "";
@@ -507,22 +546,20 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         montoEntregado: 0,
         fecha: fechaISO,
 
-        // ✅ para UI
+        // ✅ UI
         estado,
-        cancelStatus,     // por si quieres ver el raw
-        isCancelled,      // boolean útil
-
+        isCancelled,
         mes,
         anio,
-        usuario,
+        usuario: usuario || "sin_user",
+        warehouse: wh,
+        bodega: wh,
         comments: q.Comments || "",
       });
     }
 
     if (userFilter) {
-      rows = rows.filter((r) =>
-        String(r.usuario || "").toLowerCase().includes(userFilter)
-      );
+      rows = rows.filter((r) => String(r.usuario || "").toLowerCase().includes(userFilter));
     }
 
     if (clientFilter) {
@@ -545,7 +582,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
-
 
 /* =========================================================
    ✅ ADMIN: LIST USERS
@@ -578,8 +614,6 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN: CHANGE USER PIN
-   PATCH /api/admin/users/:id/pin
-   body: { pin }
 ========================================================= */
 app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
   try {
@@ -597,7 +631,6 @@ app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
       return res.status(400).json({ ok: false, message: "PIN mínimo 4" });
     }
 
-    // ✅ Hash PIN -> pin_hash
     const pin_hash = await bcrypt.hash(pin, 10);
 
     const r = await dbQuery(
@@ -622,11 +655,9 @@ app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: DASHBOARD (KPIs + agrupaciones)
-   GET /api/admin/dashboard?from=2020-01-01&to=2026-01-28&scope=created|all
-   - Si no mandas fechas: from=2020-01-01 por defecto
-   - Trae Canceladas usando "Cancelled" (NO "Canceled")
-   - Paginación interna para traer suficiente data (top/skip en lotes)
+   ✅ ADMIN: DASHBOARD
+   - incluye bodega en dataset
+   - OMITE canceladas (no las contabiliza)
 ========================================================= */
 app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   try {
@@ -638,39 +669,28 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
     const fromQ = String(req.query?.from || "").trim();
     const toQ = String(req.query?.to || "").trim();
 
-    // ✅ Si no mandan fecha, por defecto desde 2020 hasta hoy (así no se muere trayendo todo el histórico)
     const DEFAULT_FROM = "2020-01-01";
     const from = fromQ || DEFAULT_FROM;
-    const to = toQ || ""; // si viene vacío, no filtramos por to
+    const to = toQ || "";
 
-    // Dashboard trae más data que una página normal, pero con límite para evitar timeouts
     const PAGE_SIZE = Math.min(Math.max(Number(req.query?.top || 500), 50), 500);
-    const MAX_PAGES = Math.min(Math.max(Number(req.query?.maxPages || 20), 1), 60); // 20*500 = 10,000 docs
-
-    // --- Helpers de parseo ---
-    const parseUserFromComments = (comments = "") => {
-      const m = String(comments).match(/\[user:([^\]]+)\]/i);
-      return m ? String(m[1]).trim() : "";
-    };
-
-    const parseWhFromComments = (comments = "") => {
-      const m = String(comments).match(/\[wh:([^\]]+)\]/i);
-      return m ? String(m[1]).trim() : "";
-    };
+    const MAX_PAGES = Math.min(Math.max(Number(req.query?.maxPages || 20), 1), 60);
 
     // ✅ scope=created -> solo usuarios existentes en app_users
     let allowedUsersSet = null;
     if (scope === "created") {
       if (!hasDb()) {
-        // si no hay DB, no podemos filtrar "created"
         allowedUsersSet = new Set();
       } else {
         const r = await dbQuery(`SELECT username FROM app_users;`);
-        allowedUsersSet = new Set((r.rows || []).map(x => String(x.username || "").trim().toLowerCase()).filter(Boolean));
+        allowedUsersSet = new Set(
+          (r.rows || [])
+            .map((x) => String(x.username || "").trim().toLowerCase())
+            .filter(Boolean)
+        );
       }
     }
 
-    // --- Construye filtro SAP por fechas (como tu /quotes) ---
     const filterParts = [];
     if (from) filterParts.push(`DocDate ge '${from}'`);
     if (to) filterParts.push(`DocDate le '${to}'`);
@@ -679,18 +699,17 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
       : "";
 
-    // ✅ Traemos también Cancelled (propiedad correcta) + DocumentStatus
+    // ✅ Traemos CancelStatus y Cancelled (por compat)
     const SELECT =
-      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Cancelled,Comments`;
+      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Cancelled,Comments`;
 
-    // --- Loop paginado para agarrar suficiente histórico ---
     let all = [];
     let skip = 0;
 
     for (let page = 0; page < MAX_PAGES; page++) {
       const sap = await slFetch(
         `/Quotations?$select=${SELECT}` +
-        `&$orderby=DocDate desc&$top=${PAGE_SIZE}&$skip=${skip}${sapFilter}`
+          `&$orderby=DocDate desc&$top=${PAGE_SIZE}&$skip=${skip}${sapFilter}`
       );
 
       const values = Array.isArray(sap?.value) ? sap.value : [];
@@ -703,24 +722,37 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         const usuario = parseUserFromComments(q.Comments || "");
         const usuarioKey = String(usuario || "").trim().toLowerCase();
 
-        // scope filter (created)
         if (allowedUsersSet && scope === "created") {
           if (!usuarioKey || !allowedUsersSet.has(usuarioKey)) continue;
         }
 
         const cardCode = String(q.CardCode || "").trim();
         const cardName = String(q.CardName || "").trim();
-        const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
 
-        // ✅ Estado (incluye canceladas)
-        const cancelledFlag = String(q.Cancelled || "").toLowerCase(); // típicamente "tyes" / "tno"
-        const isCancelled = (cancelledFlag === "tyes" || cancelledFlag === "y" || cancelledFlag === "yes" || cancelledFlag === "true");
+        // ✅ bodega desde comments
+        const warehouse = parseWhFromComments(q.Comments || "") || "sin_wh";
+
+        // ✅ Cancelled robusto
+        const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
+        const cancelledFlag = String(q.Cancelled || "").trim(); // tYES/tNO
+
+        const isCancelled =
+          cancelStatus.toLowerCase() === "csyes" ||
+          cancelStatus.toLowerCase() === "yes" ||
+          cancelStatus.toLowerCase() === "tyes" ||
+          cancelledFlag.toLowerCase() === "tyes" ||
+          cancelledFlag.toLowerCase() === "yes" ||
+          cancelledFlag.toLowerCase() === "y" ||
+          cancelledFlag.toLowerCase() === "true";
 
         const estado =
-          isCancelled ? "Canceled" :
-          q.DocumentStatus === "bost_Open" ? "Open" :
-          q.DocumentStatus === "bost_Close" ? "Close" :
-          String(q.DocumentStatus || "");
+          isCancelled
+            ? "Cancelled"
+            : q.DocumentStatus === "bost_Open"
+            ? "Open"
+            : q.DocumentStatus === "bost_Close"
+            ? "Close"
+            : String(q.DocumentStatus || "");
 
         let mes = "";
         let anio = "";
@@ -736,18 +768,18 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
           cardCode,
           cardName,
           montoCotizacion: Number(q.DocTotal || 0),
-          montoEntregado: 0, // si luego lo conectas, aquí lo sumas
+          montoEntregado: 0,
           fecha: fechaISO,
           estado,
+          isCancelled, // ✅ lo guardamos
           mes,
           anio,
           usuario: usuario || "sin_user",
-          warehouse: wh,
+          warehouse,
+          bodega: warehouse,
         });
       }
 
-      // ✅ Si estamos ordenados desc, y ya bajamos más allá del from, podemos cortar (ahorra tiempo)
-      // OJO: solo aplica si 'from' existe
       if (from) {
         const last = values[values.length - 1];
         const lastDate = String(last?.DocDate || "").slice(0, 10);
@@ -757,10 +789,13 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       skip += PAGE_SIZE;
     }
 
+    // ✅ CLAVE: OMITIR CANCELADAS EN DASHBOARD (no se cuentan, no se suman, no salen en charts)
+    all = all.filter((r) => !r.isCancelled);
+
     // --- Agregaciones ---
     const sumCot = all.reduce((acc, x) => acc + (Number(x.montoCotizacion) || 0), 0);
     const sumEnt = all.reduce((acc, x) => acc + (Number(x.montoEntregado) || 0), 0);
-    const fillRate = sumCot > 0 ? (sumEnt / sumCot) : 0;
+    const fillRate = sumCot > 0 ? sumEnt / sumCot : 0;
 
     function topBy(keyFn, valueFn, n = 10) {
       const m = new Map();
@@ -788,38 +823,38 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       (r) => String(r.usuario || "sin_user"),
       (r) => Number(r.montoCotizacion || 0),
       10
-    ).map(x => ({ usuario: x.key, monto: x.value }));
+    ).map((x) => ({ usuario: x.key, monto: x.value }));
 
     const topClientesMonto = topBy(
       (r) => String(r.cardName || r.cardCode || "sin_cliente"),
       (r) => Number(r.montoCotizacion || 0),
       10
-    ).map(x => ({ cliente: x.key, monto: x.value }));
+    ).map((x) => ({ cliente: x.key, monto: x.value }));
 
     const porBodegaMonto = topBy(
       (r) => String(r.warehouse || "sin_wh"),
       (r) => Number(r.montoCotizacion || 0),
       20
-    ).map(x => ({ bodega: x.key, monto: x.value }));
+    ).map((x) => ({ bodega: x.key, monto: x.value }));
 
     const porDia = topBy(
       (r) => String(r.fecha || ""),
       (r) => Number(r.montoCotizacion || 0),
       400
     )
-      .map(x => ({ fecha: x.key, monto: x.value }))
+      .map((x) => ({ fecha: x.key, monto: x.value }))
       .sort((a, b) => a.fecha.localeCompare(b.fecha));
 
     const porMes = topBy(
-      (r) => String(r.fecha || "").slice(0, 7), // YYYY-MM
+      (r) => String(r.fecha || "").slice(0, 7),
       (r) => Number(r.montoCotizacion || 0),
       200
     )
-      .map(x => ({ mes: x.key, monto: x.value }))
+      .map((x) => ({ mes: x.key, monto: x.value }))
       .sort((a, b) => a.mes.localeCompare(b.mes));
 
     const estados = countBy((r) => String(r.estado || "Unknown"))
-      .map(x => ({ estado: x.key, cantidad: x.count }))
+      .map((x) => ({ estado: x.key, cantidad: x.count }))
       .sort((a, b) => b.cantidad - a.cantidad);
 
     return res.json({
@@ -841,7 +876,6 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         porDia,
         porMes,
         estados,
-        // para pastel “Cotizado vs Entregado”
         pieCotVsEnt: {
           cotizado: sumCot,
           entregado: sumEnt,
@@ -857,6 +891,7 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN: CREATE USER
+   - ahora guarda province y warehouse_code
 ========================================================= */
 app.post("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
@@ -866,6 +901,9 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
     const fullName = String(req.body?.fullName || req.body?.full_name || "").trim();
     const pin = String(req.body?.pin || "").trim();
 
+    const province = String(req.body?.province || "").trim();
+    const warehouse_code = String(req.body?.warehouse_code || req.body?.warehouse || "").trim();
+
     if (!username) return res.status(400).json({ ok: false, message: "username requerido" });
     if (!pin || pin.length < 4) return res.status(400).json({ ok: false, message: "PIN mínimo 4" });
 
@@ -873,14 +911,14 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
 
     const ins = await dbQuery(
       `
-      INSERT INTO app_users(username, full_name, pin_hash, is_active)
-      VALUES ($1,$2,$3,TRUE)
-      RETURNING id, username, full_name, is_active, created_at;
+      INSERT INTO app_users(username, full_name, pin_hash, is_active, province, warehouse_code)
+      VALUES ($1,$2,$3,TRUE,$4,$5)
+      RETURNING id, username, full_name, is_active, province, warehouse_code, created_at;
       `,
-      [username, fullName, pin_hash]
+      [username, fullName, pin_hash, province, warehouse_code]
     );
 
-    await audit("USER_CREATED", req, "ADMIN", { username, fullName });
+    await audit("USER_CREATED", req, "ADMIN", { username, fullName, province, warehouse_code });
 
     return res.json({ ok: true, user: ins.rows[0] });
   } catch (e) {
@@ -933,7 +971,7 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
       UPDATE app_users
       SET is_active = NOT is_active
       WHERE id = $1
-      RETURNING id, username, full_name, is_active, created_at;
+      RETURNING id, username, full_name, is_active, province, warehouse_code, created_at;
       `,
       [id]
     );
@@ -989,7 +1027,7 @@ app.post("/api/auth/login", async (req, res) => {
 
     const r = await dbQuery(
       `
-      SELECT id, username, full_name, pin_hash, is_active
+      SELECT id, username, full_name, pin_hash, is_active, province, warehouse_code
       FROM app_users
       WHERE username = $1
       LIMIT 1;
@@ -1025,6 +1063,8 @@ app.post("/api/auth/login", async (req, res) => {
         id: user.id,
         username: user.username,
         full_name: user.full_name || "",
+        province: user.province || "",
+        warehouse_code: user.warehouse_code || "",
       },
     });
   } catch (e) {
@@ -1105,6 +1145,8 @@ function buildItemResponse(itemFull, code, priceListNo) {
   return {
     ok: true,
     item,
+    // ✅ este price lo usas como "precio caja" (tu UI trabaja en caja)
+    priceCaja: price,
     price,
     stock: {
       onHand,
@@ -1157,6 +1199,8 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
       warehouse: SAP_WAREHOUSE,
       priceList: SAP_PRICE_LIST,
       priceListNo,
+      // ✅ para UI (precio en caja)
+      priceCaja: r.priceCaja,
       price: r.price,
       stock: r.stock,
     });
@@ -1200,6 +1244,8 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
             ok: true,
             name: r.item.ItemName,
             unit: r.item.SalesUnit,
+            // ✅ precio en caja
+            priceCaja: r.priceCaja,
             price: r.price,
             stock: r.stock,
           };
@@ -1263,7 +1309,8 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ SAP: CREAR COTIZACIÓN
-   ✅ ahora acepta JSON o multipart con adjuntos
+   - agrega [wh:XXX] en comments para que Dashboard/Histórico muestren bodega
+   - interpreta qty como CANTIDAD EN CAJAS (no unidades)
 ========================================================= */
 app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
   try {
@@ -1276,7 +1323,6 @@ app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
     const isMultipart = String(req.headers["content-type"] || "").includes("multipart/form-data");
 
     if (isMultipart) {
-      // en multipart viene "payload" como string
       if (req.body?.payload) {
         try {
           body = JSON.parse(req.body.payload);
@@ -1293,11 +1339,28 @@ app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
     if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
     if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
 
+    const creator = req.user?.username || "unknown";
+
+    // ✅ buscamos bodega del usuario (si existe en DB)
+    const meta = await getUserMetaByUsername(creator);
+    const whUser = String(meta?.warehouse_code || "").trim();
+    const whFinal = whUser || String(body?.warehouse || body?.wh || "").trim() || SAP_WAREHOUSE;
+
+    // ✅ IMPORTANTE: qty se toma como CAJAS
+    // (si en front ya trabajan en cajas, no hay conversión)
     const DocumentLines = lines
-      .map((l) => ({
-        ItemCode: String(l.itemCode || "").trim(),
-        Quantity: Number(l.qty || 0),
-      }))
+      .map((l) => {
+        const itemCode = String(l.itemCode || "").trim();
+
+        // preferimos qtyCaja / qtyBoxes si viene, si no qty
+        const qtyBoxes =
+          Number(l.qtyCaja ?? l.qtyBoxes ?? l.qty ?? 0);
+
+        return {
+          ItemCode: itemCode,
+          Quantity: Number.isFinite(qtyBoxes) ? qtyBoxes : 0,
+        };
+      })
       .filter((x) => x.ItemCode && x.Quantity > 0);
 
     if (!DocumentLines.length) {
@@ -1305,11 +1368,12 @@ app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
     }
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
-    const creator = req.user?.username || "unknown";
 
+    // ✅ guardamos tags para que luego dashboard/histórico lo lean
     const sapComments = [
       `[WEB PEDIDOS]`,
       `[user:${creator}]`,
+      `[wh:${whFinal}]`,
       comments ? comments : "Cotización mercaderista",
     ].join(" ");
 
@@ -1321,7 +1385,7 @@ app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
       attachmentEntry = await createSapAttachmentEntry(files);
     }
 
-    // ✅ 2) Crear cotización y asignar AttachmentEntry
+    // ✅ 2) Crear cotización
     const payload = {
       CardCode: cardCode,
       DocDate: docDate,
@@ -1341,6 +1405,7 @@ app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
       cardCode,
       lines: DocumentLines.length,
       docDate,
+      wh: whFinal,
       hasAttachments: files.length > 0,
       attachmentEntry: attachmentEntry || null,
     });
@@ -1350,6 +1415,7 @@ app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
       message: "Cotización creada",
       docEntry: created.DocEntry,
       docNum: created.DocNum,
+      warehouse: whFinal,
       attachmentEntry: attachmentEntry || null,
     });
   } catch (err) {
