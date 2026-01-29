@@ -393,7 +393,7 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: USERS + CRUD (igual que tu base)
+   ✅ ADMIN: USERS + CRUD
 ========================================================= */
 let ALLOWED_USERS_CACHE = { ts: 0, set: null };
 const ALLOWED_USERS_TTL_MS = 60_000;
@@ -612,7 +612,8 @@ async function getPriceListNoByNameCached(name) {
     PRICE_LIST_CACHE.name === name &&
     PRICE_LIST_CACHE.no !== null &&
     now - PRICE_LIST_CACHE.ts < PRICE_LIST_TTL_MS
-  ) return PRICE_LIST_CACHE.no;
+  )
+    return PRICE_LIST_CACHE.no;
 
   const safe = name.replace(/'/g, "''");
   let no = null;
@@ -679,7 +680,7 @@ function getSalesUomFactor(itemFull) {
 }
 
 /* =========================================================
-   ✅ CACHE + SINGLE-FLIGHT (CLAVE para que no tarde 1 minuto)
+   ✅ CACHE + SINGLE-FLIGHT
 ========================================================= */
 function cacheGet(map, key, ttl) {
   const c = map.get(key);
@@ -701,6 +702,16 @@ const INFLIGHT_ITEM = new Map(); // key -> promise
 
 const ITEM_META_TTL_MS = 6 * 60 * 60 * 1000; // 6 horas
 const ITEM_STOCK_TTL_MS = 10_000; // 10s
+
+// ✅ helper robusto: encuentra la bodega exacta (TRIM + string)
+function findWarehouseRow(collection, warehouseCode) {
+  if (!Array.isArray(collection) || !collection.length) return null;
+  const wh = String(warehouseCode || "").trim();
+  return (
+    collection.find((w) => String(w?.WarehouseCode || "").trim() === wh) ||
+    null
+  );
+}
 
 async function fetchItemMeta(code, priceListNo) {
   const key = `${code}::${priceListNo}`;
@@ -738,45 +749,36 @@ async function fetchItemMeta(code, priceListNo) {
   return meta;
 }
 
+/* =========================================================
+   ✅ STOCK (CORREGIDO)
+   - En algunos Service Layer, el path /Items('x')/ItemWarehouseInfoCollection
+     + $filter no funciona bien o devuelve vacío.
+   - Solución: traer ItemWarehouseInfoCollection por $expand (como tu código viejo)
+     y luego filtrar en JS por WarehouseCode.
+========================================================= */
 async function fetchItemStock(code, warehouseCode) {
   const key = `${code}::${warehouseCode}`;
   const cached = cacheGet(ITEM_STOCK_CACHE, key, ITEM_STOCK_TTL_MS);
   if (cached) return cached;
 
-  const whSafe = String(warehouseCode).replace(/'/g, "''");
+  let itemFull = null;
 
-  let row = null;
-
-  // ✅ Intento 1: navegación con filtro normal (sin double-encode)
+  // ✅ Método compatible: $expand ItemWarehouseInfoCollection y buscar la bodega en JS
   try {
-    const r = await slFetch(
-      `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection` +
-        `?$select=WarehouseCode,InStock,Committed,Ordered` +
-        `&$filter=WarehouseCode eq '${whSafe}'&$top=1`
+    itemFull = await slFetch(
+      `/Items('${encodeURIComponent(code)}')` +
+        `?$select=ItemCode,ItemWarehouseInfoCollection` +
+        `&$expand=ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`
     );
-    const values = Array.isArray(r?.value) ? r.value : [];
-    row = values[0] || null;
   } catch {
-    row = null;
+    itemFull = null;
   }
 
-  // ✅ Fallback 2: si no soporta filtro en navegación, traer top y filtrar en JS
-  if (!row) {
-    try {
-      const r2 = await slFetch(
-        `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection` +
-          `?$select=WarehouseCode,InStock,Committed,Ordered&$top=50`
-      );
-      const values2 = Array.isArray(r2?.value) ? r2.value : [];
-      row = values2.find((x) => String(x?.WarehouseCode || "") === String(warehouseCode)) || null;
-    } catch {
-      row = null;
-    }
-  }
+  const wrow = findWarehouseRow(itemFull?.ItemWarehouseInfoCollection, warehouseCode);
 
-  const onHand = row?.InStock != null ? Number(row.InStock) : null;
-  const committed = row?.Committed != null ? Number(row.Committed) : null;
-  const ordered = row?.Ordered != null ? Number(row.Ordered) : null;
+  const onHand = wrow?.InStock != null ? Number(wrow.InStock) : null;
+  const committed = wrow?.Committed != null ? Number(wrow.Committed) : null;
+  const ordered = wrow?.Ordered != null ? Number(wrow.Ordered) : null;
 
   let available = null;
   if (Number.isFinite(onHand) && Number.isFinite(committed)) available = onHand - committed;
@@ -795,20 +797,17 @@ async function fetchItemStock(code, warehouseCode) {
 }
 
 /* =========================================================
-   ✅ MEGA OPT: 1 SOLA LLAMADA (si SAP lo soporta)
+   ✅ 1 SOLA LLAMADA (CORREGIDO)
+   - Quitamos $filter dentro del $expand (no siempre lo soporta SAP SL)
+   - Expandimos toda la colección y filtramos por bodega en JS (como tu viejo)
 ========================================================= */
 async function fetchItemAllInOne(code, priceListNo, warehouseCode) {
-  const whSafe = String(warehouseCode).replace(/'/g, "''");
-
   const path =
     `/Items('${encodeURIComponent(code)}')` +
-    `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage` +
+    `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage,ItemWarehouseInfoCollection` +
     `&$expand=` +
     `ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity),` +
-    `ItemWarehouseInfoCollection(` +
-    `$select=WarehouseCode,InStock,Committed,Ordered;` +
-    `$filter=WarehouseCode eq '${whSafe}'` +
-    `)`;
+    `ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`;
 
   const itemFull = await slFetch(path);
 
@@ -816,9 +815,7 @@ async function fetchItemAllInOne(code, priceListNo, warehouseCode) {
   const factorCaja = getSalesUomFactor(itemFull);
   const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
 
-  const wrow = Array.isArray(itemFull?.ItemWarehouseInfoCollection)
-    ? itemFull.ItemWarehouseInfoCollection[0] || null
-    : null;
+  const wrow = findWarehouseRow(itemFull?.ItemWarehouseInfoCollection, warehouseCode);
 
   const onHand = wrow?.InStock != null ? Number(wrow.InStock) : null;
   const committed = wrow?.Committed != null ? Number(wrow.Committed) : null;
@@ -891,7 +888,7 @@ async function getOneItemOptimized(code, priceListNo, warehouseCode) {
 }
 
 /* =========================================================
-   ✅ SAP: ITEM (rápido)  + ✅ INVENTARIO VISIBLE
+   ✅ SAP: ITEM (rápido) + ✅ INVENTARIO VISIBLE
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -900,7 +897,7 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
 
-    const warehouseCode = getWarehouseFromReq(req);
+    const warehouseCode = getWarehouseFromReq(req); // ✅ bodega del usuario (token)
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
 
     const r = await getOneItemOptimized(code, priceListNo, warehouseCode);
@@ -926,69 +923,6 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
     });
   } catch (err) {
     console.error("❌ /api/sap/item:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* =========================================================
-   ✅ (INTEGRADO DEL CÓDIGO VIEJO) SAP: MULTI ITEMS
-   - tu web de pedidos normalmente llama /api/sap/items?codes=...
-   - aquí devolvemos stock por bodega para cada item (igual que antes)
-   ✅ NO TOCA lo demás, solo agrega este endpoint
-========================================================= */
-app.get("/api/sap/items", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const codes = String(req.query.codes || "")
-      .split(",")
-      .map((x) => x.trim())
-      .filter(Boolean);
-
-    if (!codes.length) return res.status(400).json({ ok: false, message: "codes vacío" });
-
-    const warehouseCode = getWarehouseFromReq(req);
-    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
-
-    const CONCURRENCY = 6;
-    const items = {};
-    let i = 0;
-
-    async function worker() {
-      while (i < codes.length) {
-        const idx = i++;
-        const code = codes[idx];
-        try {
-          const r = await getOneItemOptimized(code, priceListNo, warehouseCode);
-          items[code] = {
-            ok: true,
-            name: r.item?.ItemName,
-            unit: r.item?.SalesUnit, // Caja
-            price: r.price, // Caja (si factor existe)
-            priceUnit: r.priceUnit,
-            factorCaja: r.factorCaja,
-            stock: r.stock, // ✅ inventario por bodega
-            disponible: r?.stock?.available ?? null, // ✅ visible (compat)
-            enStock: r?.stock?.hasStock ?? null, // ✅ visible (compat)
-          };
-        } catch (e) {
-          items[code] = { ok: false, message: String(e.message || e) };
-        }
-      }
-    }
-
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-
-    return res.json({
-      ok: true,
-      warehouse: warehouseCode,
-      bodega: warehouseCode, // ✅ alias
-      priceList: SAP_PRICE_LIST,
-      priceListNo,
-      items,
-    });
-  } catch (err) {
-    console.error("❌ /api/sap/items:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
@@ -1132,7 +1066,7 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: HISTÓRICO / DASHBOARD (igual a tu lógica anterior)
+   ✅ ADMIN: HISTÓRICO / DASHBOARD
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
