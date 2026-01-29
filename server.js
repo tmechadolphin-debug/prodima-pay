@@ -1151,9 +1151,18 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
    - agrega CancelStatus en select + rows.push
    - OMITE canceladas (csYes) sin contarlas
 ========================================================= */
+/* =========================================================
+   ✅ ADMIN: DASHBOARD
+   ✅ FIX:
+   - scope=created ahora filtra en SAP por Comments ([user:...]) para que sea rápido
+   - si no hay usuarios creados => responde inmediato
+   - mantiene exclusión de canceladas (csYes)
+========================================================= */
 app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
 
     const scope = String(req.query?.scope || "created").trim().toLowerCase(); // created | all
     const fromQ = String(req.query?.from || "").trim();
@@ -1166,7 +1175,7 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
     const PAGE_SIZE = Math.min(Math.max(Number(req.query?.top || 500), 50), 500);
     const MAX_PAGES = Math.min(Math.max(Number(req.query?.maxPages || 20), 1), 80);
 
-    // ✅ helpers de parseo (no existían en este viejo)
+    // ✅ helpers de parseo
     const parseUserFromComments = (comments = "") => {
       const m = String(comments).match(/\[user:([^\]]+)\]/i);
       return m ? String(m[1]).trim() : "";
@@ -1178,39 +1187,127 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
 
     // ✅ scope=created -> solo usuarios existentes en app_users
     let allowedUsersSet = null;
+
+    // (opcional) cache corto para no pegarle a DB siempre
+    // si no quieres cache, puedes borrar este bloque y dejar el query directo.
+    if (!global.__ALLOWED_USERS_CACHE__) {
+      global.__ALLOWED_USERS_CACHE__ = { ts: 0, set: null };
+    }
+    const USERS_TTL_MS = 60 * 1000; // 1 min
+
     if (scope === "created") {
       if (!hasDb()) {
-        allowedUsersSet = new Set();
+        allowedUsersSet = new Set(); // no DB => no hay "created"
       } else {
-        const r = await dbQuery(`SELECT username FROM app_users;`);
-        allowedUsersSet = new Set(
-          (r.rows || [])
-            .map((x) => String(x.username || "").trim().toLowerCase())
-            .filter(Boolean)
-        );
+        const now = Date.now();
+        const cache = global.__ALLOWED_USERS_CACHE__;
+        if (cache.set && now - cache.ts < USERS_TTL_MS) {
+          allowedUsersSet = cache.set;
+        } else {
+          const r = await dbQuery(`SELECT username FROM app_users WHERE is_active = TRUE;`);
+          allowedUsersSet = new Set(
+            (r.rows || [])
+              .map((x) => String(x.username || "").trim().toLowerCase())
+              .filter(Boolean)
+          );
+          global.__ALLOWED_USERS_CACHE__ = { ts: now, set: allowedUsersSet };
+        }
+      }
+
+      // ✅ si no hay usuarios creados, responde inmediato (evita “cargando”)
+      if (!allowedUsersSet || allowedUsersSet.size === 0) {
+        return res.json({
+          ok: true,
+          scope,
+          from,
+          to: to || null,
+          fetched: 0,
+          kpis: { totalCotizaciones: 0, montoCotizado: 0, montoEntregado: 0, fillRate: 0 },
+          charts: {
+            topUsuariosMonto: [],
+            topClientesMonto: [],
+            porBodegaMonto: [],
+            porDia: [],
+            porMes: [],
+            estados: [],
+            pieCotVsEnt: { cotizado: 0, entregado: 0, fillRate: 0 },
+          },
+        });
       }
     }
 
-    const filterParts = [];
-    if (from) filterParts.push(`DocDate ge '${from}'`);
-    if (to) filterParts.push(`DocDate le '${to}'`);
+    // ✅ arma $filter base por fechas
+    const baseFilterParts = [];
+    if (from) baseFilterParts.push(`DocDate ge '${from}'`);
+    if (to) baseFilterParts.push(`DocDate le '${to}'`);
 
-    const sapFilter = filterParts.length
-      ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
-      : "";
+    // ✅ si scope=created y la lista es “razonable”, filtramos en SAP por Comments
+    // (evita URL enorme si hay demasiados usuarios)
+    const MAX_USERS_IN_SAP_FILTER = 25;
+    const usersForSap =
+      scope === "created" && allowedUsersSet
+        ? [...allowedUsersSet].slice(0, MAX_USERS_IN_SAP_FILTER)
+        : [];
 
-    // ✅ Traemos CancelStatus
+    function buildUserCommentsFilter(useSubstringof) {
+      if (!usersForSap.length) return "";
+
+      const clauses = usersForSap.map((u) => {
+        const safeU = String(u).replace(/'/g, "''");
+        const needle = `[user:${safeU}]`;
+        return useSubstringof
+          ? `substringof('${needle.replace(/'/g, "''")}',Comments)`
+          : `contains(Comments,'${needle.replace(/'/g, "''")}')`;
+      });
+
+      return `(${clauses.join(" or ")})`;
+    }
+
+    // ✅ Construye filtro completo (intentamos contains, fallback substringof)
+    function buildSapFilter(useSubstringof) {
+      const parts = [...baseFilterParts];
+
+      if (scope === "created" && usersForSap.length) {
+        const userPart = buildUserCommentsFilter(useSubstringof);
+        if (userPart) parts.push(userPart);
+      }
+
+      return parts.length ? `&$filter=${encodeURIComponent(parts.join(" and "))}` : "";
+    }
+
     const SELECT =
       `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Cancelled,Comments`;
 
+    async function fetchPage(sapSkip, useSubstringof) {
+      const sapFilter = buildSapFilter(useSubstringof);
+      return slFetch(
+        `/Quotations?$select=${SELECT}` +
+          `&$orderby=DocDate desc&$top=${PAGE_SIZE}&$skip=${sapSkip}${sapFilter}`
+      );
+    }
+
     const all = [];
-    let skip = 0;
+    let sapSkip = 0;
+
+    // ✅ probamos contains primero; si falla, usamos substringof
+    let useSubstringof = false;
+    let triedFallback = false;
 
     for (let page = 0; page < MAX_PAGES; page++) {
-      const sap = await slFetch(
-        `/Quotations?$select=${SELECT}` +
-          `&$orderby=DocDate desc&$top=${PAGE_SIZE}&$skip=${skip}${sapFilter}`
-      );
+      let sap;
+      try {
+        sap = await fetchPage(sapSkip, useSubstringof);
+      } catch (e) {
+        const msg = String(e?.message || e);
+        // fallback típico cuando contains no existe en tu SL
+        if (!triedFallback && msg.toLowerCase().includes("contains")) {
+          triedFallback = true;
+          useSubstringof = true;
+          page--; // reintenta misma página con substringof
+          continue;
+        }
+        throw e;
+      }
 
       const values = Array.isArray(sap?.value) ? sap.value : [];
       if (!values.length) break;
@@ -1222,18 +1319,19 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         const usuario = parseUserFromComments(q.Comments || "");
         const usuarioKey = String(usuario || "").trim().toLowerCase();
 
-        if (allowedUsersSet && scope === "created") {
+        // ✅ si por alguna razón no aplicó el filtro de SAP (ej: usersForSap truncado),
+        // mantenemos el check local para no colar usuarios no creados.
+        if (scope === "created" && allowedUsersSet) {
           if (!usuarioKey || !allowedUsersSet.has(usuarioKey)) continue;
         }
 
         const cardCode = String(q.CardCode || "").trim();
         const cardName = String(q.CardName || "").trim();
-
         const warehouse = parseWhFromComments(q.Comments || "") || "sin_wh";
 
-        // ✅ excluir canceladas por CancelStatus csYes (con fallback a Cancelled)
+        // ✅ excluir canceladas (csYes) + fallback a Cancelled
         const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
-        const cancelledFlag = String(q.Cancelled || "").trim(); // tYES/tNO (por si acaso)
+        const cancelledFlag = String(q.Cancelled || "").trim();   // tYES/tNO
 
         const isCancelled =
           cancelStatus.toLowerCase() === "csyes" ||
@@ -1242,7 +1340,6 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
           cancelledFlag.toLowerCase() === "y" ||
           cancelledFlag.toLowerCase() === "true";
 
-        // ✅ NO MOSTRAR / NO CONTABILIZAR canceladas
         if (isCancelled) continue;
 
         const estado =
@@ -1269,10 +1366,7 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
           montoEntregado: 0,
           fecha: fechaISO,
           estado,
-
-          // ✅ agregado
-          cancelStatus, // (en no-canceladas será csNo normalmente)
-
+          cancelStatus, // ✅ agregado
           mes,
           anio,
           usuario: usuario || "sin_user",
@@ -1287,7 +1381,7 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         if (lastDate && lastDate < from) break;
       }
 
-      skip += PAGE_SIZE;
+      sapSkip += PAGE_SIZE;
     }
 
     // --- Agregaciones ---
@@ -1374,11 +1468,7 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         porDia,
         porMes,
         estados,
-        pieCotVsEnt: {
-          cotizado: sumCot,
-          entregado: sumEnt,
-          fillRate,
-        },
+        pieCotVsEnt: { cotizado: sumCot, entregado: sumEnt, fillRate },
       },
     });
   } catch (err) {
@@ -1386,6 +1476,7 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
+
 
 /* =========================================================
    ✅ SAP: CREAR COTIZACIÓN
