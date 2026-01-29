@@ -450,7 +450,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       : "";
 
     const sap = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Canceled,Comments` +
+      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments` +
         `&$orderby=DocDate desc&$top=${top}&$skip=${skip}${sapFilter}`
     );
 
