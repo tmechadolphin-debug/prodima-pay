@@ -695,9 +695,7 @@ const ITEM_META_CACHE = new Map(); // code::priceListNo -> meta
 const ITEM_STOCK_CACHE = new Map(); // code::wh -> stock
 const INFLIGHT_ITEM = new Map(); // key -> promise
 
-// ✅ meta casi no cambia
 const ITEM_META_TTL_MS = 6 * 60 * 60 * 1000; // 6 horas
-// ✅ stock corto
 const ITEM_STOCK_TTL_MS = 10_000; // 10s
 
 async function fetchItemMeta(code, priceListNo) {
@@ -705,7 +703,6 @@ async function fetchItemMeta(code, priceListNo) {
   const cached = cacheGet(ITEM_META_CACHE, key, ITEM_META_TTL_MS);
   if (cached) return cached;
 
-  // Nota: NO traemos bodegas aquí
   let itemFull;
   try {
     itemFull = await slFetch(
@@ -742,21 +739,35 @@ async function fetchItemStock(code, warehouseCode) {
   const cached = cacheGet(ITEM_STOCK_CACHE, key, ITEM_STOCK_TTL_MS);
   if (cached) return cached;
 
-  // ✅ forma rápida: colección global si existe (algunas instalaciones lo soportan)
-  // Si falla, cae a expand o a navegación
+  const whSafe = String(warehouseCode).replace(/'/g, "''");
+
   let row = null;
 
-  // 1) Intento directo por navegación:
+  // ✅ Intento 1: navegación con filtro normal (sin double-encode)
   try {
     const r = await slFetch(
       `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection` +
         `?$select=WarehouseCode,InStock,Committed,Ordered` +
-        `&$filter=${encodeURIComponent(`WarehouseCode eq '${String(warehouseCode).replace(/'/g, "''")}'`)}`
+        `&$filter=WarehouseCode eq '${whSafe}'&$top=1`
     );
     const values = Array.isArray(r?.value) ? r.value : [];
     row = values[0] || null;
   } catch {
     row = null;
+  }
+
+  // ✅ Fallback 2: si no soporta filtro en navegación, traer top y filtrar en JS
+  if (!row) {
+    try {
+      const r2 = await slFetch(
+        `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection` +
+          `?$select=WarehouseCode,InStock,Committed,Ordered&$top=50`
+      );
+      const values2 = Array.isArray(r2?.value) ? r2.value : [];
+      row = values2.find((x) => String(x?.WarehouseCode || "") === String(warehouseCode)) || null;
+    } catch {
+      row = null;
+    }
   }
 
   const onHand = row?.InStock != null ? Number(row.InStock) : null;
@@ -781,12 +792,10 @@ async function fetchItemStock(code, warehouseCode) {
 
 /* =========================================================
    ✅ MEGA OPT: 1 SOLA LLAMADA (si SAP lo soporta)
-   - Item + UoM + Prices + SOLO warehouse requerido
 ========================================================= */
 async function fetchItemAllInOne(code, priceListNo, warehouseCode) {
   const whSafe = String(warehouseCode).replace(/'/g, "''");
 
-  // $expand con filtro dentro (si tu SL lo soporta)
   const path =
     `/Items('${encodeURIComponent(code)}')` +
     `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage` +
@@ -839,7 +848,6 @@ async function fetchItemAllInOne(code, priceListNo, warehouseCode) {
    ✅ getOneItem Optimizado + SINGLE-FLIGHT
 ========================================================= */
 async function getOneItemOptimized(code, priceListNo, warehouseCode) {
-  // single-flight por key completa (evita 10 requests iguales)
   const inflightKey = `${code}::${priceListNo}::${warehouseCode}`;
 
   if (INFLIGHT_ITEM.has(inflightKey)) {
@@ -847,11 +855,9 @@ async function getOneItemOptimized(code, priceListNo, warehouseCode) {
   }
 
   const p = (async () => {
-    // 1) intenta 1-call
     try {
       const r = await fetchItemAllInOne(code, priceListNo, warehouseCode);
 
-      // llena caches (meta largo + stock corto)
       cacheSet(ITEM_META_CACHE, `${code}::${priceListNo}`, {
         item: r.item,
         price: r.price,
@@ -863,7 +869,6 @@ async function getOneItemOptimized(code, priceListNo, warehouseCode) {
 
       return r;
     } catch {
-      // 2) fallback: meta + stock (paralelo) con caches
       const [meta, stock] = await Promise.all([
         fetchItemMeta(code, priceListNo),
         fetchItemStock(code, warehouseCode),
@@ -882,7 +887,7 @@ async function getOneItemOptimized(code, priceListNo, warehouseCode) {
 }
 
 /* =========================================================
-   ✅ SAP: ITEM (rápido)
+   ✅ SAP: ITEM (rápido)  + ✅ INVENTARIO VISIBLE
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -896,17 +901,24 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 
     const r = await getOneItemOptimized(code, priceListNo, warehouseCode);
 
+    // ✅ campos “visibles” para el frontend
+    const disponible = r?.stock?.available ?? null;
+    const enStock = r?.stock?.hasStock ?? null;
+
     return res.json({
       ok: true,
       item: r.item,
       warehouse: warehouseCode,
+      bodega: warehouseCode,            // ✅ alias
       priceList: SAP_PRICE_LIST,
       priceListNo,
       price: Number(r.price ?? 0),
       priceUnit: r.priceUnit,
       factorCaja: r.factorCaja,
       uom: r.item?.SalesUnit || "Caja",
-      stock: r.stock,
+      stock: r.stock,                   // ✅ detalle
+      disponible,                       // ✅ visible
+      enStock,                          // ✅ visible
     });
   } catch (err) {
     console.error("❌ /api/sap/item:", err.message);
@@ -915,8 +927,7 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ NUEVO: SEARCH ITEMS (autocomplete por código o descripción)
-   - Esto hace que al escribir no llames /item/:code
+   ✅ NUEVO: SEARCH ITEMS (autocomplete)
 ========================================================= */
 const ITEM_SEARCH_CACHE = new Map();
 const ITEM_SEARCH_TTL_MS = 20_000;
@@ -936,7 +947,6 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const safe = q.replace(/'/g, "''");
 
-    // ✅ liviano: solo ItemCode, ItemName, SalesUnit
     let r;
     try {
       r = await slFetch(
@@ -945,7 +955,6 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
           `&$orderby=ItemName asc&$top=${top}`
       );
     } catch {
-      // fallback viejo OData
       r = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem` +
           `&$filter=substringof('${safe}',ItemCode) or substringof('${safe}',ItemName)` +
@@ -971,7 +980,7 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: SEARCH CUSTOMERS (como antes, rápido)
+   ✅ SAP: SEARCH CUSTOMERS
 ========================================================= */
 const CUSTOMER_SEARCH_CACHE = new Map();
 const CUSTOMER_SEARCH_TTL_MS = 20_000;
@@ -1057,7 +1066,6 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN: HISTÓRICO / DASHBOARD (igual a tu lógica anterior)
-   (lo dejo como lo tenías optimizado, no lo recorto)
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
