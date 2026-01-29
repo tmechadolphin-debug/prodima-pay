@@ -697,8 +697,7 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         const cardCode = String(q.CardCode || "").trim();
         const cardName = String(q.CardName || "").trim();
         const wh = parseWhFromComments(q.Comments || "") ||
-        String(q.WhsCode || q.Warehouse || q.WarehouseCode || q.wh || "").trim() ||
-        "sin_wh";
+        const wh = resolveWh(q);
 
 
         // ✅ Estado (incluye canceladas)
