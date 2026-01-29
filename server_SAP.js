@@ -537,10 +537,19 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+    if (!hasDb()) {
+      return res.status(500).json({ ok: false, message: "DB no configurada" });
+    }
 
     const r = await dbQuery(`
-      SELECT id, username, full_name, is_active, created_at
+      SELECT
+        id,
+        username,
+        full_name,
+        is_active,
+        province,
+        warehouse_code,
+        created_at
       FROM app_users
       ORDER BY created_at DESC;
     `);
@@ -548,6 +557,51 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
     return res.json({ ok: true, users: r.rows || [] });
   } catch (e) {
     console.error("❌ users list:", e.message);
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
+   ✅ ADMIN: CHANGE USER PIN
+   PATCH /api/admin/users/:id/pin
+   body: { pin }
+========================================================= */
+app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) {
+      return res.status(500).json({ ok: false, message: "DB no configurada" });
+    }
+
+    const id = Number(req.params.id);
+    const pin = String(req.body?.pin || "").trim();
+
+    if (!id || id <= 0) {
+      return res.status(400).json({ ok: false, message: "ID inválido" });
+    }
+    if (!pin || pin.length < 4) {
+      return res.status(400).json({ ok: false, message: "PIN mínimo 4" });
+    }
+
+    // ✅ Hash PIN -> pin_hash
+    const pin_hash = await bcrypt.hash(pin, 10);
+
+    const r = await dbQuery(
+      `
+      UPDATE app_users
+      SET pin_hash = $1
+      WHERE id = $2
+      RETURNING id, username, full_name, is_active, province, warehouse_code, created_at;
+      `,
+      [pin_hash, id]
+    );
+
+    if (!r.rows?.length) {
+      return res.status(404).json({ ok: false, message: "Usuario no existe" });
+    }
+
+    return res.json({ ok: true, user: r.rows[0] });
+  } catch (e) {
+    console.error("❌ change pin:", e.message);
     return res.status(500).json({ ok: false, message: e.message });
   }
 });
