@@ -107,7 +107,8 @@ async function dbQuery(text, params = []) {
 }
 
 /* =========================================================
-   ✅ DB Schema + MIGRACIONES
+   ✅ DB Schema (crear tablas si no existen)
+   + asegura columnas province/warehouse_code
 ========================================================= */
 async function ensureSchema() {
   if (!hasDb()) {
@@ -115,7 +116,6 @@ async function ensureSchema() {
     return;
   }
 
-  // Base
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS app_users (
       id BIGSERIAL PRIMARY KEY,
@@ -123,9 +123,15 @@ async function ensureSchema() {
       full_name TEXT DEFAULT '',
       pin_hash TEXT NOT NULL,
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      province TEXT DEFAULT '',
+      warehouse_code TEXT DEFAULT '',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+
+  // ✅ si ya existía la tabla vieja, aseguramos columnas
+  await dbQuery(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS province TEXT DEFAULT '';`);
+  await dbQuery(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS warehouse_code TEXT DEFAULT '';`);
 
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS audit_events (
@@ -139,11 +145,7 @@ async function ensureSchema() {
     );
   `);
 
-  // ✅ Migraciones seguras (para que no te falle el SELECT de admin/users)
-  await dbQuery(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS province TEXT DEFAULT '';`);
-  await dbQuery(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS warehouse_code TEXT DEFAULT '';`);
-
-  console.log("✅ DB Schema OK (app_users, audit_events) + migraciones");
+  console.log("✅ DB Schema OK (app_users, audit_events)");
 }
 
 async function audit(event_type, req, actor = "", payload = {}) {
@@ -226,53 +228,6 @@ function verifyUser(req, res, next) {
   } catch (e) {
     return res.status(401).json({ ok: false, message: "Token expirado o inválido" });
   }
-}
-
-/* =========================================================
-   ✅ Helpers parse tags en Comments
-========================================================= */
-function parseTag(comments = "", tag = "user") {
-  const re = new RegExp(`\\[${tag}:([^\\]]+)\\]`, "i");
-  const m = String(comments || "").match(re);
-  return m ? String(m[1]).trim() : "";
-}
-
-function parseUserFromComments(comments = "") {
-  return parseTag(comments, "user");
-}
-
-function parseWhFromComments(comments = "") {
-  return parseTag(comments, "wh");
-}
-
-/* =========================================================
-   ✅ Cache: mapa username->warehouse_code (para inferir bodega)
-========================================================= */
-let USER_WH_CACHE = { ts: 0, map: new Map() };
-const USER_WH_TTL_MS = 30 * 1000;
-
-async function getUserWarehouseMapCached() {
-  if (!hasDb()) return new Map();
-  const now = Date.now();
-  if (USER_WH_CACHE.map.size && now - USER_WH_CACHE.ts < USER_WH_TTL_MS) {
-    return USER_WH_CACHE.map;
-  }
-  const r = await dbQuery(`SELECT username, warehouse_code FROM app_users;`);
-  const m = new Map();
-  for (const row of r.rows || []) {
-    const u = String(row.username || "").trim().toLowerCase();
-    const wh = String(row.warehouse_code || "").trim();
-    if (u) m.set(u, wh);
-  }
-  USER_WH_CACHE = { ts: now, map: m };
-  return m;
-}
-
-async function getWarehouseForUsername(username) {
-  const u = String(username || "").trim().toLowerCase();
-  if (!u) return "";
-  const map = await getUserWarehouseMapCached();
-  return String(map.get(u) || "").trim();
 }
 
 /* =========================================================
@@ -405,7 +360,9 @@ async function createSapAttachmentEntry(files = []) {
 
     fs.copyFileSync(f.path, dest);
 
-    try { fs.unlinkSync(f.path); } catch {}
+    try {
+      fs.unlinkSync(f.path);
+    } catch {}
 
     lines.push({
       FileName: path.basename(finalName, "." + ext),
@@ -423,6 +380,43 @@ async function createSapAttachmentEntry(files = []) {
   if (!absoluteEntry) throw new Error("No se creó AttachmentEntry en SAP.");
 
   return absoluteEntry;
+}
+
+/* =========================================================
+   ✅ Helpers parse tags en Comments
+========================================================= */
+function parseUserFromComments(comments = "") {
+  const m = String(comments).match(/\[user:([^\]]+)\]/i);
+  return m ? String(m[1]).trim() : "";
+}
+
+function parseWhFromComments(comments = "") {
+  const m = String(comments).match(/\[wh:([^\]]+)\]/i);
+  return m ? String(m[1]).trim() : "";
+}
+
+/* =========================================================
+   ✅ Helper: trae meta del usuario (province, warehouse_code)
+========================================================= */
+async function getUserMetaByUsername(username) {
+  if (!hasDb()) return null;
+  const u = String(username || "").trim().toLowerCase();
+  if (!u) return null;
+
+  try {
+    const r = await dbQuery(
+      `
+      SELECT username, full_name, province, warehouse_code, is_active
+      FROM app_users
+      WHERE username = $1
+      LIMIT 1;
+      `,
+      [u]
+    );
+    return r.rows?.[0] || null;
+  } catch {
+    return null;
+  }
 }
 
 /* =========================================================
@@ -468,7 +462,7 @@ app.post("/api/admin/login", async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
-   FIX: bodega visible + scope=created paginado correctamente
+   - incluye Bodega (warehouse) parseada de comments [wh:XXX]
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -476,28 +470,14 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
     }
 
-    const scope = String(req.query?.scope || "all").trim().toLowerCase(); // created | all
-
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
 
     const from = String(req.query?.from || "").trim();
     const to = String(req.query?.to || "").trim();
 
-    // "top" = tamaño página que quieres devolver YA filtrado
-    const top = Math.min(Number(req.query?.top || req.query?.limit || 20), 200);
-    const skip = Math.max(Number(req.query?.skip || 0), 0); // para UI (página)
-
-    // Para construir "página" con filtros, hay que traer más de SAP (porque filtro se hace en Node)
-    const SAP_PAGE = Math.min(Math.max(Number(req.query?.sapPage || 200), 50), 500);
-    const MAX_PAGES = Math.min(Math.max(Number(req.query?.maxPages || 30), 1), 80);
-
-    // ✅ allowed users para scope=created
-    let allowedUsersSet = null;
-    if (scope === "created") {
-      const whMap = await getUserWarehouseMapCached();
-      allowedUsersSet = new Set([...whMap.keys()]); // usernames
-    }
+    const top = Math.min(Number(req.query?.top || req.query?.limit || 200), 500);
+    const skip = Math.max(Number(req.query?.skip || 0), 0);
 
     const filterParts = [];
     if (from) filterParts.push(`DocDate ge '${from}'`);
@@ -507,105 +487,95 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
       : "";
 
-    // ✅ Traemos CancelStatus + Comments (para usuario y wh)
-    const SELECT =
-      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
+    // ✅ incluye CancelStatus + Cancelled (por compat)
+    const sap = await slFetch(
+      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Cancelled,Comments` +
+        `&$orderby=DocDate desc&$top=${top}&$skip=${skip}${sapFilter}`
+    );
 
-    const whMap = await getUserWarehouseMapCached();
+    const values = Array.isArray(sap?.value) ? sap.value : [];
+    let rows = [];
 
-    // Queremos devolver "top" registros DESPUÉS de aplicar filtros, empezando en "skip"
-    const targetStart = skip;
-    const targetEnd = skip + top;
+    for (const q of values) {
+      const rawDate = String(q.DocDate || "");
+      const fechaISO = rawDate.slice(0, 10);
 
-    let rowsAllFiltered = [];
-    let sapSkip = 0;
+      const usuario = parseUserFromComments(q.Comments || "");
+      const cardCode = String(q.CardCode || "").trim();
+      const cardName = String(q.CardName || "").trim();
 
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const sap = await slFetch(
-        `/Quotations?$select=${SELECT}` +
-          `&$orderby=DocDate desc&$top=${SAP_PAGE}&$skip=${sapSkip}${sapFilter}`
-      );
+      const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
 
-      const values = Array.isArray(sap?.value) ? sap.value : [];
-      if (!values.length) break;
+      // ✅ Cancelled robusto (CancelStatus o Cancelled)
+      const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo (típico)
+      const cancelledFlag = String(q.Cancelled || "").trim(); // tYES/tNO (típico)
 
-      for (const q of values) {
-        const fechaISO = String(q.DocDate || "").slice(0, 10);
-        const cardCode = String(q.CardCode || "").trim();
-        const cardName = String(q.CardName || "").trim();
+      const isCancelled =
+        cancelStatus.toLowerCase() === "csyes" ||
+        cancelStatus.toLowerCase() === "yes" ||
+        cancelStatus.toLowerCase() === "tyes" ||
+        cancelledFlag.toLowerCase() === "tyes" ||
+        cancelledFlag.toLowerCase() === "yes" ||
+        cancelledFlag.toLowerCase() === "y" ||
+        cancelledFlag.toLowerCase() === "true";
 
-        const usuario = parseUserFromComments(q.Comments || "");
-        const usuarioKey = String(usuario || "").trim().toLowerCase();
+      const estado = isCancelled
+        ? "Cancelled"
+        : q.DocumentStatus === "bost_Open"
+        ? "Open"
+        : q.DocumentStatus === "bost_Close"
+        ? "Close"
+        : String(q.DocumentStatus || "");
 
-        // ✅ scope created
-        if (allowedUsersSet && scope === "created") {
-          if (!usuarioKey || !allowedUsersSet.has(usuarioKey)) continue;
-        }
+      let mes = "";
+      let anio = "";
+      try {
+        const d = new Date(fechaISO);
+        mes = d.toLocaleString("es-PA", { month: "long" });
+        anio = String(d.getFullYear());
+      } catch {}
 
-        // ✅ filtros UI
-        if (userFilter && !String(usuarioKey).includes(userFilter)) continue;
+      rows.push({
+        docEntry: q.DocEntry,
+        docNum: q.DocNum,
+        cardCode,
+        cardName,
+        customerName: cardName,
+        nombreCliente: cardName,
+        montoCotizacion: Number(q.DocTotal || 0),
+        montoEntregado: 0,
+        fecha: fechaISO,
 
-        if (clientFilter) {
-          const cc = String(cardCode || "").toLowerCase();
-          const cn = String(cardName || "").toLowerCase();
-          if (!cc.includes(clientFilter) && !cn.includes(clientFilter)) continue;
-        }
-
-        // ✅ Estado Cancelled correcto
-        const cancelStatus = String(q.CancelStatus || "").trim();
-        const isCancelled =
-          cancelStatus.toLowerCase() === "csyes" ||
-          cancelStatus.toLowerCase() === "yes" ||
-          cancelStatus.toLowerCase() === "tyes";
-
-        const estado = isCancelled
-          ? "Cancelled"
-          : q.DocumentStatus === "bost_Open"
-          ? "Open"
-          : q.DocumentStatus === "bost_Close"
-          ? "Close"
-          : String(q.DocumentStatus || "");
-
-        // ✅ Bodega: 1) comments [wh:] 2) inferir por usuario en DB 3) fallback
-        const whFromComments = parseWhFromComments(q.Comments || "");
-        const whFromDb = usuarioKey ? String(whMap.get(usuarioKey) || "") : "";
-        const warehouse = (whFromComments || whFromDb || "").trim() || "sin_wh";
-
-        rowsAllFiltered.push({
-          docEntry: q.DocEntry,
-          docNum: q.DocNum,
-          cardCode,
-          cardName,
-          customerName: cardName,
-          nombreCliente: cardName,
-          montoCotizacion: Number(q.DocTotal || 0),
-          montoEntregado: 0,
-          fecha: fechaISO,
-          estado,
-          isCancelled,
-          usuario: usuario || "sin_user",
-          bodega: warehouse,      // ✅ para UI
-          warehouse: warehouse,   // ✅ alias
-          comments: q.Comments || "",
-        });
-      }
-
-      // Ya tenemos suficiente para cubrir hasta targetEnd
-      if (rowsAllFiltered.length >= targetEnd) break;
-
-      sapSkip += SAP_PAGE;
+        // ✅ UI
+        estado,
+        isCancelled,
+        mes,
+        anio,
+        usuario: usuario || "sin_user",
+        warehouse: wh,
+        bodega: wh,
+        comments: q.Comments || "",
+      });
     }
 
-    const pageRows = rowsAllFiltered.slice(targetStart, targetEnd);
+    if (userFilter) {
+      rows = rows.filter((r) => String(r.usuario || "").toLowerCase().includes(userFilter));
+    }
+
+    if (clientFilter) {
+      rows = rows.filter(
+        (r) =>
+          String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
+          String(r.cardName || "").toLowerCase().includes(clientFilter)
+      );
+    }
 
     return res.json({
       ok: true,
-      scope,
       top,
       skip,
-      totalFilteredSoFar: rowsAllFiltered.length, // útil para debug
-      count: pageRows.length,
-      quotes: pageRows,
+      count: rows.length,
+      quotes: rows,
     });
   } catch (err) {
     console.error("❌ /api/admin/quotes:", err.message);
@@ -685,8 +655,9 @@ app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: DASHBOARD (KPIs + agrupaciones)
-   FIX: bodega visible + Cancelled correcto + inferencia DB
+   ✅ ADMIN: DASHBOARD
+   - incluye bodega en dataset
+   - OMITE canceladas (no las contabiliza)
 ========================================================= */
 app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   try {
@@ -705,11 +676,19 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
     const PAGE_SIZE = Math.min(Math.max(Number(req.query?.top || 500), 50), 500);
     const MAX_PAGES = Math.min(Math.max(Number(req.query?.maxPages || 20), 1), 60);
 
-    const whMap = await getUserWarehouseMapCached();
-
+    // ✅ scope=created -> solo usuarios existentes en app_users
     let allowedUsersSet = null;
     if (scope === "created") {
-      allowedUsersSet = new Set([...whMap.keys()]);
+      if (!hasDb()) {
+        allowedUsersSet = new Set();
+      } else {
+        const r = await dbQuery(`SELECT username FROM app_users;`);
+        allowedUsersSet = new Set(
+          (r.rows || [])
+            .map((x) => String(x.username || "").trim().toLowerCase())
+            .filter(Boolean)
+        );
+      }
     }
 
     const filterParts = [];
@@ -720,9 +699,9 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
       : "";
 
-    // ✅ Usamos CancelStatus (más confiable para estado)
+    // ✅ Traemos CancelStatus y Cancelled (por compat)
     const SELECT =
-      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
+      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Cancelled,Comments`;
 
     let all = [];
     let skip = 0;
@@ -737,7 +716,8 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       if (!values.length) break;
 
       for (const q of values) {
-        const fechaISO = String(q.DocDate || "").slice(0, 10);
+        const rawDate = String(q.DocDate || "");
+        const fechaISO = rawDate.slice(0, 10);
 
         const usuario = parseUserFromComments(q.Comments || "");
         const usuarioKey = String(usuario || "").trim().toLowerCase();
@@ -749,25 +729,30 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         const cardCode = String(q.CardCode || "").trim();
         const cardName = String(q.CardName || "").trim();
 
-        // ✅ Bodega: comments -> DB -> fallback
-        const whFromComments = parseWhFromComments(q.Comments || "");
-        const whFromDb = usuarioKey ? String(whMap.get(usuarioKey) || "") : "";
-        const warehouse = (whFromComments || whFromDb || "").trim() || "sin_wh";
+        // ✅ bodega desde comments
+        const warehouse = parseWhFromComments(q.Comments || "") || "sin_wh";
 
-        // ✅ Estado Cancelled correcto
-        const cancelStatus = String(q.CancelStatus || "").trim();
+        // ✅ Cancelled robusto
+        const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
+        const cancelledFlag = String(q.Cancelled || "").trim(); // tYES/tNO
+
         const isCancelled =
           cancelStatus.toLowerCase() === "csyes" ||
           cancelStatus.toLowerCase() === "yes" ||
-          cancelStatus.toLowerCase() === "tyes";
+          cancelStatus.toLowerCase() === "tyes" ||
+          cancelledFlag.toLowerCase() === "tyes" ||
+          cancelledFlag.toLowerCase() === "yes" ||
+          cancelledFlag.toLowerCase() === "y" ||
+          cancelledFlag.toLowerCase() === "true";
 
-        const estado = isCancelled
-          ? "Cancelled"
-          : q.DocumentStatus === "bost_Open"
-          ? "Open"
-          : q.DocumentStatus === "bost_Close"
-          ? "Close"
-          : String(q.DocumentStatus || "");
+        const estado =
+          isCancelled
+            ? "Cancelled"
+            : q.DocumentStatus === "bost_Open"
+            ? "Open"
+            : q.DocumentStatus === "bost_Close"
+            ? "Close"
+            : String(q.DocumentStatus || "");
 
         let mes = "";
         let anio = "";
@@ -786,6 +771,7 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
           montoEntregado: 0,
           fecha: fechaISO,
           estado,
+          isCancelled, // ✅ lo guardamos
           mes,
           anio,
           usuario: usuario || "sin_user",
@@ -803,6 +789,10 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       skip += PAGE_SIZE;
     }
 
+    // ✅ CLAVE: OMITIR CANCELADAS EN DASHBOARD (no se cuentan, no se suman, no salen en charts)
+    all = all.filter((r) => !r.isCancelled);
+
+    // --- Agregaciones ---
     const sumCot = all.reduce((acc, x) => acc + (Number(x.montoCotizacion) || 0), 0);
     const sumEnt = all.reduce((acc, x) => acc + (Number(x.montoEntregado) || 0), 0);
     const fillRate = sumCot > 0 ? sumEnt / sumCot : 0;
@@ -886,7 +876,11 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         porDia,
         porMes,
         estados,
-        pieCotVsEnt: { cotizado: sumCot, entregado: sumEnt, fillRate },
+        pieCotVsEnt: {
+          cotizado: sumCot,
+          entregado: sumEnt,
+          fillRate,
+        },
       },
     });
   } catch (err) {
@@ -897,7 +891,7 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN: CREATE USER
-   (agrega province + warehouse_code opcional)
+   - ahora guarda province y warehouse_code
 ========================================================= */
 app.post("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
@@ -963,7 +957,7 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: TOGGLE ACTIVO
+   ✅ ADMIN: TOGGLE ACTIVO (opcional)
 ========================================================= */
 app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
   try {
@@ -996,7 +990,7 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: AUDIT
+   ✅ ADMIN: AUDIT (opcional)
 ========================================================= */
 app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
   try {
@@ -1080,7 +1074,7 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ MERCADERISTAS: ME
+   ✅ MERCADERISTAS: ME (opcional)
 ========================================================= */
 app.get("/api/auth/me", verifyUser, async (req, res) => {
   return res.json({ ok: true, user: req.user });
@@ -1151,6 +1145,8 @@ function buildItemResponse(itemFull, code, priceListNo) {
   return {
     ok: true,
     item,
+    // ✅ este price lo usas como "precio caja" (tu UI trabaja en caja)
+    priceCaja: price,
     price,
     stock: {
       onHand,
@@ -1203,6 +1199,8 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
       warehouse: SAP_WAREHOUSE,
       priceList: SAP_PRICE_LIST,
       priceListNo,
+      // ✅ para UI (precio en caja)
+      priceCaja: r.priceCaja,
       price: r.price,
       stock: r.stock,
     });
@@ -1246,6 +1244,8 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
             ok: true,
             name: r.item.ItemName,
             unit: r.item.SalesUnit,
+            // ✅ precio en caja
+            priceCaja: r.priceCaja,
             price: r.price,
             stock: r.stock,
           };
@@ -1309,7 +1309,8 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ SAP: CREAR COTIZACIÓN
-   FIX: WarehouseCode por línea + tag [wh:] + qty en cajas
+   - agrega [wh:XXX] en comments para que Dashboard/Histórico muestren bodega
+   - interpreta qty como CANTIDAD EN CAJAS (no unidades)
 ========================================================= */
 app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
   try {
@@ -1317,6 +1318,7 @@ app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
       return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
     }
 
+    // ✅ Soporte JSON normal o multipart(payload)
     let body = req.body || {};
     const isMultipart = String(req.headers["content-type"] || "").includes("multipart/form-data");
 
@@ -1339,24 +1341,24 @@ app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
 
     const creator = req.user?.username || "unknown";
 
-    // ✅ bodega del usuario (DB) -> fallback env
-    const userWh = (await getWarehouseForUsername(creator)).trim();
-    const whToUse = userWh || SAP_WAREHOUSE || "01";
+    // ✅ buscamos bodega del usuario (si existe en DB)
+    const meta = await getUserMetaByUsername(creator);
+    const whUser = String(meta?.warehouse_code || "").trim();
+    const whFinal = whUser || String(body?.warehouse || body?.wh || "").trim() || SAP_WAREHOUSE;
 
-    // ✅ Construye líneas (cantidad EN CAJAS)
-    // Prioridad: qtyBoxes -> cajas -> qty
+    // ✅ IMPORTANTE: qty se toma como CAJAS
+    // (si en front ya trabajan en cajas, no hay conversión)
     const DocumentLines = lines
       .map((l) => {
-        const item = String(l.itemCode || "").trim();
-        const qtyBoxes =
-          l.qtyBoxes ?? l.cajas ?? l.qty ?? 0;
+        const itemCode = String(l.itemCode || "").trim();
 
-        const qty = Number(qtyBoxes || 0);
+        // preferimos qtyCaja / qtyBoxes si viene, si no qty
+        const qtyBoxes =
+          Number(l.qtyCaja ?? l.qtyBoxes ?? l.qty ?? 0);
 
         return {
-          ItemCode: item,
-          Quantity: qty,                 // ✅ cajas (tal cual)
-          WarehouseCode: String(whToUse) // ✅ evita ODBC -2028 por wh
+          ItemCode: itemCode,
+          Quantity: Number.isFinite(qtyBoxes) ? qtyBoxes : 0,
         };
       })
       .filter((x) => x.ItemCode && x.Quantity > 0);
@@ -1367,14 +1369,15 @@ app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
 
-    // ✅ Comments con tags para dashboard/histórico
+    // ✅ guardamos tags para que luego dashboard/histórico lo lean
     const sapComments = [
       `[WEB PEDIDOS]`,
       `[user:${creator}]`,
-      `[wh:${whToUse}]`,
+      `[wh:${whFinal}]`,
       comments ? comments : "Cotización mercaderista",
     ].join(" ");
 
+    // ✅ 1) Si hay archivos => creamos AttachmentEntry en SAP
     const files = Array.isArray(req.files) ? req.files : [];
     let attachmentEntry = null;
 
@@ -1382,6 +1385,7 @@ app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
       attachmentEntry = await createSapAttachmentEntry(files);
     }
 
+    // ✅ 2) Crear cotización
     const payload = {
       CardCode: cardCode,
       DocDate: docDate,
@@ -1401,9 +1405,9 @@ app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
       cardCode,
       lines: DocumentLines.length,
       docDate,
+      wh: whFinal,
       hasAttachments: files.length > 0,
       attachmentEntry: attachmentEntry || null,
-      warehouse: whToUse,
     });
 
     return res.json({
@@ -1411,8 +1415,8 @@ app.post("/api/sap/quote", maybeUpload, verifyUser, async (req, res) => {
       message: "Cotización creada",
       docEntry: created.DocEntry,
       docNum: created.DocNum,
+      warehouse: whFinal,
       attachmentEntry: attachmentEntry || null,
-      warehouse: whToUse,
     });
   } catch (err) {
     console.error("❌ /api/sap/quote:", err.message);
