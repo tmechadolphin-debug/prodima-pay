@@ -696,7 +696,8 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
 
         const cardCode = String(q.CardCode || "").trim();
         const cardName = String(q.CardName || "").trim();
-        const wh = parseWhFromComments(q.Comments || "");
+        const wh = resolveWh(q);
+
 
         // ✅ Estado (incluye canceladas)
         const cancelledFlag = String(q.Cancelled || "").toLowerCase(); // típicamente "tyes" / "tno"
