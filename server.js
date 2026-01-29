@@ -315,7 +315,10 @@ async function slLogin() {
 }
 
 async function slFetch(path, options = {}) {
+  const t0 = Date.now();
+
   if (!SL_COOKIE || Date.now() - SL_COOKIE_TIME > 25 * 60 * 1000) {
+    console.log("🔐 slFetch: haciendo login (cookie vacía/expirada)");
     await slLogin();
   }
 
@@ -329,25 +332,18 @@ async function slFetch(path, options = {}) {
   });
 
   const text = await res.text();
+  const ms = Date.now() - t0;
+
+  console.log(`⏱️ SAP ${res.status} ${path.slice(0,80)}... (${ms}ms)`);
 
   if (res.status === 401 || res.status === 403) {
+    console.log("♻️ SAP 401/403 -> relogin y retry");
     SL_COOKIE = null;
     await slLogin();
     return slFetch(path, options);
   }
 
-  let json;
-  try {
-    json = text ? JSON.parse(text) : {};
-  } catch {
-    json = { raw: text };
-  }
-
-  if (!res.ok) {
-    throw new Error(`SAP error ${res.status}: ${text}`);
-  }
-
-  return json;
+  // ... igual que ya lo tienes
 }
 
 /* =========================================================
@@ -984,7 +980,9 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
 
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
@@ -994,18 +992,13 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
     const r = await getOneItem(code, priceListNo, warehouseCode);
 
-    const priceCaja = Number(r.price ?? 0);
-
     return res.json({
       ok: true,
       item: r.item,
       warehouse: warehouseCode,
       priceList: SAP_PRICE_LIST,
       priceListNo,
-      price: priceCaja,
-      priceUnit: r.priceUnit,
-      factorCaja: r.factorCaja,
-      uom: r.item?.SalesUnit || "Caja",
+      price: r.price,
       stock: r.stock,
     });
   } catch (err) {
