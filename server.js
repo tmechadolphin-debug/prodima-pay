@@ -480,20 +480,25 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const skip = Math.max(Number(req.query?.skip || 0), 0);
 
     const filterParts = [];
-    if (from) filterParts.push(`DocDate ge '${from}'`);
-    if (to) filterParts.push(`DocDate le '${to}'`);
+    if (from) filterParts.push(DocDate ge '${from}');
+    if (to) filterParts.push(DocDate le '${to}');
 
     const sapFilter = filterParts.length
-      ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
+      ? &$filter=${encodeURIComponent(filterParts.join(" and "))}
       : "";
 
-    // ✅ incluye CancelStatus + Cancelled (por compat)
     const sap = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Cancelled,Comments` +
-        `&$orderby=DocDate desc&$top=${top}&$skip=${skip}${sapFilter}`
+      /Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments +
+        &$orderby=DocDate desc&$top=${top}&$skip=${skip}${sapFilter}
     );
 
     const values = Array.isArray(sap?.value) ? sap.value : [];
+
+    const parseUserFromComments = (comments = "") => {
+      const m = String(comments).match(/\[user:([^\]]+)\]/i);
+      return m ? String(m[1]).trim() : "";
+    };
+
     let rows = [];
 
     for (const q of values) {
@@ -502,30 +507,15 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
       const usuario = parseUserFromComments(q.Comments || "");
       const cardCode = String(q.CardCode || "").trim();
+
+      const estado =
+        q.DocumentStatus === "bost_Open"
+          ? "Open"
+          : q.DocumentStatus === "bost_Close"
+          ? "Close"
+          : String(q.DocumentStatus || "");
+
       const cardName = String(q.CardName || "").trim();
-
-      const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
-
-      // ✅ Cancelled robusto (CancelStatus o Cancelled)
-      const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo (típico)
-      const cancelledFlag = String(q.Cancelled || "").trim(); // tYES/tNO (típico)
-
-      const isCancelled =
-        cancelStatus.toLowerCase() === "csyes" ||
-        cancelStatus.toLowerCase() === "yes" ||
-        cancelStatus.toLowerCase() === "tyes" ||
-        cancelledFlag.toLowerCase() === "tyes" ||
-        cancelledFlag.toLowerCase() === "yes" ||
-        cancelledFlag.toLowerCase() === "y" ||
-        cancelledFlag.toLowerCase() === "true";
-
-      const estado = isCancelled
-        ? "Cancelled"
-        : q.DocumentStatus === "bost_Open"
-        ? "Open"
-        : q.DocumentStatus === "bost_Close"
-        ? "Close"
-        : String(q.DocumentStatus || "");
 
       let mes = "";
       let anio = "";
@@ -545,21 +535,18 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         montoCotizacion: Number(q.DocTotal || 0),
         montoEntregado: 0,
         fecha: fechaISO,
-
-        // ✅ UI
         estado,
-        isCancelled,
         mes,
         anio,
-        usuario: usuario || "sin_user",
-        warehouse: wh,
-        bodega: wh,
+        usuario,
         comments: q.Comments || "",
       });
     }
 
     if (userFilter) {
-      rows = rows.filter((r) => String(r.usuario || "").toLowerCase().includes(userFilter));
+      rows = rows.filter((r) =>
+        String(r.usuario || "").toLowerCase().includes(userFilter)
+      );
     }
 
     if (clientFilter) {
@@ -582,7 +569,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
-
 /* =========================================================
    ✅ ADMIN: LIST USERS
 ========================================================= */
