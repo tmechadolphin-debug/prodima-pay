@@ -8,7 +8,6 @@ import cors from "cors";
 import pg from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { Agent, setGlobalDispatcher } from "undici";
 
 const { Pool } = pg;
 
