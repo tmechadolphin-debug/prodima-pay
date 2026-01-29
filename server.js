@@ -554,9 +554,10 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN: DASHBOARD (KPIs + agrupaciones)
-   GET /api/admin/dashboard?from=2020-01-01&to=2026-01-28
-       &top=500&skip=0
-       &onlyCreatedUsers=1   (opcional)
+   GET /api/admin/dashboard?from=2020-01-01&to=2026-01-28&scope=created|all
+   - Si no mandas fechas: from=2020-01-01 por defecto
+   - Trae Canceladas usando "Cancelled" (NO "Canceled")
+   - Paginación interna para traer suficiente data (top/skip en lotes)
 ========================================================= */
 app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   try {
@@ -564,27 +565,43 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
     }
 
-    const from = String(req.query?.from || "").trim(); // YYYY-MM-DD
-    const to = String(req.query?.to || "").trim();     // YYYY-MM-DD
+    const scope = String(req.query?.scope || "created").trim().toLowerCase(); // created | all
+    const fromQ = String(req.query?.from || "").trim();
+    const toQ = String(req.query?.to || "").trim();
 
-    const top = Math.min(Number(req.query?.top || 500), 500);
-    const skip = Math.max(Number(req.query?.skip || 0), 0);
+    // ✅ Si no mandan fecha, por defecto desde 2020 hasta hoy (así no se muere trayendo todo el histórico)
+    const DEFAULT_FROM = "2020-01-01";
+    const from = fromQ || DEFAULT_FROM;
+    const to = toQ || ""; // si viene vacío, no filtramos por to
 
-    // ✅ si quieres que el dashboard sea solo usuarios creados
-    const onlyCreatedUsers = String(req.query?.onlyCreatedUsers || "").trim() === "1";
+    // Dashboard trae más data que una página normal, pero con límite para evitar timeouts
+    const PAGE_SIZE = Math.min(Math.max(Number(req.query?.top || 500), 50), 500);
+    const MAX_PAGES = Math.min(Math.max(Number(req.query?.maxPages || 20), 1), 60); // 20*500 = 10,000 docs
 
-    // 1) si onlyCreatedUsers=1 => cargamos lista de usernames creados (DB)
-    let createdUsersSet = null;
-    if (onlyCreatedUsers) {
+    // --- Helpers de parseo ---
+    const parseUserFromComments = (comments = "") => {
+      const m = String(comments).match(/\[user:([^\]]+)\]/i);
+      return m ? String(m[1]).trim() : "";
+    };
+
+    const parseWhFromComments = (comments = "") => {
+      const m = String(comments).match(/\[wh:([^\]]+)\]/i);
+      return m ? String(m[1]).trim() : "";
+    };
+
+    // ✅ scope=created -> solo usuarios existentes en app_users
+    let allowedUsersSet = null;
+    if (scope === "created") {
       if (!hasDb()) {
-        return res.status(500).json({ ok: false, message: "DB no configurada para filtrar usuarios creados" });
+        // si no hay DB, no podemos filtrar "created"
+        allowedUsersSet = new Set();
+      } else {
+        const r = await dbQuery(`SELECT username FROM app_users;`);
+        allowedUsersSet = new Set((r.rows || []).map(x => String(x.username || "").trim().toLowerCase()).filter(Boolean));
       }
-      const ur = await dbQuery(`SELECT username FROM app_users;`);
-      const list = (ur.rows || []).map(r => String(r.username || "").trim().toLowerCase()).filter(Boolean);
-      createdUsersSet = new Set(list);
     }
 
-    // 2) construir $filter en SAP por fechas (como tu /quotes)
+    // --- Construye filtro SAP por fechas (como tu /quotes) ---
     const filterParts = [];
     if (from) filterParts.push(`DocDate ge '${from}'`);
     if (to) filterParts.push(`DocDate le '${to}'`);
@@ -593,182 +610,174 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
       : "";
 
-    // 3) traer data de SAP (paginable)
-    const sap = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments` +
-      `&$orderby=DocDate desc&$top=${top}&$skip=${skip}${sapFilter}`
-    );
+    // ✅ Traemos también Cancelled (propiedad correcta) + DocumentStatus
+    const SELECT =
+      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Cancelled,Comments`;
 
-    const values = Array.isArray(sap?.value) ? sap.value : [];
+    // --- Loop paginado para agarrar suficiente histórico ---
+    let all = [];
+    let skip = 0;
 
-    // parsers
-    const parseUserFromComments = (comments = "") => {
-      const m = String(comments).match(/\[user:([^\]]+)\]/i);
-      return m ? String(m[1]).trim() : "";
-    };
-    const parseWhFromComments = (comments = "") => {
-      const m = String(comments).match(/\[wh:([^\]]+)\]/i);
-      return m ? String(m[1]).trim() : "";
-    };
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const sap = await slFetch(
+        `/Quotations?$select=${SELECT}` +
+        `&$orderby=DocDate desc&$top=${PAGE_SIZE}&$skip=${skip}${sapFilter}`
+      );
 
-    // normaliza estado incluyendo canceladas SIN pedir "Canceled"
-    const normalizeEstado = (documentStatus) => {
-      const ds = String(documentStatus || "");
-      const dsLower = ds.toLowerCase();
-      if (dsLower.includes("cancel")) return "Cancelada";
-      if (ds === "bost_Open") return "Open";
-      if (ds === "bost_Close") return "Close";
-      return ds || "";
-    };
+      const values = Array.isArray(sap?.value) ? sap.value : [];
+      if (!values.length) break;
 
-    // 4) normalizar filas
-    let rows = values.map((q) => {
-      const rawDate = String(q.DocDate || "");
-      const fechaISO = rawDate.slice(0, 10);
+      for (const q of values) {
+        const rawDate = String(q.DocDate || "");
+        const fechaISO = rawDate.slice(0, 10);
 
-      const usuario = parseUserFromComments(q.Comments || "");
-      const usuarioKey = String(usuario || "").trim().toLowerCase();
+        const usuario = parseUserFromComments(q.Comments || "");
+        const usuarioKey = String(usuario || "").trim().toLowerCase();
 
-      const warehouse = parseWhFromComments(q.Comments || "");
+        // scope filter (created)
+        if (allowedUsersSet && scope === "created") {
+          if (!usuarioKey || !allowedUsersSet.has(usuarioKey)) continue;
+        }
 
-      const cardCode = String(q.CardCode || "").trim();
-      const cardName = String(q.CardName || "").trim();
+        const cardCode = String(q.CardCode || "").trim();
+        const cardName = String(q.CardName || "").trim();
+        const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
 
-      const monto = Number(q.DocTotal || 0);
+        // ✅ Estado (incluye canceladas)
+        const cancelledFlag = String(q.Cancelled || "").toLowerCase(); // típicamente "tyes" / "tno"
+        const isCancelled = (cancelledFlag === "tyes" || cancelledFlag === "y" || cancelledFlag === "yes" || cancelledFlag === "true");
 
-      // mes yyyy-mm
-      const ym = fechaISO ? fechaISO.slice(0, 7) : "";
+        const estado =
+          isCancelled ? "Canceled" :
+          q.DocumentStatus === "bost_Open" ? "Open" :
+          q.DocumentStatus === "bost_Close" ? "Close" :
+          String(q.DocumentStatus || "");
 
-      return {
-        docEntry: q.DocEntry,
-        docNum: q.DocNum,
-        cardCode,
-        cardName,
-        montoCotizacion: monto,
-        montoEntregado: 0, // si luego lo calculas, aquí
-        fecha: fechaISO,
-        ym,
-        estado: normalizeEstado(q.DocumentStatus),
-        usuario,
-        warehouse,
-        comments: q.Comments || "",
-      };
-    });
+        let mes = "";
+        let anio = "";
+        try {
+          const d = new Date(fechaISO);
+          mes = d.toLocaleString("es-PA", { month: "long" });
+          anio = String(d.getFullYear());
+        } catch {}
 
-    // 5) si solo users creados => filtrar aquí
-    if (createdUsersSet) {
-      rows = rows.filter(r => createdUsersSet.has(String(r.usuario || "").trim().toLowerCase()));
+        all.push({
+          docEntry: q.DocEntry,
+          docNum: q.DocNum,
+          cardCode,
+          cardName,
+          montoCotizacion: Number(q.DocTotal || 0),
+          montoEntregado: 0, // si luego lo conectas, aquí lo sumas
+          fecha: fechaISO,
+          estado,
+          mes,
+          anio,
+          usuario: usuario || "sin_user",
+          warehouse: wh,
+        });
+      }
+
+      // ✅ Si estamos ordenados desc, y ya bajamos más allá del from, podemos cortar (ahorra tiempo)
+      // OJO: solo aplica si 'from' existe
+      if (from) {
+        const last = values[values.length - 1];
+        const lastDate = String(last?.DocDate || "").slice(0, 10);
+        if (lastDate && lastDate < from) break;
+      }
+
+      skip += PAGE_SIZE;
     }
 
-    // 6) KPIs
-    const totalCotizaciones = rows.length;
-    const montoTotalCotizado = rows.reduce((a, r) => a + (Number(r.montoCotizacion) || 0), 0);
-    const montoTotalEntregado = rows.reduce((a, r) => a + (Number(r.montoEntregado) || 0), 0);
-    const fillRate = montoTotalCotizado > 0 ? (montoTotalEntregado / montoTotalCotizado) : 0;
+    // --- Agregaciones ---
+    const sumCot = all.reduce((acc, x) => acc + (Number(x.montoCotizacion) || 0), 0);
+    const sumEnt = all.reduce((acc, x) => acc + (Number(x.montoEntregado) || 0), 0);
+    const fillRate = sumCot > 0 ? (sumEnt / sumCot) : 0;
 
-    // 7) agrupaciones
-    function topNByAmount(map, n = 10) {
-      return Array.from(map.entries())
-        .map(([k, v]) => ({ key: k, ...v }))
-        .sort((a, b) => (b.monto || 0) - (a.monto || 0))
+    function topBy(keyFn, valueFn, n = 10) {
+      const m = new Map();
+      for (const row of all) {
+        const k = keyFn(row);
+        const v = valueFn(row);
+        m.set(k, (m.get(k) || 0) + v);
+      }
+      return [...m.entries()]
+        .map(([k, v]) => ({ key: k, value: v }))
+        .sort((a, b) => b.value - a.value)
         .slice(0, n);
     }
 
-    // Top usuarios (monto)
-    const byUser = new Map();
-    for (const r of rows) {
-      const k = String(r.usuario || "sin_user").trim() || "sin_user";
-      const cur = byUser.get(k) || { monto: 0, cant: 0 };
-      cur.monto += Number(r.montoCotizacion || 0);
-      cur.cant += 1;
-      byUser.set(k, cur);
+    function countBy(keyFn) {
+      const m = new Map();
+      for (const row of all) {
+        const k = keyFn(row);
+        m.set(k, (m.get(k) || 0) + 1);
+      }
+      return [...m.entries()].map(([k, v]) => ({ key: k, count: v }));
     }
-    const topUsuarios = topNByAmount(byUser, 10).map(x => ({ usuario: x.key, monto: x.monto, cant: x.cant }));
 
-    // Top clientes (monto)
-    const byClient = new Map();
-    for (const r of rows) {
-      const k = String(r.cardName || r.cardCode || "sin_cliente").trim() || "sin_cliente";
-      const cur = byClient.get(k) || { monto: 0, cant: 0 };
-      cur.monto += Number(r.montoCotizacion || 0);
-      cur.cant += 1;
-      byClient.set(k, cur);
-    }
-    const topClientes = topNByAmount(byClient, 10).map(x => ({ cliente: x.key, monto: x.monto, cant: x.cant }));
+    const topUsuariosMonto = topBy(
+      (r) => String(r.usuario || "sin_user"),
+      (r) => Number(r.montoCotizacion || 0),
+      10
+    ).map(x => ({ usuario: x.key, monto: x.value }));
 
-    // Por bodega (monto)
-    const byWh = new Map();
-    for (const r of rows) {
-      const k = String(r.warehouse || "sin_wh").trim() || "sin_wh";
-      const cur = byWh.get(k) || { monto: 0, cant: 0 };
-      cur.monto += Number(r.montoCotizacion || 0);
-      cur.cant += 1;
-      byWh.set(k, cur);
-    }
-    const porBodega = topNByAmount(byWh, 20).map(x => ({ bodega: x.key, monto: x.monto, cant: x.cant }));
+    const topClientesMonto = topBy(
+      (r) => String(r.cardName || r.cardCode || "sin_cliente"),
+      (r) => Number(r.montoCotizacion || 0),
+      10
+    ).map(x => ({ cliente: x.key, monto: x.value }));
 
-    // Por mes (cantidad + monto)
-    const byMonth = new Map();
-    for (const r of rows) {
-      const k = String(r.ym || "").trim() || "sin_mes";
-      const cur = byMonth.get(k) || { monto: 0, cant: 0 };
-      cur.monto += Number(r.montoCotizacion || 0);
-      cur.cant += 1;
-      byMonth.set(k, cur);
-    }
-    const porMes = Array.from(byMonth.entries())
-      .map(([mes, v]) => ({ mes, cant: v.cant, monto: v.monto }))
-      .filter(x => x.mes !== "sin_mes")
+    const porBodegaMonto = topBy(
+      (r) => String(r.warehouse || "sin_wh"),
+      (r) => Number(r.montoCotizacion || 0),
+      20
+    ).map(x => ({ bodega: x.key, monto: x.value }));
+
+    const porDia = topBy(
+      (r) => String(r.fecha || ""),
+      (r) => Number(r.montoCotizacion || 0),
+      400
+    )
+      .map(x => ({ fecha: x.key, monto: x.value }))
+      .sort((a, b) => a.fecha.localeCompare(b.fecha));
+
+    const porMes = topBy(
+      (r) => String(r.fecha || "").slice(0, 7), // YYYY-MM
+      (r) => Number(r.montoCotizacion || 0),
+      200
+    )
+      .map(x => ({ mes: x.key, monto: x.value }))
       .sort((a, b) => a.mes.localeCompare(b.mes));
 
-    // Por día (monto) - útil para gráfico lineal
-    const byDay = new Map();
-    for (const r of rows) {
-      const k = String(r.fecha || "").trim() || "sin_dia";
-      const cur = byDay.get(k) || { monto: 0, cant: 0 };
-      cur.monto += Number(r.montoCotizacion || 0);
-      cur.cant += 1;
-      byDay.set(k, cur);
-    }
-    const porDia = Array.from(byDay.entries())
-      .map(([dia, v]) => ({ dia, cant: v.cant, monto: v.monto }))
-      .filter(x => x.dia !== "sin_dia")
-      .sort((a, b) => a.dia.localeCompare(b.dia));
-
-    // Estados
-    const byEstado = new Map();
-    for (const r of rows) {
-      const k = String(r.estado || "sin_estado").trim() || "sin_estado";
-      byEstado.set(k, (byEstado.get(k) || 0) + 1);
-    }
-    const estados = Array.from(byEstado.entries()).map(([estado, cant]) => ({ estado, cant }));
+    const estados = countBy((r) => String(r.estado || "Unknown"))
+      .map(x => ({ estado: x.key, cantidad: x.count }))
+      .sort((a, b) => b.cantidad - a.cantidad);
 
     return res.json({
       ok: true,
-      from: from || null,
+      scope,
+      from,
       to: to || null,
-      top,
-      skip,
-      onlyCreatedUsers,
-      count: rows.length,
-
+      fetched: all.length,
       kpis: {
-        totalCotizaciones,
-        montoTotalCotizado,
-        montoTotalEntregado,
+        totalCotizaciones: all.length,
+        montoCotizado: sumCot,
+        montoEntregado: sumEnt,
         fillRate,
       },
-
       charts: {
+        topUsuariosMonto,
+        topClientesMonto,
+        porBodegaMonto,
         porDia,
         porMes,
-      },
-
-      tables: {
-        topUsuarios,
-        topClientes,
-        porBodega,
         estados,
+        // para pastel “Cotizado vs Entregado”
+        pieCotVsEnt: {
+          cotizado: sumCot,
+          entregado: sumEnt,
+          fillRate,
+        },
       },
     });
   } catch (err) {
@@ -776,8 +785,6 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
-
-
 
 /* =========================================================
    ✅ ADMIN: CREATE USER
