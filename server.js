@@ -450,7 +450,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       : "";
 
     const sap = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments` +
+      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Canceled,Comments` +
         `&$orderby=DocDate desc&$top=${top}&$skip=${skip}${sapFilter}`
     );
 
@@ -498,6 +498,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         montoEntregado: 0,
         fecha: fechaISO,
         estado,
+        cancelStatus: q.CancelStatus ?? q.Canceled ?? "", // ✅ CLAVE
         mes,
         anio,
         usuario,
