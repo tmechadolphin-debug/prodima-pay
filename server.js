@@ -534,6 +534,91 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
+   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
+   - Paginación real (500 por página)
+   - Soporta skip/limit para el front
+========================================================= */
+app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query?.limit || req.query?.top || 500), 1), 500);
+    const skip = Math.max(Number(req.query?.skip || 0), 0);
+
+    const from = String(req.query?.from || "").trim();
+    const to = String(req.query?.to || "").trim();
+
+    const filterParts = [];
+    if (from) filterParts.push(`DocDate ge '${from}'`);
+    if (to) filterParts.push(`DocDate le '${to}'`);
+
+    const sapFilter = filterParts.length
+      ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
+      : "";
+
+    const SELECT =
+      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
+
+    // ✅ Esto devuelve exactamente "la página" que el front pide
+    const sap = await slFetch(
+      `/Quotations?$select=${SELECT}` +
+        `&$orderby=DocDate desc&$top=${limit}&$skip=${skip}${sapFilter}`
+    );
+
+    const values = Array.isArray(sap?.value) ? sap.value : [];
+
+    const parseUserFromComments = (comments = "") => {
+      const m = String(comments).match(/\[user:([^\]]+)\]/i);
+      return m ? String(m[1]).trim() : "";
+    };
+
+    const quotes = values.map((q) => {
+      const fechaISO = String(q.DocDate || "").slice(0, 10);
+
+      const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
+      const isCancelled = cancelStatus.toLowerCase() === "csyes";
+
+      const estado = isCancelled
+        ? "Cancelled"
+        : q.DocumentStatus === "bost_Open"
+        ? "Open"
+        : q.DocumentStatus === "bost_Close"
+        ? "Close"
+        : String(q.DocumentStatus || "");
+
+      const usuario = parseUserFromComments(q.Comments || "");
+
+      return {
+        docEntry: q.DocEntry,
+        docNum: q.DocNum,
+        cardCode: String(q.CardCode || "").trim(),
+        cardName: String(q.CardName || "").trim(),
+        montoCotizacion: Number(q.DocTotal || 0),
+        fecha: fechaISO,
+        estado,
+        cancelStatus,
+        isCancelled,
+        usuario,
+        comments: q.Comments || "",
+      };
+    });
+
+    return res.json({
+      ok: true,
+      limit,
+      skip,
+      count: quotes.length,
+      quotes,
+    });
+  } catch (err) {
+    console.error("❌ /api/admin/quotes:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+/* =========================================================
    ✅ ADMIN: AUDIT
 ========================================================= */
 app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
