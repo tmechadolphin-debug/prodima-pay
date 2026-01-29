@@ -795,64 +795,33 @@ async function fetchItemStock(code, warehouseCode) {
 ========================================================= */
 async function fetchItemAllInOne(code, priceListNo, warehouseCode) {
   const whSafe = String(warehouseCode).replace(/'/g, "''");
-  const whTrim = String(warehouseCode || "").trim();
 
-  // 1) Intento rápido: $expand con $filter interno (si SAP lo soporta)
-  const pathFiltered =
+  const path =
     `/Items('${encodeURIComponent(code)}')` +
     `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage` +
     `&$expand=` +
     `ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity),` +
     `ItemWarehouseInfoCollection(` +
-      `$select=WarehouseCode,InStock,Committed,Ordered;` +
-      `$filter=WarehouseCode eq '${whSafe}'` +
+    `$select=WarehouseCode,InStock,Committed,Ordered;` +
+    `$filter=WarehouseCode eq '${whSafe}'` +
     `)`;
 
-  let itemFull = await slFetch(pathFiltered);
+  const itemFull = await slFetch(path);
 
-  // Helper: buscar la fila de bodega correcta (como el código viejo)
-// ✅ Seleccionar la fila correcta de la bodega (NO usar [0])
-function pickWarehouseRow(itemFull, warehouseCode) {
-  if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) return null;
-
-  return (
-    itemFull.ItemWarehouseInfoCollection.find(
-      (w) => String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
-    ) || null
-  );
-}
-
-
-  let wrow = pickWarehouseRow(itemFull);
-
-  // 2) Fallback: si no vino la bodega correcta (o vino vacío), traemos la colección completa
-  //    (solo pasa cuando el Service Layer no soporta $filter dentro del $expand)
-  if (!wrow) {
-    const pathFullWarehouses =
-      `/Items('${encodeURIComponent(code)}')` +
-      `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage,ItemWarehouseInfoCollection` +
-      `&$expand=` +
-      `ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity),` +
-      `ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`;
-
-    itemFull = await slFetch(pathFullWarehouses);
-    wrow = pickWarehouseRow(itemFull);
-  }
-
-  // Precios / factor caja
   const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
   const factorCaja = getSalesUomFactor(itemFull);
   const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
 
-  // Stock (si no existe esa bodega, queda null)
+  const wrow = Array.isArray(itemFull?.ItemWarehouseInfoCollection)
+    ? itemFull.ItemWarehouseInfoCollection[0] || null
+    : null;
+
   const onHand = wrow?.InStock != null ? Number(wrow.InStock) : null;
   const committed = wrow?.Committed != null ? Number(wrow.Committed) : null;
   const ordered = wrow?.Ordered != null ? Number(wrow.Ordered) : null;
 
   let available = null;
-  if (Number.isFinite(onHand) && Number.isFinite(committed)) {
-    available = onHand - committed; // ✅ DISPONIBLE REAL
-  }
+  if (Number.isFinite(onHand) && Number.isFinite(committed)) available = onHand - committed;
 
   return {
     item: {
