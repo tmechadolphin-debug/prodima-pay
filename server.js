@@ -21,7 +21,8 @@ const SAP_PASS = process.env.SAP_PASS || "";
 // ⚠️ DEFAULT WAREHOUSE (fallback si usuario no tiene)
 const SAP_WAREHOUSE = process.env.SAP_WAREHOUSE || "01";
 
-const SAP_PRICE_LIST = process.env.SAP_PRICE_LIST || "Lista 02 Res. Com. Ind. Analitic";
+const SAP_PRICE_LIST =
+  process.env.SAP_PRICE_LIST || "Lista 02 Res. Com. Ind. Analitic";
 
 // ---- Web / CORS ----
 const YAPPY_ALIAS = process.env.YAPPY_ALIAS || "@prodimasansae";
@@ -74,7 +75,13 @@ function provinceToWarehouse(province) {
   if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
 
   // 500
-  if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera")
+  if (
+    p === "veraguas" ||
+    p === "coclé" ||
+    p === "cocle" ||
+    p === "los santos" ||
+    p === "herrera"
+  )
     return "500";
 
   // 300
@@ -404,6 +411,11 @@ app.post("/api/admin/login", async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
+   ✅ FIX:
+   - Paginación real (no se queda en 20/200)
+   - Soporta skip/limit para el front
+   - Aplica filtros (user/client/from/to) ANTES de paginar resultados (evita “solo aparecen en página 2/3”)
+   - Agrega CancelStatus en SAP select y en rows.push
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -413,15 +425,17 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
+
     const from = String(req.query?.from || "").trim();
     const to = String(req.query?.to || "").trim();
-    const limit = Math.min(Number(req.query?.limit || 200), 500);
 
-    const sap = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments&$orderby=DocDate desc&$top=${limit}`
-    );
+    // ✅ paginación para el front (sobre resultados filtrados)
+    const limit = Math.min(Math.max(Number(req.query?.limit || req.query?.top || 500), 1), 500);
+    const skip = Math.max(Number(req.query?.skip || 0), 0);
 
-    const values = Array.isArray(sap?.value) ? sap.value : [];
+    // ✅ Traemos de SAP en bloques de 500 y filtramos server-side hasta completar (skip+limit)
+    const SAP_PAGE = 500;
+    const MAX_PAGES = 80; // 80*500 = 40,000 docs (suficiente para meses con 60/día)
 
     const parseUserFromComments = (comments = "") => {
       const m = String(comments).match(/\[user:([^\]]+)\]/i);
@@ -429,7 +443,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     };
 
     const bpCache = new Map();
-
     async function getBPName(cardCode) {
       if (!cardCode) return "";
       if (bpCache.has(cardCode)) return bpCache.get(cardCode);
@@ -448,62 +461,115 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       }
     }
 
-    let rows = [];
+    // ✅ filtro por fechas directo en SAP (reduce carga)
+    const filterParts = [];
+    if (from) filterParts.push(`DocDate ge '${from}'`);
+    if (to) filterParts.push(`DocDate le '${to}'`);
 
-    for (const q of values) {
-      const docDate = q.DocDate || "";
-      const usuario = parseUserFromComments(q.Comments || "");
-      const cardCode = String(q.CardCode || "").trim();
+    const sapFilter = filterParts.length
+      ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
+      : "";
 
-      const estado =
-        q.DocumentStatus === "bost_Open" ? "Open" :
-        q.DocumentStatus === "bost_Close" ? "Close" :
-        String(q.DocumentStatus || "");
+    // ✅ IMPORTANTE: agregar CancelStatus
+    const SELECT =
+      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
 
-      let cardName = String(q.CardName || "").trim();
-      if (!cardName) {
-        cardName = await getBPName(cardCode);
+    const need = skip + limit;
+    const matched = [];
+
+    let sapSkip = 0;
+    for (let page = 0; page < MAX_PAGES && matched.length < need; page++) {
+      const sap = await slFetch(
+        `/Quotations?$select=${SELECT}` +
+          `&$orderby=DocDate desc&$top=${SAP_PAGE}&$skip=${sapSkip}${sapFilter}`
+      );
+
+      const values = Array.isArray(sap?.value) ? sap.value : [];
+      if (!values.length) break;
+
+      for (const q of values) {
+        const docDateRaw = String(q.DocDate || "");
+        const fechaISO = docDateRaw.slice(0, 10);
+
+        const usuario = parseUserFromComments(q.Comments || "");
+        const cardCode = String(q.CardCode || "").trim();
+
+        // ✅ filtros (antes de paginar)
+        if (userFilter && !String(usuario || "").toLowerCase().includes(userFilter)) continue;
+
+        let cardName = String(q.CardName || "").trim();
+        if (!cardName) cardName = await getBPName(cardCode);
+
+        if (clientFilter) {
+          const cc = String(cardCode || "").toLowerCase();
+          const cn = String(cardName || "").toLowerCase();
+          if (!cc.includes(clientFilter) && !cn.includes(clientFilter)) continue;
+        }
+
+        // ✅ estado
+        const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
+        const isCancelled = cancelStatus.toLowerCase() === "csyes";
+
+        const estado = isCancelled
+          ? "Cancelled"
+          : q.DocumentStatus === "bost_Open"
+          ? "Open"
+          : q.DocumentStatus === "bost_Close"
+          ? "Close"
+          : String(q.DocumentStatus || "");
+
+        let mes = "";
+        let anio = "";
+        try {
+          const d = new Date(fechaISO);
+          mes = d.toLocaleString("es-PA", { month: "long" });
+          anio = String(d.getFullYear());
+        } catch {}
+
+        matched.push({
+          docEntry: q.DocEntry,
+          docNum: q.DocNum,
+          cardCode,
+          cardName,
+          customerName: cardName,
+          nombreCliente: cardName,
+          montoCotizacion: Number(q.DocTotal || 0),
+          montoEntregado: 0,
+          fecha: fechaISO,
+          estado,
+
+          // ✅ nuevo: cancel status en output
+          cancelStatus,
+          isCancelled,
+
+          mes,
+          anio,
+          usuario,
+          comments: q.Comments || "",
+        });
+
+        if (matched.length >= need) break;
       }
 
-      let mes = "";
-      let anio = "";
-      try {
-        const d = new Date(docDate);
-        mes = d.toLocaleString("es-PA", { month: "long" });
-        anio = String(d.getFullYear());
-      } catch {}
+      // corte rápido si ya estamos por debajo del from
+      if (from) {
+        const last = values[values.length - 1];
+        const lastDate = String(last?.DocDate || "").slice(0, 10);
+        if (lastDate && lastDate < from) break;
+      }
 
-      rows.push({
-        docEntry: q.DocEntry,
-        docNum: q.DocNum,
-        cardCode,
-        cardName,
-        customerName: cardName,
-        nombreCliente: cardName,
-        montoCotizacion: Number(q.DocTotal || 0),
-        montoEntregado: 0,
-        fecha: docDate,
-        estado,
-        mes,
-        anio,
-        usuario,
-        comments: q.Comments || ""
-      });
+      sapSkip += SAP_PAGE;
     }
 
-    if (userFilter) rows = rows.filter(r => String(r.usuario || "").toLowerCase().includes(userFilter));
+    const pageRows = matched.slice(skip, skip + limit);
 
-    if (clientFilter) {
-      rows = rows.filter(r =>
-        String(r.cardCode || "").toLowerCase().includes(clientFilter) ||
-        String(r.cardName || "").toLowerCase().includes(clientFilter)
-      );
-    }
-
-    if (from) rows = rows.filter(r => String(r.fecha || "") >= from);
-    if (to) rows = rows.filter(r => String(r.fecha || "") <= to);
-
-    return res.json({ ok: true, quotes: rows });
+    return res.json({
+      ok: true,
+      limit,
+      skip,
+      count: pageRows.length,
+      quotes: pageRows,
+    });
   } catch (err) {
     console.error("❌ /api/admin/quotes:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
@@ -710,7 +776,7 @@ app.post("/api/auth/login", async (req, res) => {
     await audit("USER_LOGIN_OK", req, username, {
       username,
       province: user.province,
-      warehouse_code: user.warehouse_code
+      warehouse_code: user.warehouse_code,
     });
 
     return res.json({
@@ -763,9 +829,7 @@ async function getPriceListNoByNameCached(name) {
 
   if (no === null) {
     try {
-      const r2 = await slFetch(
-        `/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`
-      );
+      const r2 = await slFetch(`/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`);
       if (r2?.value?.length) no = r2.value[0].PriceListNo;
     } catch {}
   }
@@ -778,11 +842,11 @@ function getPriceFromPriceList(itemFull, priceListNo) {
   const listNo = Number(priceListNo);
 
   const row = Array.isArray(itemFull?.ItemPrices)
-    ? itemFull.ItemPrices.find(p => Number(p?.PriceList) === listNo)
+    ? itemFull.ItemPrices.find((p) => Number(p?.PriceList) === listNo)
     : null;
 
-  const price = (row && row.Price != null) ? Number(row.Price) : null;
-  return (Number.isFinite(price) ? price : null);
+  const price = row && row.Price != null ? Number(row.Price) : null;
+  return Number.isFinite(price) ? price : null;
 }
 
 /* =========================================================
@@ -809,13 +873,13 @@ function getSalesUomFactor(itemFull) {
 
   // Busca UoM de ventas
   let row =
-    coll.find(x => String(x?.UoMType || "").toLowerCase().includes("sales")) ||
-    coll.find(x => String(x?.UoMType || "").toLowerCase().includes("iut_sales")) ||
+    coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("sales")) ||
+    coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("iut_sales")) ||
     null;
 
   // Si no encontró, intenta al menos la primera con BaseQuantity > 1
   if (!row) {
-    row = coll.find(x => Number(x?.BaseQuantity) > 1) || null;
+    row = coll.find((x) => Number(x?.BaseQuantity) > 1) || null;
   }
 
   if (!row) return null;
@@ -829,7 +893,7 @@ function getSalesUomFactor(itemFull) {
   // Si trae ambos, la conversión real es Base/Alt
   if (Number.isFinite(b) && b > 0 && Number.isFinite(a) && a > 0) {
     const f = b / a;
-    return (Number.isFinite(f) && f > 0) ? f : null;
+    return Number.isFinite(f) && f > 0 ? f : null;
   }
 
   // Si trae solo BaseQuantity (común), úsalo
@@ -850,21 +914,19 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   const factorCaja = getSalesUomFactor(itemFull);
 
   // ✅ Si hay factor, lo aplica. Si no hay factor, deja unitario.
-  const priceCaja =
-    (priceUnit != null && factorCaja != null)
-      ? (priceUnit * factorCaja)
-      : priceUnit;
+  const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
 
   let warehouseRow = null;
   if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
-    warehouseRow = itemFull.ItemWarehouseInfoCollection.find(w =>
-      String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
-    ) || null;
+    warehouseRow =
+      itemFull.ItemWarehouseInfoCollection.find(
+        (w) => String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
+      ) || null;
   }
 
-  const onHand = (warehouseRow?.InStock != null) ? Number(warehouseRow.InStock) : null;
-  const committed = (warehouseRow?.Committed != null) ? Number(warehouseRow.Committed) : null;
-  const ordered = (warehouseRow?.Ordered != null) ? Number(warehouseRow.Ordered) : null;
+  const onHand = warehouseRow?.InStock != null ? Number(warehouseRow.InStock) : null;
+  const committed = warehouseRow?.Committed != null ? Number(warehouseRow.Committed) : null;
+  const ordered = warehouseRow?.Ordered != null ? Number(warehouseRow.Ordered) : null;
 
   let available = null;
   if (Number.isFinite(onHand) && Number.isFinite(committed)) {
@@ -882,8 +944,8 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
       committed: Number.isFinite(committed) ? committed : null,
       ordered: Number.isFinite(ordered) ? ordered : null,
       available: Number.isFinite(available) ? available : null,
-      hasStock: (available != null) ? (available > 0) : null,
-    }
+      hasStock: available != null ? available > 0 : null,
+    },
   };
 }
 
@@ -898,21 +960,16 @@ async function getOneItem(code, priceListNo, warehouseCode) {
   let itemFull;
 
   // ✅ AQUÍ estaba la otra parte del problema: falta $expand
-  // (Muchos Service Layer no devuelven ItemUnitOfMeasurementCollection sin expand)
   try {
     itemFull = await slFetch(
       `/Items('${encodeURIComponent(code)}')` +
-      `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection` +
-      `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
+        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection` +
+        `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
     );
   } catch (e1) {
     try {
-      // fallback 1: sin select, pero expand
-      itemFull = await slFetch(
-        `/Items('${encodeURIComponent(code)}')?$expand=ItemUnitOfMeasurementCollection`
-      );
+      itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')?$expand=ItemUnitOfMeasurementCollection`);
     } catch (e2) {
-      // fallback 2: total
       itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
     }
   }
@@ -927,9 +984,7 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
@@ -948,13 +1003,11 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
       priceList: SAP_PRICE_LIST,
       priceListNo,
       price: priceCaja,
-      // Debug útil para confirmar si te llegó factor
       priceUnit: r.priceUnit,
       factorCaja: r.factorCaja,
       uom: r.item?.SalesUnit || "Caja",
       stock: r.stock,
     });
-
   } catch (err) {
     console.error("❌ /api/sap/item:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
@@ -963,27 +1016,18 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ SAP: SEARCH CUSTOMERS (autocomplete)
-   GET /api/sap/customers/search?q=ricamar&top=20
 ========================================================= */
 app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
     const q = String(req.query?.q || "").trim();
     const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
 
-    if (q.length < 2) {
-      return res.json({ ok: true, results: [] });
-    }
+    if (q.length < 2) return res.json({ ok: true, results: [] });
 
-    // OData: escapamos comillas
     const safe = q.replace(/'/g, "''");
 
-    // Busca por CardName o CardCode
-    // Nota: algunos SL soportan contains, otros solo substringof
-    // Intentamos contains primero y si falla hacemos fallback.
     let r;
     try {
       r = await slFetch(
@@ -996,8 +1040,7 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
     }
 
     const values = Array.isArray(r?.value) ? r.value : [];
-
-    const results = values.map(x => ({
+    const results = values.map((x) => ({
       CardCode: x.CardCode,
       CardName: x.CardName,
       Phone1: x.Phone1 || "",
@@ -1005,31 +1048,25 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
     }));
 
     return res.json({ ok: true, q, results });
-
   } catch (err) {
     console.error("❌ /api/sap/customers/search:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
 
-
 /* =========================================================
    ✅ SAP: MULTI ITEMS (warehouse dinámico)
 ========================================================= */
 app.get("/api/sap/items", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
     const codes = String(req.query.codes || "")
       .split(",")
       .map((x) => x.trim())
       .filter(Boolean);
 
-    if (!codes.length) {
-      return res.status(400).json({ ok: false, message: "codes vacío" });
-    }
+    if (!codes.length) return res.status(400).json({ ok: false, message: "codes vacío" });
 
     const warehouseCode = getWarehouseFromReq(req);
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
@@ -1047,8 +1084,8 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
           items[code] = {
             ok: true,
             name: r.item.ItemName,
-            unit: r.item.SalesUnit,     // Caja
-            price: r.price,             // Caja (si factor existe)
+            unit: r.item.SalesUnit, // Caja
+            price: r.price, // Caja (si factor existe)
             priceUnit: r.priceUnit,
             factorCaja: r.factorCaja,
             stock: r.stock,
@@ -1079,17 +1116,13 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
 ========================================================= */
 app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "CardCode vacío." });
 
     const bp = await slFetch(
-      `/BusinessPartners('${encodeURIComponent(
-        code
-      )}')?$select=CardCode,CardName,Phone1,Phone2,EmailAddress,Address,City,Country,ZipCode`
+      `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Phone1,Phone2,EmailAddress,Address,City,Country,ZipCode`
     );
 
     const addrParts = [bp.Address, bp.City, bp.ZipCode, bp.Country].filter(Boolean).join(", ");
@@ -1113,14 +1146,14 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN: DASHBOARD
-   - incluye bodega en dataset
-   - OMITE canceladas (no las contabiliza)
+   ✅ FIX:
+   - define parseUserFromComments/parseWhFromComments
+   - agrega CancelStatus en select + rows.push
+   - OMITE canceladas (csYes) sin contarlas
 ========================================================= */
 app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
     const scope = String(req.query?.scope || "created").trim().toLowerCase(); // created | all
     const fromQ = String(req.query?.from || "").trim();
@@ -1131,7 +1164,17 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
     const to = toQ || "";
 
     const PAGE_SIZE = Math.min(Math.max(Number(req.query?.top || 500), 50), 500);
-    const MAX_PAGES = Math.min(Math.max(Number(req.query?.maxPages || 20), 1), 60);
+    const MAX_PAGES = Math.min(Math.max(Number(req.query?.maxPages || 20), 1), 80);
+
+    // ✅ helpers de parseo (no existían en este viejo)
+    const parseUserFromComments = (comments = "") => {
+      const m = String(comments).match(/\[user:([^\]]+)\]/i);
+      return m ? String(m[1]).trim() : "";
+    };
+    const parseWhFromComments = (comments = "") => {
+      const m = String(comments).match(/\[wh:([^\]]+)\]/i);
+      return m ? String(m[1]).trim() : "";
+    };
 
     // ✅ scope=created -> solo usuarios existentes en app_users
     let allowedUsersSet = null;
@@ -1156,11 +1199,11 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
       : "";
 
-    // ✅ Traemos CancelStatus y Cancelled (por compat)
+    // ✅ Traemos CancelStatus
     const SELECT =
       `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Cancelled,Comments`;
 
-    let all = [];
+    const all = [];
     let skip = 0;
 
     for (let page = 0; page < MAX_PAGES; page++) {
@@ -1186,26 +1229,24 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         const cardCode = String(q.CardCode || "").trim();
         const cardName = String(q.CardName || "").trim();
 
-        // ✅ bodega desde comments
         const warehouse = parseWhFromComments(q.Comments || "") || "sin_wh";
 
-        // ✅ Cancelled robusto
+        // ✅ excluir canceladas por CancelStatus csYes (con fallback a Cancelled)
         const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
-        const cancelledFlag = String(q.Cancelled || "").trim(); // tYES/tNO
+        const cancelledFlag = String(q.Cancelled || "").trim(); // tYES/tNO (por si acaso)
 
         const isCancelled =
           cancelStatus.toLowerCase() === "csyes" ||
-          cancelStatus.toLowerCase() === "yes" ||
-          cancelStatus.toLowerCase() === "tyes" ||
           cancelledFlag.toLowerCase() === "tyes" ||
           cancelledFlag.toLowerCase() === "yes" ||
           cancelledFlag.toLowerCase() === "y" ||
           cancelledFlag.toLowerCase() === "true";
 
+        // ✅ NO MOSTRAR / NO CONTABILIZAR canceladas
+        if (isCancelled) continue;
+
         const estado =
-          isCancelled
-            ? "Cancelled"
-            : q.DocumentStatus === "bost_Open"
+          q.DocumentStatus === "bost_Open"
             ? "Open"
             : q.DocumentStatus === "bost_Close"
             ? "Close"
@@ -1228,7 +1269,10 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
           montoEntregado: 0,
           fecha: fechaISO,
           estado,
-          isCancelled, // ✅ lo guardamos
+
+          // ✅ agregado
+          cancelStatus, // (en no-canceladas será csNo normalmente)
+
           mes,
           anio,
           usuario: usuario || "sin_user",
@@ -1245,9 +1289,6 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
 
       skip += PAGE_SIZE;
     }
-
-    // ✅ CLAVE: OMITIR CANCELADAS EN DASHBOARD (no se cuentan, no se suman, no salen en charts)
-    all = all.filter((r) => !r.isCancelled);
 
     // --- Agregaciones ---
     const sumCot = all.reduce((acc, x) => acc + (Number(x.montoCotizacion) || 0), 0);
@@ -1351,9 +1392,7 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
     const cardCode = String(req.body?.cardCode || "").trim();
     const comments = String(req.body?.comments || "").trim();
@@ -1387,7 +1426,9 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       province ? `[prov:${province}]` : "",
       warehouseCode ? `[wh:${warehouseCode}]` : "",
       comments ? comments : "Cotización mercaderista",
-    ].filter(Boolean).join(" ");
+    ]
+      .filter(Boolean)
+      .join(" ");
 
     const payload = {
       CardCode: cardCode,
