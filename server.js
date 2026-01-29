@@ -12,25 +12,31 @@ app.use(express.json({ limit: "2mb" }));
 /* =========================================================
    ✅ ENV
 ========================================================= */
+// ---- SAP ----
 const SAP_BASE_URL = process.env.SAP_BASE_URL || "";
 const SAP_COMPANYDB = process.env.SAP_COMPANYDB || "";
 const SAP_USER = process.env.SAP_USER || "";
 const SAP_PASS = process.env.SAP_PASS || "";
 
+// ⚠️ DEFAULT WAREHOUSE (fallback si usuario no tiene)
 const SAP_WAREHOUSE = process.env.SAP_WAREHOUSE || "01";
 
 const SAP_PRICE_LIST =
   process.env.SAP_PRICE_LIST || "Lista 02 Res. Com. Ind. Analitic";
 
+// ---- Web / CORS ----
 const YAPPY_ALIAS = process.env.YAPPY_ALIAS || "@prodimasansae";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
+// ---- DB Supabase ----
 const DATABASE_URL = process.env.DATABASE_URL || "";
 
+// ---- Admin ----
 const ADMIN_USER = process.env.ADMIN_USER || "PRODIMA";
 const ADMIN_PASS = process.env.ADMIN_PASS || "ADMINISTRADOR";
 const JWT_SECRET = process.env.JWT_SECRET || "prodima_change_this_secret";
 
+// ---- Timezone Fix (para fecha SAP) ----
 const TZ_OFFSET_MIN = Number(process.env.TZ_OFFSET_MIN || -300);
 
 /* =========================================================
@@ -46,7 +52,7 @@ app.use(
 app.options("*", cors());
 
 /* =========================================================
-   ✅ Provincias -> Bodegas
+   ✅ Provincias + Bodegas (Auto)
 ========================================================= */
 function provinceToWarehouse(province) {
   const p = String(province || "").trim().toLowerCase();
@@ -78,7 +84,7 @@ function provinceToWarehouse(province) {
 }
 
 /* =========================================================
-   ✅ DB Pool (Supabase)
+   ✅ DB Pool (Supabase) - FIX SSL
 ========================================================= */
 let pool = null;
 
@@ -93,9 +99,7 @@ function getPool() {
     pool = new Pool({
       connectionString: DATABASE_URL,
       ssl: { rejectUnauthorized: false },
-      max: 6,
-      idleTimeoutMillis: 30_000,
-      connectionTimeoutMillis: 8_000,
+      max: 3,
     });
 
     pool.on("error", (err) => console.error("❌ DB pool error:", err.message));
@@ -109,7 +113,7 @@ async function dbQuery(text, params = []) {
 }
 
 /* =========================================================
-   ✅ Schema
+   ✅ DB Schema
 ========================================================= */
 async function ensureSchema() {
   if (!hasDb()) {
@@ -195,9 +199,11 @@ function verifyAdmin(req, res, next) {
   try {
     const auth = String(req.headers.authorization || "");
     if (!auth.startsWith("Bearer "))
-      return res.status(401).json({ ok: false, message: "Falta Bearer token" });
+      return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
 
-    const decoded = jwt.verify(auth.replace("Bearer ", "").trim(), JWT_SECRET);
+    const token = auth.replace("Bearer ", "").trim();
+    const decoded = jwt.verify(token, JWT_SECRET);
+
     if (!decoded || decoded.typ !== "admin")
       return res.status(403).json({ ok: false, message: "Token inválido" });
 
@@ -208,86 +214,121 @@ function verifyAdmin(req, res, next) {
   }
 }
 
-function verifyUser(req, res, next) {
+/**
+ * ✅ FIX #1: verifyUser rehidrata desde DB
+ * - No dependes del warehouse_code viejo del JWT
+ * - Valida is_active real
+ */
+async function verifyUser(req, res, next) {
   try {
     const auth = String(req.headers.authorization || "");
     if (!auth.startsWith("Bearer "))
-      return res.status(401).json({ ok: false, message: "Falta Bearer token" });
+      return res.status(401).json({ ok: false, message: "Falta Authorization Bearer token" });
 
-    const decoded = jwt.verify(auth.replace("Bearer ", "").trim(), JWT_SECRET);
+    const token = auth.replace("Bearer ", "").trim();
+    const decoded = jwt.verify(token, JWT_SECRET);
+
     if (!decoded || decoded.typ !== "user")
       return res.status(403).json({ ok: false, message: "Token inválido" });
 
-    req.user = decoded;
+    // ✅ rehidratar desde DB (si existe)
+    if (hasDb()) {
+      const uid = Number(decoded.uid || 0);
+      let r = null;
+
+      if (uid) {
+        r = await dbQuery(
+          `SELECT id, username, full_name, is_active, province, warehouse_code
+           FROM app_users
+           WHERE id = $1
+           LIMIT 1`,
+          [uid]
+        );
+      } else {
+        const uname = String(decoded.username || "").trim().toLowerCase();
+        r = await dbQuery(
+          `SELECT id, username, full_name, is_active, province, warehouse_code
+           FROM app_users
+           WHERE username = $1
+           LIMIT 1`,
+          [uname]
+        );
+      }
+
+      if (!r || !r.rowCount) {
+        return res.status(401).json({ ok: false, message: "Usuario no existe (DB)" });
+      }
+
+      const u = r.rows[0];
+      if (!u.is_active) {
+        return res.status(401).json({ ok: false, message: "Usuario desactivado" });
+      }
+
+      // ✅ usa datos reales de DB
+      req.user = {
+        typ: "user",
+        uid: u.id,
+        username: u.username,
+        full_name: u.full_name || "",
+        province: u.province || "",
+        warehouse_code: String(u.warehouse_code || "").trim(),
+      };
+    } else {
+      // fallback sin DB
+      req.user = decoded;
+    }
+
     next();
   } catch {
     return res.status(401).json({ ok: false, message: "Token expirado o inválido" });
   }
 }
 
-function missingSapEnv() {
-  return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
-}
-
-function getWarehouseFromReq(req) {
-  const wh = String(req.user?.warehouse_code || "").trim();
-  return wh || SAP_WAREHOUSE || "01";
-}
-
-function parseUserFromComments(comments = "") {
-  const m = String(comments).match(/\[user:([^\]]+)\]/i);
-  return m ? String(m[1]).trim() : "";
-}
-function parseWhFromComments(comments = "") {
-  const m = String(comments).match(/\[wh:([^\]]+)\]/i);
-  return m ? String(m[1]).trim() : "";
-}
-
 /* =========================================================
-   ✅ SAP: Cookie + Timeout + Retry
+   ✅ SAP Helpers (Service Layer Cookie + Cache)
 ========================================================= */
 let SL_COOKIE = null;
 let SL_COOKIE_TIME = 0;
 
-const SAP_TIMEOUT_MS = Number(process.env.SAP_TIMEOUT_MS || 12_000);
-const SAP_RETRY_ON_NETWORK = 1;
+let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
+const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
 
-function readSetCookies(res) {
-  try {
-    if (res?.headers?.getSetCookie) return res.headers.getSetCookie();
-  } catch {}
-  const sc = res?.headers?.get?.("set-cookie");
-  return sc ? [sc] : [];
+const ITEM_CACHE = new Map();
+const ITEM_TTL_MS = 20 * 1000;
+
+function missingSapEnv() {
+  return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
 }
 
 async function slLogin() {
-  if (missingSapEnv()) return;
+  if (missingSapEnv()) {
+    console.log("⚠️ Faltan variables SAP en Render > Environment");
+    return;
+  }
 
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), SAP_TIMEOUT_MS);
+  const payload = {
+    CompanyDB: SAP_COMPANYDB,
+    UserName: SAP_USER,
+    Password: SAP_PASS,
+  };
 
   const res = await fetch(`${SAP_BASE_URL}/Login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      CompanyDB: SAP_COMPANYDB,
-      UserName: SAP_USER,
-      Password: SAP_PASS,
-    }),
-    signal: controller.signal,
-  }).finally(() => clearTimeout(t));
+    body: JSON.stringify(payload),
+  });
 
   if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Login SAP falló (${res.status}): ${txt}`);
+    const t = await res.text();
+    throw new Error(`Login SAP falló (${res.status}): ${t}`);
   }
 
-  const cookies = readSetCookies(res);
-  if (!cookies || !cookies.length) throw new Error("No se recibió cookie del Service Layer.");
+  const setCookie = res.headers.get("set-cookie");
+  if (!setCookie) throw new Error("No se recibió cookie del Service Layer.");
 
-  SL_COOKIE = cookies
-    .map((c) => String(c).split(";")[0])
-    .filter(Boolean)
+  SL_COOKIE = setCookie
+    .split(",")
+    .map((s) => s.split(";")[0])
     .join("; ");
 
   SL_COOKIE_TIME = Date.now();
@@ -298,50 +339,33 @@ async function slFetch(path, options = {}) {
     await slLogin();
   }
 
-  let lastErr = null;
+  const res = await fetch(`${SAP_BASE_URL}${path}`, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: SL_COOKIE,
+      ...(options.headers || {}),
+    },
+  });
 
-  for (let attempt = 0; attempt <= SAP_RETRY_ON_NETWORK; attempt++) {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), SAP_TIMEOUT_MS);
+  const text = await res.text();
 
-    try {
-      const res = await fetch(`${SAP_BASE_URL}${path}`, {
-        ...options,
-        headers: {
-          "Content-Type": "application/json",
-          Cookie: SL_COOKIE,
-          ...(options.headers || {}),
-        },
-        signal: controller.signal,
-      });
-
-      const text = await res.text().catch(() => "");
-
-      if (res.status === 401 || res.status === 403) {
-        SL_COOKIE = null;
-        await slLogin();
-        continue;
-      }
-
-      let json;
-      try {
-        json = text ? JSON.parse(text) : {};
-      } catch {
-        json = { raw: text };
-      }
-
-      if (!res.ok) throw new Error(`SAP error ${res.status}: ${text}`);
-      return json;
-    } catch (e) {
-      lastErr = e;
-      if (attempt < SAP_RETRY_ON_NETWORK) continue;
-      throw lastErr;
-    } finally {
-      clearTimeout(t);
-    }
+  if (res.status === 401 || res.status === 403) {
+    SL_COOKIE = null;
+    await slLogin();
+    return slFetch(path, options);
   }
 
-  throw lastErr || new Error("SAP fetch error");
+  let json;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    json = { raw: text };
+  }
+
+  if (!res.ok) throw new Error(`SAP error ${res.status}: ${text}`);
+
+  return json;
 }
 
 /* =========================================================
@@ -353,6 +377,14 @@ function getDateISOInOffset(offsetMinutes = -300) {
   const localMs = utcMs + offsetMinutes * 60000;
   const local = new Date(localMs);
   return local.toISOString().slice(0, 10);
+}
+
+/* =========================================================
+   ✅ Helper: warehouse por usuario
+========================================================= */
+function getWarehouseFromReq(req) {
+  const wh = String(req.user?.warehouse_code || "").trim();
+  return wh || SAP_WAREHOUSE || "01";
 }
 
 /* =========================================================
@@ -370,7 +402,7 @@ app.get("/api/health", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN LOGIN
+   ✅ ADMIN: LOGIN
 ========================================================= */
 app.post("/api/admin/login", async (req, res) => {
   try {
@@ -386,6 +418,7 @@ app.post("/api/admin/login", async (req, res) => {
 
     const token = signAdminToken();
     await audit("ADMIN_LOGIN_OK", req, user, { user });
+
     return res.json({ ok: true, token });
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message });
@@ -393,27 +426,8 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: USERS + CRUD
+   ✅ ADMIN: LIST USERS
 ========================================================= */
-let ALLOWED_USERS_CACHE = { ts: 0, set: null };
-const ALLOWED_USERS_TTL_MS = 60_000;
-
-async function getAllowedUsersSetCached() {
-  if (!hasDb()) return new Set();
-  const now = Date.now();
-  if (ALLOWED_USERS_CACHE.set && now - ALLOWED_USERS_CACHE.ts < ALLOWED_USERS_TTL_MS) {
-    return ALLOWED_USERS_CACHE.set;
-  }
-  const r = await dbQuery(`SELECT username FROM app_users;`);
-  const set = new Set(
-    (r.rows || [])
-      .map((x) => String(x.username || "").trim().toLowerCase())
-      .filter(Boolean)
-  );
-  ALLOWED_USERS_CACHE = { ts: now, set };
-  return set;
-}
-
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
@@ -430,6 +444,9 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   }
 });
 
+/* =========================================================
+   ✅ ADMIN: CREATE USER (province -> warehouse auto)
+========================================================= */
 app.post("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
@@ -437,6 +454,7 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
     const username = String(req.body?.username || "").trim().toLowerCase();
     const fullName = String(req.body?.fullName || req.body?.full_name || "").trim();
     const pin = String(req.body?.pin || "").trim();
+
     const province = String(req.body?.province || "").trim();
     let warehouse_code = String(req.body?.warehouse_code || "").trim();
 
@@ -456,8 +474,6 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
       [username, fullName, pin_hash, province, warehouse_code]
     );
 
-    ALLOWED_USERS_CACHE = { ts: 0, set: null };
-
     await audit("USER_CREATED", req, "ADMIN", { username, fullName, province, warehouse_code });
     return res.json({ ok: true, user: ins.rows[0] });
   } catch (e) {
@@ -468,6 +484,9 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
   }
 });
 
+/* =========================================================
+   ✅ ADMIN: DELETE USER
+========================================================= */
 app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
@@ -478,8 +497,6 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
     const r = await dbQuery(`DELETE FROM app_users WHERE id = $1 RETURNING id, username;`, [id]);
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
 
-    ALLOWED_USERS_CACHE = { ts: 0, set: null };
-
     await audit("USER_DELETED", req, "ADMIN", { id, username: r.rows[0]?.username });
     return res.json({ ok: true, message: "Usuario eliminado" });
   } catch (e) {
@@ -487,6 +504,9 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
   }
 });
 
+/* =========================================================
+   ✅ ADMIN: TOGGLE ACTIVO
+========================================================= */
 app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
@@ -513,6 +533,9 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
   }
 });
 
+/* =========================================================
+   ✅ ADMIN: AUDIT
+========================================================= */
 app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
@@ -531,7 +554,7 @@ app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ LOGIN USUARIOS
+   ✅ MERCADERISTAS: LOGIN
 ========================================================= */
 app.post("/api/auth/login", async (req, res) => {
   try {
@@ -539,11 +562,16 @@ app.post("/api/auth/login", async (req, res) => {
 
     const username = String(req.body?.username || "").trim().toLowerCase();
     const pin = String(req.body?.pin || "").trim();
+
     if (!username || !pin) return res.status(400).json({ ok: false, message: "username y pin requeridos" });
 
     const r = await dbQuery(
-      `SELECT id, username, full_name, pin_hash, is_active, province, warehouse_code
-       FROM app_users WHERE username = $1 LIMIT 1;`,
+      `
+      SELECT id, username, full_name, pin_hash, is_active, province, warehouse_code
+      FROM app_users
+      WHERE username = $1
+      LIMIT 1;
+      `,
       [username]
     );
 
@@ -574,6 +602,7 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     const token = signUserToken(user);
+
     await audit("USER_LOGIN_OK", req, username, {
       username,
       province: user.province,
@@ -596,24 +625,26 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
+/* =========================================================
+   ✅ MERCADERISTAS: ME
+========================================================= */
 app.get("/api/auth/me", verifyUser, async (req, res) => {
   return res.json({ ok: true, user: req.user });
 });
 
 /* =========================================================
-   ✅ PriceListNo cache
+   ✅ PriceListNo cached
 ========================================================= */
-let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
-const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
-
 async function getPriceListNoByNameCached(name) {
   const now = Date.now();
+
   if (
     PRICE_LIST_CACHE.name === name &&
     PRICE_LIST_CACHE.no !== null &&
     now - PRICE_LIST_CACHE.ts < PRICE_LIST_TTL_MS
-  )
+  ) {
     return PRICE_LIST_CACHE.no;
+  }
 
   const safe = name.replace(/'/g, "''");
   let no = null;
@@ -641,10 +672,14 @@ function getPriceFromPriceList(itemFull, priceListNo) {
   const row = Array.isArray(itemFull?.ItemPrices)
     ? itemFull.ItemPrices.find((p) => Number(p?.PriceList) === listNo)
     : null;
+
   const price = row && row.Price != null ? Number(row.Price) : null;
   return Number.isFinite(price) ? price : null;
 }
 
+/* =========================================================
+   ✅ Factor UoM de VENTAS (Caja)
+========================================================= */
 function getSalesUomFactor(itemFull) {
   const directFields = [
     itemFull?.SalesItemsPerUnit,
@@ -652,6 +687,7 @@ function getSalesUomFactor(itemFull) {
     itemFull?.SalesQtyPerPackage,
     itemFull?.SalesPackagingUnit,
   ];
+
   for (const v of directFields) {
     const n = Number(v);
     if (Number.isFinite(n) && n > 0) return n;
@@ -676,161 +712,44 @@ function getSalesUomFactor(itemFull) {
     return Number.isFinite(f) && f > 0 ? f : null;
   }
   if (Number.isFinite(b) && b > 0) return b;
+
   return null;
 }
 
 /* =========================================================
-   ✅ CACHE + SINGLE-FLIGHT
+   ✅ FIX #2: Stock usando el patrón que A TI te funciona
+   - ItemWarehouseInfoCollection en $select (NO $expand)
+   - fallback si no viene colección
 ========================================================= */
-function cacheGet(map, key, ttl) {
-  const c = map.get(key);
-  if (!c) return null;
-  if (Date.now() - c.ts > ttl) return null;
-  return c.data;
-}
-function cacheSet(map, key, data, maxSize = 5000) {
-  map.set(key, { ts: Date.now(), data });
-  if (map.size > maxSize) {
-    const firstKey = map.keys().next().value;
-    map.delete(firstKey);
-  }
-}
-
-const ITEM_META_CACHE = new Map(); // code::priceListNo -> meta
-const ITEM_STOCK_CACHE = new Map(); // code::wh -> stock
-const INFLIGHT_ITEM = new Map(); // key -> promise
-
-const ITEM_META_TTL_MS = 6 * 60 * 60 * 1000; // 6 horas
-const ITEM_STOCK_TTL_MS = 10_000; // 10s
-
-// ✅ helper robusto: encuentra la bodega exacta (TRIM + string)
-function findWarehouseRow(collection, warehouseCode) {
-  if (!Array.isArray(collection) || !collection.length) return null;
-  const wh = String(warehouseCode || "").trim();
-  return (
-    collection.find((w) => String(w?.WarehouseCode || "").trim() === wh) ||
-    null
-  );
-}
-
-async function fetchItemMeta(code, priceListNo) {
-  const key = `${code}::${priceListNo}`;
-  const cached = cacheGet(ITEM_META_CACHE, key, ITEM_META_TTL_MS);
-  if (cached) return cached;
-
-  let itemFull;
-  try {
-    itemFull = await slFetch(
-      `/Items('${encodeURIComponent(code)}')` +
-        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage` +
-        `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
-    );
-  } catch {
-    itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
-  }
+function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
+  const item = {
+    ItemCode: itemFull.ItemCode ?? code,
+    ItemName: itemFull.ItemName ?? `Producto ${code}`,
+    SalesUnit: itemFull.SalesUnit ?? "",
+    InventoryItem: itemFull.InventoryItem ?? null,
+  };
 
   const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
   const factorCaja = getSalesUomFactor(itemFull);
   const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
 
-  const meta = {
-    item: {
-      ItemCode: itemFull.ItemCode ?? code,
-      ItemName: itemFull.ItemName ?? `Producto ${code}`,
-      SalesUnit: itemFull.SalesUnit ?? "",
-      InventoryItem: itemFull.InventoryItem ?? null,
-    },
-    price: priceCaja,
-    priceUnit,
-    factorCaja,
-  };
-
-  cacheSet(ITEM_META_CACHE, key, meta);
-  return meta;
-}
-
-/* =========================================================
-   ✅ STOCK (CORREGIDO)
-   - En algunos Service Layer, el path /Items('x')/ItemWarehouseInfoCollection
-     + $filter no funciona bien o devuelve vacío.
-   - Solución: traer ItemWarehouseInfoCollection por $expand (como tu código viejo)
-     y luego filtrar en JS por WarehouseCode.
-========================================================= */
-async function fetchItemStock(code, warehouseCode) {
-  const key = `${code}::${warehouseCode}`;
-  const cached = cacheGet(ITEM_STOCK_CACHE, key, ITEM_STOCK_TTL_MS);
-  if (cached) return cached;
-
-  let itemFull = null;
-
-  // ✅ Método compatible: $expand ItemWarehouseInfoCollection y buscar la bodega en JS
-  try {
-    itemFull = await slFetch(
-      `/Items('${encodeURIComponent(code)}')` +
-        `?$select=ItemCode,ItemWarehouseInfoCollection` +
-        `&$expand=ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`
-    );
-  } catch {
-    itemFull = null;
+  let warehouseRow = null;
+  if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
+    warehouseRow =
+      itemFull.ItemWarehouseInfoCollection.find(
+        (w) => String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
+      ) || null;
   }
 
-  const wrow = findWarehouseRow(itemFull?.ItemWarehouseInfoCollection, warehouseCode);
-
-  const onHand = wrow?.InStock != null ? Number(wrow.InStock) : null;
-  const committed = wrow?.Committed != null ? Number(wrow.Committed) : null;
-  const ordered = wrow?.Ordered != null ? Number(wrow.Ordered) : null;
-
-  let available = null;
-  if (Number.isFinite(onHand) && Number.isFinite(committed)) available = onHand - committed;
-
-  const stock = {
-    warehouse: warehouseCode,
-    onHand: Number.isFinite(onHand) ? onHand : null,
-    committed: Number.isFinite(committed) ? committed : null,
-    ordered: Number.isFinite(ordered) ? ordered : null,
-    available: Number.isFinite(available) ? available : null,
-    hasStock: available != null ? available > 0 : null,
-  };
-
-  cacheSet(ITEM_STOCK_CACHE, key, stock);
-  return stock;
-}
-
-/* =========================================================
-   ✅ 1 SOLA LLAMADA (CORREGIDO)
-   - Quitamos $filter dentro del $expand (no siempre lo soporta SAP SL)
-   - Expandimos toda la colección y filtramos por bodega en JS (como tu viejo)
-========================================================= */
-async function fetchItemAllInOne(code, priceListNo, warehouseCode) {
-  const path =
-    `/Items('${encodeURIComponent(code)}')` +
-    `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage,ItemWarehouseInfoCollection` +
-    `&$expand=` +
-    `ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity),` +
-    `ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`;
-
-  const itemFull = await slFetch(path);
-
-  const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
-  const factorCaja = getSalesUomFactor(itemFull);
-  const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
-
-  const wrow = findWarehouseRow(itemFull?.ItemWarehouseInfoCollection, warehouseCode);
-
-  const onHand = wrow?.InStock != null ? Number(wrow.InStock) : null;
-  const committed = wrow?.Committed != null ? Number(wrow.Committed) : null;
-  const ordered = wrow?.Ordered != null ? Number(wrow.Ordered) : null;
+  const onHand = warehouseRow?.InStock != null ? Number(warehouseRow.InStock) : null;
+  const committed = warehouseRow?.Committed != null ? Number(warehouseRow.Committed) : null;
+  const ordered = warehouseRow?.Ordered != null ? Number(warehouseRow.Ordered) : null;
 
   let available = null;
   if (Number.isFinite(onHand) && Number.isFinite(committed)) available = onHand - committed;
 
   return {
-    item: {
-      ItemCode: itemFull.ItemCode ?? code,
-      ItemName: itemFull.ItemName ?? `Producto ${code}`,
-      SalesUnit: itemFull.SalesUnit ?? "",
-      InventoryItem: itemFull.InventoryItem ?? null,
-    },
+    item,
     price: priceCaja,
     priceUnit,
     factorCaja,
@@ -845,50 +764,51 @@ async function fetchItemAllInOne(code, priceListNo, warehouseCode) {
   };
 }
 
-/* =========================================================
-   ✅ getOneItem Optimizado + SINGLE-FLIGHT
-========================================================= */
-async function getOneItemOptimized(code, priceListNo, warehouseCode) {
-  const inflightKey = `${code}::${priceListNo}::${warehouseCode}`;
+async function getOneItem(code, priceListNo, warehouseCode) {
+  const now = Date.now();
+  const key = `${code}::${warehouseCode}::${priceListNo}`;
+  const cached = ITEM_CACHE.get(key);
+  if (cached && now - cached.ts < ITEM_TTL_MS) return cached.data;
 
-  if (INFLIGHT_ITEM.has(inflightKey)) {
-    return INFLIGHT_ITEM.get(inflightKey);
-  }
+  let itemFull;
 
-  const p = (async () => {
-    try {
-      const r = await fetchItemAllInOne(code, priceListNo, warehouseCode);
-
-      cacheSet(ITEM_META_CACHE, `${code}::${priceListNo}`, {
-        item: r.item,
-        price: r.price,
-        priceUnit: r.priceUnit,
-        factorCaja: r.factorCaja,
-      });
-
-      cacheSet(ITEM_STOCK_CACHE, `${code}::${warehouseCode}`, r.stock);
-
-      return r;
-    } catch {
-      const [meta, stock] = await Promise.all([
-        fetchItemMeta(code, priceListNo),
-        fetchItemStock(code, warehouseCode),
-      ]);
-      return { ...meta, stock };
-    }
-  })();
-
-  INFLIGHT_ITEM.set(inflightKey, p);
-
+  // ✅ IMPORTANTE: NO expandimos ItemWarehouseInfoCollection (como tu viejo)
   try {
-    return await p;
-  } finally {
-    INFLIGHT_ITEM.delete(inflightKey);
+    itemFull = await slFetch(
+      `/Items('${encodeURIComponent(code)}')` +
+        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection` +
+        `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
+    );
+  } catch (e1) {
+    try {
+      itemFull = await slFetch(
+        `/Items('${encodeURIComponent(code)}')` +
+          `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection`
+      );
+    } catch (e2) {
+      itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
+    }
   }
+
+  // ✅ fallback: si SAP no trajo la colección, la pedimos por endpoint alterno
+  if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
+    try {
+      const whInfo = await slFetch(
+        `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,Committed,Ordered`
+      );
+      if (Array.isArray(whInfo?.value)) {
+        itemFull.ItemWarehouseInfoCollection = whInfo.value;
+      }
+    } catch {}
+  }
+
+  const data = buildItemResponse(itemFull, code, priceListNo, warehouseCode);
+  ITEM_CACHE.set(key, { ts: now, data });
+  return data;
 }
 
 /* =========================================================
-   ✅ SAP: ITEM (rápido) + ✅ INVENTARIO VISIBLE
+   ✅ SAP: ITEM (warehouse dinámico) + ✅ disponible top-level
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -897,29 +817,27 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
 
-    const warehouseCode = getWarehouseFromReq(req); // ✅ bodega del usuario (token)
+    const warehouseCode = getWarehouseFromReq(req);
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
 
-    const r = await getOneItemOptimized(code, priceListNo, warehouseCode);
-
-    // ✅ campos “visibles” para el frontend
-    const disponible = r?.stock?.available ?? null;
-    const enStock = r?.stock?.hasStock ?? null;
+    const r = await getOneItem(code, priceListNo, warehouseCode);
 
     return res.json({
       ok: true,
       item: r.item,
       warehouse: warehouseCode,
-      bodega: warehouseCode, // ✅ alias
+      bodega: warehouseCode,
       priceList: SAP_PRICE_LIST,
       priceListNo,
       price: Number(r.price ?? 0),
       priceUnit: r.priceUnit,
       factorCaja: r.factorCaja,
       uom: r.item?.SalesUnit || "Caja",
-      stock: r.stock, // ✅ detalle
-      disponible, // ✅ visible
-      enStock, // ✅ visible
+      stock: r.stock,
+
+      // ✅ para tu columna “Disponible”
+      disponible: r?.stock?.available ?? null,
+      enStock: r?.stock?.hasStock ?? null,
     });
   } catch (err) {
     console.error("❌ /api/sap/item:", err.message);
@@ -928,54 +846,63 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ NUEVO: SEARCH ITEMS (autocomplete)
+   ✅ SAP: MULTI ITEMS (warehouse dinámico) + disponible
 ========================================================= */
-const ITEM_SEARCH_CACHE = new Map();
-const ITEM_SEARCH_TTL_MS = 20_000;
-
-app.get("/api/sap/items/search", verifyUser, async (req, res) => {
+app.get("/api/sap/items", verifyUser, async (req, res) => {
   try {
     if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
-    const q = String(req.query?.q || "").trim();
-    const top = Math.min(Math.max(Number(req.query?.top || 20), 5), 50);
+    const codes = String(req.query.codes || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
 
-    if (q.length < 2) return res.json({ ok: true, q, results: [] });
+    if (!codes.length) return res.status(400).json({ ok: false, message: "codes vacío" });
 
-    const key = `${q.toLowerCase()}::${top}`;
-    const cached = cacheGet(ITEM_SEARCH_CACHE, key, ITEM_SEARCH_TTL_MS);
-    if (cached) return res.json({ ok: true, q, results: cached });
+    const warehouseCode = getWarehouseFromReq(req);
+    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
 
-    const safe = q.replace(/'/g, "''");
+    const CONCURRENCY = 5;
+    const items = {};
+    let i = 0;
 
-    let r;
-    try {
-      r = await slFetch(
-        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem` +
-          `&$filter=(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))` +
-          `&$orderby=ItemName asc&$top=${top}`
-      );
-    } catch {
-      r = await slFetch(
-        `/Items?$select=ItemCode,ItemName,SalesUnit,InventoryItem` +
-          `&$filter=substringof('${safe}',ItemCode) or substringof('${safe}',ItemName)` +
-          `&$orderby=ItemName asc&$top=${top}`
-      );
+    async function worker() {
+      while (i < codes.length) {
+        const idx = i++;
+        const code = codes[idx];
+        try {
+          const r = await getOneItem(code, priceListNo, warehouseCode);
+          items[code] = {
+            ok: true,
+            name: r.item.ItemName,
+            unit: r.item.SalesUnit,
+            price: r.price,
+            priceUnit: r.priceUnit,
+            factorCaja: r.factorCaja,
+            stock: r.stock,
+
+            // ✅ para tu columna “Disponible”
+            disponible: r?.stock?.available ?? null,
+            enStock: r?.stock?.hasStock ?? null,
+          };
+        } catch (e) {
+          items[code] = { ok: false, message: String(e.message || e) };
+        }
+      }
     }
 
-    const values = Array.isArray(r?.value) ? r.value : [];
-    const results = values.map((x) => ({
-      ItemCode: x.ItemCode,
-      ItemName: x.ItemName,
-      SalesUnit: x.SalesUnit || "",
-      InventoryItem: x.InventoryItem ?? null,
-    }));
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
-    cacheSet(ITEM_SEARCH_CACHE, key, results, 4000);
-
-    return res.json({ ok: true, q, results });
+    return res.json({
+      ok: true,
+      warehouse: warehouseCode,
+      bodega: warehouseCode,
+      priceList: SAP_PRICE_LIST,
+      priceListNo,
+      items,
+    });
   } catch (err) {
-    console.error("❌ /api/sap/items/search:", err.message);
+    console.error("❌ /api/sap/items:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
@@ -983,9 +910,6 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 /* =========================================================
    ✅ SAP: SEARCH CUSTOMERS
 ========================================================= */
-const CUSTOMER_SEARCH_CACHE = new Map();
-const CUSTOMER_SEARCH_TTL_MS = 20_000;
-
 app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
   try {
     if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
@@ -995,24 +919,16 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
 
     if (q.length < 2) return res.json({ ok: true, results: [] });
 
-    const cacheKey = `${q.toLowerCase()}::${top}`;
-    const cached = cacheGet(CUSTOMER_SEARCH_CACHE, cacheKey, CUSTOMER_SEARCH_TTL_MS);
-    if (cached) return res.json({ ok: true, q, results: cached });
-
     const safe = q.replace(/'/g, "''");
 
     let r;
     try {
       r = await slFetch(
-        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress` +
-          `&$filter=CardType eq 'cCustomer' and (contains(CardName,'${safe}') or contains(CardCode,'${safe}'))` +
-          `&$orderby=CardName asc&$top=${top}`
+        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=contains(CardName,'${safe}') or contains(CardCode,'${safe}')&$orderby=CardName asc&$top=${top}`
       );
-    } catch (e) {
+    } catch {
       r = await slFetch(
-        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress` +
-          `&$filter=contains(CardName,'${safe}') or contains(CardCode,'${safe}')` +
-          `&$orderby=CardName asc&$top=${top}`
+        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=substringof('${safe}',CardName) or substringof('${safe}',CardCode)&$orderby=CardName asc&$top=${top}`
       );
     }
 
@@ -1024,11 +940,8 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
       EmailAddress: x.EmailAddress || "",
     }));
 
-    cacheSet(CUSTOMER_SEARCH_CACHE, cacheKey, results, 4000);
-
     return res.json({ ok: true, q, results });
   } catch (err) {
-    console.error("❌ /api/sap/customers/search:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
@@ -1066,230 +979,7 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: HISTÓRICO / DASHBOARD
-========================================================= */
-app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const userFilter = String(req.query?.user || "").trim().toLowerCase();
-    const clientFilter = String(req.query?.client || "").trim().toLowerCase();
-    const from = String(req.query?.from || "").trim();
-    const to = String(req.query?.to || "").trim();
-
-    const limit = Math.min(Math.max(Number(req.query?.limit || req.query?.top || 500), 1), 500);
-    const skip = Math.max(Number(req.query?.skip || 0), 0);
-
-    const SAP_PAGE = 500;
-    const MAX_PAGES = 80;
-
-    const bpCache = new Map();
-    async function getBPName(cardCode) {
-      if (!cardCode) return "";
-      if (bpCache.has(cardCode)) return bpCache.get(cardCode);
-      try {
-        const bp = await slFetch(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`);
-        const name = String(bp?.CardName || "").trim();
-        bpCache.set(cardCode, name);
-        return name;
-      } catch {
-        bpCache.set(cardCode, "");
-        return "";
-      }
-    }
-
-    const filterParts = [];
-    if (from) filterParts.push(`DocDate ge '${from}'`);
-    if (to) filterParts.push(`DocDate le '${to}'`);
-    const sapFilter = filterParts.length ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}` : "";
-
-    const SELECT = `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
-
-    const need = skip + limit;
-    const matched = [];
-
-    let sapSkip = 0;
-    for (let page = 0; page < MAX_PAGES && matched.length < need; page++) {
-      const sap = await slFetch(
-        `/Quotations?$select=${SELECT}&$orderby=DocDate desc&$top=${SAP_PAGE}&$skip=${sapSkip}${sapFilter}`
-      );
-
-      const values = Array.isArray(sap?.value) ? sap.value : [];
-      if (!values.length) break;
-
-      for (const q of values) {
-        const fechaISO = String(q.DocDate || "").slice(0, 10);
-        const usuario = parseUserFromComments(q.Comments || "");
-        const cardCode = String(q.CardCode || "").trim();
-
-        if (userFilter && !String(usuario || "").toLowerCase().includes(userFilter)) continue;
-
-        let cardName = String(q.CardName || "").trim();
-        if (!cardName) cardName = await getBPName(cardCode);
-
-        if (clientFilter) {
-          const cc = String(cardCode || "").toLowerCase();
-          const cn = String(cardName || "").toLowerCase();
-          if (!cc.includes(clientFilter) && !cn.includes(clientFilter)) continue;
-        }
-
-        const cancelStatus = String(q.CancelStatus || "").trim();
-        const isCancelled = cancelStatus.toLowerCase() === "csyes";
-
-        const estado = isCancelled
-          ? "Cancelled"
-          : q.DocumentStatus === "bost_Open"
-          ? "Open"
-          : q.DocumentStatus === "bost_Close"
-          ? "Close"
-          : String(q.DocumentStatus || "");
-
-        matched.push({
-          docEntry: q.DocEntry,
-          docNum: q.DocNum,
-          cardCode,
-          cardName,
-          montoCotizacion: Number(q.DocTotal || 0),
-          montoEntregado: 0,
-          fecha: fechaISO,
-          estado,
-          cancelStatus,
-          isCancelled,
-          usuario,
-          comments: q.Comments || "",
-        });
-
-        if (matched.length >= need) break;
-      }
-
-      if (from) {
-        const last = values[values.length - 1];
-        const lastDate = String(last?.DocDate || "").slice(0, 10);
-        if (lastDate && lastDate < from) break;
-      }
-
-      sapSkip += SAP_PAGE;
-    }
-
-    const pageRows = matched.slice(skip, skip + limit);
-    return res.json({ ok: true, limit, skip, count: pageRows.length, quotes: pageRows });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const scope = String(req.query?.scope || "created").trim().toLowerCase();
-    const fromQ = String(req.query?.from || "").trim();
-    const toQ = String(req.query?.to || "").trim();
-
-    const from = fromQ || "2020-01-01";
-    const to = toQ || "";
-
-    const PAGE_SIZE = Math.min(Math.max(Number(req.query?.top || 500), 50), 500);
-    const MAX_PAGES = Math.min(Math.max(Number(req.query?.maxPages || 20), 1), 80);
-
-    let allowedUsersSet = null;
-    if (scope === "created") allowedUsersSet = await getAllowedUsersSetCached();
-
-    const filterParts = [];
-    if (from) filterParts.push(`DocDate ge '${from}'`);
-    if (to) filterParts.push(`DocDate le '${to}'`);
-    const sapFilter = filterParts.length ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}` : "";
-
-    const SELECT =
-      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Cancelled,Comments`;
-
-    const all = [];
-    let skip = 0;
-
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const sap = await slFetch(
-        `/Quotations?$select=${SELECT}&$orderby=DocDate desc&$top=${PAGE_SIZE}&$skip=${skip}${sapFilter}`
-      );
-
-      const values = Array.isArray(sap?.value) ? sap.value : [];
-      if (!values.length) break;
-
-      for (const q of values) {
-        const fechaISO = String(q.DocDate || "").slice(0, 10);
-
-        const usuario = parseUserFromComments(q.Comments || "");
-        const usuarioKey = String(usuario || "").trim().toLowerCase();
-
-        if (allowedUsersSet && scope === "created") {
-          if (!usuarioKey || !allowedUsersSet.has(usuarioKey)) continue;
-        }
-
-        const warehouse = parseWhFromComments(q.Comments || "") || "sin_wh";
-
-        const cancelStatus = String(q.CancelStatus || "").trim();
-        const cancelledFlag = String(q.Cancelled || "").trim();
-        const isCancelled =
-          cancelStatus.toLowerCase() === "csyes" ||
-          cancelledFlag.toLowerCase() === "tyes" ||
-          cancelledFlag.toLowerCase() === "true";
-
-        if (isCancelled) continue;
-
-        const estado =
-          q.DocumentStatus === "bost_Open"
-            ? "Open"
-            : q.DocumentStatus === "bost_Close"
-            ? "Close"
-            : String(q.DocumentStatus || "");
-
-        all.push({
-          docEntry: q.DocEntry,
-          docNum: q.DocNum,
-          cardCode: String(q.CardCode || "").trim(),
-          cardName: String(q.CardName || "").trim(),
-          montoCotizacion: Number(q.DocTotal || 0),
-          montoEntregado: 0,
-          fecha: fechaISO,
-          estado,
-          cancelStatus,
-          usuario: usuario || "sin_user",
-          warehouse,
-        });
-      }
-
-      if (from) {
-        const last = values[values.length - 1];
-        const lastDate = String(last?.DocDate || "").slice(0, 10);
-        if (lastDate && lastDate < from) break;
-      }
-
-      skip += PAGE_SIZE;
-    }
-
-    const sumCot = all.reduce((a, x) => a + (Number(x.montoCotizacion) || 0), 0);
-    const sumEnt = all.reduce((a, x) => a + (Number(x.montoEntregado) || 0), 0);
-    const fillRate = sumCot > 0 ? sumEnt / sumCot : 0;
-
-    return res.json({
-      ok: true,
-      scope,
-      from,
-      to: to || null,
-      fetched: all.length,
-      kpis: {
-        totalCotizaciones: all.length,
-        montoCotizado: sumCot,
-        montoEntregado: sumEnt,
-        fillRate,
-      },
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   ✅ CREAR COTIZACIÓN
+   ✅ SAP: CREAR COTIZACIÓN
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
@@ -1312,7 +1002,8 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       }))
       .filter((x) => x.ItemCode && x.Quantity > 0);
 
-    if (!DocumentLines.length) return res.status(400).json({ ok: false, message: "No hay líneas válidas." });
+    if (!DocumentLines.length)
+      return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
 
@@ -1329,16 +1020,18 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       .filter(Boolean)
       .join(" ");
 
+    const payload = {
+      CardCode: cardCode,
+      DocDate: docDate,
+      DocDueDate: docDate,
+      Comments: sapComments,
+      JournalMemo: "Cotización web mercaderistas",
+      DocumentLines,
+    };
+
     const created = await slFetch(`/Quotations`, {
       method: "POST",
-      body: JSON.stringify({
-        CardCode: cardCode,
-        DocDate: docDate,
-        DocDueDate: docDate,
-        Comments: sapComments,
-        JournalMemo: "Cotización web mercaderistas",
-        DocumentLines,
-      }),
+      body: JSON.stringify(payload),
     });
 
     await audit("QUOTE_CREATED", req, creator, {
@@ -1355,9 +1048,10 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       docEntry: created.DocEntry,
       docNum: created.DocNum,
       warehouse: warehouseCode,
+      bodega: warehouseCode,
     });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err.message });
   }
 });
 
