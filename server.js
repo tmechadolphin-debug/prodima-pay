@@ -403,7 +403,10 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
+   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP) - FIX REAL
+   - Filtra por fecha en SAP (OData $filter) para traer TODO desde 2020
+   - Paginación real con $skip + $top
+   - Detecta canceladas con campo Canceled (tYES)
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -413,12 +416,31 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
-    const from = String(req.query?.from || "").trim();
-    const to = String(req.query?.to || "").trim();
-    const limit = Math.min(Number(req.query?.limit || 200), 500);
 
+    // ✅ fechas: default desde 2020 si no mandan nada
+    const from = String(req.query?.from || "2020-01-01").trim(); // YYYY-MM-DD
+    const to = String(req.query?.to || getDateISOInOffset(TZ_OFFSET_MIN)).trim();
+
+    // ✅ paginación
+    const limit = Math.min(Math.max(Number(req.query?.limit || 20), 5), 200); // 5..200
+    const page = Math.max(Number(req.query?.page || 1), 1);
+    const skip = (page - 1) * limit;
+
+    // ✅ OData date filter
+    // (DocDate es YYYY-MM-DD en SAP normalmente)
+    const safeFrom = from.replace(/'/g, "''");
+    const safeTo = to.replace(/'/g, "''");
+
+    const filterParts = [];
+    if (safeFrom) filterParts.push(`DocDate ge '${safeFrom}'`);
+    if (safeTo) filterParts.push(`DocDate le '${safeTo}'`);
+    const dateFilter = filterParts.length ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}` : "";
+
+    // ✅ Trae también Canceled para marcar canceladas correctamente
     const sap = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments&$orderby=DocDate desc&$top=${limit}`
+      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,Comments,Canceled` +
+      `${dateFilter}` +
+      `&$orderby=DocDate desc&$skip=${skip}&$top=${limit}`
     );
 
     const values = Array.isArray(sap?.value) ? sap.value : [];
@@ -428,41 +450,49 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       return m ? String(m[1]).trim() : "";
     };
 
-    const bpCache = new Map();
+    const parseWhFromComments = (comments = "") => {
+      const m = String(comments).match(/\[wh:([^\]]+)\]/i);
+      return m ? String(m[1]).trim() : "";
+    };
 
+    // (Opcional) cache de BP si CardName viene vacío
+    const bpCache = new Map();
     async function getBPName(cardCode) {
       if (!cardCode) return "";
       if (bpCache.has(cardCode)) return bpCache.get(cardCode);
-
       try {
-        const bp = await slFetch(
-          `/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`
-        );
+        const bp = await slFetch(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`);
         const name = String(bp?.CardName || "").trim();
         bpCache.set(cardCode, name);
         return name;
-      } catch (e) {
-        console.error("❌ BP lookup fail:", cardCode, e.message);
+      } catch {
         bpCache.set(cardCode, "");
         return "";
       }
     }
 
     let rows = [];
-
     for (const q of values) {
-      const docDate = String(q.DocDate || "").slice(0, 10); // ✅ deja YYYY-MM-DD
+      const docDate = q.DocDate || "";
       const usuario = parseUserFromComments(q.Comments || "");
+      const wh = parseWhFromComments(q.Comments || "");
+
       const cardCode = String(q.CardCode || "").trim();
 
-      const estado =
-        q.DocumentStatus === "bost_Open" ? "Open" :
-        q.DocumentStatus === "bost_Close" ? "Close" :
-        String(q.DocumentStatus || "");
-
       let cardName = String(q.CardName || "").trim();
-      if (!cardName) {
-        cardName = await getBPName(cardCode);
+      if (!cardName) cardName = await getBPName(cardCode);
+
+      // ✅ Estado real (Cancelada primero)
+      let estado = "";
+      const canceled = String(q.Canceled || "").toLowerCase(); // tYES / tNO
+      if (canceled === "tyes") {
+        estado = "Cancelada";
+      } else if (q.DocumentStatus === "bost_Open") {
+        estado = "Open";
+      } else if (q.DocumentStatus === "bost_Close") {
+        estado = "Close";
+      } else {
+        estado = String(q.DocumentStatus || "");
       }
 
       let mes = "";
@@ -481,16 +511,18 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         customerName: cardName,
         nombreCliente: cardName,
         montoCotizacion: Number(q.DocTotal || 0),
-        montoEntregado: 0,
+        montoEntregado: 0, // si luego lo calculas, aquí lo rellenas
         fecha: docDate,
         estado,
         mes,
         anio,
         usuario,
+        warehouse: wh,
         comments: q.Comments || ""
       });
     }
 
+    // filtros extra (por user/cliente) en Node
     if (userFilter) rows = rows.filter(r => String(r.usuario || "").toLowerCase().includes(userFilter));
 
     if (clientFilter) {
@@ -500,10 +532,15 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       );
     }
 
-    if (from) rows = rows.filter(r => String(r.fecha || "") >= from);
-    if (to) rows = rows.filter(r => String(r.fecha || "") <= to);
+    return res.json({
+      ok: true,
+      page,
+      limit,
+      from: safeFrom,
+      to: safeTo,
+      quotes: rows
+    });
 
-    return res.json({ ok: true, quotes: rows });
   } catch (err) {
     console.error("❌ /api/admin/quotes:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
