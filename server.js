@@ -574,7 +574,11 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     const token = signUserToken(user);
-    await audit("USER_LOGIN_OK", req, username, { username, province: user.province, warehouse_code: user.warehouse_code });
+    await audit("USER_LOGIN_OK", req, username, {
+      username,
+      province: user.province,
+      warehouse_code: user.warehouse_code
+    });
 
     return res.json({
       ok: true,
@@ -691,12 +695,27 @@ function cacheSet(map, key, data, maxSize = 5000) {
   }
 }
 
-const ITEM_META_CACHE = new Map(); // code::priceListNo -> meta
-const ITEM_STOCK_CACHE = new Map(); // code::wh -> stock
-const INFLIGHT_ITEM = new Map(); // key -> promise
+const ITEM_META_CACHE = new Map();    // code::priceListNo -> meta
+const ITEM_STOCK_CACHE = new Map();   // code::wh -> stock
+const INFLIGHT_ITEM = new Map();      // key -> promise
 
 const ITEM_META_TTL_MS = 6 * 60 * 60 * 1000; // 6 horas
-const ITEM_STOCK_TTL_MS = 10_000; // 10s
+const ITEM_STOCK_TTL_MS = 10_000;            // 10s
+
+/* =========================================================
+   ✅ NUEVO (CORREGIDO): elegir fila correcta de bodega
+========================================================= */
+function pickWarehouseRow(itemFull, warehouseCode) {
+  if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) return null;
+
+  const wh = String(warehouseCode || "").trim();
+
+  return (
+    itemFull.ItemWarehouseInfoCollection.find(
+      (w) => String(w?.WarehouseCode || "").trim() === wh
+    ) || null
+  );
+}
 
 async function fetchItemMeta(code, priceListNo) {
   const key = `${code}::${priceListNo}`;
@@ -792,36 +811,56 @@ async function fetchItemStock(code, warehouseCode) {
 
 /* =========================================================
    ✅ MEGA OPT: 1 SOLA LLAMADA (si SAP lo soporta)
+   ✅ CORREGIDO: pickWarehouseRow fuera + se llama con warehouseCode
 ========================================================= */
 async function fetchItemAllInOne(code, priceListNo, warehouseCode) {
   const whSafe = String(warehouseCode).replace(/'/g, "''");
 
-  const path =
+  // 1) Intento rápido: $expand con $filter interno (si SAP lo soporta)
+  const pathFiltered =
     `/Items('${encodeURIComponent(code)}')` +
     `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage` +
     `&$expand=` +
     `ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity),` +
     `ItemWarehouseInfoCollection(` +
-    `$select=WarehouseCode,InStock,Committed,Ordered;` +
-    `$filter=WarehouseCode eq '${whSafe}'` +
+      `$select=WarehouseCode,InStock,Committed,Ordered;` +
+      `$filter=WarehouseCode eq '${whSafe}'` +
     `)`;
 
-  const itemFull = await slFetch(path);
+  let itemFull = await slFetch(pathFiltered);
 
+  // ✅ CORREGIDO: pasar warehouseCode
+  let wrow = pickWarehouseRow(itemFull, warehouseCode);
+
+  // 2) Fallback: si no vino la bodega correcta (o vino vacío), trae la colección completa
+  if (!wrow) {
+    const pathFullWarehouses =
+      `/Items('${encodeURIComponent(code)}')` +
+      `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage,ItemWarehouseInfoCollection` +
+      `&$expand=` +
+      `ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity),` +
+      `ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`;
+
+    itemFull = await slFetch(pathFullWarehouses);
+
+    // ✅ CORREGIDO: pasar warehouseCode
+    wrow = pickWarehouseRow(itemFull, warehouseCode);
+  }
+
+  // Precios / factor caja
   const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
   const factorCaja = getSalesUomFactor(itemFull);
   const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
 
-  const wrow = Array.isArray(itemFull?.ItemWarehouseInfoCollection)
-    ? itemFull.ItemWarehouseInfoCollection[0] || null
-    : null;
-
+  // Stock (si no existe esa bodega, queda null)
   const onHand = wrow?.InStock != null ? Number(wrow.InStock) : null;
   const committed = wrow?.Committed != null ? Number(wrow.Committed) : null;
   const ordered = wrow?.Ordered != null ? Number(wrow.Ordered) : null;
 
   let available = null;
-  if (Number.isFinite(onHand) && Number.isFinite(committed)) available = onHand - committed;
+  if (Number.isFinite(onHand) && Number.isFinite(committed)) {
+    available = onHand - committed; // ✅ DISPONIBLE REAL
+  }
 
   return {
     item: {
@@ -901,7 +940,6 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 
     const r = await getOneItemOptimized(code, priceListNo, warehouseCode);
 
-    // ✅ campos “visibles” para el frontend
     const disponible = r?.stock?.available ?? null;
     const enStock = r?.stock?.hasStock ?? null;
 
@@ -909,16 +947,16 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
       ok: true,
       item: r.item,
       warehouse: warehouseCode,
-      bodega: warehouseCode,            // ✅ alias
+      bodega: warehouseCode,
       priceList: SAP_PRICE_LIST,
       priceListNo,
       price: Number(r.price ?? 0),
       priceUnit: r.priceUnit,
       factorCaja: r.factorCaja,
       uom: r.item?.SalesUnit || "Caja",
-      stock: r.stock,                   // ✅ detalle
-      disponible,                       // ✅ visible
-      enStock,                          // ✅ visible
+      stock: r.stock,
+      disponible,
+      enStock,
     });
   } catch (err) {
     console.error("❌ /api/sap/item:", err.message);
@@ -1007,7 +1045,7 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
           `&$filter=CardType eq 'cCustomer' and (contains(CardName,'${safe}') or contains(CardCode,'${safe}'))` +
           `&$orderby=CardName asc&$top=${top}`
       );
-    } catch (e) {
+    } catch {
       r = await slFetch(
         `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress` +
           `&$filter=contains(CardName,'${safe}') or contains(CardCode,'${safe}')` +
