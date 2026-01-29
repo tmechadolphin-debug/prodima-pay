@@ -449,6 +449,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
       : "";
 
+    // ✅ IMPORTANTE: agregar CancelStatus
     const sap = await slFetch(
       `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments` +
         `&$orderby=DocDate desc&$top=${top}&$skip=${skip}${sapFilter}`
@@ -470,12 +471,20 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       const usuario = parseUserFromComments(q.Comments || "");
       const cardCode = String(q.CardCode || "").trim();
 
-      const estado =
-        q.DocumentStatus === "bost_Open"
-          ? "Open"
-          : q.DocumentStatus === "bost_Close"
-          ? "Close"
-          : String(q.DocumentStatus || "");
+      // ✅ Diferenciar canceladas correctamente
+      const cancelStatus = String(q.CancelStatus || "").trim(); // suele venir csYes/csNo
+      const isCancelled =
+        cancelStatus.toLowerCase() === "csyes" ||
+        cancelStatus.toLowerCase() === "yes" ||
+        cancelStatus.toLowerCase() === "tyes";
+
+      const estado = isCancelled
+        ? "Cancelled"
+        : q.DocumentStatus === "bost_Open"
+        ? "Open"
+        : q.DocumentStatus === "bost_Close"
+        ? "Close"
+        : String(q.DocumentStatus || "");
 
       const cardName = String(q.CardName || "").trim();
 
@@ -497,8 +506,12 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         montoCotizacion: Number(q.DocTotal || 0),
         montoEntregado: 0,
         fecha: fechaISO,
+
+        // ✅ para UI
         estado,
-        cancelStatus: q.CancelStatus ?? q.Canceled ?? "", // ✅ CLAVE
+        cancelStatus,     // por si quieres ver el raw
+        isCancelled,      // boolean útil
+
         mes,
         anio,
         usuario,
@@ -532,6 +545,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
+
 
 /* =========================================================
    ✅ ADMIN: LIST USERS
@@ -696,8 +710,7 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
 
         const cardCode = String(q.CardCode || "").trim();
         const cardName = String(q.CardName || "").trim();
-        const wh = resolveWh(q);
-
+        const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
 
         // ✅ Estado (incluye canceladas)
         const cancelledFlag = String(q.Cancelled || "").toLowerCase(); // típicamente "tyes" / "tno"
