@@ -78,7 +78,7 @@ function provinceToWarehouse(province) {
   )
     return "300";
 
-  if (p === "RCI" || p === "rci") return "01";
+  if (p === "RCI" || p === "RCI") return "01";
 
   return SAP_WAREHOUSE || "01";
 }
@@ -369,6 +369,46 @@ async function slFetch(path, options = {}) {
 }
 
 /* =========================================================
+   ✅ NUEVO: calcular monto entregado desde Entregas (DeliveryNotes)
+   - Quote (Quotations) -> Orders -> DeliveryNotes
+   - Se usa SOLO en /api/admin/quotes
+========================================================= */
+async function getOrdersFromQuote(quoteDocEntry) {
+  const filter = `DocumentLines/any(d: d/BaseEntry eq ${Number(
+    quoteDocEntry
+  )} and d/BaseType eq 23)`;
+  const sap = await slFetch(
+    `/Orders?$select=DocEntry,DocNum,DocTotal,DocDate&$top=50&$filter=${encodeURIComponent(filter)}`
+  );
+  return Array.isArray(sap?.value) ? sap.value : [];
+}
+
+async function getDeliveriesFromOrder(orderDocEntry) {
+  const filter = `DocumentLines/any(d: d/BaseEntry eq ${Number(
+    orderDocEntry
+  )} and d/BaseType eq 17)`;
+  const sap = await slFetch(
+    `/DeliveryNotes?$select=DocEntry,DocNum,DocTotal,DocDate&$top=50&$filter=${encodeURIComponent(filter)}`
+  );
+  return Array.isArray(sap?.value) ? sap.value : [];
+}
+
+async function getDeliveredAmountForQuote(quoteDocEntry) {
+  const orders = await getOrdersFromQuote(quoteDocEntry);
+  if (!orders.length) return 0;
+
+  let totalDelivered = 0;
+
+  for (const o of orders) {
+    const dels = await getDeliveriesFromOrder(o.DocEntry);
+    for (const d of dels) {
+      totalDelivered += Number(d.DocTotal || 0);
+    }
+  }
+  return totalDelivered;
+}
+
+/* =========================================================
    ✅ FIX FECHA SAP
 ========================================================= */
 function getDateISOInOffset(offsetMinutes = -300) {
@@ -537,6 +577,7 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
    ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
    - Paginación real (500 por página)
    - Soporta skip/limit para el front
+   - ✅ AHORA INCLUYE montoEntregado (desde DeliveryNotes)
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -574,7 +615,9 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       return m ? String(m[1]).trim() : "";
     };
 
-    const quotes = values.map((q) => {
+    // ✅ CAMBIO MÍNIMO: antes era map(), ahora necesitamos await para montoEntregado
+    const quotes = [];
+    for (const q of values) {
       const fechaISO = String(q.DocDate || "").slice(0, 10);
 
       const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
@@ -590,20 +633,30 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
       const usuario = parseUserFromComments(q.Comments || "");
 
-      return {
+      // ✅ NUEVO: monto entregado (sumatoria DocTotal de DeliveryNotes)
+      let montoEntregado = 0;
+      try {
+        montoEntregado = await getDeliveredAmountForQuote(q.DocEntry);
+      } catch (e) {
+        // si falla, no rompe el histórico
+        montoEntregado = 0;
+      }
+
+      quotes.push({
         docEntry: q.DocEntry,
         docNum: q.DocNum,
         cardCode: String(q.CardCode || "").trim(),
         cardName: String(q.CardName || "").trim(),
         montoCotizacion: Number(q.DocTotal || 0),
+        montoEntregado: Number(montoEntregado || 0), // ✅ AÑADIDO
         fecha: fechaISO,
         estado,
         cancelStatus,
         isCancelled,
         usuario,
         comments: q.Comments || "",
-      };
-    });
+      });
+    }
 
     return res.json({
       ok: true,
