@@ -78,7 +78,7 @@ function provinceToWarehouse(province) {
   )
     return "300";
 
-  if (p === "RCI" || p === "RCI") return "01";
+  if (p === "rci") return "01";
 
   return SAP_WAREHOUSE || "01";
 }
@@ -215,7 +215,7 @@ function verifyAdmin(req, res, next) {
 }
 
 /**
- * ✅ FIX #1: verifyUser rehidrata desde DB
+ * ✅ verifyUser rehidrata desde DB
  * - No dependes del warehouse_code viejo del JWT
  * - Valida is_active real
  */
@@ -534,63 +534,122 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ (NUEVO) ENTREGADO desde COTIZACIÓN:
-      Quotations (OQUT) -> Orders (ORDR) -> DeliveryNotes (ODLN)
-   - montoEntregado = suma DocTotal de entregas vinculadas
-   - Si no hay pedido/entrega, devuelve 0
+   ✅ MONTO ENTREGADO (SL robusto: sin any(), usando $expand y filtrado en Node)
 ========================================================= */
-async function getDeliveredAmountFromQuotationDocEntry(qDocEntry) {
+function addDaysISO(isoDate, days) {
+  try {
+    const d = new Date(String(isoDate).slice(0, 10) + "T00:00:00Z");
+    d.setUTCDate(d.getUTCDate() + Number(days || 0));
+    return d.toISOString().slice(0, 10);
+  } catch {
+    return String(isoDate || "").slice(0, 10);
+  }
+}
+
+const DELIVERED_CACHE = new Map(); // key -> {ts, val}
+const DELIVERED_TTL_MS = 60 * 1000;
+
+/**
+ * Devuelve SUM(DocTotal) de DeliveryNotes enlazadas:
+ * Quotation (23) -> Orders (17) -> DeliveryNotes (15)
+ * Sin SQL directo, solo Service Layer.
+ */
+async function getDeliveredAmountFromQuotationDocEntry(qDocEntry, cardCode, docDate) {
   const qde = Number(qDocEntry);
+  const cc = String(cardCode || "").trim();
+  const dd = String(docDate || "").slice(0, 10);
+
   if (!Number.isFinite(qde) || qde <= 0) return 0;
 
-  // 1) Buscar pedidos basados en la cotización (BaseType 23 = Quotation)
+  const cacheKey = `${qde}::${cc}::${dd}`;
+  const now = Date.now();
+  const cached = DELIVERED_CACHE.get(cacheKey);
+  if (cached && now - cached.ts < DELIVERED_TTL_MS) return cached.val;
+
+  // Ventana de búsqueda (ajústala si lo necesitas)
+  const from = dd ? addDaysISO(dd, -3) : "";
+  const to = dd ? addDaysISO(dd, 90) : "";
+
+  // 1) Orders basadas en la cotización (BaseType=23, BaseEntry=qDocEntry)
   let orders = [];
   try {
-    const filterOrders = `DocumentLines/any(l: l/BaseType eq 23 and l/BaseEntry eq ${qde})`;
-    const rOrders = await slFetch(
-      `/Orders?$select=DocEntry,DocNum,DocTotal&$top=50&$filter=${encodeURIComponent(filterOrders)}`
+    const filters = [];
+    if (cc) filters.push(`CardCode eq '${cc.replace(/'/g, "''")}'`);
+    if (from) filters.push(`DocDate ge '${from}'`);
+    if (to) filters.push(`DocDate le '${to}'`);
+
+    const f = filters.length ? `&$filter=${encodeURIComponent(filters.join(" and "))}` : "";
+
+    const r = await slFetch(
+      `/Orders?$select=DocEntry,DocNum,DocDate,CardCode,DocTotal` +
+        `&$top=200${f}` +
+        `&$expand=DocumentLines($select=BaseType,BaseEntry)`
     );
-    orders = Array.isArray(rOrders?.value) ? rOrders.value : [];
+
+    const vals = Array.isArray(r?.value) ? r.value : [];
+    orders = vals.filter((o) => {
+      const lines = Array.isArray(o?.DocumentLines) ? o.DocumentLines : [];
+      return lines.some((l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === qde);
+    });
   } catch (e) {
-    console.error("⚠️ delivered lookup (orders) fail:", qde, e.message);
+    console.error("⚠️ delivered: orders expand fail:", qde, e.message);
+    DELIVERED_CACHE.set(cacheKey, { ts: now, val: 0 });
     return 0;
   }
 
-  if (!orders.length) return 0;
+  if (!orders.length) {
+    DELIVERED_CACHE.set(cacheKey, { ts: now, val: 0 });
+    return 0;
+  }
 
-  // 2) Por cada pedido, buscar entregas basadas en el pedido (BaseType 17 = Sales Order)
+  const orderDocEntries = new Set(
+    orders.map((o) => Number(o?.DocEntry)).filter((x) => Number.isFinite(x) && x > 0)
+  );
+
+  // 2) DeliveryNotes basadas en esos Orders (BaseType=17, BaseEntry=orderDocEntry)
   let delivered = 0;
 
-  for (const o of orders) {
-    const oDocEntry = Number(o?.DocEntry);
-    if (!Number.isFinite(oDocEntry) || oDocEntry <= 0) continue;
+  try {
+    const filters = [];
+    if (cc) filters.push(`CardCode eq '${cc.replace(/'/g, "''")}'`);
+    if (from) filters.push(`DocDate ge '${from}'`);
+    if (to) filters.push(`DocDate le '${to}'`);
 
-    try {
-      const filterDel = `DocumentLines/any(l: l/BaseType eq 17 and l/BaseEntry eq ${oDocEntry})`;
-      const rDel = await slFetch(
-        `/DeliveryNotes?$select=DocEntry,DocNum,DocTotal&$top=50&$filter=${encodeURIComponent(filterDel)}`
+    const f = filters.length ? `&$filter=${encodeURIComponent(filters.join(" and "))}` : "";
+
+    const r = await slFetch(
+      `/DeliveryNotes?$select=DocEntry,DocNum,DocDate,CardCode,DocTotal` +
+        `&$top=300${f}` +
+        `&$expand=DocumentLines($select=BaseType,BaseEntry)`
+    );
+
+    const dels = Array.isArray(r?.value) ? r.value : [];
+
+    for (const d of dels) {
+      const lines = Array.isArray(d?.DocumentLines) ? d.DocumentLines : [];
+      const matches = lines.some(
+        (l) => Number(l?.BaseType) === 17 && orderDocEntries.has(Number(l?.BaseEntry))
       );
-      const dels = Array.isArray(rDel?.value) ? rDel.value : [];
 
-      for (const d of dels) {
+      if (matches) {
         const dt = Number(d?.DocTotal || 0);
         if (Number.isFinite(dt)) delivered += dt;
       }
-    } catch (e) {
-      console.error("⚠️ delivered lookup (deliveries) fail:", qde, "order", oDocEntry, e.message);
-      // seguimos con los demás
     }
+  } catch (e) {
+    console.error("⚠️ delivered: deliveries expand fail:", qde, e.message);
+    delivered = 0;
   }
 
-  // redondeo seguro
-  return Number.isFinite(delivered) ? Number(delivered.toFixed(2)) : 0;
+  const val = Number.isFinite(delivered) ? Number(delivered.toFixed(2)) : 0;
+  DELIVERED_CACHE.set(cacheKey, { ts: now, val });
+  return val;
 }
 
 /* =========================================================
    ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
    - Paginación real (500 por página)
-   - Soporta skip/limit para el front
-   - ✅ AHORA: montoEntregado
+   - ✅ montoEntregado (Entrega) por SL sin SQL
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -615,7 +674,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const SELECT =
       `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
 
-    // ✅ Esto devuelve exactamente "la página" que el front pide
     const sap = await slFetch(
       `/Quotations?$select=${SELECT}` +
         `&$orderby=DocDate desc&$top=${limit}&$skip=${skip}${sapFilter}`
@@ -631,7 +689,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const quotes = values.map((q) => {
       const fechaISO = String(q.DocDate || "").slice(0, 10);
 
-      const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
+      const cancelStatus = String(q.CancelStatus || "").trim();
       const isCancelled = cancelStatus.toLowerCase() === "csyes";
 
       const estado = isCancelled
@@ -650,10 +708,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         cardCode: String(q.CardCode || "").trim(),
         cardName: String(q.CardName || "").trim(),
         montoCotizacion: Number(q.DocTotal || 0),
-
-        // ✅ NUEVO: entregado (se calcula luego)
-        montoEntregado: 0,
-
+        montoEntregado: 0, // ✅ lo llenamos abajo
         fecha: fechaISO,
         estado,
         cancelStatus,
@@ -663,18 +718,21 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       };
     });
 
-    // ✅ Enriquecer con montoEntregado (concurrencia limitada)
-    const CONCURRENCY = 4;
+    // ✅ llenar montoEntregado con concurrencia controlada
+    const CONCURRENCY = 6;
     let idx = 0;
 
     async function worker() {
       while (idx < quotes.length) {
-        const my = idx++;
-        const row = quotes[my];
-        const qde = Number(row?.docEntry || 0);
-
+        const i = idx++;
+        const row = quotes[i];
         try {
-          row.montoEntregado = await getDeliveredAmountFromQuotationDocEntry(qde);
+          const qde = Number(row.docEntry || 0);
+          row.montoEntregado = await getDeliveredAmountFromQuotationDocEntry(
+            qde,
+            row.cardCode,
+            row.fecha
+          );
         } catch {
           row.montoEntregado = 0;
         }
@@ -880,7 +938,7 @@ function getSalesUomFactor(itemFull) {
 }
 
 /* =========================================================
-   ✅ FIX #2: Stock usando el patrón que A TI te funciona
+   ✅ Stock usando el patrón que A TI te funciona
    - ItemWarehouseInfoCollection en $select (NO $expand)
    - fallback si no viene colección
 ========================================================= */
@@ -935,7 +993,6 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 
   let itemFull;
 
-  // ✅ IMPORTANTE: NO expandimos ItemWarehouseInfoCollection (como tu viejo)
   try {
     itemFull = await slFetch(
       `/Items('${encodeURIComponent(code)}')` +
