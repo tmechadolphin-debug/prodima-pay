@@ -78,7 +78,7 @@ function provinceToWarehouse(province) {
   )
     return "300";
 
-  if (p === "RCI" || p === "rci") return "01";
+  if (p === "RCI" || p === "RCI") return "01";
 
   return SAP_WAREHOUSE || "01";
 }
@@ -534,9 +534,63 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
+   ✅ (NUEVO) ENTREGADO desde COTIZACIÓN:
+      Quotations (OQUT) -> Orders (ORDR) -> DeliveryNotes (ODLN)
+   - montoEntregado = suma DocTotal de entregas vinculadas
+   - Si no hay pedido/entrega, devuelve 0
+========================================================= */
+async function getDeliveredAmountFromQuotationDocEntry(qDocEntry) {
+  const qde = Number(qDocEntry);
+  if (!Number.isFinite(qde) || qde <= 0) return 0;
+
+  // 1) Buscar pedidos basados en la cotización (BaseType 23 = Quotation)
+  let orders = [];
+  try {
+    const filterOrders = `DocumentLines/any(l: l/BaseType eq 23 and l/BaseEntry eq ${qde})`;
+    const rOrders = await slFetch(
+      `/Orders?$select=DocEntry,DocNum,DocTotal&$top=50&$filter=${encodeURIComponent(filterOrders)}`
+    );
+    orders = Array.isArray(rOrders?.value) ? rOrders.value : [];
+  } catch (e) {
+    console.error("⚠️ delivered lookup (orders) fail:", qde, e.message);
+    return 0;
+  }
+
+  if (!orders.length) return 0;
+
+  // 2) Por cada pedido, buscar entregas basadas en el pedido (BaseType 17 = Sales Order)
+  let delivered = 0;
+
+  for (const o of orders) {
+    const oDocEntry = Number(o?.DocEntry);
+    if (!Number.isFinite(oDocEntry) || oDocEntry <= 0) continue;
+
+    try {
+      const filterDel = `DocumentLines/any(l: l/BaseType eq 17 and l/BaseEntry eq ${oDocEntry})`;
+      const rDel = await slFetch(
+        `/DeliveryNotes?$select=DocEntry,DocNum,DocTotal&$top=50&$filter=${encodeURIComponent(filterDel)}`
+      );
+      const dels = Array.isArray(rDel?.value) ? rDel.value : [];
+
+      for (const d of dels) {
+        const dt = Number(d?.DocTotal || 0);
+        if (Number.isFinite(dt)) delivered += dt;
+      }
+    } catch (e) {
+      console.error("⚠️ delivered lookup (deliveries) fail:", qde, "order", oDocEntry, e.message);
+      // seguimos con los demás
+    }
+  }
+
+  // redondeo seguro
+  return Number.isFinite(delivered) ? Number(delivered.toFixed(2)) : 0;
+}
+
+/* =========================================================
    ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
    - Paginación real (500 por página)
    - Soporta skip/limit para el front
+   - ✅ AHORA: montoEntregado
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -596,6 +650,10 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         cardCode: String(q.CardCode || "").trim(),
         cardName: String(q.CardName || "").trim(),
         montoCotizacion: Number(q.DocTotal || 0),
+
+        // ✅ NUEVO: entregado (se calcula luego)
+        montoEntregado: 0,
+
         fecha: fechaISO,
         estado,
         cancelStatus,
@@ -604,6 +662,26 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         comments: q.Comments || "",
       };
     });
+
+    // ✅ Enriquecer con montoEntregado (concurrencia limitada)
+    const CONCURRENCY = 4;
+    let idx = 0;
+
+    async function worker() {
+      while (idx < quotes.length) {
+        const my = idx++;
+        const row = quotes[my];
+        const qde = Number(row?.docEntry || 0);
+
+        try {
+          row.montoEntregado = await getDeliveredAmountFromQuotationDocEntry(qde);
+        } catch {
+          row.montoEntregado = 0;
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
     return res.json({
       ok: true,
