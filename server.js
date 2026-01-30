@@ -78,7 +78,7 @@ function provinceToWarehouse(province) {
   )
     return "300";
 
-  if (p === "darién" || p === "darien") return "300";
+  if (p === "RCI" || p === "RCI") return "01";
 
   return SAP_WAREHOUSE || "01";
 }
