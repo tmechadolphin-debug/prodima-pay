@@ -574,6 +574,9 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
    - page/limit
    - includeTotal=1 SOLO si el front lo necesita
    - half-open date: [from, to+1)
+   ✅ FIX DUPLICADOS:
+      - $orderby estable: DocDate desc, DocEntry desc
+      - dedupe por DocEntry en scan
 ========================================================= */
 async function scanQuotes({
   f,
@@ -594,14 +597,17 @@ async function scanQuotes({
   const uFilter = String(userFilter || "").trim().toLowerCase();
   const cFilter = String(clientFilter || "").trim().toLowerCase();
 
-  // Para evitar cuelgue: si includeTotal=0, cortamos cuando llenamos la página
-  const maxSapPages = includeTotal ? 200 : 50; // suficiente para llenar 1 página
+  const maxSapPages = includeTotal ? 200 : 50;
+
+  // ✅ DEDUPE por DocEntry (cinturón y tirantes)
+  const seenDocEntry = new Set();
 
   for (let page = 0; page < maxSapPages; page++) {
     const raw = await slFetch(
       `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
         `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
-        `&$orderby=DocDate desc&$top=${batchTop}&$skip=${skipSap}`
+        // ✅ ORDERBY estable para paginar sin duplicar
+        `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`
     );
 
     const rows = Array.isArray(raw?.value) ? raw.value : [];
@@ -609,6 +615,12 @@ async function scanQuotes({
     skipSap += rows.length;
 
     for (const q of rows) {
+      const de = Number(q?.DocEntry);
+      if (Number.isFinite(de)) {
+        if (seenDocEntry.has(de)) continue; // ✅ evita repetidos
+        seenDocEntry.add(de);
+      }
+
       if (isCancelledLike(q)) continue;
 
       const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
@@ -669,7 +681,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const page = Math.max(1, Number.isFinite(pageRaw) ? pageRaw : 1);
     const skip = (page - 1) * limit;
 
-    const includeTotal = String(req.query?.includeTotal || "0") === "1"; // ✅ default 0 para no colgar
+    const includeTotal = String(req.query?.includeTotal || "0") === "1";
 
     const userFilter = String(req.query?.user || "");
     const clientFilter = String(req.query?.client || "");
