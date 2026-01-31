@@ -755,7 +755,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: TRACE (Cotización -> Pedido -> Entrega) por DocNum
+   ✅ ADMIN: TRACE Quote -> Order -> Delivery (SIN query options raras)
+   - Evita $apply / contains / expand parametrizado
 ========================================================= */
 app.get("/api/admin/trace/quote/:docNum", verifyAdmin, async (req, res) => {
   try {
@@ -767,89 +768,121 @@ app.get("/api/admin/trace/quote/:docNum", verifyAdmin, async (req, res) => {
     if (!docNum) return res.status(400).json({ ok: false, message: "docNum inválido" });
 
     // 1) Buscar cotización por DocNum
-    const q = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate` +
-      `&$filter=DocNum eq ${docNum}`
+    // OData simple: $filter=DocNum eq 225597
+    const qh = await slFetch(
+      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments` +
+        `&$filter=${encodeURIComponent(`DocNum eq ${docNum}`)}` +
+        `&$top=1`
     );
 
-    const quote = Array.isArray(q?.value) && q.value.length ? q.value[0] : null;
-    if (!quote) {
-      return res.status(404).json({ ok: false, message: `No existe cotización DocNum ${docNum}` });
+    const quote = Array.isArray(qh?.value) && qh.value.length ? qh.value[0] : null;
+    if (!quote?.DocEntry) {
+      return res.status(404).json({ ok: false, message: `No se encontró cotización DocNum ${docNum}` });
     }
 
     const quoteEntry = Number(quote.DocEntry);
 
-    // Traer líneas de cotización (items)
+    // 2) Traer líneas de la cotización (sin expand parametrizado; usamos sub-endpoint)
     const qLines = await slFetch(
-      `/Quotations(${quoteEntry})/DocumentLines?$select=ItemCode,ItemDescription,Quantity,LineTotal`
+      `/Quotations(${quoteEntry})/DocumentLines?$select=LineNum,ItemCode,ItemDescription,Quantity,LineTotal`
     );
     const quoteLines = Array.isArray(qLines?.value) ? qLines.value : [];
 
-    // 2) Buscar pedidos que nacieron de esa cotización (BaseType=23 = quotation)
-    const o = await slFetch(
-      `/Orders?$select=DocEntry,DocNum,DocTotal,DocDate` +
-      `&$filter=DocumentLines/any(d: d/BaseType eq 23 and d/BaseEntry eq ${quoteEntry})`
+    // 3) Encontrar pedidos (Orders / ORDR) que tengan líneas basadas en esta cotización
+    // Estrategia: buscamos en OrderLines por BaseType=23 y BaseEntry=quoteEntry,
+    // recogemos los DocEntry de pedidos y luego pedimos headers.
+    const orderLinesHit = await slFetch(
+      `/Orders/DocumentLines?$select=DocEntry,BaseType,BaseEntry&$filter=${encodeURIComponent(
+        `BaseType eq 23 and BaseEntry eq ${quoteEntry}`
+      )}&$top=2000`
     );
-    const orders = Array.isArray(o?.value) ? o.value : [];
 
-    // 3) Para cada pedido, buscar entregas (BaseType=17 = sales order)
-    const deliveries = [];
-    for (const ord of orders) {
-      const orderEntry = Number(ord.DocEntry);
+    const orderDocEntries = Array.from(
+      new Set(
+        (Array.isArray(orderLinesHit?.value) ? orderLinesHit.value : [])
+          .map((x) => Number(x?.DocEntry))
+          .filter((n) => Number.isFinite(n) && n > 0)
+      )
+    );
 
-      const d = await slFetch(
-        `/DeliveryNotes?$select=DocEntry,DocNum,DocTotal,DocDate` +
-        `&$filter=DocumentLines/any(x: x/BaseType eq 17 and x/BaseEntry eq ${orderEntry})`
+    let orders = [];
+    for (const oe of orderDocEntries) {
+      try {
+        const oh = await slFetch(
+          `/Orders(${oe})?$select=DocEntry,DocNum,DocTotal,DocDate,DocumentStatus,CancelStatus`
+        );
+        orders.push(oh);
+      } catch {}
+    }
+
+    // 4) Encontrar entregas (DeliveryNotes / ODLN) basadas en esos pedidos
+    // BaseType del pedido = 17
+    let deliveries = [];
+    let deliveryDocEntries = [];
+
+    if (orderDocEntries.length) {
+      const baseOr = orderDocEntries.map((oe) => `BaseEntry eq ${oe}`).join(" or ");
+      const dLinesHit = await slFetch(
+        `/DeliveryNotes/DocumentLines?$select=DocEntry,BaseType,BaseEntry&$filter=${encodeURIComponent(
+          `BaseType eq 17 and (${baseOr})`
+        )}&$top=5000`
       );
 
-      const vals = Array.isArray(d?.value) ? d.value : [];
-      for (const dv of vals) {
-        deliveries.push({
-          docEntry: dv.DocEntry,
-          docNum: dv.DocNum,
-          docTotal: Number(dv.DocTotal || 0),
-          docDate: String(dv.DocDate || "").slice(0, 10),
-          baseOrderDocNum: ord.DocNum,
-          baseOrderDocEntry: ord.DocEntry
-        });
+      deliveryDocEntries = Array.from(
+        new Set(
+          (Array.isArray(dLinesHit?.value) ? dLinesHit.value : [])
+            .map((x) => Number(x?.DocEntry))
+            .filter((n) => Number.isFinite(n) && n > 0)
+        )
+      );
+
+      for (const de of deliveryDocEntries) {
+        try {
+          const dh = await slFetch(
+            `/DeliveryNotes(${de})?$select=DocEntry,DocNum,DocTotal,DocDate,DocumentStatus,CancelStatus`
+          );
+          deliveries.push(dh);
+        } catch {}
       }
     }
 
     // Totales
-    const totalPedido = orders.reduce((a, x) => a + Number(x.DocTotal || 0), 0);
-    const totalEntregado = deliveries.reduce((a, x) => a + Number(x.docTotal || 0), 0);
+    const totalPedido = orders.reduce((a, b) => a + Number(b?.DocTotal || 0), 0);
+    const totalEntregado = deliveries.reduce((a, b) => a + Number(b?.DocTotal || 0), 0);
 
-    // Respuesta amigable para tu “sencillo”
-    const rows = quoteLines.map(l => ({
+    // 5) Rows "simple": por línea de cotización (ItemCode/Desc) + DocNum quote/order/delivery
+    // Nota: esto NO “mapea” línea por línea contra pedidos/entregas (eso requiere más lógica por BaseLine),
+    // pero te da lo que pediste: código, descripción, cotización, pedido y entrega del documento.
+    const rows = quoteLines.map((l) => ({
       itemCode: String(l.ItemCode || "").trim(),
       descripcion: String(l.ItemDescription || "").trim(),
-      cotizacion: quote.DocNum,
-      pedido: orders.map(x => x.DocNum),     // pueden ser varios
-      entrega: deliveries.map(x => x.docNum) // pueden ser varias
+      cotizacion: Number(quote.DocNum || docNum),
+      pedido: orders.map((o) => Number(o?.DocNum || 0)).filter((n) => n > 0),
+      entrega: deliveries.map((d) => Number(d?.DocNum || 0)).filter((n) => n > 0),
+      qty: Number(l.Quantity || 0),
+      lineTotal: Number(l.LineTotal || 0),
     }));
 
     return res.json({
       ok: true,
       quote: {
-        docEntry: quote.DocEntry,
-        docNum: quote.DocNum,
-        cardCode: quote.CardCode,
-        cardName: quote.CardName,
+        docEntry: quoteEntry,
+        docNum: Number(quote.DocNum || docNum),
+        cardCode: String(quote.CardCode || "").trim(),
+        cardName: String(quote.CardName || "").trim(),
+        docTotal: Number(quote.DocTotal || 0),
         docDate: String(quote.DocDate || "").slice(0, 10),
-        docTotal: Number(quote.DocTotal || 0)
+        cancelStatus: String(quote.CancelStatus || ""),
+        status: String(quote.DocumentStatus || ""),
       },
-      orders: orders.map(x => ({
-        docEntry: x.DocEntry,
-        docNum: x.DocNum,
-        docDate: String(x.DocDate || "").slice(0, 10),
-        docTotal: Number(x.DocTotal || 0)
-      })),
+      orders,
       deliveries,
       totals: {
+        totalCotizacion: Number(quote.DocTotal || 0),
         totalPedido,
-        totalEntregado
+        totalEntregado,
       },
-      rows
+      rows,
     });
   } catch (err) {
     console.error("❌ /api/admin/trace/quote:", err.message);
