@@ -78,7 +78,7 @@ function provinceToWarehouse(province) {
   )
     return "300";
 
-  if (p === "RCI") return "01";
+  if (p === "RCI" || p === "RCI") return "01";
 
   return SAP_WAREHOUSE || "01";
 }
@@ -215,7 +215,9 @@ function verifyAdmin(req, res, next) {
 }
 
 /**
- * ✅ verifyUser rehidrata desde DB
+ * ✅ FIX #1: verifyUser rehidrata desde DB
+ * - No dependes del warehouse_code viejo del JWT
+ * - Valida is_active real
  */
 async function verifyUser(req, res, next) {
   try {
@@ -262,6 +264,7 @@ async function verifyUser(req, res, next) {
         return res.status(401).json({ ok: false, message: "Usuario desactivado" });
       }
 
+      // ✅ usa datos reales de DB
       req.user = {
         typ: "user",
         uid: u.id,
@@ -271,6 +274,7 @@ async function verifyUser(req, res, next) {
         warehouse_code: String(u.warehouse_code || "").trim(),
       };
     } else {
+      // fallback sin DB
       req.user = decoded;
     }
 
@@ -530,6 +534,97 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
+   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
+   - Paginación real (500 por página)
+   - Soporta skip/limit para el front
+========================================================= */
+app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query?.limit || req.query?.top || 500), 1), 500);
+    const skip = Math.max(Number(req.query?.skip || 0), 0);
+
+    const from = String(req.query?.from || "").trim();
+    const to = String(req.query?.to || "").trim();
+
+    const filterParts = [];
+    if (from) filterParts.push(`DocDate ge '${from}'`);
+    if (to) filterParts.push(`DocDate le '${to}'`);
+
+    const sapFilter = filterParts.length
+      ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
+      : "";
+
+    const SELECT =
+      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
+
+    const sap = await slFetch(
+      `/Quotations?$select=${SELECT}` +
+        `&$orderby=DocDate desc&$top=${limit}&$skip=${skip}${sapFilter}`
+    );
+
+    const values = Array.isArray(sap?.value) ? sap.value : [];
+
+    const parseUserFromComments = (comments = "") => {
+      const m = String(comments).match(/\[user:([^\]]+)\]/i);
+      return m ? String(m[1]).trim() : "";
+    };
+
+    const quotes = values.map((q) => {
+      const fechaISO = String(q.DocDate || "").slice(0, 10);
+
+      const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
+      const isCancelled = cancelStatus.toLowerCase() === "csyes";
+
+      const estado = isCancelled
+        ? "Cancelled"
+        : q.DocumentStatus === "bost_Open"
+        ? "Open"
+        : q.DocumentStatus === "bost_Close"
+        ? "Close"
+        : String(q.DocumentStatus || "");
+
+      const usuario = parseUserFromComments(q.Comments || "");
+
+      return {
+        docEntry: q.DocEntry,
+        docNum: q.DocNum,
+        cardCode: String(q.CardCode || "").trim(),
+        cardName: String(q.CardName || "").trim(),
+        montoCotizacion: Number(q.DocTotal || 0),
+        fecha: fechaISO,
+        estado,
+        cancelStatus,
+        isCancelled,
+        usuario,
+        comments: q.Comments || "",
+
+        // 🔸 Campos que tu front ya espera, pero aquí NO se calculan:
+        montoEntregado: 0,
+        pedidoDocNum: null,
+        pedidoDocEntry: null,
+        entregasDocNums: [],
+        pendiente: Number(q.DocTotal || 0),
+      };
+    });
+
+    return res.json({
+      ok: true,
+      limit,
+      skip,
+      count: quotes.length,
+      quotes,
+    });
+  } catch (err) {
+    console.error("❌ /api/admin/quotes:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+/* =========================================================
    ✅ ADMIN: AUDIT
 ========================================================= */
 app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
@@ -713,7 +808,7 @@ function getSalesUomFactor(itemFull) {
 }
 
 /* =========================================================
-   ✅ Stock helper
+   ✅ FIX #2: Stock usando el patrón que A TI te funciona
 ========================================================= */
 function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   const item = {
@@ -783,6 +878,7 @@ async function getOneItem(code, priceListNo, warehouseCode) {
     }
   }
 
+  // ✅ fallback: si SAP no trajo la colección, la pedimos por endpoint alterno
   if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
     try {
       const whInfo = await slFetch(
@@ -826,71 +922,13 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
       factorCaja: r.factorCaja,
       uom: r.item?.SalesUnit || "Caja",
       stock: r.stock,
+
+      // ✅ para tu columna “Disponible”
       disponible: r?.stock?.available ?? null,
       enStock: r?.stock?.hasStock ?? null,
     });
   } catch (err) {
     console.error("❌ /api/sap/item:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* =========================================================
-   ✅ SAP: MULTI ITEMS
-========================================================= */
-app.get("/api/sap/items", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const codes = String(req.query.codes || "")
-      .split(",")
-      .map((x) => x.trim())
-      .filter(Boolean);
-
-    if (!codes.length) return res.status(400).json({ ok: false, message: "codes vacío" });
-
-    const warehouseCode = getWarehouseFromReq(req);
-    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
-
-    const CONCURRENCY = 5;
-    const items = {};
-    let i = 0;
-
-    async function worker() {
-      while (i < codes.length) {
-        const idx = i++;
-        const code = codes[idx];
-        try {
-          const r = await getOneItem(code, priceListNo, warehouseCode);
-          items[code] = {
-            ok: true,
-            name: r.item.ItemName,
-            unit: r.item.SalesUnit,
-            price: r.price,
-            priceUnit: r.priceUnit,
-            factorCaja: r.factorCaja,
-            stock: r.stock,
-            disponible: r?.stock?.available ?? null,
-            enStock: r?.stock?.hasStock ?? null,
-          };
-        } catch (e) {
-          items[code] = { ok: false, message: String(e.message || e) };
-        }
-      }
-    }
-
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-
-    return res.json({
-      ok: true,
-      warehouse: warehouseCode,
-      bodega: warehouseCode,
-      priceList: SAP_PRICE_LIST,
-      priceListNo,
-      items,
-    });
-  } catch (err) {
-    console.error("❌ /api/sap/items:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
@@ -1044,134 +1082,63 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN SAP HELPERS (Orders / DeliveryNotes / Quotations)
+   ✅ ADMIN SAP HELPERS (DocNum → documento completo)
 ========================================================= */
-function asISODate10(x) {
-  return String(x || "").slice(0, 10);
+function isIsoDate(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
+}
+function addDaysISO(dateISO, days) {
+  const d = new Date(dateISO + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-async function getOneByDocNum(entity, docNum, withLines = false) {
+async function sapGetFirstByDocNum(entity, docNum, select, expand) {
   const n = Number(docNum);
   if (!Number.isFinite(n) || n <= 0) throw new Error("DocNum inválido");
 
-  // Select base
-  const baseSelect = `DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,CancelStatus,DocumentStatus,Comments`;
-  const linesSelect = `DocumentLines($select=LineNum,ItemCode,ItemDescription,Dscription,Quantity,Price,LineTotal,BaseType,BaseEntry,BaseLine)`;
+  const parts = [];
+  if (select) parts.push(`$select=${encodeURIComponent(select)}`);
+  parts.push(`$filter=${encodeURIComponent(`DocNum eq ${n}`)}`);
+  parts.push(`$top=1`);
+  if (expand) parts.push(`$expand=${encodeURIComponent(expand)}`);
 
-  const expand = withLines ? `&$expand=${encodeURIComponent(linesSelect)}` : "";
-
-  const path =
-    `/${entity}?$select=${encodeURIComponent(baseSelect)}` +
-    `&$filter=${encodeURIComponent(`DocNum eq ${n}`)}` +
-    `&$top=1${expand}`;
-
+  const path = `/${entity}?${parts.join("&")}`;
   const r = await slFetch(path);
-  const rows = Array.isArray(r?.value) ? r.value : [];
-  return rows[0] || null;
+  const arr = Array.isArray(r?.value) ? r.value : [];
+  return arr[0] || null;
 }
 
-async function listOrdersByCardAndDate(cardCode, docDate, top = 80) {
-  const safeCard = String(cardCode || "").replace(/'/g, "''");
-  const d = String(docDate || "").slice(0, 10);
-  const t = Math.min(Math.max(Number(top || 80), 1), 200);
+async function sapGetByDocEntry(entity, docEntry, select, expand) {
+  const n = Number(docEntry);
+  if (!Number.isFinite(n) || n <= 0) throw new Error("DocEntry inválido");
 
-  const select = `DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,CancelStatus,DocumentStatus`;
-  const filter = `CardCode eq '${safeCard}' and DocDate ge '${d}' and DocDate le '${d}'`;
-
-  const path =
-    `/Orders?$select=${encodeURIComponent(select)}` +
-    `&$filter=${encodeURIComponent(filter)}` +
-    `&$orderby=DocDate desc&$top=${t}`;
-
-  const r = await slFetch(path);
-  return Array.isArray(r?.value) ? r.value : [];
-}
-
-async function listDeliveriesByCardAndRange(cardCode, from, to, top = 150) {
-  const safeCard = String(cardCode || "").replace(/'/g, "''");
-  const f = String(from || "").slice(0, 10);
-  const t0 = String(to || "").slice(0, 10);
-  const t = Math.min(Math.max(Number(top || 150), 1), 250);
-
-  const select = `DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,CancelStatus,DocumentStatus`;
-  const filter = `CardCode eq '${safeCard}' and DocDate ge '${f}' and DocDate le '${t0}'`;
-
-  const path =
-    `/DeliveryNotes?$select=${encodeURIComponent(select)}` +
-    `&$filter=${encodeURIComponent(filter)}` +
-    `&$orderby=DocDate desc&$top=${t}`;
-
-  const r = await slFetch(path);
-  return Array.isArray(r?.value) ? r.value : [];
-}
-
-/**
- * Trace:
- * Quote(23) -> Order(17) -> Delivery(15)
- * - Order lines: BaseType=23 & BaseEntry=Quote.DocEntry
- * - Delivery lines: BaseType=17 & BaseEntry=Order.DocEntry
- */
-async function traceFromQuoteDocNum(quoteDocNum) {
-  const quote = await getOneByDocNum("Quotations", quoteDocNum, false);
-  if (!quote) return { quote: null, order: null, deliveries: [], totals: { delivered: 0 } };
-
-  const quoteDocEntry = Number(quote.DocEntry);
-  const cardCode = String(quote.CardCode || "").trim();
-  const docDate = asISODate10(quote.DocDate);
-
-  // 1) Orders candidates same day + card
-  const candidates = await listOrdersByCardAndDate(cardCode, docDate, 120);
-
-  let order = null;
-  for (const c of candidates) {
-    const full = await getOneByDocNum("Orders", c.DocNum, true);
-    const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
-    const match = lines.some(
-      (l) => Number(l.BaseType) === 23 && Number(l.BaseEntry) === quoteDocEntry
-    );
-    if (match) {
-      order = full;
-      break;
-    }
-  }
-
-  if (!order) {
-    return { quote, order: null, deliveries: [], totals: { delivered: 0 } };
-  }
-
-  const orderDocEntry = Number(order.DocEntry);
-
-  // 2) deliveries candidates (range amplio)
-  const deliveriesCand = await listDeliveriesByCardAndRange(cardCode, docDate, "2099-12-31", 200);
-
-  const deliveries = [];
-  for (const d of deliveriesCand) {
-    const full = await getOneByDocNum("DeliveryNotes", d.DocNum, true);
-    const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
-    const match = lines.some(
-      (l) => Number(l.BaseType) === 17 && Number(l.BaseEntry) === orderDocEntry
-    );
-    if (match) deliveries.push(full);
-  }
-
-  const delivered = deliveries.reduce((a, x) => a + Number(x?.DocTotal || 0), 0);
-
-  return {
-    quote,
-    order,
-    deliveries,
-    totals: { delivered },
-  };
+  let path = `/${entity}(${n})`;
+  const qs = [];
+  if (select) qs.push(`$select=${encodeURIComponent(select)}`);
+  if (expand) qs.push(`$expand=${encodeURIComponent(expand)}`);
+  if (qs.length) path += `?${qs.join("&")}`;
+  return slFetch(path);
 }
 
 /* =========================================================
-   ✅ ADMIN: SAP ORDER / DELIVERY endpoints
+   ✅ ADMIN: SAP Order/Delivery by DocNum (para debug/trace)
 ========================================================= */
 app.get("/api/admin/sap/order/:docNum", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    const withLines = String(req.query?.withLines || "") === "1" || String(req.query?.withLines || "") === "true";
-    const order = await getOneByDocNum("Orders", req.params.docNum, withLines);
+
+    const docNum = Number(req.params.docNum || 0);
+    const order = await sapGetFirstByDocNum(
+      "Orders",
+      docNum,
+      "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments",
+      "DocumentLines($select=ItemCode,ItemDescription,Quantity,Price,LineTotal,BaseType,BaseEntry,BaseLine)"
+    );
+
     if (!order) return res.status(404).json({ ok: false, message: "Pedido no encontrado" });
     return res.json({ ok: true, order });
   } catch (e) {
@@ -1182,8 +1149,15 @@ app.get("/api/admin/sap/order/:docNum", verifyAdmin, async (req, res) => {
 app.get("/api/admin/sap/delivery/:docNum", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    const withLines = String(req.query?.withLines || "") === "1" || String(req.query?.withLines || "") === "true";
-    const delivery = await getOneByDocNum("DeliveryNotes", req.params.docNum, withLines);
+
+    const docNum = Number(req.params.docNum || 0);
+    const delivery = await sapGetFirstByDocNum(
+      "DeliveryNotes",
+      docNum,
+      "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments",
+      "DocumentLines($select=ItemCode,ItemDescription,Quantity,Price,LineTotal,BaseType,BaseEntry,BaseLine)"
+    );
+
     if (!delivery) return res.status(404).json({ ok: false, message: "Entrega no encontrada" });
     return res.json({ ok: true, delivery });
   } catch (e) {
@@ -1192,168 +1166,191 @@ app.get("/api/admin/sap/delivery/:docNum", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: TRACE QUOTE (DocNum) -> Order -> Deliveries
+   ✅ ADMIN: TRACE QUOTE (Opción 1)
+   GET /api/admin/trace/quote/:docNum
 ========================================================= */
 app.get("/api/admin/trace/quote/:docNum", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
-    const docNum = Number(req.params.docNum || 0);
-    if (!docNum) return res.status(400).json({ ok: false, message: "DocNum inválido" });
+    const quoteDocNum = Number(req.params.docNum || 0);
+    if (!quoteDocNum) return res.status(400).json({ ok: false, message: "docNum inválido" });
 
-    const t = await traceFromQuoteDocNum(docNum);
-
-    if (!t.quote) return res.status(404).json({ ok: false, message: "Cotización no encontrada" });
-
-    return res.json({
-      ok: true,
-      quote: t.quote,
-      order: t.order,
-      deliveries: t.deliveries,
-      totals: {
-        totalCotizado: Number(t.quote?.DocTotal || 0),
-        totalPedido: Number(t.order?.DocTotal || 0),
-        totalEntregado: Number(t.totals?.delivered || 0),
-        pendiente: Number(t.quote?.DocTotal || 0) - Number(t.totals?.delivered || 0),
-      },
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
-   - con MontoEntregado (Service Layer trace)
-========================================================= */
-app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
-  try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
-
-    const limit = Math.min(Math.max(Number(req.query?.limit || req.query?.top || 500), 1), 500);
-    const skip = Math.max(Number(req.query?.skip || 0), 0);
-
-    const from = String(req.query?.from || "").trim();
-    const to = String(req.query?.to || "").trim();
-
-    const filterParts = [];
-    if (from) filterParts.push(`DocDate ge '${from}'`);
-    if (to) filterParts.push(`DocDate le '${to}'`);
-
-    const sapFilter = filterParts.length
-      ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
-      : "";
-
-    const SELECT =
-      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
-
-    const sap = await slFetch(
-      `/Quotations?$select=${SELECT}` +
-        `&$orderby=DocDate desc&$top=${limit}&$skip=${skip}${sapFilter}`
+    // 1) Quote por DocNum
+    const quote = await sapGetFirstByDocNum(
+      "Quotations",
+      quoteDocNum,
+      "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments",
+      "DocumentLines($select=ItemCode,ItemDescription,Quantity,Price,LineTotal)"
     );
 
-    const values = Array.isArray(sap?.value) ? sap.value : [];
+    if (!quote) return res.status(404).json({ ok: false, message: "Cotización no encontrada" });
 
-    const parseUserFromComments = (comments = "") => {
-      const m = String(comments).match(/\[user:([^\]]+)\]/i);
-      return m ? String(m[1]).trim() : "";
-    };
+    const quoteDocEntry = Number(quote.DocEntry);
+    const cardCode = String(quote.CardCode || "").trim();
+    const quoteDate = String(quote.DocDate || "").slice(0, 10);
 
-    let quotes = values.map((q) => {
-      const fechaISO = String(q.DocDate || "").slice(0, 10);
+    // Rango para buscar documentos relacionados (ajustable)
+    const from = isIsoDate(req.query?.from) ? String(req.query.from) : addDaysISO(quoteDate, -7);
+    const to = isIsoDate(req.query?.to) ? String(req.query.to) : addDaysISO(quoteDate, 30);
 
-      const cancelStatus = String(q.CancelStatus || "").trim();
-      const isCancelled = cancelStatus.toLowerCase() === "csyes";
+    // 2) Pedidos candidatos por CardCode + rango de fechas
+    //    (después validamos BaseType/BaseEntry en sus líneas)
+    const ordersList = await slFetch(
+      `/Orders?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus` +
+        `&$filter=${encodeURIComponent(`CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate le '${to}'`)}` +
+        `&$orderby=DocDate asc&$top=50`
+    );
 
-      const estado = isCancelled
-        ? "Cancelled"
-        : q.DocumentStatus === "bost_Open"
-        ? "Open"
-        : q.DocumentStatus === "bost_Close"
-        ? "Close"
-        : String(q.DocumentStatus || "");
+    const orderCandidates = Array.isArray(ordersList?.value) ? ordersList.value : [];
 
-      const usuario = parseUserFromComments(q.Comments || "");
+    const orders = [];
+    for (const o of orderCandidates) {
+      // Pedimos líneas para revisar base doc
+      const od = await sapGetByDocEntry(
+        "Orders",
+        o.DocEntry,
+        "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments",
+        "DocumentLines($select=ItemCode,ItemDescription,Quantity,Price,LineTotal,BaseType,BaseEntry,BaseLine)"
+      );
 
-      return {
-        docEntry: q.DocEntry,
-        docNum: q.DocNum,
-        cardCode: String(q.CardCode || "").trim(),
-        cardName: String(q.CardName || "").trim(),
-        montoCotizacion: Number(q.DocTotal || 0),
-        fecha: fechaISO,
-        estado,
-        cancelStatus,
-        isCancelled,
-        usuario,
-        comments: q.Comments || "",
+      const lines = Array.isArray(od?.DocumentLines) ? od.DocumentLines : [];
+      const linked = lines.some(
+        (l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry
+      );
 
-        // defaults
-        montoEntregado: 0,
-        pendiente: Number(q.DocTotal || 0),
-        pedidoDocNum: null,
-        pedidoDocEntry: null,
-        entregasDocNums: [],
-      };
-    });
+      if (linked) orders.push(od);
 
-    // ✅ calcular entregado si:
-    // - withDelivered=1, o
-    // - limit pequeño (<=50)
-    const withDelivered =
-      String(req.query?.withDelivered || "") === "1" ||
-      String(req.query?.withDelivered || "") === "true" ||
-      limit <= 50;
+      // Evita pegarle demasiado a SAP
+      await sleep(60);
+    }
 
-    if (withDelivered && quotes.length) {
-      const CONCURRENCY = 3;
-      let idx = 0;
+    // 3) Entregas candidatas por CardCode + rango; validar BaseType/BaseEntry contra pedidos encontrados
+    const deliveries = [];
+    const deliveryDocEntrySet = new Set();
 
-      async function worker() {
-        while (idx < quotes.length) {
-          const i = idx++;
-          const q = quotes[i];
+    if (orders.length) {
+      const delList = await slFetch(
+        `/DeliveryNotes?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus` +
+          `&$filter=${encodeURIComponent(`CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate le '${to}'`)}` +
+          `&$orderby=DocDate asc&$top=80`
+      );
 
-          try {
-            // Trace solo para NO canceladas (si quieres incluir canceladas quita esto)
-            // (igual puedes entregar en canceladas, pero normalmente no aplica)
-            // if (q.isCancelled) continue;
+      const delCandidates = Array.isArray(delList?.value) ? delList.value : [];
+      const orderDocEntrySet = new Set(orders.map((x) => Number(x.DocEntry)));
 
-            const t = await traceFromQuoteDocNum(Number(q.docNum));
+      for (const d of delCandidates) {
+        const dd = await sapGetByDocEntry(
+          "DeliveryNotes",
+          d.DocEntry,
+          "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments",
+          "DocumentLines($select=ItemCode,ItemDescription,Quantity,Price,LineTotal,BaseType,BaseEntry,BaseLine)"
+        );
 
-            const delivered = Number(t?.totals?.delivered || 0);
+        const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
+        const linked = lines.some(
+          (l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry))
+        );
 
-            q.montoEntregado = Number.isFinite(delivered) ? +delivered.toFixed(2) : 0;
-            q.pendiente = +(Number(q.montoCotizacion || 0) - Number(q.montoEntregado || 0)).toFixed(2);
-
-            if (t?.order) {
-              q.pedidoDocNum = t.order.DocNum ?? null;
-              q.pedidoDocEntry = t.order.DocEntry ?? null;
-            }
-
-            const ds = Array.isArray(t?.deliveries) ? t.deliveries : [];
-            q.entregasDocNums = ds.map((d) => d?.DocNum).filter(Boolean);
-          } catch {
-            // si falla, deja defaults (0)
+        if (linked) {
+          const de = Number(dd.DocEntry);
+          if (!deliveryDocEntrySet.has(de)) {
+            deliveryDocEntrySet.add(de);
+            deliveries.push(dd);
           }
         }
-      }
 
-      await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+        await sleep(60);
+      }
     }
+
+    // Totales
+    const totalCotizado = Number(quote.DocTotal || 0);
+    const totalPedido = orders.reduce((a, o) => a + Number(o?.DocTotal || 0), 0);
+    const totalEntregado = deliveries.reduce((a, d) => a + Number(d?.DocTotal || 0), 0);
+    const pendiente = Number((totalCotizado - totalEntregado).toFixed(2));
+
+    // Resumen tipo tu tabla
+    const rows = [
+      {
+        Tipo: "Cotización",
+        DocNum: quote.DocNum,
+        DocEntry: quote.DocEntry,
+        Cliente: quote.CardCode,
+        Nombre: quote.CardName,
+        Fecha: String(quote.DocDate || "").slice(0, 10),
+        Monto: totalCotizado,
+      },
+      ...orders.map((o) => ({
+        Tipo: "Pedido",
+        DocNum: o.DocNum,
+        DocEntry: o.DocEntry,
+        Cliente: o.CardCode,
+        Nombre: o.CardName,
+        Fecha: String(o.DocDate || "").slice(0, 10),
+        Monto: Number(o.DocTotal || 0),
+      })),
+      ...deliveries.map((d) => ({
+        Tipo: "Entrega",
+        DocNum: d.DocNum,
+        DocEntry: d.DocEntry,
+        Cliente: d.CardCode,
+        Nombre: d.CardName,
+        Fecha: String(d.DocDate || "").slice(0, 10),
+        Monto: Number(d.DocTotal || 0),
+      })),
+    ];
 
     return res.json({
       ok: true,
-      limit,
-      skip,
-      count: quotes.length,
-      quotes,
+      quote: {
+        DocEntry: quote.DocEntry,
+        DocNum: quote.DocNum,
+        DocDate: quote.DocDate,
+        DocTotal: totalCotizado,
+        CardCode: quote.CardCode,
+        CardName: quote.CardName,
+        DocumentStatus: quote.DocumentStatus,
+        CancelStatus: quote.CancelStatus,
+        Comments: quote.Comments,
+        DocumentLines: quote.DocumentLines || [],
+      },
+      orders: orders.map((o) => ({
+        DocEntry: o.DocEntry,
+        DocNum: o.DocNum,
+        DocDate: o.DocDate,
+        DocTotal: Number(o.DocTotal || 0),
+        CardCode: o.CardCode,
+        CardName: o.CardName,
+        DocumentStatus: o.DocumentStatus,
+        CancelStatus: o.CancelStatus,
+        Comments: o.Comments,
+        DocumentLines: o.DocumentLines || [],
+      })),
+      deliveries: deliveries.map((d) => ({
+        DocEntry: d.DocEntry,
+        DocNum: d.DocNum,
+        DocDate: d.DocDate,
+        DocTotal: Number(d.DocTotal || 0),
+        CardCode: d.CardCode,
+        CardName: d.CardName,
+        DocumentStatus: d.DocumentStatus,
+        CancelStatus: d.CancelStatus,
+        Comments: d.Comments,
+        DocumentLines: d.DocumentLines || [],
+      })),
+      totals: {
+        totalCotizado,
+        totalPedido,
+        totalEntregado,
+        pendiente,
+      },
+      rows,
+      debug: { from, to, cardCode, quoteDocEntry },
     });
-  } catch (err) {
-    console.error("❌ /api/admin/quotes:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
+  } catch (e) {
+    console.error("❌ /api/admin/trace/quote:", e.message);
+    return res.status(500).json({ ok: false, message: e.message });
   }
 });
 
