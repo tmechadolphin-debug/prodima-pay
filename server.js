@@ -1,545 +1,894 @@
-<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="robots" content="noindex,nofollow,noarchive" />
-  <title>PRODIMA · Admin (Usuarios · Histórico · Dashboard)</title>
+import express from "express";
+import cors from "cors";
+import pg from "pg";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import * as XLSX from "xlsx";
 
-  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+const { Pool } = pg;
 
-  <!-- ✅ Excel export (XLSX) -->
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.19.3/dist/xlsx.full.min.js"></script>
+const app = express();
+app.use(express.json({ limit: "2mb" }));
 
-  <!-- ✅ Charts -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+/* =========================================================
+   ✅ ENV
+========================================================= */
+const {
+  PORT = 3000,
+  CORS_ORIGIN = "*",
 
-  <style>
-    /* === TU CSS SIN CAMBIOS === */
-    :root{
-      --brand:#c31b1c;
-      --accent:#ffbf24;
-      --ink:#1f1f1f;
-      --muted:#6b6b6b;
-      --card:#ffffff;
-      --bd:#f1d39f;
-      --shadow: 0 18px 50px rgba(0,0,0,.10);
-      --ok:#0c8c6a;
-      --warn:#e67e22;
-      --bad:#c31b1c;
+  DATABASE_URL = "",
+
+  JWT_SECRET = "change_me",
+
+  ADMIN_USER = "PRODIMA",
+  ADMIN_PASS = "ADMINISTRADOR",
+
+  SAP_BASE_URL = "",
+  SAP_COMPANYDB = "",
+  SAP_USER = "",
+  SAP_PASS = "",
+
+  SAP_WAREHOUSE = "300",
+  SAP_PRICE_LIST = "Lista 02 Res. Com. Ind. Analitic",
+  YAPPY_ALIAS = "@prodimasansae",
+} = process.env;
+
+/* =========================================================
+   ✅ CORS
+========================================================= */
+app.use(
+  cors({
+    origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
+    credentials: false,
+  })
+);
+
+/* =========================================================
+   ✅ DB (Postgres)
+========================================================= */
+const pool = new Pool({
+  connectionString: DATABASE_URL || undefined,
+  ssl: DATABASE_URL && DATABASE_URL.includes("sslmode")
+    ? { rejectUnauthorized: false }
+    : undefined,
+});
+
+async function ensureDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      full_name TEXT DEFAULT '',
+      pin_hash TEXT NOT NULL,
+      province TEXT DEFAULT '',
+      warehouse_code TEXT DEFAULT '',
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+}
+
+function provinceToWarehouse(province) {
+  const p = String(province || "").trim().toLowerCase();
+  if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
+  if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera") return "500";
+  if (
+    p === "panamá" || p === "panama" ||
+    p === "panamá oeste" || p === "panama oeste" ||
+    p === "colón" || p === "colon"
+  ) return "300";
+  if (p === "rci") return "01";
+  return SAP_WAREHOUSE || "300";
+}
+
+/* =========================================================
+   ✅ Helpers
+========================================================= */
+function safeJson(res, status, obj) {
+  res.status(status).json(obj);
+}
+
+function signAdminToken(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: "12h" });
+}
+
+function signUserToken(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: "30d" });
+}
+
+function verifyAdmin(req, res, next) {
+  const auth = String(req.headers.authorization || "");
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
+
+  try {
+    const decoded = jwt.verify(m[1], JWT_SECRET);
+    if (decoded?.role !== "admin") {
+      return safeJson(res, 403, { ok: false, message: "Forbidden" });
     }
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{
-      font-family:'Montserrat',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
-      color:var(--ink);
-      background:linear-gradient(120deg,#fff3db 0%, #ffffff 55%, #fff3db 100%);
-      min-height:100vh;
-    }
-    .topbar{
-      background:linear-gradient(90deg,var(--brand) 0%, #e0341d 45%, var(--accent) 100%);
-      color:#fff;
-      padding:12px 16px;
-      font-weight:900;
-      letter-spacing:.3px;
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:12px;
-      flex-wrap:wrap;
-    }
-    .topbar .left{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-    .pill{
-      background:#fff;
-      color:#7b1a01;
-      border:1px solid #ffd27f;
-      border-radius:999px;
-      padding:6px 10px;
-      font-size:12px;
-      font-weight:900;
-      box-shadow:0 10px 18px rgba(0,0,0,.06);
-      white-space:nowrap;
-    }
-    .pill.ok{ color:var(--ok); border-color:#b7f0db; }
-    .pill.bad{ color:#b30000; border-color:#ffd27f; }
-    .pill.warn{ color:#8a4b00; border-color:#ffe3a8; }
-
-    .btn{
-      height:40px;border-radius:14px;font-weight:900;border:0;cursor:pointer;
-      padding:0 14px;display:inline-flex;align-items:center;justify-content:center;gap:8px;
-      letter-spacing:.2px;user-select:none;
-    }
-    .btn-primary{
-      background:linear-gradient(90deg,var(--brand) 0%, var(--accent) 100%);
-      color:#fff;box-shadow:0 12px 22px rgba(195,21,28,.25);
-    }
-    .btn-outline{
-      background:#fff;color:var(--brand);border:1px solid #ffd27f;
-    }
-    .btn-danger{
-      background:linear-gradient(90deg,#a40b0d 0%, #ff7a00 100%);
-      color:#fff;
-    }
-    .btn:disabled{opacity:.6;cursor:not-allowed}
-
-    .wrap{max-width:1300px;margin:18px auto 60px;padding:0 16px}
-    .hero{
-      background:
-        radial-gradient(1000px 420px at 20% -10%, rgba(255,191,36,.55), transparent 60%),
-        radial-gradient(900px 420px at 95% 0%, rgba(195,21,28,.22), transparent 62%),
-        #fff;
-      border:1px solid var(--bd);
-      border-radius:22px;
-      box-shadow: var(--shadow);
-      padding:16px 16px 14px;
-    }
-    .hero h1{font-size:22px;font-weight:900;color:var(--brand);margin-bottom:4px}
-    .hero p{color:#6a3b1b;font-weight:700;font-size:13px;line-height:1.35;max-width:1100px}
-
-    .tabs{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
-    .tab{
-      background:#fff;border:1px solid #ffd27f;border-radius:999px;
-      padding:10px 14px;font-weight:900;color:#7b1a01;cursor:pointer;
-      box-shadow:0 10px 18px rgba(0,0,0,.06);
-      user-select:none;
-    }
-    .tab.active{
-      background:linear-gradient(90deg, rgba(195,21,28,.10), rgba(255,191,36,.35));
-      border-color:var(--bd);
-      color:var(--brand);
-    }
-
-    .section{
-      margin-top:16px;background:var(--card);border:1px solid var(--bd);
-      border-radius:18px;box-shadow: var(--shadow);overflow:hidden;
-    }
-    .section-h{
-      background:linear-gradient(90deg, rgba(195,21,28,.08), rgba(255,191,36,.25));
-      border-bottom:1px solid var(--bd);
-      padding:12px 14px;
-      display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
-    }
-    .section-h strong{color:var(--brand);font-weight:900;letter-spacing:.2px}
-    .section-b{padding:14px}
-
-    .row{
-      display:grid;
-      grid-template-columns: 1fr 1fr 1fr 1fr;
-      gap:10px;
-    }
-    @media (max-width:1050px){ .row{grid-template-columns:1fr 1fr} }
-    @media (max-width:560px){ .row{grid-template-columns:1fr} }
-
-    label{display:block;font-weight:900;color:#6a3b1b;font-size:12px;margin-bottom:6px;letter-spacing:.2px}
-    .input{
-      width:100%;height:42px;border-radius:14px;border:1px solid #ffd27f;
-      padding:0 12px;outline:none;background:#fffdf6;font-weight:800;color:#2b1c16;
-    }
-    .input::placeholder{color:#c08a40;font-weight:700}
-    .note{
-      margin-top:10px;background:#fff7e8;border:1px dashed #f3c776;border-radius:14px;
-      padding:10px 12px;color:#70421c;font-weight:700;font-size:12px;line-height:1.35;
-    }
-
-    .cards{
-      display:grid;grid-template-columns: repeat(4, 1fr);gap:12px;margin-top:10px;
-    }
-    @media (max-width:1050px){ .cards{grid-template-columns: repeat(2, 1fr);} }
-    @media (max-width:560px){ .cards{grid-template-columns: 1fr;} }
-
-    .stat{
-      background:linear-gradient(180deg,#fffef8 0%, #fff7e8 100%);
-      border:1px solid var(--bd);
-      border-radius:16px;
-      padding:12px;
-    }
-    .stat .k{color:#7a4a1a;font-weight:900;font-size:12px}
-    .stat .v{margin-top:6px;font-weight:900;font-size:20px;color:#111}
-    .stat .s{margin-top:6px;font-weight:800;font-size:12px;color:#6b6b6b}
-
-    table{
-      width:100%;
-      border-collapse:separate;border-spacing:0;
-      border:1px solid var(--bd);
-      border-radius:16px;
-      overflow:hidden;
-    }
-    thead th{
-      text-align:left;padding:10px 10px;font-size:12px;color:#6a3b1b;font-weight:900;
-      background:linear-gradient(90deg, rgba(195,21,28,.06), rgba(255,191,36,.20));
-      border-bottom:1px solid var(--bd);
-      white-space:nowrap;
-    }
-    tbody td{
-      padding:10px 10px;border-bottom:1px dashed var(--bd);vertical-align:top;
-      background:#fff;font-size:12px;font-weight:800;color:#2b1c16;
-    }
-    tbody tr:last-child td{border-bottom:0}
-    .tableWrap{overflow:auto;border-radius:16px}
-
-    .tag{
-      display:inline-flex;align-items:center;justify-content:center;
-      border-radius:999px;padding:4px 8px;border:1px solid #ffd27f;
-      font-weight:900;font-size:11px;background:#fff;white-space:nowrap;
-    }
-    .tag.ok{border-color:#b7f0db;color:var(--ok)}
-    .tag.bad{border-color:#ffd27f;color:#b30000}
-    .tag.warn{border-color:#ffe3a8;color:#8a4b00}
-
-    .muted{color:#777;font-weight:800;font-size:12px}
-
-    .barRow{display:flex;gap:10px;align-items:center}
-    .bar{
-      flex:1;height:12px;border-radius:999px;background:#ffe7b7;
-      border:1px solid #ffd27f;overflow:hidden;
-    }
-    .bar > i{
-      display:block;height:100%;
-      width:0%;
-      background:linear-gradient(90deg,var(--brand) 0%, var(--accent) 100%);
-    }
-
-    .toast{
-      position:fixed;right:18px;bottom:18px;background:#111;color:#fff;
-      padding:12px 14px;border-radius:14px;box-shadow:0 20px 50px rgba(0,0,0,.25);
-      display:none;max-width:560px;z-index:999;font-weight:800;line-height:1.35;
-    }
-    .toast.ok{background:linear-gradient(90deg,#0c8c6a,#1bb88a)}
-    .toast.bad{background:linear-gradient(90deg,#a40b0d,#ff7a00)}
-
-    .overlay{
-      position:fixed;inset:0;background:rgba(0,0,0,.55);
-      display:none;align-items:center;justify-content:center;padding:18px;z-index:1000;
-    }
-    .modal{
-      width:min(560px, 96vw);background:#fff;border:1px solid var(--bd);
-      border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,.28);overflow:hidden;
-    }
-    .modal-h{
-      padding:12px 14px;background:linear-gradient(90deg,var(--brand) 0%, var(--accent) 100%);
-      color:#fff;font-weight:900;display:flex;justify-content:space-between;align-items:center;gap:10px;
-    }
-    .modal-b{padding:14px}
-    .modal-b .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-    @media (max-width:560px){ .modal-b .row2{grid-template-columns:1fr} }
-    .modal-f{
-      padding:14px;display:flex;justify-content:flex-end;gap:10px;
-      border-top:1px solid var(--bd);background:#fffef8;
-    }
-    .chip{
-      display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;
-      font-size:11px;font-weight:900;border:1px solid #ffd27f;background:#fff;color:#7b1a01;white-space:nowrap;
-    }
-    .chip.ok{border-color:#b7f0db;color:#0c8c6a}
-    .chip.bad{border-color:#ffd27f;color:#b30000}
-    .chip.warn{border-color:#ffe3a8;color:#8a4b00}
-
-    .chartCard{
-      background:linear-gradient(180deg,#fffef8 0%, #fff7e8 100%);
-      border:1px solid var(--bd);
-      border-radius:16px;
-      padding:12px;
-    }
-    .chartWrap{position:relative;width:100%;height:260px;margin-top:10px}
-
-    .tog{
-      display:flex;align-items:center;gap:10px;flex-wrap:wrap;
-      padding:10px 12px;border:1px solid #ffd27f;border-radius:16px;background:#fff;
-      box-shadow:0 10px 18px rgba(0,0,0,.06);
-    }
-    .switch{
-      position:relative;display:inline-block;width:46px;height:26px;flex:0 0 auto;
-    }
-    .switch input{display:none}
-    .slider{
-      position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;
-      background:#ffe7b7;border:1px solid #ffd27f;border-radius:999px;transition:.2s;
-    }
-    .slider:before{
-      position:absolute;content:"";height:20px;width:20px;left:3px;top:2px;
-      background:white;border-radius:50%;transition:.2s;
-      box-shadow:0 8px 18px rgba(0,0,0,.18);
-    }
-    .switch input:checked + .slider{
-      background:linear-gradient(90deg, rgba(195,21,28,.20), rgba(255,191,36,.45));
-    }
-    .switch input:checked + .slider:before{transform:translateX(20px)}
-  </style>
-</head>
-
-<body>
-  <div class="topbar">
-    <div class="left">
-      <div>🛠️ PRODIMA · Admin</div>
-      <span class="pill bad" id="apiStatus">API: verificando...</span>
-      <span class="pill bad" id="authStatus">Admin: no</span>
-      <span class="pill bad" id="whoami">Usuario: --</span>
-      <span class="pill warn" id="scopePill">Scope: Todos</span>
-    </div>
-
-    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <button class="btn btn-outline" id="btnRefresh" type="button" style="height:34px;border-radius:12px;padding:0 10px;font-size:12px">
-        🔄 Refrescar
-      </button>
-      <button class="btn btn-outline" id="btnLogout" type="button" style="display:none;height:34px;border-radius:12px;padding:0 10px;font-size:12px">
-        🚪 Salir
-      </button>
-    </div>
-  </div>
-
-  <div class="wrap">
-    <section class="hero">
-      <h1>Panel Administrador</h1>
-      <p>
-        ✅ Dashboard (KPIs + gráficos) · ✅ Histórico con export Excel · ✅ Usuarios mercaderistas (provincia → bodega automático).<br>
-        ✅ Nuevo: <b>Filtro Scope</b> para ver solo cotizaciones hechas por <b>usuarios creados en este sistema</b> (o ver todo).
-      </p>
-
-      <div class="tabs">
-        <div class="tab active" data-tab="dash">📊 Dashboard</div>
-        <div class="tab" data-tab="quotes">🧾 Histórico</div>
-        <div class="tab" data-tab="users">👥 Usuarios</div>
-      </div>
-    </section>
-
-    <!-- ✅ Scope Toggle (global) -->
-    <section class="section">
-      <div class="section-h">
-        <strong>🎯 Scope de datos</strong>
-        <span class="pill" id="scopeHint">—</span>
-      </div>
-      <div class="section-b">
-        <div class="tog">
-          <label class="switch" title="Filtrar por usuarios creados en app_users">
-            <input id="scopeOnlyCreated" type="checkbox" checked>
-            <span class="slider"></span>
-          </label>
-
-          <div style="display:flex;flex-direction:column;gap:4px">
-            <div style="font-weight:900;color:#6a3b1b">
-              Solo cotizaciones de <span style="color:var(--brand)">usuarios creados</span>
-            </div>
-            <div class="muted">
-              Si lo apagas, verás cotizaciones “en general”. Esto también limpia “sin_user / sin_wh” en dashboard.
-            </div>
-          </div>
-
-          <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-            <span class="chip ok" id="createdUsersChip">Usuarios creados: 0</span>
-            <span class="chip warn" id="excludedChip">Excluidos: 0</span>
-          </div>
-        </div>
-
-        <div class="note">
-          ✅ Nota: el <b>Entregado</b> se calcula desde SAP con <code>withDelivered=1</code> (trace Quote → Order → Delivery).
-          <br>✅ El Dashboard omite <b>Cancelled</b>: solo suma <b>Open</b> y <b>Close</b>.
-        </div>
-      </div>
-    </section>
-
-    <!-- DASHBOARD -->
-    <section class="section" id="tab_dash">
-      <!-- (tu dashboard igual, sin cambios) -->
-      <!-- ... -->
-      <!-- ✅ Por espacio: mantén exactamente tu sección dashboard/histórico igual -->
-      <!-- (No la alteré, porque el fix era server) -->
-      <!-- Pega aquí tu dashboard + histórico tal como lo tenías -->
-      <!-- --- -->
-      <!-- Para no duplicar 100% aquí (es larguísimo), la parte modificada fue SOLO en Usuarios + JS -->
-      <!-- --- -->
-
-      <!-- ⚠️ NOTA: En tu caso real pega tu dashboard completo tal cual ya lo tenías arriba. -->
-    </section>
-
-    <!-- HISTÓRICO -->
-    <section class="section" id="tab_quotes" style="display:none">
-      <!-- (tu histórico igual, sin cambios) -->
-    </section>
-
-    <!-- USUARIOS -->
-    <section class="section" id="tab_users" style="display:none">
-      <div class="section-h">
-        <strong>👥 Usuarios mercaderistas</strong>
-        <span class="pill" id="usersHint">—</span>
-      </div>
-      <div class="section-b">
-
-        <div class="row">
-          <div>
-            <label for="uUsername">Username</label>
-            <input id="uUsername" class="input" placeholder="Ej: vane15">
-          </div>
-          <div>
-            <label for="uFullName">Nombre</label>
-            <input id="uFullName" class="input" placeholder="Ej: Vanessa Pérez">
-          </div>
-          <div>
-            <label for="uPin">PIN</label>
-            <input id="uPin" class="input" placeholder="Mínimo 4" type="password">
-          </div>
-          <div>
-            <label for="uProvince">Provincia (define la bodega)</label>
-            <input id="uProvince" class="input" placeholder="Ej: Panamá / Chiriquí / Veraguas">
-            <div class="muted" style="margin-top:6px">
-              Bodega sugerida: <b id="uWhPreview">--</b>
-            </div>
-          </div>
-        </div>
-
-        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
-          <button class="btn btn-primary" id="btnCreateUser" type="button">➕ Crear usuario</button>
-
-          <!-- ✅ NUEVO: Export users from server -->
-          <button class="btn btn-outline" id="btnExportUsersXlsx" type="button">📄 Exportar Excel</button>
-
-          <span class="pill" id="usersCount">0 usuarios</span>
-        </div>
-
-        <div class="tableWrap" style="margin-top:10px">
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Username</th>
-                <th>Nombre</th>
-                <th>Activo</th>
-                <th>Provincia</th>
-                <th>Bodega</th>
-                <th>Creado</th>
-                <th>Acción</th>
-              </tr>
-            </thead>
-            <tbody id="usersBody"></tbody>
-          </table>
-        </div>
-
-        <div class="note">
-          ✅ Botón <b>Cambiar PIN</b> por usuario.
-          Esto llama a <b>PATCH /api/admin/users/:id/pin</b> con <code>{ pin }</code>.
-        </div>
-      </div>
-    </section>
-
-    <div class="muted" style="text-align:center;margin-top:16px">
-      ©️ 2026 PRODIMA · Admin interno
-    </div>
-  </div>
-
-  <div id="toast" class="toast"></div>
-
-  <!-- LOGIN MODAL -->
-  <div class="overlay" id="overlayLogin">
-    <div class="modal">
-      <div class="modal-h">
-        <div>🔐 Login Administrador</div>
-        <div class="chip bad" id="loginState">🔒 Bloqueado</div>
-      </div>
-
-      <div class="modal-b">
-        <div class="row2">
-          <div>
-            <label for="aUser">Usuario</label>
-            <input id="aUser" class="input" placeholder="ADMIN" autocomplete="username">
-          </div>
-          <div>
-            <label for="aPass">Contraseña</label>
-            <input id="aPass" class="input" type="password" placeholder="********" autocomplete="current-password">
-          </div>
-        </div>
-        <div class="note" style="margin-top:10px">
-          ✅ Debes iniciar sesión como admin para ver Dashboard / Histórico / Usuarios.
-        </div>
-      </div>
-
-      <div class="modal-f">
-        <button class="btn btn-primary" id="btnLogin" type="button">Entrar</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- CHANGE PIN MODAL -->
-  <div class="overlay" id="overlayPin">
-    <div class="modal">
-      <div class="modal-h">
-        <div>🔑 Cambiar PIN</div>
-        <div class="chip warn" id="pinUserChip">—</div>
-      </div>
-
-      <div class="modal-b">
-        <div class="row2">
-          <div>
-            <label for="pinNew">Nuevo PIN</label>
-            <input id="pinNew" class="input" type="password" placeholder="Mínimo 4">
-          </div>
-          <div>
-            <label for="pinNew2">Confirmar PIN</label>
-            <input id="pinNew2" class="input" type="password" placeholder="Repite PIN">
-          </div>
-        </div>
-        <div class="note" style="margin-top:10px">
-          Se actualizará el PIN del usuario seleccionado. Esto NO cambia la bodega, solo credenciales.
-        </div>
-      </div>
-
-      <div class="modal-f">
-        <button class="btn btn-outline" id="btnPinCancel" type="button">Cancelar</button>
-        <button class="btn btn-primary" id="btnPinSave" type="button">Guardar</button>
-      </div>
-    </div>
-  </div>
-
-<script>
-/* =========================================
-   ✅ CONFIG
-========================================= */
-const API_BASE = "https://prodima-pay.onrender.com";
-const ADMIN_TOKEN_KEY = "prodima_admin_token";
-
-/* =========================================
-   State
-========================================= */
-let USERS_LIST = [];
-let CREATED_USER_SET = new Set();
-let LAST_QUOTES_RAW = [];
-let LAST_QUOTES = [];
-let QUOTES_PAGE = 1;
-const PAGE_SIZE = 20;
-let QUOTES_HAS_MORE = true;
-let PIN_TARGET = { id:null, username:"" };
-
-/* === TODO TU JS ORIGINAL AQUÍ === */
-/* (para mantenerlo corto en este mensaje: pega tu JS completo tal cual, y SOLO agrega este bloque nuevo abajo) */
-
-/* ✅ NUEVO: Export Usuarios XLSX desde server (con token) */
-async function exportUsersXlsxFromServer(){
-  try{
-    const res = await fetch(`${API_BASE}/api/admin/users.xlsx`, { headers: authHeaders() });
-    if(!res.ok){
-      const txt = await res.text().catch(()=> "");
-      throw new Error(txt || "No se pudo exportar usuarios");
-    }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `prodima_usuarios_${Date.now()}.xlsx`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-
-    showToast("Excel de usuarios descargado ✅","ok");
-  }catch(err){
-    showToast(err.message || err, "bad");
+    req.admin = decoded;
+    next();
+  } catch {
+    return safeJson(res, 401, { ok: false, message: "Invalid token" });
   }
 }
 
-/* ✅ Hook del botón */
-document.addEventListener("DOMContentLoaded", ()=>{
-  const btn = document.getElementById("btnExportUsersXlsx");
-  if(btn) btn.addEventListener("click", exportUsersXlsxFromServer);
-});
-</script>
+function verifyUser(req, res, next) {
+  const auth = String(req.headers.authorization || "");
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
 
-</body>
-</html>
+  try {
+    const decoded = jwt.verify(m[1], JWT_SECRET);
+    if (decoded?.role !== "user") {
+      return safeJson(res, 403, { ok: false, message: "Forbidden" });
+    }
+    req.user = decoded;
+    next();
+  } catch {
+    return safeJson(res, 401, { ok: false, message: "Invalid token" });
+  }
+}
+
+function missingSapEnv() {
+  return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function addDaysISO(iso, days) {
+  const d = new Date(String(iso || "").slice(0, 10));
+  if (Number.isNaN(d.getTime())) return "";
+  d.setDate(d.getDate() + Number(days || 0));
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+
+// ✅ más robusto
+function parseUserFromComments(comments) {
+  const s = String(comments || "");
+  let m = s.match(/\[(user|usuario)\s*:\s*([^\]]+)\]/i);
+  if (m) return String(m[2]).trim();
+
+  m = s.match(/(?:^|\s)(user|usuario)\s*:\s*([^\n\r]+)/i);
+  if (m) return String(m[2]).trim();
+
+  return "";
+}
+
+function parseWhFromComments(comments) {
+  const m = String(comments || "").match(/\[wh:([^\]]+)\]/i);
+  return m ? String(m[1]).trim() : "";
+}
+
+function isCancelledLike(q) {
+  const cancelVal = q?.CancelStatus ?? q?.cancelStatus ?? q?.Cancelled ?? q?.cancelled ?? "";
+  const cancelRaw = String(cancelVal).trim().toLowerCase();
+  const commLower = String(q?.Comments || q?.comments || "").toLowerCase();
+  return (
+    cancelRaw === "csyes" ||
+    cancelRaw === "yes" ||
+    cancelRaw === "true" ||
+    cancelRaw === "1" ||
+    cancelRaw.includes("csyes") ||
+    cancelRaw.includes("cancel") ||
+    commLower.includes("[cancel") ||
+    commLower.includes("cancelad")
+  );
+}
+
+/* =========================================================
+   ✅ SAP Service Layer (Session cookie)
+========================================================= */
+let SL_COOKIE = "";
+let SL_COOKIE_AT = 0;
+
+async function slLogin() {
+  const url = `${SAP_BASE_URL.replace(/\/$/, "")}/Login`;
+  const body = {
+    CompanyDB: SAP_COMPANYDB,
+    UserName: SAP_USER,
+    Password: SAP_PASS,
+  };
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const txt = await r.text();
+  let data = {};
+  try { data = JSON.parse(txt); } catch { /* ignore */ }
+
+  if (!r.ok) {
+    throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
+  }
+
+  const setCookie = r.headers.get("set-cookie") || "";
+  const cookies = [];
+  for (const part of setCookie.split(",")) {
+    const s = part.trim();
+    if (s.startsWith("B1SESSION=") || s.startsWith("ROUTEID=")) {
+      cookies.push(s.split(";")[0]);
+    }
+  }
+  SL_COOKIE = cookies.join("; ");
+  SL_COOKIE_AT = Date.now();
+  return true;
+}
+
+async function slFetch(path) {
+  if (missingSapEnv()) throw new Error("Missing SAP env");
+
+  if (!SL_COOKIE || (Date.now() - SL_COOKIE_AT) > 25 * 60 * 1000) {
+    await slLogin();
+  }
+
+  const base = SAP_BASE_URL.replace(/\/$/, "");
+  const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
+
+  const r = await fetch(url, {
+    method: "GET",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: SL_COOKIE,
+    },
+  });
+
+  const txt = await r.text();
+  let data = {};
+  try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+
+  if (!r.ok) {
+    if (r.status === 401 || r.status === 403) {
+      SL_COOKIE = "";
+      await slLogin();
+      return slFetch(path);
+    }
+    throw new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
+  }
+
+  return data;
+}
+
+/* =========================================================
+   ✅ SAP helpers
+========================================================= */
+async function sapGetFirstByDocNum(entity, docNum, select) {
+  const n = Number(docNum);
+  if (!Number.isFinite(n) || n <= 0) throw new Error("DocNum inválido");
+
+  const parts = [];
+  if (select) parts.push(`$select=${encodeURIComponent(select)}`);
+  parts.push(`$filter=${encodeURIComponent(`DocNum eq ${n}`)}`);
+  parts.push(`$top=1`);
+
+  const path = `/${entity}?${parts.join("&")}`;
+  const r = await slFetch(path);
+  const arr = Array.isArray(r?.value) ? r.value : [];
+  return arr[0] || null;
+}
+
+async function sapGetByDocEntry(entity, docEntry, select) {
+  const n = Number(docEntry);
+  if (!Number.isFinite(n) || n <= 0) throw new Error("DocEntry inválido");
+
+  let path = `/${entity}(${n})`;
+  if (select) path += `?$select=${encodeURIComponent(select)}`;
+  return slFetch(path);
+}
+
+/* =========================================================
+   ✅ TRACE logic + cache
+========================================================= */
+const TRACE_CACHE = new Map();
+const TRACE_TTL_MS = 6 * 60 * 60 * 1000;
+
+function cacheGet(key) {
+  const it = TRACE_CACHE.get(key);
+  if (!it) return null;
+  if ((Date.now() - it.at) > TRACE_TTL_MS) {
+    TRACE_CACHE.delete(key);
+    return null;
+  }
+  return it.data;
+}
+function cacheSet(key, data) {
+  TRACE_CACHE.set(key, { at: Date.now(), data });
+}
+
+async function traceQuote(quoteDocNum, fromOverride, toOverride) {
+  const cacheKey = `QDOCNUM:${quoteDocNum}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  const quoteHead = await sapGetFirstByDocNum(
+    "Quotations",
+    quoteDocNum,
+    "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments"
+  );
+  if (!quoteHead) {
+    const out = { ok: false, message: "Cotización no encontrada" };
+    cacheSet(cacheKey, out);
+    return out;
+  }
+
+  const quote = await sapGetByDocEntry("Quotations", quoteHead.DocEntry);
+  const quoteDocEntry = Number(quote.DocEntry);
+  const cardCode = String(quote.CardCode || "").trim();
+  const quoteDate = String(quote.DocDate || "").slice(0, 10);
+
+  const from = /^\d{4}-\d{2}-\d{2}$/.test(String(fromOverride || ""))
+    ? String(fromOverride)
+    : addDaysISO(quoteDate, -7);
+
+  const to = /^\d{4}-\d{2}-\d{2}$/.test(String(toOverride || ""))
+    ? String(toOverride)
+    : addDaysISO(quoteDate, 30);
+
+  const ordersList = await slFetch(
+    `/Orders?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
+      `&$filter=${encodeURIComponent(
+        `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate le '${to}'`
+      )}` +
+      `&$orderby=DocDate asc&$top=80`
+  );
+  const orderCandidates = Array.isArray(ordersList?.value) ? ordersList.value : [];
+
+  const orders = [];
+  for (const o of orderCandidates) {
+    const od = await sapGetByDocEntry("Orders", o.DocEntry);
+    const lines = Array.isArray(od?.DocumentLines) ? od.DocumentLines : [];
+    const linked = lines.some(
+      (l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry
+    );
+    if (linked) orders.push(od);
+    await sleep(30);
+  }
+
+  const deliveries = [];
+  const orderDocEntrySet = new Set(orders.map((x) => Number(x.DocEntry)));
+
+  if (orders.length) {
+    const delList = await slFetch(
+      `/DeliveryNotes?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
+        `&$filter=${encodeURIComponent(
+          `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate le '${to}'`
+        )}` +
+        `&$orderby=DocDate asc&$top=120`
+    );
+    const delCandidates = Array.isArray(delList?.value) ? delList.value : [];
+
+    const seen = new Set();
+    for (const d of delCandidates) {
+      const dd = await sapGetByDocEntry("DeliveryNotes", d.DocEntry);
+      const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
+      const linked = lines.some(
+        (l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry))
+      );
+      if (linked) {
+        const de = Number(dd.DocEntry);
+        if (!seen.has(de)) {
+          seen.add(de);
+          deliveries.push(dd);
+        }
+      }
+      await sleep(30);
+    }
+  }
+
+  const totalCotizado = Number(quote.DocTotal || 0);
+  const totalPedido = orders.reduce((a, o) => a + Number(o?.DocTotal || 0), 0);
+  const totalEntregado = deliveries.reduce((a, d) => a + Number(d?.DocTotal || 0), 0);
+  const pendiente = Number((totalCotizado - totalEntregado).toFixed(2));
+
+  const out = {
+    ok: true,
+    quote,
+    orders,
+    deliveries,
+    totals: { totalCotizado, totalPedido, totalEntregado, pendiente },
+    debug: { from, to, cardCode, quoteDocEntry },
+  };
+
+  cacheSet(cacheKey, out);
+  cacheSet(`QDOCENTRY:${quoteDocEntry}`, out);
+  return out;
+}
+
+/* =========================================================
+   ✅ PriceList helper (para precios en caja / pedidos)
+========================================================= */
+let PRICE_LIST_NUM_CACHE = null;
+let PRICE_LIST_NUM_AT = 0;
+
+async function getPriceListNum() {
+  if (PRICE_LIST_NUM_CACHE && (Date.now() - PRICE_LIST_NUM_AT) < 12 * 60 * 60 * 1000) {
+    return PRICE_LIST_NUM_CACHE;
+  }
+
+  const name = String(SAP_PRICE_LIST || "").trim();
+  if (!name) return null;
+
+  const r = await slFetch(
+    `/PriceLists?$select=ListNum,ListName&$filter=${encodeURIComponent(
+      `ListName eq '${name.replace(/'/g, "''")}'`
+    )}&$top=1`
+  );
+  const arr = Array.isArray(r?.value) ? r.value : [];
+  const num = arr?.[0]?.ListNum ?? null;
+
+  PRICE_LIST_NUM_CACHE = num;
+  PRICE_LIST_NUM_AT = Date.now();
+  return num;
+}
+
+/* =========================================================
+   ✅ Routes
+========================================================= */
+app.get("/api/health", async (req, res) => {
+  safeJson(res, 200, {
+    ok: true,
+    message: "✅ PRODIMA API activa",
+    yappy: YAPPY_ALIAS,
+    warehouse_default: SAP_WAREHOUSE,
+    priceList: SAP_PRICE_LIST,
+    db: DATABASE_URL ? "on" : "off",
+  });
+});
+
+/* ------------------ Admin Auth ------------------ */
+app.post("/api/admin/login", async (req, res) => {
+  const user = String(req.body?.user || "").trim();
+  const pass = String(req.body?.pass || "").trim();
+
+  if (user !== ADMIN_USER || pass !== ADMIN_PASS) {
+    return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
+  }
+
+  const token = signAdminToken({ role: "admin", user });
+  return safeJson(res, 200, { ok: true, token });
+});
+
+/* ------------------ Pedidos Auth (FIX) ------------------ */
+async function doPedidosLogin(req, res) {
+  try {
+    const username =
+      String(req.body?.username || req.body?.user || "").trim().toLowerCase();
+    const pin =
+      String(req.body?.pin || req.body?.pass || "").trim();
+
+    if (!username || !pin) {
+      return safeJson(res, 400, { ok: false, message: "username y pin requeridos" });
+    }
+
+    const r = await pool.query(
+      `SELECT id, username, full_name, pin_hash, warehouse_code, is_active
+       FROM app_users
+       WHERE lower(username)=lower($1)
+       LIMIT 1`,
+      [username]
+    );
+
+    const u = r.rows?.[0];
+    if (!u) return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
+    if (!u.is_active) return safeJson(res, 403, { ok: false, message: "Usuario inactivo" });
+
+    const ok = await bcrypt.compare(pin, u.pin_hash);
+    if (!ok) return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
+
+    const token = signUserToken({
+      role: "user",
+      username: u.username,
+      full_name: u.full_name || "",
+      warehouse_code: u.warehouse_code || "",
+      user_id: u.id,
+    });
+
+    return safeJson(res, 200, {
+      ok: true,
+      token,
+      user: {
+        id: u.id,
+        username: u.username,
+        full_name: u.full_name || "",
+        warehouse_code: u.warehouse_code || "",
+      },
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+}
+
+app.post("/api/pedidos/login", doPedidosLogin);
+// alias compatibilidad
+app.post("/api/login", doPedidosLogin);
+
+app.get("/api/pedidos/me", verifyUser, async (req, res) => {
+  safeJson(res, 200, { ok: true, user: req.user });
+});
+
+/* ------------------ Users ------------------ */
+app.get("/api/admin/users", verifyAdmin, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, username, full_name, province, warehouse_code, is_active, created_at
+       FROM app_users
+       ORDER BY id DESC`
+    );
+    safeJson(res, 200, { ok: true, users: r.rows });
+  } catch (e) {
+    safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+// ✅ Excel users (server)
+app.get("/api/admin/users.xlsx", verifyAdmin, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, username, full_name, province, warehouse_code, is_active, created_at
+       FROM app_users
+       ORDER BY id DESC`
+    );
+
+    const data = r.rows.map(x => ({
+      ID: x.id,
+      Username: x.username,
+      Nombre: x.full_name,
+      Provincia: x.province,
+      Bodega: x.warehouse_code,
+      Activo: x.is_active ? "Sí" : "No",
+      Creado: String(x.created_at || "").replace("T", " ").slice(0, 19),
+    }));
+
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Usuarios");
+
+    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="prodima_usuarios_${Date.now()}.xlsx"`);
+    return res.status(200).send(buf);
+  } catch (e) {
+    safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+app.post("/api/admin/users", verifyAdmin, async (req, res) => {
+  try {
+    const username = String(req.body?.username || "").trim().toLowerCase();
+    const fullName = String(req.body?.fullName || req.body?.full_name || "").trim();
+    const pin = String(req.body?.pin || "").trim();
+    const province = String(req.body?.province || "").trim();
+
+    if (!username) return safeJson(res, 400, { ok: false, message: "username requerido" });
+    if (!pin || pin.length < 4) return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
+
+    const wh = provinceToWarehouse(province);
+    const pin_hash = await bcrypt.hash(pin, 10);
+
+    const r = await pool.query(
+      `INSERT INTO app_users (username, full_name, pin_hash, province, warehouse_code, is_active)
+       VALUES ($1,$2,$3,$4,$5,TRUE)
+       RETURNING id, username, full_name, province, warehouse_code, is_active, created_at`,
+      [username, fullName, pin_hash, province, wh]
+    );
+
+    safeJson(res, 200, { ok: true, user: r.rows[0] });
+  } catch (e) {
+    const msg = String(e.message || "");
+    if (msg.includes("duplicate key")) {
+      return safeJson(res, 409, { ok: false, message: "username ya existe" });
+    }
+    safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id || 0);
+    const r = await pool.query(
+      `UPDATE app_users
+       SET is_active = NOT is_active
+       WHERE id=$1
+       RETURNING id, username, full_name, province, warehouse_code, is_active, created_at`,
+      [id]
+    );
+    if (!r.rows[0]) return safeJson(res, 404, { ok: false, message: "No encontrado" });
+    safeJson(res, 200, { ok: true, user: r.rows[0] });
+  } catch (e) {
+    safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id || 0);
+    const pin = String(req.body?.pin || "").trim();
+    if (!pin || pin.length < 4) return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
+
+    const pin_hash = await bcrypt.hash(pin, 10);
+    const r = await pool.query(
+      `UPDATE app_users SET pin_hash=$2 WHERE id=$1 RETURNING id`,
+      [id, pin_hash]
+    );
+    if (!r.rows[0]) return safeJson(res, 404, { ok: false, message: "No encontrado" });
+    safeJson(res, 200, { ok: true });
+  } catch (e) {
+    safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id || 0);
+    const r = await pool.query(`DELETE FROM app_users WHERE id=$1 RETURNING id`, [id]);
+    if (!r.rows[0]) return safeJson(res, 404, { ok: false, message: "No encontrado" });
+    safeJson(res, 200, { ok: true });
+  } catch (e) {
+    safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+/* ------------------ TRACE quote ------------------ */
+app.get("/api/admin/trace/quote/:docNum", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    const quoteDocNum = Number(req.params.docNum || 0);
+    if (!quoteDocNum) return safeJson(res, 400, { ok: false, message: "docNum inválido" });
+
+    const from = String(req.query?.from || "");
+    const to = String(req.query?.to || "");
+
+    const out = await traceQuote(quoteDocNum, from, to);
+    if (!out.ok) return safeJson(res, 404, out);
+    safeJson(res, 200, out);
+  } catch (e) {
+    safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
+   ✅ Quotes list (Histórico) - FIX FILTRO + PAGINACIÓN
+   - si viene user/client: el server pagina sobre el resultado filtrado
+========================================================= */
+app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    const from = String(req.query?.from || "");
+    const to = String(req.query?.to || "");
+
+    const userFilter = String(req.query?.user || "").trim().toLowerCase();
+    const clientFilter = String(req.query?.client || "").trim().toLowerCase();
+
+    const withDelivered = String(req.query?.withDelivered || "0") === "1";
+
+    const top = req.query?.top != null
+      ? Number(req.query.top)
+      : (req.query?.limit != null ? Number(req.query.limit) : 20);
+
+    const skip = req.query?.skip != null ? Number(req.query.skip) : 0;
+
+    const safeTop = Math.max(1, Math.min(500, Number.isFinite(top) ? top : 20));
+    const safeSkip = Math.max(0, Number.isFinite(skip) ? skip : 0);
+
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const defaultFrom = addDaysISO(today, -30);
+
+    const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
+    const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
+
+    // ✅ Normaliza a formato HTML
+    function normalizeQuoteRow(q) {
+      const usuario = parseUserFromComments(q.Comments || "") || "";
+      const wh = parseWhFromComments(q.Comments || "") || "";
+      return {
+        docEntry: q.DocEntry,
+        docNum: q.DocNum,
+        cardCode: q.CardCode,
+        cardName: q.CardName,
+        fecha: String(q.DocDate || "").slice(0, 10),
+        estado: q.DocumentStatus || "",
+        cancelStatus: q.CancelStatus ?? "",
+        comments: q.Comments || "",
+        usuario,
+        warehouse: wh,
+        montoCotizacion: Number(q.DocTotal || 0),
+        montoEntregado: 0,
+        pendiente: Number(q.DocTotal || 0),
+      };
+    }
+
+    const needServerSideFiltering = !!(userFilter || clientFilter);
+
+    let out = [];
+
+    if (!needServerSideFiltering) {
+      // comportamiento normal (rápido)
+      const raw = await slFetch(
+        `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
+          `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate le '${t}'`)}` +
+          `&$orderby=DocDate desc&$top=${safeTop}&$skip=${safeSkip}`
+      );
+      const quotes = Array.isArray(raw?.value) ? raw.value : [];
+      out = quotes.map(normalizeQuoteRow);
+    } else {
+      // ✅ FIX: iteramos páginas SAP y paginamos sobre el FILTRADO
+      const batchTop = 200;
+      let rawSkip = 0;
+      let collected = [];
+      let skippedMatches = 0;
+      let guard = 0;
+
+      while (collected.length < safeTop && guard < 50) {
+        guard++;
+
+        const raw = await slFetch(
+          `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
+            `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate le '${t}'`)}` +
+            `&$orderby=DocDate desc&$top=${batchTop}&$skip=${rawSkip}`
+        );
+
+        const page = Array.isArray(raw?.value) ? raw.value : [];
+        if (!page.length) break;
+
+        for (const q of page) {
+          const row = normalizeQuoteRow(q);
+
+          // filtros
+          if (userFilter) {
+            if (!String(row.usuario || "").toLowerCase().includes(userFilter)) continue;
+          }
+          if (clientFilter) {
+            const cc = String(row.cardCode || "").toLowerCase();
+            const cn = String(row.cardName || "").toLowerCase();
+            if (!cc.includes(clientFilter) && !cn.includes(clientFilter)) continue;
+          }
+
+          // paginación SOBRE matches
+          if (skippedMatches < safeSkip) {
+            skippedMatches++;
+            continue;
+          }
+          collected.push(row);
+          if (collected.length >= safeTop) break;
+        }
+
+        if (page.length < batchTop) break;
+        rawSkip += batchTop;
+      }
+
+      out = collected;
+    }
+
+    // ✅ Enriquecer entregado SOLO lo devuelto
+    if (withDelivered && out.length) {
+      const CONC = 2;
+      let idx = 0;
+
+      async function worker() {
+        while (idx < out.length) {
+          const i = idx++;
+          const q = out[i];
+
+          if (isCancelledLike({ CancelStatus: q.cancelStatus, Comments: q.comments })) {
+            q.montoEntregado = 0;
+            q.pendiente = Number(q.montoCotizacion || 0);
+            continue;
+          }
+
+          try {
+            const tr = await traceQuote(q.docNum, f, t);
+            if (tr.ok) {
+              q.montoEntregado = Number(tr.totals?.totalEntregado || 0);
+              q.pendiente = Number(tr.totals?.pendiente || (Number(q.montoCotizacion || 0) - Number(q.montoEntregado || 0)));
+              q.pedidoDocNum = tr.orders?.[0]?.DocNum ?? null;
+              q.entregasDocNums = Array.isArray(tr.deliveries) ? tr.deliveries.map((d) => d.DocNum) : [];
+            }
+          } catch {
+            // dejamos 0 si algo falla
+          }
+
+          await sleep(20);
+        }
+      }
+
+      await Promise.all(Array.from({ length: CONC }, worker));
+    }
+
+    return safeJson(res, 200, {
+      ok: true,
+      quotes: out,
+      from: f,
+      to: t,
+      limit: safeTop,
+      skip: safeSkip,
+    });
+  } catch (e) {
+    safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+/* ------------------ Dashboard (simple) ------------------ */
+app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
+  safeJson(res, 200, { ok: true });
+});
+
+/* =========================================================
+   ✅ Opcional: endpoints de apoyo para "precios en caja"
+   (Si tu app Pedidos los usa, esto te sirve; si no, no afecta)
+========================================================= */
+app.get("/api/pedidos/pricelist", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+    const num = await getPriceListNum();
+    safeJson(res, 200, { ok: true, listName: SAP_PRICE_LIST, listNum: num });
+  } catch (e) {
+    safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+// Ejemplo simple de items (filtra local; precio tal cual SAP para la lista)
+app.get("/api/pedidos/items", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    const q = String(req.query?.q || "").trim().toLowerCase();
+    const listNum = await getPriceListNum();
+
+    const raw = await slFetch(`/Items?$select=ItemCode,ItemName,SalesUnit,ItemPrices&$top=500&$orderby=ItemCode asc`);
+    let items = Array.isArray(raw?.value) ? raw.value : [];
+
+    if (q) {
+      items = items.filter(it => {
+        const code = String(it.ItemCode || "").toLowerCase();
+        const name = String(it.ItemName || "").toLowerCase();
+        return code.includes(q) || name.includes(q);
+      }).slice(0, 120);
+    } else {
+      items = items.slice(0, 120);
+    }
+
+    const out = items.map(it => {
+      const prices = Array.isArray(it.ItemPrices) ? it.ItemPrices : [];
+      const row = prices.find(p => (listNum != null && Number(p.PriceList) === Number(listNum))) || null;
+      return {
+        itemCode: it.ItemCode,
+        itemName: it.ItemName,
+        salesUnit: it.SalesUnit || "Caja",
+        price: row ? Number(row.Price || 0) : 0, // ✅ precio “tal cual SAP”
+        currency: row?.Currency || "USD",
+      };
+    });
+
+    safeJson(res, 200, { ok: true, items: out });
+  } catch (e) {
+    safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
+   ✅ Start
+========================================================= */
+(async () => {
+  try {
+    await ensureDb();
+    console.log("DB ready ✅");
+  } catch (e) {
+    console.error("DB init error:", e.message);
+  }
+
+  app.listen(Number(PORT), () => {
+    console.log(`Server listening on :${PORT}`);
+  });
+})();
