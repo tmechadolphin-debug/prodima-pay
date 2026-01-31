@@ -406,42 +406,71 @@ function refDocNum(x) {
   return Number.isFinite(n) ? n : null;
 }
 
-async function findOrderFromQuote({ quoteDocEntry, quoteDocNum, cardCode, docDateISO }) {
+a// =========================================================
+// ✅ TRACE REAL usando DocumentLines.BaseType/BaseEntry
+// =========================================================
+const TRACE_CACHE = new Map(); // quoteDocEntry -> { ts, data }
+const TRACE_TTL_MS = 5 * 60 * 1000; // 5 min
+const TRACE_CONCURRENCY = 3;
+
+function addDaysISO(dateISO, days) {
+  const d = new Date(dateISO + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+function sapSafeString(s) {
+  return String(s || "").replace(/'/g, "''");
+}
+function getLines(doc) {
+  const lines = doc?.DocumentLines;
+  return Array.isArray(lines) ? lines : [];
+}
+function asNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * 1) Encontrar PEDIDO desde COTIZACION
+ *    Order.DocumentLines: BaseType=23 (Quotation) y BaseEntry = quoteDocEntry
+ */
+async function findOrderFromQuote({ quoteDocEntry, cardCode, docDateISO }) {
   const safeCard = sapSafeString(cardCode);
 
-  // candidatos por CardCode + DocDate (mismo día)
+  // Trae candidatos por CardCode + DocDate (mismo día)
   const cand = await slFetch(
-    `/Orders?$select=DocEntry,DocNum,DocTotal,DocDate,CardCode&$filter=CardCode eq '${safeCard}' and DocDate eq '${docDateISO}'&$orderby=DocEntry desc&$top=40`
+    `/Orders?$select=DocEntry,DocNum,DocTotal,DocDate,CardCode&$filter=CardCode eq '${safeCard}' and DocDate eq '${docDateISO}'&$orderby=DocEntry desc&$top=60`
   );
 
   const list = Array.isArray(cand?.value) ? cand.value : [];
   if (!list.length) return null;
 
-  // revisar DocumentReferences (detalle)
   for (const o of list) {
-    const de = Number(o.DocEntry);
-    if (!Number.isFinite(de)) continue;
+    const de = asNum(o.DocEntry);
+    if (!de) continue;
 
-    let full = null;
+    // IMPORTANT: aquí sí traemos líneas y revisamos BaseType/BaseEntry
+    let full;
     try {
-      full = await slFetch(`/Orders(${de})?$select=DocEntry,DocNum,DocTotal,DocDate,DocumentReferences`);
-    } catch {
-      full = o;
+      full = await slFetch(
+        `/Orders(${de})?$select=DocEntry,DocNum,DocTotal,DocDate,DocumentLines&$expand=DocumentLines($select=BaseType,BaseEntry)`
+      );
+    } catch (e) {
+      // fallback sin expand (si tu SL no soporta expand aquí)
+      full = await slFetch(`/Orders(${de})`);
     }
 
-    const refs = getRefs(full);
-    const match = refs.some((r) => {
-      const t = refType(r);
-      const rde = refDocEntry(r);
-      const rdn = refDocNum(r);
-      // 23 = Quotations
-      return t === 23 && ((Number.isFinite(rde) && rde === quoteDocEntry) || (Number.isFinite(rdn) && rdn === quoteDocNum));
+    const lines = getLines(full);
+    const match = lines.some((ln) => {
+      const bt = asNum(ln.BaseType);
+      const be = asNum(ln.BaseEntry);
+      return bt === 23 && be === quoteDocEntry;
     });
 
     if (match) {
       return {
-        DocEntry: Number(full.DocEntry ?? o.DocEntry),
-        DocNum: Number(full.DocNum ?? o.DocNum),
+        DocEntry: asNum(full.DocEntry) ?? de,
+        DocNum: asNum(full.DocNum) ?? asNum(o.DocNum),
         DocTotal: Number(full.DocTotal ?? o.DocTotal ?? 0),
         DocDate: String(full.DocDate ?? o.DocDate ?? docDateISO).slice(0, 10),
       };
@@ -451,12 +480,16 @@ async function findOrderFromQuote({ quoteDocEntry, quoteDocNum, cardCode, docDat
   return null;
 }
 
-async function sumDeliveriesFromOrder({ orderDocEntry, orderDocNum, cardCode, fromISO, toISO }) {
+/**
+ * 2) Sumar ENTREGAS desde PEDIDO
+ *    DeliveryNotes.DocumentLines: BaseType=17 (Order) y BaseEntry = orderDocEntry
+ */
+async function sumDeliveriesFromOrder({ orderDocEntry, cardCode, fromISO, toISO }) {
   const safeCard = sapSafeString(cardCode);
 
-  // candidatos por CardCode + rango fecha
+  // Candidatos por CardCode + rango de fecha (para no traer TODAS)
   const cand = await slFetch(
-    `/DeliveryNotes?$select=DocEntry,DocNum,DocTotal,DocDate,CardCode&$filter=CardCode eq '${safeCard}' and DocDate ge '${fromISO}' and DocDate le '${toISO}'&$orderby=DocEntry desc&$top=80`
+    `/DeliveryNotes?$select=DocEntry,DocNum,DocTotal,DocDate,CardCode&$filter=CardCode eq '${safeCard}' and DocDate ge '${fromISO}' and DocDate le '${toISO}'&$orderby=DocEntry desc&$top=120`
   );
 
   const list = Array.isArray(cand?.value) ? cand.value : [];
@@ -466,23 +499,23 @@ async function sumDeliveriesFromOrder({ orderDocEntry, orderDocNum, cardCode, fr
   const deliveries = [];
 
   for (const d of list) {
-    const de = Number(d.DocEntry);
-    if (!Number.isFinite(de)) continue;
+    const de = asNum(d.DocEntry);
+    if (!de) continue;
 
-    let full = null;
+    let full;
     try {
-      full = await slFetch(`/DeliveryNotes(${de})?$select=DocEntry,DocNum,DocTotal,DocDate,DocumentReferences`);
-    } catch {
-      full = d;
+      full = await slFetch(
+        `/DeliveryNotes(${de})?$select=DocEntry,DocNum,DocTotal,DocDate,DocumentLines&$expand=DocumentLines($select=BaseType,BaseEntry)`
+      );
+    } catch (e) {
+      full = await slFetch(`/DeliveryNotes(${de})`);
     }
 
-    const refs = getRefs(full);
-    const match = refs.some((r) => {
-      const t = refType(r);
-      const rde = refDocEntry(r);
-      const rdn = refDocNum(r);
-      // 17 = Orders
-      return t === 17 && ((Number.isFinite(rde) && rde === orderDocEntry) || (Number.isFinite(rdn) && rdn === orderDocNum));
+    const lines = getLines(full);
+    const match = lines.some((ln) => {
+      const bt = asNum(ln.BaseType);
+      const be = asNum(ln.BaseEntry);
+      return bt === 17 && be === orderDocEntry;
     });
 
     if (match) {
@@ -490,8 +523,8 @@ async function sumDeliveriesFromOrder({ orderDocEntry, orderDocNum, cardCode, fr
       total += Number.isFinite(docTotal) ? docTotal : 0;
 
       deliveries.push({
-        DocEntry: Number(full.DocEntry ?? d.DocEntry),
-        DocNum: Number(full.DocNum ?? d.DocNum),
+        DocEntry: asNum(full.DocEntry) ?? de,
+        DocNum: asNum(full.DocNum) ?? asNum(d.DocNum),
         DocTotal: Number.isFinite(docTotal) ? docTotal : 0,
         DocDate: String(full.DocDate ?? d.DocDate ?? "").slice(0, 10),
       });
@@ -506,16 +539,21 @@ async function traceQuoteDelivered({ quoteDocEntry, quoteDocNum, cardCode, docDa
   const cached = TRACE_CACHE.get(quoteDocEntry);
   if (cached && now - cached.ts < TRACE_TTL_MS) return cached.data;
 
-  const order = await findOrderFromQuote({ quoteDocEntry, quoteDocNum, cardCode, docDateISO });
+  const order = await findOrderFromQuote({
+    quoteDocEntry,
+    quoteDocNum,
+    cardCode,
+    docDateISO,
+  });
 
   let out = { order: null, deliveries: [], montoEntregado: 0 };
 
   if (order) {
     const fromISO = docDateISO;
     const toISO = addDaysISO(docDateISO, 45);
+
     const del = await sumDeliveriesFromOrder({
       orderDocEntry: order.DocEntry,
-      orderDocNum: order.DocNum,
       cardCode,
       fromISO,
       toISO,
@@ -528,20 +566,6 @@ async function traceQuoteDelivered({ quoteDocEntry, quoteDocNum, cardCode, docDa
   return out;
 }
 
-async function mapWithConcurrency(items, concurrency, mapper) {
-  const res = new Array(items.length);
-  let i = 0;
-
-  async function worker() {
-    while (i < items.length) {
-      const idx = i++;
-      res[idx] = await mapper(items[idx], idx);
-    }
-  }
-
-  await Promise.all(Array.from({ length: Math.max(1, concurrency) }, worker));
-  return res;
-}
 
 /* =========================================================
    ✅ FIX FECHA SAP
