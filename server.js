@@ -53,7 +53,17 @@ const pool = new Pool({
     : undefined,
 });
 
+function hasDb() {
+  return Boolean(DATABASE_URL);
+}
+
+async function dbQuery(text, params = []) {
+  return pool.query(text, params);
+}
+
 async function ensureDb() {
+  if (!hasDb()) return; // ✅ evita crashear si no hay DB configurada
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS app_users (
       id SERIAL PRIMARY KEY,
@@ -68,6 +78,26 @@ async function ensureDb() {
   `);
 }
 
+/* =========================================================
+   ✅ Utils / Timezone
+   - America/Panama = UTC-5 => -300 minutos
+========================================================= */
+const TZ_OFFSET_MIN = -300;
+
+function getDateISOInOffset(offsetMin = 0) {
+  const now = new Date();
+  // UTC ms + offset minutes
+  const ms = now.getTime() + now.getTimezoneOffset() * 60_000 + Number(offsetMin) * 60_000;
+  const d = new Date(ms);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+
+/* =========================================================
+   ✅ Warehouse map
+========================================================= */
 function provinceToWarehouse(province) {
   const p = String(province || "").trim().toLowerCase();
   if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
@@ -84,6 +114,24 @@ function provinceToWarehouse(province) {
   return SAP_WAREHOUSE || "300";
 }
 
+function getWarehouseFromReq(req) {
+  // prioridad: token -> query -> header -> default
+  const whToken = String(req.user?.warehouse_code || "").trim();
+  if (whToken) return whToken;
+
+  const whQuery = String(req.query?.warehouse || req.query?.wh || "").trim();
+  if (whQuery) return whQuery;
+
+  const whHeader = String(req.headers["x-warehouse"] || "").trim();
+  if (whHeader) return whHeader;
+
+  // fallback: por provincia del token
+  const prov = String(req.user?.province || "").trim();
+  if (prov) return provinceToWarehouse(prov);
+
+  return SAP_WAREHOUSE || "300";
+}
+
 /* =========================================================
    ✅ Helpers
 ========================================================= */
@@ -93,6 +141,20 @@ function safeJson(res, status, obj) {
 
 function signToken(payload, ttl = "12h") {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: ttl });
+}
+
+function signUserToken(u, ttl = "30d") {
+  return signToken(
+    {
+      role: "user",
+      id: u.id,
+      username: u.username,
+      full_name: u.full_name || "",
+      province: u.province || "",
+      warehouse_code: u.warehouse_code || "",
+    },
+    ttl
+  );
 }
 
 function readBearer(req) {
@@ -115,7 +177,6 @@ function verifyAdmin(req, res, next) {
   }
 }
 
-/* ✅ NUEVO: middleware para Pedidos (usuarios app_users) */
 function verifyUser(req, res, next) {
   const token = readBearer(req);
   if (!token) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
@@ -127,6 +188,18 @@ function verifyUser(req, res, next) {
     next();
   } catch {
     return safeJson(res, 401, { ok: false, message: "Invalid token" });
+  }
+}
+
+async function audit(eventName, req, actor, extra = {}) {
+  // ✅ logging simple (no revienta si no existe tabla)
+  try {
+    console.log(
+      `[AUDIT] ${new Date().toISOString()} ${eventName} actor=${actor} ip=${req.ip}`,
+      extra
+    );
+  } catch {
+    // no-op
   }
 }
 
@@ -193,7 +266,9 @@ async function slLogin() {
 
   const txt = await r.text();
   let data = {};
-  try { data = JSON.parse(txt); } catch {}
+  try {
+    data = JSON.parse(txt);
+  } catch {}
 
   if (!r.ok) {
     throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
@@ -212,33 +287,43 @@ async function slLogin() {
   return true;
 }
 
-async function slFetch(path) {
+// ✅ FIX: ahora soporta GET/POST/etc (antes solo GET)
+async function slFetch(path, options = {}) {
   if (missingSapEnv()) throw new Error("Missing SAP env");
 
-  if (!SL_COOKIE || (Date.now() - SL_COOKIE_AT) > 25 * 60 * 1000) {
+  if (!SL_COOKIE || Date.now() - SL_COOKIE_AT > 25 * 60 * 1000) {
     await slLogin();
   }
 
   const base = SAP_BASE_URL.replace(/\/$/, "");
   const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
 
+  const method = String(options.method || "GET").toUpperCase();
+  const headers = {
+    "Content-Type": "application/json",
+    Cookie: SL_COOKIE,
+    ...(options.headers || {}),
+  };
+
   const r = await fetch(url, {
-    method: "GET",
-    headers: {
-      "Content-Type": "application/json",
-      Cookie: SL_COOKIE,
-    },
+    method,
+    headers,
+    body: options.body,
   });
 
   const txt = await r.text();
   let data = {};
-  try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+  try {
+    data = JSON.parse(txt);
+  } catch {
+    data = { raw: txt };
+  }
 
   if (!r.ok) {
     if (r.status === 401 || r.status === 403) {
       SL_COOKIE = "";
       await slLogin();
-      return slFetch(path);
+      return slFetch(path, options);
     }
     throw new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
   }
@@ -247,7 +332,7 @@ async function slFetch(path) {
 }
 
 /* =========================================================
-   ✅ SAP helpers (SIN $expand DocumentLines)
+   ✅ SAP helpers
 ========================================================= */
 async function sapGetFirstByDocNum(entity, docNum, select) {
   const n = Number(docNum);
@@ -282,7 +367,7 @@ const TRACE_TTL_MS = 6 * 60 * 60 * 1000;
 function cacheGet(key) {
   const it = TRACE_CACHE.get(key);
   if (!it) return null;
-  if ((Date.now() - it.at) > TRACE_TTL_MS) {
+  if (Date.now() - it.at > TRACE_TTL_MS) {
     TRACE_CACHE.delete(key);
     return null;
   }
@@ -334,9 +419,7 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
   for (const o of orderCandidates) {
     const od = await sapGetByDocEntry("Orders", o.DocEntry);
     const lines = Array.isArray(od?.DocumentLines) ? od.DocumentLines : [];
-    const linked = lines.some(
-      (l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry
-    );
+    const linked = lines.some((l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry);
     if (linked) orders.push(od);
     await sleep(50);
   }
@@ -358,9 +441,7 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
     for (const d of delCandidates) {
       const dd = await sapGetByDocEntry("DeliveryNotes", d.DocEntry);
       const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
-      const linked = lines.some(
-        (l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry))
-      );
+      const linked = lines.some((l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry)));
       if (linked) {
         const de = Number(dd.DocEntry);
         if (!seen.has(de)) {
@@ -401,18 +482,20 @@ app.get("/api/health", async (req, res) => {
     yappy: YAPPY_ALIAS,
     warehouse_default: SAP_WAREHOUSE,
     priceList: SAP_PRICE_LIST,
-    db: DATABASE_URL ? "on" : "off",
+    db: hasDb() ? "on" : "off",
   });
 });
 
-/* ------------------ ✅ LOGIN PEDIDOS (NUEVO) ------------------ */
+/* ------------------ ✅ LOGIN PEDIDOS ------------------ */
 /*
-  Pedidos debe llamar:
+  Pedidos llama:
   POST /api/login
   body: { username, pin }
 */
 app.post("/api/login", async (req, res) => {
   try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
     const username = String(req.body?.username || req.body?.user || "").trim().toLowerCase();
     const pin = String(req.body?.pin || req.body?.pass || "").trim();
 
@@ -420,7 +503,7 @@ app.post("/api/login", async (req, res) => {
       return safeJson(res, 400, { ok: false, message: "username y pin requeridos" });
     }
 
-    const r = await pool.query(
+    const r = await dbQuery(
       `SELECT id, username, full_name, pin_hash, province, warehouse_code, is_active
        FROM app_users
        WHERE username=$1
@@ -435,17 +518,17 @@ app.post("/api/login", async (req, res) => {
     const ok = await bcrypt.compare(pin, u.pin_hash);
     if (!ok) return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
 
-    const token = signToken(
-      {
-        role: "user",
-        id: u.id,
-        username: u.username,
-        full_name: u.full_name || "",
-        province: u.province || "",
-        warehouse_code: u.warehouse_code || "",
-      },
-      "30d"
-    );
+    // si no tiene warehouse_code, lo calculamos
+    let wh = String(u.warehouse_code || "").trim();
+    if (!wh) {
+      wh = provinceToWarehouse(u.province || "");
+      try {
+        await dbQuery(`UPDATE app_users SET warehouse_code=$1 WHERE id=$2`, [wh, u.id]);
+        u.warehouse_code = wh;
+      } catch {}
+    }
+
+    const token = signUserToken(u, "30d");
 
     return safeJson(res, 200, {
       ok: true,
@@ -463,8 +546,18 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
-/* ✅ opcional: para validar sesión desde Pedidos */
+/* ✅ Alias: si tu front usa /api/auth/login (MERCADERISTAS) */
+app.post("/api/auth/login", async (req, res) => {
+  // Reutiliza el mismo flujo (mismo body esperado)
+  req.url = "/api/login";
+  return app._router.handle(req, res);
+});
+
+/* ✅ validar sesión */
 app.get("/api/me", verifyUser, async (req, res) => {
+  safeJson(res, 200, { ok: true, user: req.user });
+});
+app.get("/api/auth/me", verifyUser, async (req, res) => {
   safeJson(res, 200, { ok: true, user: req.user });
 });
 
@@ -484,7 +577,9 @@ app.post("/api/admin/login", async (req, res) => {
 /* ------------------ Users ------------------ */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
-    const r = await pool.query(
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
+    const r = await dbQuery(
       `SELECT id, username, full_name, province, warehouse_code, is_active, created_at
        FROM app_users
        ORDER BY id DESC`
@@ -497,6 +592,8 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
 
 app.post("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
     const username = String(req.body?.username || "").trim().toLowerCase();
     const fullName = String(req.body?.fullName || req.body?.full_name || "").trim();
     const pin = String(req.body?.pin || "").trim();
@@ -508,7 +605,7 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
     const wh = provinceToWarehouse(province);
     const pin_hash = await bcrypt.hash(pin, 10);
 
-    const r = await pool.query(
+    const r = await dbQuery(
       `INSERT INTO app_users (username, full_name, pin_hash, province, warehouse_code, is_active)
        VALUES ($1,$2,$3,$4,$5,TRUE)
        RETURNING id, username, full_name, province, warehouse_code, is_active, created_at`,
@@ -527,8 +624,10 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
 
 app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
   try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
     const id = Number(req.params.id || 0);
-    const r = await pool.query(
+    const r = await dbQuery(
       `UPDATE app_users
        SET is_active = NOT is_active
        WHERE id=$1
@@ -544,15 +643,14 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
 
 app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
   try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
     const id = Number(req.params.id || 0);
     const pin = String(req.body?.pin || "").trim();
     if (!pin || pin.length < 4) return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
 
     const pin_hash = await bcrypt.hash(pin, 10);
-    const r = await pool.query(
-      `UPDATE app_users SET pin_hash=$2 WHERE id=$1 RETURNING id`,
-      [id, pin_hash]
-    );
+    const r = await dbQuery(`UPDATE app_users SET pin_hash=$2 WHERE id=$1 RETURNING id`, [id, pin_hash]);
     if (!r.rows[0]) return safeJson(res, 404, { ok: false, message: "No encontrado" });
     safeJson(res, 200, { ok: true });
   } catch (e) {
@@ -562,8 +660,10 @@ app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
 
 app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
   try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
     const id = Number(req.params.id || 0);
-    const r = await pool.query(`DELETE FROM app_users WHERE id=$1 RETURNING id`, [id]);
+    const r = await dbQuery(`DELETE FROM app_users WHERE id=$1 RETURNING id`, [id]);
     if (!r.rows[0]) return safeJson(res, 404, { ok: false, message: "No encontrado" });
     safeJson(res, 200, { ok: true });
   } catch (e) {
@@ -644,17 +744,13 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
 
-    const top = req.query?.top != null
-      ? Number(req.query.top)
-      : (req.query?.limit != null ? Number(req.query.limit) : 20);
-
+    const top = req.query?.top != null ? Number(req.query.top) : req.query?.limit != null ? Number(req.query.limit) : 20;
     const skip = req.query?.skip != null ? Number(req.query.skip) : 0;
 
     const safeTop = Math.max(1, Math.min(500, Number.isFinite(top) ? top : 20));
     const safeSkip = Math.max(0, Number.isFinite(skip) ? skip : 0);
 
-    const now = new Date();
-    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const defaultFrom = addDaysISO(today, -30);
 
     const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
@@ -688,9 +784,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       };
     });
 
-    if (userFilter) {
-      out = out.filter((x) => String(x.usuario || "").toLowerCase().includes(userFilter));
-    }
+    if (userFilter) out = out.filter((x) => String(x.usuario || "").toLowerCase().includes(userFilter));
     if (clientFilter) {
       out = out.filter((x) => {
         const cc = String(x.cardCode || "").toLowerCase();
@@ -717,10 +811,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
             const tr = await traceQuote(q.docNum, f, t);
             if (tr.ok) {
               q.montoEntregado = Number(tr.totals?.totalEntregado || 0);
-              q.pendiente = Number(
-                tr.totals?.pendiente ||
-                (Number(q.montoCotizacion || 0) - Number(q.montoEntregado || 0))
-              );
+              q.pendiente = Number(tr.totals?.pendiente || Number(q.montoCotizacion || 0) - Number(q.montoEntregado || 0));
               q.pedidoDocNum = tr.orders?.[0]?.DocNum ?? null;
               q.entregasDocNums = Array.isArray(tr.deliveries) ? tr.deliveries.map((d) => d.DocNum) : [];
             }
@@ -744,83 +835,16 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ MERCADERISTAS: LOGIN
+   ✅ PRICE LIST CACHE
 ========================================================= */
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
-
-    const username = String(req.body?.username || "").trim().toLowerCase();
-    const pin = String(req.body?.pin || "").trim();
-
-    if (!username || !pin) return res.status(400).json({ ok: false, message: "username y pin requeridos" });
-
-    const r = await dbQuery(
-      `
-      SELECT id, username, full_name, pin_hash, is_active, province, warehouse_code
-      FROM app_users
-      WHERE username = $1
-      LIMIT 1;
-      `,
-      [username]
-    );
-
-    if (!r.rowCount) {
-      await audit("USER_LOGIN_FAIL", req, username, { username, reason: "not_found" });
-      return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
-    }
-
-    const user = r.rows[0];
-    if (!user.is_active) {
-      await audit("USER_LOGIN_FAIL", req, username, { username, reason: "inactive" });
-      return res.status(401).json({ ok: false, message: "Usuario desactivado" });
-    }
-
-    const okPin = await bcrypt.compare(pin, user.pin_hash);
-    if (!okPin) {
-      await audit("USER_LOGIN_FAIL", req, username, { username, reason: "bad_pin" });
-      return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
-    }
-
-    let wh = String(user.warehouse_code || "").trim();
-    if (!wh) {
-      wh = provinceToWarehouse(user.province || "");
-      try {
-        await dbQuery(`UPDATE app_users SET warehouse_code=$1 WHERE id=$2`, [wh, user.id]);
-        user.warehouse_code = wh;
-      } catch {}
-    }
-
-    const token = signUserToken(user);
-
-    await audit("USER_LOGIN_OK", req, username, {
-      username,
-      province: user.province,
-      warehouse_code: user.warehouse_code,
-    });
-
-    return res.json({
-      ok: true,
-      token,
-      user: {
-        id: user.id,
-        username: user.username,
-        full_name: user.full_name || "",
-        province: user.province || "",
-        warehouse_code: user.warehouse_code || "",
-      },
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
-  }
-});
+let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
+const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
 
 /* =========================================================
-   ✅ MERCADERISTAS: ME
+   ✅ Item cache
 ========================================================= */
-app.get("/api/auth/me", verifyUser, async (req, res) => {
-  return res.json({ ok: true, user: req.user });
-});
+const ITEM_CACHE = new Map();
+const ITEM_TTL_MS = 10 * 60 * 1000;
 
 /* =========================================================
    ✅ PriceListNo cached
@@ -828,11 +852,7 @@ app.get("/api/auth/me", verifyUser, async (req, res) => {
 async function getPriceListNoByNameCached(name) {
   const now = Date.now();
 
-  if (
-    PRICE_LIST_CACHE.name === name &&
-    PRICE_LIST_CACHE.no !== null &&
-    now - PRICE_LIST_CACHE.ts < PRICE_LIST_TTL_MS
-  ) {
+  if (PRICE_LIST_CACHE.name === name && PRICE_LIST_CACHE.no !== null && now - PRICE_LIST_CACHE.ts < PRICE_LIST_TTL_MS) {
     return PRICE_LIST_CACHE.no;
   }
 
@@ -840,9 +860,7 @@ async function getPriceListNoByNameCached(name) {
   let no = null;
 
   try {
-    const r1 = await slFetch(
-      `/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`
-    );
+    const r1 = await slFetch(`/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`);
     if (r1?.value?.length) no = r1.value[0].PriceListNo;
   } catch {}
 
@@ -907,9 +925,7 @@ function getSalesUomFactor(itemFull) {
 }
 
 /* =========================================================
-   ✅ FIX #2: Stock usando el patrón que A TI te funciona
-   - ItemWarehouseInfoCollection en $select (NO $expand)
-   - fallback si no viene colección
+   ✅ Stock usando tu patrón (NO $expand WarehouseInfo)
 ========================================================= */
 function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   const item = {
@@ -962,7 +978,7 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 
   let itemFull;
 
-  // ✅ IMPORTANTE: NO expandimos ItemWarehouseInfoCollection (como tu viejo)
+  // ✅ NO expandimos ItemWarehouseInfoCollection
   try {
     itemFull = await slFetch(
       `/Items('${encodeURIComponent(code)}')` +
@@ -980,15 +996,13 @@ async function getOneItem(code, priceListNo, warehouseCode) {
     }
   }
 
-  // ✅ fallback: si SAP no trajo la colección, la pedimos por endpoint alterno
+  // ✅ fallback si SAP no trajo la colección
   if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
     try {
       const whInfo = await slFetch(
         `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,Committed,Ordered`
       );
-      if (Array.isArray(whInfo?.value)) {
-        itemFull.ItemWarehouseInfoCollection = whInfo.value;
-      }
+      if (Array.isArray(whInfo?.value)) itemFull.ItemWarehouseInfoCollection = whInfo.value;
     } catch {}
   }
 
@@ -998,7 +1012,7 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 }
 
 /* =========================================================
-   ✅ SAP: ITEM (warehouse dinámico) + ✅ disponible top-level
+   ✅ SAP: ITEM (warehouse dinámico) + disponible
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -1024,8 +1038,6 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
       factorCaja: r.factorCaja,
       uom: r.item?.SalesUnit || "Caja",
       stock: r.stock,
-
-      // ✅ para tu columna “Disponible”
       disponible: r?.stock?.available ?? null,
       enStock: r?.stock?.hasStock ?? null,
     });
@@ -1070,8 +1082,6 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
             priceUnit: r.priceUnit,
             factorCaja: r.factorCaja,
             stock: r.stock,
-
-            // ✅ para tu columna “Disponible”
             disponible: r?.stock?.available ?? null,
             enStock: r?.stock?.hasStock ?? null,
           };
@@ -1192,8 +1202,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       }))
       .filter((x) => x.ItemCode && x.Quantity > 0);
 
-    if (!DocumentLines.length)
-      return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
+    if (!DocumentLines.length) return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
 
@@ -1251,7 +1260,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 (async () => {
   try {
     await ensureDb();
-    console.log("DB ready ✅");
+    console.log(hasDb() ? "DB ready ✅" : "DB not configured (skipped init) ⚠️");
   } catch (e) {
     console.error("DB init error:", e.message);
   }
