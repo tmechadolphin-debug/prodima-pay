@@ -754,138 +754,50 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   }
 });
 
-/* =========================================================
-   ✅ ADMIN: TRACE Quote -> Order -> Delivery (SIN query options raras)
-   - Evita $apply / contains / expand parametrizado
-========================================================= */
-app.get("/api/admin/trace/quote/:docNum", verifyAdmin, async (req, res) => {
+// =========================================================
+// ✅ ADMIN: BUSCAR ENTREGA POR DocNum (DeliveryNotes)
+// =========================================================
+app.get("/api/admin/sap/delivery/:docNum", verifyAdmin, async (req, res) => {
   try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
     const docNum = Number(req.params.docNum || 0);
     if (!docNum) return res.status(400).json({ ok: false, message: "docNum inválido" });
 
-    // 1) Buscar cotización por DocNum
-    // OData simple: $filter=DocNum eq 225597
-    const qh = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments` +
-        `&$filter=${encodeURIComponent(`DocNum eq ${docNum}`)}` +
-        `&$top=1`
+    const SELECT = "DocEntry,DocNum,DocTotal,DocDate,CardCode,CardName,DocumentStatus,CancelStatus";
+    const sap = await slFetch(
+      `/DeliveryNotes?$select=${SELECT}&$filter=DocNum eq ${docNum}&$top=1`
     );
 
-    const quote = Array.isArray(qh?.value) && qh.value.length ? qh.value[0] : null;
-    if (!quote?.DocEntry) {
-      return res.status(404).json({ ok: false, message: `No se encontró cotización DocNum ${docNum}` });
-    }
+    const row = Array.isArray(sap?.value) && sap.value.length ? sap.value[0] : null;
+    if (!row) return res.status(404).json({ ok: false, message: "Entrega no encontrada" });
 
-    const quoteEntry = Number(quote.DocEntry);
-
-    // 2) Traer líneas de la cotización (sin expand parametrizado; usamos sub-endpoint)
-    const qLines = await slFetch(
-      `/Quotations(${quoteEntry})/DocumentLines?$select=LineNum,ItemCode,ItemDescription,Quantity,LineTotal`
-    );
-    const quoteLines = Array.isArray(qLines?.value) ? qLines.value : [];
-
-    // 3) Encontrar pedidos (Orders / ORDR) que tengan líneas basadas en esta cotización
-    // Estrategia: buscamos en OrderLines por BaseType=23 y BaseEntry=quoteEntry,
-    // recogemos los DocEntry de pedidos y luego pedimos headers.
-    const orderLinesHit = await slFetch(
-      `/Orders/DocumentLines?$select=DocEntry,BaseType,BaseEntry&$filter=${encodeURIComponent(
-        `BaseType eq 23 and BaseEntry eq ${quoteEntry}`
-      )}&$top=2000`
-    );
-
-    const orderDocEntries = Array.from(
-      new Set(
-        (Array.isArray(orderLinesHit?.value) ? orderLinesHit.value : [])
-          .map((x) => Number(x?.DocEntry))
-          .filter((n) => Number.isFinite(n) && n > 0)
-      )
-    );
-
-    let orders = [];
-    for (const oe of orderDocEntries) {
-      try {
-        const oh = await slFetch(
-          `/Orders(${oe})?$select=DocEntry,DocNum,DocTotal,DocDate,DocumentStatus,CancelStatus`
-        );
-        orders.push(oh);
-      } catch {}
-    }
-
-    // 4) Encontrar entregas (DeliveryNotes / ODLN) basadas en esos pedidos
-    // BaseType del pedido = 17
-    let deliveries = [];
-    let deliveryDocEntries = [];
-
-    if (orderDocEntries.length) {
-      const baseOr = orderDocEntries.map((oe) => `BaseEntry eq ${oe}`).join(" or ");
-      const dLinesHit = await slFetch(
-        `/DeliveryNotes/DocumentLines?$select=DocEntry,BaseType,BaseEntry&$filter=${encodeURIComponent(
-          `BaseType eq 17 and (${baseOr})`
-        )}&$top=5000`
-      );
-
-      deliveryDocEntries = Array.from(
-        new Set(
-          (Array.isArray(dLinesHit?.value) ? dLinesHit.value : [])
-            .map((x) => Number(x?.DocEntry))
-            .filter((n) => Number.isFinite(n) && n > 0)
-        )
-      );
-
-      for (const de of deliveryDocEntries) {
-        try {
-          const dh = await slFetch(
-            `/DeliveryNotes(${de})?$select=DocEntry,DocNum,DocTotal,DocDate,DocumentStatus,CancelStatus`
-          );
-          deliveries.push(dh);
-        } catch {}
-      }
-    }
-
-    // Totales
-    const totalPedido = orders.reduce((a, b) => a + Number(b?.DocTotal || 0), 0);
-    const totalEntregado = deliveries.reduce((a, b) => a + Number(b?.DocTotal || 0), 0);
-
-    // 5) Rows "simple": por línea de cotización (ItemCode/Desc) + DocNum quote/order/delivery
-    // Nota: esto NO “mapea” línea por línea contra pedidos/entregas (eso requiere más lógica por BaseLine),
-    // pero te da lo que pediste: código, descripción, cotización, pedido y entrega del documento.
-    const rows = quoteLines.map((l) => ({
-      itemCode: String(l.ItemCode || "").trim(),
-      descripcion: String(l.ItemDescription || "").trim(),
-      cotizacion: Number(quote.DocNum || docNum),
-      pedido: orders.map((o) => Number(o?.DocNum || 0)).filter((n) => n > 0),
-      entrega: deliveries.map((d) => Number(d?.DocNum || 0)).filter((n) => n > 0),
-      qty: Number(l.Quantity || 0),
-      lineTotal: Number(l.LineTotal || 0),
-    }));
-
-    return res.json({
-      ok: true,
-      quote: {
-        docEntry: quoteEntry,
-        docNum: Number(quote.DocNum || docNum),
-        cardCode: String(quote.CardCode || "").trim(),
-        cardName: String(quote.CardName || "").trim(),
-        docTotal: Number(quote.DocTotal || 0),
-        docDate: String(quote.DocDate || "").slice(0, 10),
-        cancelStatus: String(quote.CancelStatus || ""),
-        status: String(quote.DocumentStatus || ""),
-      },
-      orders,
-      deliveries,
-      totals: {
-        totalCotizacion: Number(quote.DocTotal || 0),
-        totalPedido,
-        totalEntregado,
-      },
-      rows,
-    });
+    return res.json({ ok: true, delivery: row });
   } catch (err) {
-    console.error("❌ /api/admin/trace/quote:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+// =========================================================
+// ✅ ADMIN: BUSCAR PEDIDO POR DocNum (Orders / ORDR)
+// =========================================================
+app.get("/api/admin/sap/order/:docNum", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const docNum = Number(req.params.docNum || 0);
+    if (!docNum) return res.status(400).json({ ok: false, message: "docNum inválido" });
+
+    const SELECT = "DocEntry,DocNum,DocTotal,DocDate,CardCode,CardName,DocumentStatus,CancelStatus";
+    const sap = await slFetch(
+      `/Orders?$select=${SELECT}&$filter=DocNum eq ${docNum}&$top=1`
+    );
+
+    const row = Array.isArray(sap?.value) && sap.value.length ? sap.value[0] : null;
+    if (!row) return res.status(404).json({ ok: false, message: "Pedido no encontrado" });
+
+    return res.json({ ok: true, order: row });
+  } catch (err) {
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
