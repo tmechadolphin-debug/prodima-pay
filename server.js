@@ -744,17 +744,512 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ Start
+   ✅ MERCADERISTAS: LOGIN
 ========================================================= */
-(async () => {
+app.post("/api/auth/login", async (req, res) => {
   try {
-    await ensureDb();
-    console.log("DB ready ✅");
+    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+
+    const username = String(req.body?.username || "").trim().toLowerCase();
+    const pin = String(req.body?.pin || "").trim();
+
+    if (!username || !pin) return res.status(400).json({ ok: false, message: "username y pin requeridos" });
+
+    const r = await dbQuery(
+      `
+      SELECT id, username, full_name, pin_hash, is_active, province, warehouse_code
+      FROM app_users
+      WHERE username = $1
+      LIMIT 1;
+      `,
+      [username]
+    );
+
+    if (!r.rowCount) {
+      await audit("USER_LOGIN_FAIL", req, username, { username, reason: "not_found" });
+      return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
+    }
+
+    const user = r.rows[0];
+    if (!user.is_active) {
+      await audit("USER_LOGIN_FAIL", req, username, { username, reason: "inactive" });
+      return res.status(401).json({ ok: false, message: "Usuario desactivado" });
+    }
+
+    const okPin = await bcrypt.compare(pin, user.pin_hash);
+    if (!okPin) {
+      await audit("USER_LOGIN_FAIL", req, username, { username, reason: "bad_pin" });
+      return res.status(401).json({ ok: false, message: "Credenciales inválidas" });
+    }
+
+    let wh = String(user.warehouse_code || "").trim();
+    if (!wh) {
+      wh = provinceToWarehouse(user.province || "");
+      try {
+        await dbQuery(`UPDATE app_users SET warehouse_code=$1 WHERE id=$2`, [wh, user.id]);
+        user.warehouse_code = wh;
+      } catch {}
+    }
+
+    const token = signUserToken(user);
+
+    await audit("USER_LOGIN_OK", req, username, {
+      username,
+      province: user.province,
+      warehouse_code: user.warehouse_code,
+    });
+
+    return res.json({
+      ok: true,
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        full_name: user.full_name || "",
+        province: user.province || "",
+        warehouse_code: user.warehouse_code || "",
+      },
+    });
   } catch (e) {
-    console.error("DB init error:", e.message);
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
+   ✅ MERCADERISTAS: ME
+========================================================= */
+app.get("/api/auth/me", verifyUser, async (req, res) => {
+  return res.json({ ok: true, user: req.user });
+});
+
+/* =========================================================
+   ✅ PriceListNo cached
+========================================================= */
+async function getPriceListNoByNameCached(name) {
+  const now = Date.now();
+
+  if (
+    PRICE_LIST_CACHE.name === name &&
+    PRICE_LIST_CACHE.no !== null &&
+    now - PRICE_LIST_CACHE.ts < PRICE_LIST_TTL_MS
+  ) {
+    return PRICE_LIST_CACHE.no;
   }
 
-  app.listen(Number(PORT), () => {
-    console.log(`Server listening on :${PORT}`);
-  });
-})();
+  const safe = name.replace(/'/g, "''");
+  let no = null;
+
+  try {
+    const r1 = await slFetch(
+      `/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`
+    );
+    if (r1?.value?.length) no = r1.value[0].PriceListNo;
+  } catch {}
+
+  if (no === null) {
+    try {
+      const r2 = await slFetch(`/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`);
+      if (r2?.value?.length) no = r2.value[0].PriceListNo;
+    } catch {}
+  }
+
+  PRICE_LIST_CACHE = { name, no, ts: now };
+  return no;
+}
+
+function getPriceFromPriceList(itemFull, priceListNo) {
+  const listNo = Number(priceListNo);
+  const row = Array.isArray(itemFull?.ItemPrices)
+    ? itemFull.ItemPrices.find((p) => Number(p?.PriceList) === listNo)
+    : null;
+
+  const price = row && row.Price != null ? Number(row.Price) : null;
+  return Number.isFinite(price) ? price : null;
+}
+
+/* =========================================================
+   ✅ Factor UoM de VENTAS (Caja)
+========================================================= */
+function getSalesUomFactor(itemFull) {
+  const directFields = [
+    itemFull?.SalesItemsPerUnit,
+    itemFull?.SalesQtyPerPackUnit,
+    itemFull?.SalesQtyPerPackage,
+    itemFull?.SalesPackagingUnit,
+  ];
+
+  for (const v of directFields) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+
+  const coll = itemFull?.ItemUnitOfMeasurementCollection;
+  if (!Array.isArray(coll) || !coll.length) return null;
+
+  let row =
+    coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("sales")) ||
+    coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("iut_sales")) ||
+    null;
+
+  if (!row) row = coll.find((x) => Number(x?.BaseQuantity) > 1) || null;
+  if (!row) return null;
+
+  const b = Number(row?.BaseQuantity ?? row?.BaseQty ?? null);
+  const a = Number(row?.AlternateQuantity ?? row?.AltQty ?? row?.AlternativeQuantity ?? null);
+
+  if (Number.isFinite(b) && b > 0 && Number.isFinite(a) && a > 0) {
+    const f = b / a;
+    return Number.isFinite(f) && f > 0 ? f : null;
+  }
+  if (Number.isFinite(b) && b > 0) return b;
+
+  return null;
+}
+
+/* =========================================================
+   ✅ FIX #2: Stock usando el patrón que A TI te funciona
+   - ItemWarehouseInfoCollection en $select (NO $expand)
+   - fallback si no viene colección
+========================================================= */
+function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
+  const item = {
+    ItemCode: itemFull.ItemCode ?? code,
+    ItemName: itemFull.ItemName ?? `Producto ${code}`,
+    SalesUnit: itemFull.SalesUnit ?? "",
+    InventoryItem: itemFull.InventoryItem ?? null,
+  };
+
+  const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
+  const factorCaja = getSalesUomFactor(itemFull);
+  const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
+
+  let warehouseRow = null;
+  if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
+    warehouseRow =
+      itemFull.ItemWarehouseInfoCollection.find(
+        (w) => String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
+      ) || null;
+  }
+
+  const onHand = warehouseRow?.InStock != null ? Number(warehouseRow.InStock) : null;
+  const committed = warehouseRow?.Committed != null ? Number(warehouseRow.Committed) : null;
+  const ordered = warehouseRow?.Ordered != null ? Number(warehouseRow.Ordered) : null;
+
+  let available = null;
+  if (Number.isFinite(onHand) && Number.isFinite(committed)) available = onHand - committed;
+
+  return {
+    item,
+    price: priceCaja,
+    priceUnit,
+    factorCaja,
+    stock: {
+      warehouse: warehouseCode,
+      onHand: Number.isFinite(onHand) ? onHand : null,
+      committed: Number.isFinite(committed) ? committed : null,
+      ordered: Number.isFinite(ordered) ? ordered : null,
+      available: Number.isFinite(available) ? available : null,
+      hasStock: available != null ? available > 0 : null,
+    },
+  };
+}
+
+async function getOneItem(code, priceListNo, warehouseCode) {
+  const now = Date.now();
+  const key = `${code}::${warehouseCode}::${priceListNo}`;
+  const cached = ITEM_CACHE.get(key);
+  if (cached && now - cached.ts < ITEM_TTL_MS) return cached.data;
+
+  let itemFull;
+
+  // ✅ IMPORTANTE: NO expandimos ItemWarehouseInfoCollection (como tu viejo)
+  try {
+    itemFull = await slFetch(
+      `/Items('${encodeURIComponent(code)}')` +
+        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection` +
+        `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
+    );
+  } catch (e1) {
+    try {
+      itemFull = await slFetch(
+        `/Items('${encodeURIComponent(code)}')` +
+          `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection`
+      );
+    } catch (e2) {
+      itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
+    }
+  }
+
+  // ✅ fallback: si SAP no trajo la colección, la pedimos por endpoint alterno
+  if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
+    try {
+      const whInfo = await slFetch(
+        `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,Committed,Ordered`
+      );
+      if (Array.isArray(whInfo?.value)) {
+        itemFull.ItemWarehouseInfoCollection = whInfo.value;
+      }
+    } catch {}
+  }
+
+  const data = buildItemResponse(itemFull, code, priceListNo, warehouseCode);
+  ITEM_CACHE.set(key, { ts: now, data });
+  return data;
+}
+
+/* =========================================================
+   ✅ SAP: ITEM (warehouse dinámico) + ✅ disponible top-level
+========================================================= */
+app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const code = String(req.params.code || "").trim();
+    if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
+
+    const warehouseCode = getWarehouseFromReq(req);
+    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
+
+    const r = await getOneItem(code, priceListNo, warehouseCode);
+
+    return res.json({
+      ok: true,
+      item: r.item,
+      warehouse: warehouseCode,
+      bodega: warehouseCode,
+      priceList: SAP_PRICE_LIST,
+      priceListNo,
+      price: Number(r.price ?? 0),
+      priceUnit: r.priceUnit,
+      factorCaja: r.factorCaja,
+      uom: r.item?.SalesUnit || "Caja",
+      stock: r.stock,
+
+      // ✅ para tu columna “Disponible”
+      disponible: r?.stock?.available ?? null,
+      enStock: r?.stock?.hasStock ?? null,
+    });
+  } catch (err) {
+    console.error("❌ /api/sap/item:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+/* =========================================================
+   ✅ SAP: MULTI ITEMS (warehouse dinámico) + disponible
+========================================================= */
+app.get("/api/sap/items", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const codes = String(req.query.codes || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+
+    if (!codes.length) return res.status(400).json({ ok: false, message: "codes vacío" });
+
+    const warehouseCode = getWarehouseFromReq(req);
+    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
+
+    const CONCURRENCY = 5;
+    const items = {};
+    let i = 0;
+
+    async function worker() {
+      while (i < codes.length) {
+        const idx = i++;
+        const code = codes[idx];
+        try {
+          const r = await getOneItem(code, priceListNo, warehouseCode);
+          items[code] = {
+            ok: true,
+            name: r.item.ItemName,
+            unit: r.item.SalesUnit,
+            price: r.price,
+            priceUnit: r.priceUnit,
+            factorCaja: r.factorCaja,
+            stock: r.stock,
+
+            // ✅ para tu columna “Disponible”
+            disponible: r?.stock?.available ?? null,
+            enStock: r?.stock?.hasStock ?? null,
+          };
+        } catch (e) {
+          items[code] = { ok: false, message: String(e.message || e) };
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+    return res.json({
+      ok: true,
+      warehouse: warehouseCode,
+      bodega: warehouseCode,
+      priceList: SAP_PRICE_LIST,
+      priceListNo,
+      items,
+    });
+  } catch (err) {
+    console.error("❌ /api/sap/items:", err.message);
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+/* =========================================================
+   ✅ SAP: SEARCH CUSTOMERS
+========================================================= */
+app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const q = String(req.query?.q || "").trim();
+    const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
+
+    if (q.length < 2) return res.json({ ok: true, results: [] });
+
+    const safe = q.replace(/'/g, "''");
+
+    let r;
+    try {
+      r = await slFetch(
+        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=contains(CardName,'${safe}') or contains(CardCode,'${safe}')&$orderby=CardName asc&$top=${top}`
+      );
+    } catch {
+      r = await slFetch(
+        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=substringof('${safe}',CardName) or substringof('${safe}',CardCode)&$orderby=CardName asc&$top=${top}`
+      );
+    }
+
+    const values = Array.isArray(r?.value) ? r.value : [];
+    const results = values.map((x) => ({
+      CardCode: x.CardCode,
+      CardName: x.CardName,
+      Phone1: x.Phone1 || "",
+      EmailAddress: x.EmailAddress || "",
+    }));
+
+    return res.json({ ok: true, q, results });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+/* =========================================================
+   ✅ SAP: CUSTOMER
+========================================================= */
+app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const code = String(req.params.code || "").trim();
+    if (!code) return res.status(400).json({ ok: false, message: "CardCode vacío." });
+
+    const bp = await slFetch(
+      `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Phone1,Phone2,EmailAddress,Address,City,Country,ZipCode`
+    );
+
+    const addrParts = [bp.Address, bp.City, bp.ZipCode, bp.Country].filter(Boolean).join(", ");
+
+    return res.json({
+      ok: true,
+      customer: {
+        CardCode: bp.CardCode,
+        CardName: bp.CardName,
+        Phone1: bp.Phone1,
+        Phone2: bp.Phone2,
+        EmailAddress: bp.EmailAddress,
+        Address: addrParts || bp.Address || "",
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+/* =========================================================
+   ✅ SAP: CREAR COTIZACIÓN
+========================================================= */
+app.post("/api/sap/quote", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const cardCode = String(req.body?.cardCode || "").trim();
+    const comments = String(req.body?.comments || "").trim();
+    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
+
+    if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
+    if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
+
+    const warehouseCode = getWarehouseFromReq(req);
+
+    const DocumentLines = lines
+      .map((l) => ({
+        ItemCode: String(l.itemCode || "").trim(),
+        Quantity: Number(l.qty || 0),
+        WarehouseCode: warehouseCode,
+      }))
+      .filter((x) => x.ItemCode && x.Quantity > 0);
+
+    if (!DocumentLines.length)
+      return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
+
+    const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
+
+    const creator = req.user?.username || "unknown";
+    const province = String(req.user?.province || "").trim();
+
+    const sapComments = [
+      `[WEB PEDIDOS]`,
+      `[user:${creator}]`,
+      province ? `[prov:${province}]` : "",
+      warehouseCode ? `[wh:${warehouseCode}]` : "",
+      comments ? comments : "Cotización mercaderista",
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    const payload = {
+      CardCode: cardCode,
+      DocDate: docDate,
+      DocDueDate: docDate,
+      Comments: sapComments,
+      JournalMemo: "Cotización web mercaderistas",
+      DocumentLines,
+    };
+
+    const created = await slFetch(`/Quotations`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+
+    await audit("QUOTE_CREATED", req, creator, {
+      cardCode,
+      lines: DocumentLines.length,
+      docDate,
+      province,
+      warehouseCode,
+    });
+
+    return res.json({
+      ok: true,
+      message: "Cotización creada",
+      docEntry: created.DocEntry,
+      docNum: created.DocNum,
+      warehouse: warehouseCode,
+      bodega: warehouseCode,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+/* =========================================================
+   ✅ START
+========================================================= */
+const PORT = process.env.PORT || 10000;
+
+ensureSchema()
+  .then(() => app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT)))
+  .catch(() => app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT, "(sin DB)")));
