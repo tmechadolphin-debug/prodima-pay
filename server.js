@@ -3,7 +3,6 @@ import cors from "cors";
 import pg from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import * as XLSX from "xlsx";
 
 const { Pool } = pg;
 
