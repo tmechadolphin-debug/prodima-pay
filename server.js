@@ -1246,10 +1246,17 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ START
+   ✅ Start
 ========================================================= */
-const PORT = process.env.PORT || 10000;
+(async () => {
+  try {
+    await ensureDb();
+    console.log("DB ready ✅");
+  } catch (e) {
+    console.error("DB init error:", e.message);
+  }
 
-ensureSchema()
-  .then(() => app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT)))
-  .catch(() => app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT, "(sin DB)")));
+  app.listen(Number(PORT), () => {
+    console.log(`Server listening on :${PORT}`);
+  });
+})();
