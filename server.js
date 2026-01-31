@@ -48,9 +48,10 @@ app.use(
 ========================================================= */
 const pool = new Pool({
   connectionString: DATABASE_URL || undefined,
-  ssl: DATABASE_URL && DATABASE_URL.includes("sslmode")
-    ? { rejectUnauthorized: false }
-    : undefined,
+  ssl:
+    DATABASE_URL && DATABASE_URL.includes("sslmode")
+      ? { rejectUnauthorized: false }
+      : undefined,
 });
 
 function hasDb() {
@@ -62,7 +63,7 @@ async function dbQuery(text, params = []) {
 }
 
 async function ensureDb() {
-  if (!hasDb()) return; // ✅ evita crashear si no hay DB configurada
+  if (!hasDb()) return;
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS app_users (
@@ -79,19 +80,28 @@ async function ensureDb() {
 }
 
 /* =========================================================
-   ✅ Utils / Timezone
-   - America/Panama = UTC-5 => -300 minutos
+   ✅ Time helpers (Panamá UTC-5)
 ========================================================= */
 const TZ_OFFSET_MIN = -300;
 
 function getDateISOInOffset(offsetMin = 0) {
   const now = new Date();
-  // UTC ms + offset minutes
-  const ms = now.getTime() + now.getTimezoneOffset() * 60_000 + Number(offsetMin) * 60_000;
+  const ms =
+    now.getTime() + now.getTimezoneOffset() * 60_000 + Number(offsetMin) * 60_000;
   const d = new Date(ms);
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
   const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+
+function addDaysISO(iso, days) {
+  const d = new Date(String(iso || "").slice(0, 10));
+  if (Number.isNaN(d.getTime())) return "";
+  d.setDate(d.getDate() + Number(days || 0));
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${dd}`;
 }
 
@@ -101,7 +111,8 @@ function getDateISOInOffset(offsetMin = 0) {
 function provinceToWarehouse(province) {
   const p = String(province || "").trim().toLowerCase();
   if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
-  if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera") return "500";
+  if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera")
+    return "500";
   if (
     p === "panamá" ||
     p === "panama" ||
@@ -109,13 +120,13 @@ function provinceToWarehouse(province) {
     p === "panama oeste" ||
     p === "colón" ||
     p === "colon"
-  ) return "300";
+  )
+    return "300";
   if (p === "rci") return "01";
   return SAP_WAREHOUSE || "300";
 }
 
 function getWarehouseFromReq(req) {
-  // prioridad: token -> query -> header -> default
   const whToken = String(req.user?.warehouse_code || "").trim();
   if (whToken) return whToken;
 
@@ -125,7 +136,6 @@ function getWarehouseFromReq(req) {
   const whHeader = String(req.headers["x-warehouse"] || "").trim();
   if (whHeader) return whHeader;
 
-  // fallback: por provincia del token
   const prov = String(req.user?.province || "").trim();
   if (prov) return provinceToWarehouse(prov);
 
@@ -169,7 +179,8 @@ function verifyAdmin(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded?.role !== "admin") return safeJson(res, 403, { ok: false, message: "Forbidden" });
+    if (decoded?.role !== "admin")
+      return safeJson(res, 403, { ok: false, message: "Forbidden" });
     req.admin = decoded;
     next();
   } catch {
@@ -183,7 +194,8 @@ function verifyUser(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded?.role !== "user") return safeJson(res, 403, { ok: false, message: "Forbidden" });
+    if (decoded?.role !== "user")
+      return safeJson(res, 403, { ok: false, message: "Forbidden" });
     req.user = decoded;
     next();
   } catch {
@@ -192,7 +204,6 @@ function verifyUser(req, res, next) {
 }
 
 async function audit(eventName, req, actor, extra = {}) {
-  // ✅ logging simple (no revienta si no existe tabla)
   try {
     console.log(
       `[AUDIT] ${new Date().toISOString()} ${eventName} actor=${actor} ip=${req.ip}`,
@@ -211,16 +222,6 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function addDaysISO(iso, days) {
-  const d = new Date(String(iso || "").slice(0, 10));
-  if (Number.isNaN(d.getTime())) return "";
-  d.setDate(d.getDate() + Number(days || 0));
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
-}
-
 function parseUserFromComments(comments) {
   const m = String(comments || "").match(/\[user:([^\]]+)\]/i);
   return m ? String(m[1]).trim() : "";
@@ -229,8 +230,10 @@ function parseWhFromComments(comments) {
   const m = String(comments || "").match(/\[wh:([^\]]+)\]/i);
   return m ? String(m[1]).trim() : "";
 }
+
 function isCancelledLike(q) {
-  const cancelVal = q?.CancelStatus ?? q?.cancelStatus ?? q?.Cancelled ?? q?.cancelled ?? "";
+  const cancelVal =
+    q?.CancelStatus ?? q?.cancelStatus ?? q?.Cancelled ?? q?.cancelled ?? "";
   const cancelRaw = String(cancelVal).trim().toLowerCase();
   const commLower = String(q?.Comments || q?.comments || "").toLowerCase();
   return (
@@ -271,7 +274,9 @@ async function slLogin() {
   } catch {}
 
   if (!r.ok) {
-    throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
+    throw new Error(
+      `SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`
+    );
   }
 
   const setCookie = r.headers.get("set-cookie") || "";
@@ -287,7 +292,7 @@ async function slLogin() {
   return true;
 }
 
-// ✅ FIX: ahora soporta GET/POST/etc (antes solo GET)
+// ✅ FIX: soporta GET/POST/etc
 async function slFetch(path, options = {}) {
   if (missingSapEnv()) throw new Error("Missing SAP env");
 
@@ -419,7 +424,9 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
   for (const o of orderCandidates) {
     const od = await sapGetByDocEntry("Orders", o.DocEntry);
     const lines = Array.isArray(od?.DocumentLines) ? od.DocumentLines : [];
-    const linked = lines.some((l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry);
+    const linked = lines.some(
+      (l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry
+    );
     if (linked) orders.push(od);
     await sleep(50);
   }
@@ -441,7 +448,9 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
     for (const d of delCandidates) {
       const dd = await sapGetByDocEntry("DeliveryNotes", d.DocEntry);
       const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
-      const linked = lines.some((l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry)));
+      const linked = lines.some(
+        (l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry))
+      );
       if (linked) {
         const de = Number(dd.DocEntry);
         if (!seen.has(de)) {
@@ -473,7 +482,7 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
 }
 
 /* =========================================================
-   ✅ Routes
+   ✅ HEALTH
 ========================================================= */
 app.get("/api/health", async (req, res) => {
   safeJson(res, 200, {
@@ -486,13 +495,10 @@ app.get("/api/health", async (req, res) => {
   });
 });
 
-/* ------------------ ✅ LOGIN PEDIDOS ------------------ */
-/*
-  Pedidos llama:
-  POST /api/login
-  body: { username, pin }
-*/
-app.post("/api/login", async (req, res) => {
+/* =========================================================
+   ✅ USER LOGIN (unificado)
+========================================================= */
+async function handleUserLogin(req, res) {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
 
@@ -512,13 +518,22 @@ app.post("/api/login", async (req, res) => {
     );
 
     const u = r.rows?.[0];
-    if (!u) return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
-    if (!u.is_active) return safeJson(res, 403, { ok: false, message: "Usuario inactivo" });
+    if (!u) {
+      await audit("USER_LOGIN_FAIL", req, username, { reason: "not_found" });
+      return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
+    }
+    if (!u.is_active) {
+      await audit("USER_LOGIN_FAIL", req, username, { reason: "inactive" });
+      return safeJson(res, 403, { ok: false, message: "Usuario inactivo" });
+    }
 
     const ok = await bcrypt.compare(pin, u.pin_hash);
-    if (!ok) return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
+    if (!ok) {
+      await audit("USER_LOGIN_FAIL", req, username, { reason: "bad_pin" });
+      return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
+    }
 
-    // si no tiene warehouse_code, lo calculamos
+    // si no tiene warehouse_code, lo calculamos por provincia
     let wh = String(u.warehouse_code || "").trim();
     if (!wh) {
       wh = provinceToWarehouse(u.province || "");
@@ -529,6 +544,11 @@ app.post("/api/login", async (req, res) => {
     }
 
     const token = signUserToken(u, "30d");
+
+    await audit("USER_LOGIN_OK", req, username, {
+      province: u.province,
+      warehouse_code: u.warehouse_code,
+    });
 
     return safeJson(res, 200, {
       ok: true,
@@ -544,16 +564,13 @@ app.post("/api/login", async (req, res) => {
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
-});
+}
 
-/* ✅ Alias: si tu front usa /api/auth/login (MERCADERISTAS) */
-app.post("/api/auth/login", async (req, res) => {
-  // Reutiliza el mismo flujo (mismo body esperado)
-  req.url = "/api/login";
-  return app._router.handle(req, res);
-});
+// Pedidos
+app.post("/api/login", handleUserLogin);
+// Mercaderistas (alias)
+app.post("/api/auth/login", handleUserLogin);
 
-/* ✅ validar sesión */
 app.get("/api/me", verifyUser, async (req, res) => {
   safeJson(res, 200, { ok: true, user: req.user });
 });
@@ -561,7 +578,9 @@ app.get("/api/auth/me", verifyUser, async (req, res) => {
   safeJson(res, 200, { ok: true, user: req.user });
 });
 
-/* ------------------ Admin Auth ------------------ */
+/* =========================================================
+   ✅ ADMIN LOGIN
+========================================================= */
 app.post("/api/admin/login", async (req, res) => {
   const user = String(req.body?.user || "").trim();
   const pass = String(req.body?.pass || "").trim();
@@ -574,7 +593,9 @@ app.post("/api/admin/login", async (req, res) => {
   return safeJson(res, 200, { ok: true, token });
 });
 
-/* ------------------ Users ------------------ */
+/* =========================================================
+   ✅ ADMIN USERS CRUD
+========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
@@ -671,7 +692,9 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
   }
 });
 
-/* ------------------ SAP basic ------------------ */
+/* =========================================================
+   ✅ ADMIN SAP basic
+========================================================= */
 app.get("/api/admin/sap/order/:docNum", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
@@ -682,7 +705,6 @@ app.get("/api/admin/sap/order/:docNum", verifyAdmin, async (req, res) => {
       docNum,
       "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments"
     );
-
     if (!head) return safeJson(res, 404, { ok: false, message: "Pedido no encontrado" });
 
     const order = await sapGetByDocEntry("Orders", head.DocEntry);
@@ -702,7 +724,6 @@ app.get("/api/admin/sap/delivery/:docNum", verifyAdmin, async (req, res) => {
       docNum,
       "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments"
     );
-
     if (!head) return safeJson(res, 404, { ok: false, message: "Entrega no encontrada" });
 
     const delivery = await sapGetByDocEntry("DeliveryNotes", head.DocEntry);
@@ -712,7 +733,9 @@ app.get("/api/admin/sap/delivery/:docNum", verifyAdmin, async (req, res) => {
   }
 });
 
-/* ------------------ TRACE quote ------------------ */
+/* =========================================================
+   ✅ ADMIN TRACE quote
+========================================================= */
 app.get("/api/admin/trace/quote/:docNum", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
@@ -731,7 +754,42 @@ app.get("/api/admin/trace/quote/:docNum", verifyAdmin, async (req, res) => {
   }
 });
 
-/* ------------------ Quotes list (Histórico) ------------------ */
+/* =========================================================
+   ✅ FIX PRINCIPAL: ADMIN QUOTES LIST (Dashboard)
+   - NO se corta por $top antes de filtrar
+   - pagina en SAP con $skip hasta completar (skip+limit)
+   - opcional: filtra canceladas también server-side
+========================================================= */
+async function fetchQuotesPaged({ f, t, targetCount, batchTop = 200, maxPages = 20 }) {
+  let skip = 0;
+  let pages = 0;
+  const out = [];
+
+  // OData base filter (inclusive)
+  // Nota: también filtramos canceladas en SAP para reducir ruido.
+  // Si tu SAP no soporta CancelStatus, igual lo filtramos luego con isCancelledLike.
+  const baseFilter = `DocDate ge '${f}' and DocDate le '${t}' and (CancelStatus ne 'csYes')`;
+
+  while (pages < maxPages && out.length < targetCount) {
+    const raw = await slFetch(
+      `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
+        `&$filter=${encodeURIComponent(baseFilter)}` +
+        `&$orderby=DocDate desc&$top=${batchTop}&$skip=${skip}`
+    );
+
+    const rows = Array.isArray(raw?.value) ? raw.value : [];
+    if (!rows.length) break;
+
+    out.push(...rows);
+    skip += rows.length;
+    pages += 1;
+
+    if (rows.length < batchTop) break; // no hay más páginas
+  }
+
+  return { rows: out, pages, scanned: out.length };
+}
+
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
@@ -744,10 +802,18 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
 
-    const top = req.query?.top != null ? Number(req.query.top) : req.query?.limit != null ? Number(req.query.limit) : 20;
+    // ✅ CAMBIO: default limit más alto para dashboard
+    const top =
+      req.query?.top != null
+        ? Number(req.query.top)
+        : req.query?.limit != null
+        ? Number(req.query.limit)
+        : 200;
+
+    // skip “lógico” del resultado filtrado (no el $skip de SAP)
     const skip = req.query?.skip != null ? Number(req.query.skip) : 0;
 
-    const safeTop = Math.max(1, Math.min(500, Number.isFinite(top) ? top : 20));
+    const safeTop = Math.max(1, Math.min(500, Number.isFinite(top) ? top : 200));
     const safeSkip = Math.max(0, Number.isFinite(skip) ? skip : 0);
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
@@ -756,35 +822,43 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
     const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
 
-    const raw = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
-        `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate le '${t}'`)}` +
-        `&$orderby=DocDate desc&$top=${safeTop}&$skip=${safeSkip}`
-    );
+    const targetCount = safeSkip + safeTop;
 
-    let quotes = Array.isArray(raw?.value) ? raw.value : [];
-
-    let out = quotes.map((q) => {
-      const usuario = parseUserFromComments(q.Comments || "") || "";
-      const wh = parseWhFromComments(q.Comments || "") || "";
-      return {
-        docEntry: q.DocEntry,
-        docNum: q.DocNum,
-        cardCode: q.CardCode,
-        cardName: q.CardName,
-        fecha: String(q.DocDate || "").slice(0, 10),
-        estado: q.DocumentStatus || "",
-        cancelStatus: q.CancelStatus ?? "",
-        comments: q.Comments || "",
-        usuario,
-        warehouse: wh,
-        montoCotizacion: Number(q.DocTotal || 0),
-        montoEntregado: 0,
-        pendiente: Number(q.DocTotal || 0),
-      };
+    // Traemos páginas hasta tener suficiente “material” para filtrar
+    const { rows: scannedRows, pages, scanned } = await fetchQuotesPaged({
+      f,
+      t,
+      targetCount: Math.max(targetCount * 3, 300), // buffer para filtros (cancelled, user, etc)
+      batchTop: 200,
+      maxPages: 30,
     });
 
-    if (userFilter) out = out.filter((x) => String(x.usuario || "").toLowerCase().includes(userFilter));
+    // Mapeo + filtros (cancelled, user, client)
+    let out = (Array.isArray(scannedRows) ? scannedRows : [])
+      .filter((q) => !isCancelledLike(q)) // doble seguridad
+      .map((q) => {
+        const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
+        const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
+        return {
+          docEntry: q.DocEntry,
+          docNum: q.DocNum,
+          cardCode: q.CardCode,
+          cardName: q.CardName,
+          fecha: String(q.DocDate || "").slice(0, 10),
+          estado: q.DocumentStatus || "",
+          cancelStatus: q.CancelStatus ?? "",
+          comments: q.Comments || "",
+          usuario,
+          warehouse: wh,
+          montoCotizacion: Number(q.DocTotal || 0),
+          montoEntregado: 0,
+          pendiente: Number(q.DocTotal || 0),
+        };
+      });
+
+    if (userFilter) {
+      out = out.filter((x) => String(x.usuario || "").toLowerCase().includes(userFilter));
+    }
     if (clientFilter) {
       out = out.filter((x) => {
         const cc = String(x.cardCode || "").toLowerCase();
@@ -793,6 +867,10 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       });
     }
 
+    // Aplicar “skip/limit” sobre el resultado ya filtrado (consistente)
+    out = out.slice(safeSkip, safeSkip + safeTop);
+
+    // Opcional: calcular entregado (trace) en el subset final
     if (withDelivered && out.length) {
       const CONC = 2;
       let idx = 0;
@@ -802,20 +880,18 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
           const i = idx++;
           const q = out[i];
 
-          if (isCancelledLike({ CancelStatus: q.cancelStatus, Comments: q.comments })) {
-            q.montoEntregado = 0;
-            q.pendiente = Number(q.montoCotizacion || 0);
-            continue;
-          }
           try {
             const tr = await traceQuote(q.docNum, f, t);
             if (tr.ok) {
               q.montoEntregado = Number(tr.totals?.totalEntregado || 0);
-              q.pendiente = Number(tr.totals?.pendiente || Number(q.montoCotizacion || 0) - Number(q.montoEntregado || 0));
+              q.pendiente = Number(tr.totals?.pendiente || 0);
               q.pedidoDocNum = tr.orders?.[0]?.DocNum ?? null;
-              q.entregasDocNums = Array.isArray(tr.deliveries) ? tr.deliveries.map((d) => d.DocNum) : [];
+              q.entregasDocNums = Array.isArray(tr.deliveries)
+                ? tr.deliveries.map((d) => d.DocNum)
+                : [];
             }
           } catch {}
+
           await sleep(25);
         }
       }
@@ -823,36 +899,44 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       await Promise.all(Array.from({ length: CONC }, () => worker()));
     }
 
-    return safeJson(res, 200, { ok: true, quotes: out, from: f, to: t, limit: safeTop, skip: safeSkip });
+    return safeJson(res, 200, {
+      ok: true,
+      quotes: out,
+      from: f,
+      to: t,
+      limit: safeTop,
+      skip: safeSkip,
+      debug: { pages, scanned }, // para que veas cuánto se escaneó
+    });
   } catch (e) {
     safeJson(res, 500, { ok: false, message: e.message });
   }
 });
 
-/* ------------------ Dashboard (simple) ------------------ */
+/* =========================================================
+   ✅ Dashboard simple
+========================================================= */
 app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   safeJson(res, 200, { ok: true });
 });
 
 /* =========================================================
-   ✅ PRICE LIST CACHE
+   ✅ PriceList + Item caches
 ========================================================= */
 let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
 const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
 
-/* =========================================================
-   ✅ Item cache
-========================================================= */
 const ITEM_CACHE = new Map();
 const ITEM_TTL_MS = 10 * 60 * 1000;
 
-/* =========================================================
-   ✅ PriceListNo cached
-========================================================= */
 async function getPriceListNoByNameCached(name) {
   const now = Date.now();
 
-  if (PRICE_LIST_CACHE.name === name && PRICE_LIST_CACHE.no !== null && now - PRICE_LIST_CACHE.ts < PRICE_LIST_TTL_MS) {
+  if (
+    PRICE_LIST_CACHE.name === name &&
+    PRICE_LIST_CACHE.no !== null &&
+    now - PRICE_LIST_CACHE.ts < PRICE_LIST_TTL_MS
+  ) {
     return PRICE_LIST_CACHE.no;
   }
 
@@ -860,13 +944,17 @@ async function getPriceListNoByNameCached(name) {
   let no = null;
 
   try {
-    const r1 = await slFetch(`/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`);
+    const r1 = await slFetch(
+      `/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`
+    );
     if (r1?.value?.length) no = r1.value[0].PriceListNo;
   } catch {}
 
   if (no === null) {
     try {
-      const r2 = await slFetch(`/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`);
+      const r2 = await slFetch(
+        `/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`
+      );
       if (r2?.value?.length) no = r2.value[0].PriceListNo;
     } catch {}
   }
@@ -885,9 +973,6 @@ function getPriceFromPriceList(itemFull, priceListNo) {
   return Number.isFinite(price) ? price : null;
 }
 
-/* =========================================================
-   ✅ Factor UoM de VENTAS (Caja)
-========================================================= */
 function getSalesUomFactor(itemFull) {
   const directFields = [
     itemFull?.SalesItemsPerUnit,
@@ -913,7 +998,9 @@ function getSalesUomFactor(itemFull) {
   if (!row) return null;
 
   const b = Number(row?.BaseQuantity ?? row?.BaseQty ?? null);
-  const a = Number(row?.AlternateQuantity ?? row?.AltQty ?? row?.AlternativeQuantity ?? null);
+  const a = Number(
+    row?.AlternateQuantity ?? row?.AltQty ?? row?.AlternativeQuantity ?? null
+  );
 
   if (Number.isFinite(b) && b > 0 && Number.isFinite(a) && a > 0) {
     const f = b / a;
@@ -924,9 +1011,6 @@ function getSalesUomFactor(itemFull) {
   return null;
 }
 
-/* =========================================================
-   ✅ Stock usando tu patrón (NO $expand WarehouseInfo)
-========================================================= */
 function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   const item = {
     ItemCode: itemFull.ItemCode ?? code,
@@ -937,18 +1021,22 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
 
   const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
   const factorCaja = getSalesUomFactor(itemFull);
-  const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
+  const priceCaja =
+    priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
 
   let warehouseRow = null;
   if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
     warehouseRow =
       itemFull.ItemWarehouseInfoCollection.find(
-        (w) => String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
+        (w) =>
+          String(w?.WarehouseCode || "").trim() ===
+          String(warehouseCode || "").trim()
       ) || null;
   }
 
   const onHand = warehouseRow?.InStock != null ? Number(warehouseRow.InStock) : null;
-  const committed = warehouseRow?.Committed != null ? Number(warehouseRow.Committed) : null;
+  const committed =
+    warehouseRow?.Committed != null ? Number(warehouseRow.Committed) : null;
   const ordered = warehouseRow?.Ordered != null ? Number(warehouseRow.Ordered) : null;
 
   let available = null;
@@ -978,25 +1066,23 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 
   let itemFull;
 
-  // ✅ NO expandimos ItemWarehouseInfoCollection
   try {
     itemFull = await slFetch(
       `/Items('${encodeURIComponent(code)}')` +
         `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection` +
         `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
     );
-  } catch (e1) {
+  } catch {
     try {
       itemFull = await slFetch(
         `/Items('${encodeURIComponent(code)}')` +
           `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection`
       );
-    } catch (e2) {
+    } catch {
       itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
     }
   }
 
-  // ✅ fallback si SAP no trajo la colección
   if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
     try {
       const whInfo = await slFetch(
@@ -1012,7 +1098,7 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 }
 
 /* =========================================================
-   ✅ SAP: ITEM (warehouse dinámico) + disponible
+   ✅ SAP: ITEM + ITEMS
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -1023,7 +1109,6 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 
     const warehouseCode = getWarehouseFromReq(req);
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
-
     const r = await getOneItem(code, priceListNo, warehouseCode);
 
     return res.json({
@@ -1047,9 +1132,6 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   }
 });
 
-/* =========================================================
-   ✅ SAP: MULTI ITEMS (warehouse dinámico) + disponible
-========================================================= */
 app.get("/api/sap/items", verifyUser, async (req, res) => {
   try {
     if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
@@ -1108,7 +1190,7 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: SEARCH CUSTOMERS
+   ✅ SAP: SEARCH CUSTOMERS + CUSTOMER
 ========================================================= */
 app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
   try {
@@ -1146,9 +1228,6 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
   }
 });
 
-/* =========================================================
-   ✅ SAP: CUSTOMER
-========================================================= */
 app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
   try {
     if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
@@ -1202,10 +1281,10 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       }))
       .filter((x) => x.ItemCode && x.Quantity > 0);
 
-    if (!DocumentLines.length) return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
+    if (!DocumentLines.length)
+      return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
-
     const creator = req.user?.username || "unknown";
     const province = String(req.user?.province || "").trim();
 
@@ -1255,7 +1334,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ Start
+   ✅ START
 ========================================================= */
 (async () => {
   try {
