@@ -201,15 +201,6 @@ function verifyUser(req, res, next) {
   }
 }
 
-async function audit(eventName, req, actor, extra = {}) {
-  try {
-    console.log(
-      `[AUDIT] ${new Date().toISOString()} ${eventName} actor=${actor} ip=${req.ip}`,
-      extra
-    );
-  } catch {}
-}
-
 function missingSapEnv() {
   return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
 }
@@ -420,7 +411,7 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
       `&$filter=${encodeURIComponent(
         `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
       )}` +
-      `&$orderby=DocDate asc&$top=200`
+      `&$orderby=DocDate desc,DocEntry desc&$top=200`
   );
   const orderCandidates = Array.isArray(ordersList?.value) ? ordersList.value : [];
 
@@ -428,7 +419,9 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
   for (const o of orderCandidates) {
     const od = await sapGetByDocEntry("Orders", o.DocEntry);
     const lines = Array.isArray(od?.DocumentLines) ? od.DocumentLines : [];
-    const linked = lines.some((l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry);
+    const linked = lines.some(
+      (l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry
+    );
     if (linked) orders.push(od);
     await sleep(30);
   }
@@ -442,7 +435,7 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
         `&$filter=${encodeURIComponent(
           `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
         )}` +
-        `&$orderby=DocDate asc&$top=300`
+        `&$orderby=DocDate desc,DocEntry desc&$top=300`
     );
     const delCandidates = Array.isArray(delList?.value) ? delList.value : [];
 
@@ -450,7 +443,9 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
     for (const d of delCandidates) {
       const dd = await sapGetByDocEntry("DeliveryNotes", d.DocEntry);
       const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
-      const linked = lines.some((l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry)));
+      const linked = lines.some(
+        (l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry))
+      );
       if (linked) {
         const de = Number(dd.DocEntry);
         if (!seen.has(de)) {
@@ -489,7 +484,8 @@ async function handleUserLogin(req, res) {
     const username = String(req.body?.username || req.body?.user || "").trim().toLowerCase();
     const pin = String(req.body?.pin || req.body?.pass || "").trim();
 
-    if (!username || !pin) return safeJson(res, 400, { ok: false, message: "username y pin requeridos" });
+    if (!username || !pin)
+      return safeJson(res, 400, { ok: false, message: "username y pin requeridos" });
 
     const r = await dbQuery(
       `SELECT id, username, full_name, pin_hash, province, warehouse_code, is_active
@@ -535,8 +531,12 @@ async function handleUserLogin(req, res) {
 app.post("/api/login", handleUserLogin);
 app.post("/api/auth/login", handleUserLogin);
 
-app.get("/api/me", verifyUser, async (req, res) => safeJson(res, 200, { ok: true, user: req.user }));
-app.get("/api/auth/me", verifyUser, async (req, res) => safeJson(res, 200, { ok: true, user: req.user }));
+app.get("/api/me", verifyUser, async (req, res) =>
+  safeJson(res, 200, { ok: true, user: req.user })
+);
+app.get("/api/auth/me", verifyUser, async (req, res) =>
+  safeJson(res, 200, { ok: true, user: req.user })
+);
 
 /* =========================================================
    ✅ ADMIN LOGIN
@@ -571,12 +571,9 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD)
-   - page/limit
-   - includeTotal=1 SOLO si el front lo necesita
-   - half-open date: [from, to+1)
    ✅ FIX DUPLICADOS:
-      - $orderby estable: DocDate desc, DocEntry desc
-      - dedupe por DocEntry en scan
+   - orderby estable: DocDate desc, DocEntry desc
+   - dedupe por DocEntry en el scanner
 ========================================================= */
 async function scanQuotes({
   f,
@@ -599,19 +596,20 @@ async function scanQuotes({
 
   const maxSapPages = includeTotal ? 200 : 50;
 
-  // ✅ DEDUPE por DocEntry (cinturón y tirantes)
+  // ✅ Dedup global para evitar repetidos entre páginas SAP
   const seenDocEntry = new Set();
 
   for (let page = 0; page < maxSapPages; page++) {
     const raw = await slFetch(
       `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
         `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
-        // ✅ ORDERBY estable para paginar sin duplicar
+        // ✅ FIX: orden estable (sin esto, $skip duplica/omite)
         `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`
     );
 
     const rows = Array.isArray(raw?.value) ? raw.value : [];
     if (!rows.length) break;
+
     skipSap += rows.length;
 
     for (const q of rows) {
@@ -740,7 +738,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
 /* =========================================================
    ✅ SAP: ITEM / ITEMS / CUSTOMERS / CUSTOMER / QUOTE
-   (tus rutas originales - sin cambios funcionales)
 ========================================================= */
 let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
 const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
@@ -1082,7 +1079,8 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       }))
       .filter((x) => x.ItemCode && x.Quantity > 0);
 
-    if (!DocumentLines.length) return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
+    if (!DocumentLines.length)
+      return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
