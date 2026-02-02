@@ -556,7 +556,6 @@ const DELIVERED_CACHE = new Map(); // key: quoteDocEntry -> { ts, deliveredTotal
 const DELIVERED_TTL_MS = 60 * 1000;
 
 function addDaysISO(isoYYYYMMDD, days) {
-  // isoYYYYMMDD: "2026-02-02"
   const d = new Date(`${isoYYYYMMDD}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + Number(days || 0));
   return d.toISOString().slice(0, 10);
@@ -613,7 +612,6 @@ async function getOrdersBasedOnQuotationFallback(quoteDocEntry) {
   const qDate = String(q?.DocDate || "").slice(0, 10);
   if (!qDate) return [];
 
-  // ventana razonable alrededor de la cotización
   const from = addDaysISO(qDate, -45);
   const to = addDaysISO(qDate, 45);
 
@@ -626,7 +624,6 @@ async function getOrdersBasedOnQuotationFallback(quoteDocEntry) {
     5000
   );
 
-  // revisar líneas de cada Order (concurrency)
   const matches = [];
   let idx = 0;
   const CONC = 4;
@@ -637,7 +634,7 @@ async function getOrdersBasedOnQuotationFallback(quoteDocEntry) {
       const o = orders[i];
       const de = o?.DocEntry;
       if (!de) continue;
-      if (String(o?.CancelStatus || "").toLowerCase() === "csyes") continue;
+      if (isCancelledByCancelStatus(o?.CancelStatus)) continue;
 
       const r = await slTry(
         `/Orders(${Number(de)})?$select=DocEntry&$expand=DocumentLines($select=BaseType,BaseEntry)`
@@ -669,10 +666,11 @@ async function getDeliveriesBasedOnOrderAny(orderDocEntry) {
 
 /** Fallback deliveries: buscar por rango de fecha y revisar líneas */
 async function getDeliveriesBasedOnOrderFallback(orderDocEntry, baseDateISO) {
-  // baseDateISO ayuda a recortar la búsqueda
   const base = String(baseDateISO || "").slice(0, 10);
   const from = base ? addDaysISO(base, -45) : "2000-01-01";
-  const to = base ? addDaysISO(base, 45) : addDaysISO(getDateISOInOffset(TZ_OFFSET_MIN), 1);
+  const to = base
+    ? addDaysISO(base, 45)
+    : addDaysISO(getDateISOInOffset(TZ_OFFSET_MIN), 1);
 
   const dels = await fetchPaged(
     "DeliveryNotes",
@@ -693,7 +691,7 @@ async function getDeliveriesBasedOnOrderFallback(orderDocEntry, baseDateISO) {
       const d = dels[i];
       const de = d?.DocEntry;
       if (!de) continue;
-      if (String(d?.CancelStatus || "").toLowerCase() === "csyes") continue;
+      if (isCancelledByCancelStatus(d?.CancelStatus)) continue;
 
       const r = await slTry(
         `/DeliveryNotes(${Number(de)})?$select=DocEntry&$expand=DocumentLines($select=BaseType,BaseEntry)`
@@ -727,8 +725,9 @@ async function computeDeliveredForQuotation(quoteDocEntry) {
     DELIVERED_CACHE.set(key, { ts: now, deliveredTotal: 0 });
     return 0;
   }
+
   const qDate = String(qHead.json?.DocDate || "").slice(0, 10);
-  const qCancelled = String(qHead.json?.CancelStatus || "").toLowerCase() === "csyes";
+  const qCancelled = isCancelledByCancelStatus(qHead.json?.CancelStatus);
   if (qCancelled) {
     DELIVERED_CACHE.set(key, { ts: now, deliveredTotal: 0 });
     return 0;
@@ -745,7 +744,6 @@ async function computeDeliveredForQuotation(quoteDocEntry) {
   if (tryAnyOrders.ok) {
     orders = Array.isArray(tryAnyOrders.json?.value) ? tryAnyOrders.json.value : [];
   } else {
-    // fallback 100% compatible
     orders = await getOrdersBasedOnQuotationFallback(quoteDocEntry);
   }
 
@@ -764,9 +762,8 @@ async function computeDeliveredForQuotation(quoteDocEntry) {
       const o = orders[i];
       const orderDocEntry = o?.DocEntry;
       if (!orderDocEntry) continue;
-      if (String(o?.CancelStatus || "").toLowerCase() === "csyes") continue;
+      if (isCancelledByCancelStatus(o?.CancelStatus)) continue;
 
-      // try any()
       const tryAnyDels = await slTry(
         `/DeliveryNotes?$select=DocEntry,DocNum,DocTotal,DocDate,CancelStatus&$filter=${encodeURIComponent(
           `DocumentLines/any(d: d/BaseType eq 17 and d/BaseEntry eq ${Number(orderDocEntry)})`
@@ -781,7 +778,7 @@ async function computeDeliveredForQuotation(quoteDocEntry) {
       }
 
       for (const d of deliveries) {
-        if (String(d?.CancelStatus || "").toLowerCase() === "csyes") continue;
+        if (isCancelledByCancelStatus(d?.CancelStatus)) continue;
         const n = Number(d?.DocTotal || 0);
         if (Number.isFinite(n)) deliveredTotal += n;
       }
@@ -824,9 +821,8 @@ function calcEntregaFields(montoCotizado, montoEntregado, isCancelled) {
 /* =========================================================
    ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)  ✅ CORREGIDO
    - ✅ FIX DUPLICADO: orden estable (DocDate desc, DocEntry desc)
-   - ✅ DEDUPE por DocEntry (por si SAP repite)
+   - ✅ DEDUPE por DocEntry
    - ✅ AGREGA Entregado (cotizado vs entregado)
-   - Paginación real (hasta 500 por página)
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -851,7 +847,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const SELECT =
       `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
 
-    // ✅ FIX DUPLICADO: order estable, no solo DocDate
     const sap = await slFetch(
       `/Quotations?$select=${SELECT}` +
         `&$orderby=DocDate desc,DocEntry desc&$top=${limit}&$skip=${skip}${sapFilter}`
@@ -949,10 +944,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN: DASHBOARD (MEJORA + ENTREGADO)
-   - Trae cotizaciones por rango (paginando en SAP) y agrega:
-     total cotizado / entregado / pendiente
-     por usuario y por día
-   - NO TOCA LOGIN NI CREAR COTIZACIÓN
+   - Totales: cotizado / entregado / pendiente
+   - Por usuario y por día
 ========================================================= */
 app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   try {
@@ -964,12 +957,10 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
     const to = String(req.query?.to || "").trim(); // YYYY-MM-DD
     const userFilter = String(req.query?.user || req.query?.usuario || "").trim().toLowerCase();
 
-    // Safety: si no mandan fechas, usamos hoy
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const from2 = from || today;
     const to2 = to || today;
 
-    // Traer en páginas de 500 (hasta un máximo razonable)
     const PAGE = 500;
     const MAX_DOCS = 5000;
 
@@ -984,10 +975,10 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
 
     let all = [];
-    for (let skip = 0; skip < MAX_DOCS; skip += PAGE) {
+    for (let sk = 0; sk < MAX_DOCS; sk += PAGE) {
       const sap = await slFetch(
         `/Quotations?$select=${SELECT}` +
-          `&$orderby=DocDate desc,DocEntry desc&$top=${PAGE}&$skip=${skip}${sapFilter}`
+          `&$orderby=DocDate desc,DocEntry desc&$top=${PAGE}&$skip=${sk}${sapFilter}`
       );
       const vals = Array.isArray(sap?.value) ? sap.value : [];
       if (!vals.length) break;
@@ -995,7 +986,6 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       if (vals.length < PAGE) break;
     }
 
-    // Dedupe DocEntry
     const seen = new Set();
     const quotes = [];
     for (const q of all) {
@@ -1011,7 +1001,6 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       quotes.push(q);
     }
 
-    // Calcular entregado en paralelo
     const CONCURRENCY = 6;
     let idx = 0;
 
@@ -1031,8 +1020,7 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         const i = idx++;
         const q = quotes[i];
 
-        const cancelStatus = String(q.CancelStatus || "").trim();
-        const isCancelled = isCancelledByCancelStatus(cancelStatus);
+        const isCancelled = isCancelledByCancelStatus(q?.CancelStatus);
         if (isCancelled) continue;
 
         const fecha = String(q.DocDate || "").slice(0, 10);
@@ -1056,7 +1044,6 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         if (entrega.entregado) countEntregadas += 1;
         else countPendientes += 1;
 
-        // byUser
         const ukey = String(usuario);
         const u = byUser.get(ukey) || {
           usuario: ukey,
@@ -1075,7 +1062,6 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
         else u.pendientes += 1;
         byUser.set(ukey, u);
 
-        // byDay
         const dkey = String(fecha);
         const d = byDay.get(dkey) || {
           fecha: dkey,
@@ -1366,7 +1352,6 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 
   let itemFull;
 
-  // ✅ IMPORTANTE: NO expandimos ItemWarehouseInfoCollection (como tu viejo)
   try {
     itemFull = await slFetch(
       `/Items('${encodeURIComponent(code)}')` +
@@ -1384,7 +1369,6 @@ async function getOneItem(code, priceListNo, warehouseCode) {
     }
   }
 
-  // ✅ fallback: si SAP no trajo la colección, la pedimos por endpoint alterno
   if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
     try {
       const whInfo = await slFetch(
