@@ -983,7 +983,6 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
     ItemCode: itemFull.ItemCode ?? code,
     ItemName: itemFull.ItemName ?? `Producto ${code}`,
     SalesUnit: itemFull.SalesUnit ?? "",
-   ull actual; el resto ya está en tu mensaje y no lo toqué.
    ✅ START
 ========================================================= */
 (async () => {
