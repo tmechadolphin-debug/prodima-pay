@@ -570,6 +570,161 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
+   ✅ ADMIN USERS MUTATIONS (CREAR / PIN / ACTIVO / ELIMINAR)
+   ✅ (ESTO ES LO QUE TE FALTABA)
+========================================================= */
+function normUsername(v) {
+  return String(v || "").trim().toLowerCase();
+}
+function normText(v) {
+  return String(v || "").trim();
+}
+function isPgUniqueViolation(err) {
+  return err && (err.code === "23505" || String(err.message || "").toLowerCase().includes("unique"));
+}
+
+async function adminCreateUser(req, res) {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
+    const username = normUsername(req.body?.username);
+    const full_name = normText(req.body?.full_name ?? req.body?.name ?? "");
+    const pin = normText(req.body?.pin ?? req.body?.pass ?? "");
+    const province = normText(req.body?.province ?? "");
+    const warehouse_code_in = normText(req.body?.warehouse_code ?? req.body?.warehouse ?? "");
+
+    if (!username) return safeJson(res, 400, { ok: false, message: "username requerido" });
+    if (!pin) return safeJson(res, 400, { ok: false, message: "pin requerido" });
+    if (!province) return safeJson(res, 400, { ok: false, message: "province requerida" });
+
+    // Asegura que no metan usernames raros (sin romper tu lógica)
+    if (username.length < 2) return safeJson(res, 400, { ok: false, message: "username muy corto" });
+    if (pin.length < 4) return safeJson(res, 400, { ok: false, message: "pin mínimo 4 dígitos" });
+
+    const wh = warehouse_code_in || provinceToWarehouse(province);
+
+    const pin_hash = await bcrypt.hash(pin, 10);
+
+    const r = await dbQuery(
+      `INSERT INTO app_users (username, full_name, pin_hash, province, warehouse_code, is_active)
+       VALUES ($1,$2,$3,$4,$5,TRUE)
+       RETURNING id, username, full_name, province, warehouse_code, is_active, created_at`,
+      [username, full_name, pin_hash, province, wh]
+    );
+
+    return safeJson(res, 201, { ok: true, user: r.rows[0] });
+  } catch (e) {
+    if (isPgUniqueViolation(e)) {
+      return safeJson(res, 409, { ok: false, message: "Ese username ya existe" });
+    }
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+}
+
+async function adminSetActive(req, res) {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return safeJson(res, 400, { ok: false, message: "id inválido" });
+
+    // acepta: {is_active:true/false} o {active:true/false}
+    const raw = req.body?.is_active ?? req.body?.active;
+    const is_active = raw === true || raw === "true" || raw === 1 || raw === "1";
+
+    const r = await dbQuery(
+      `UPDATE app_users
+       SET is_active=$1
+       WHERE id=$2
+       RETURNING id, username, full_name, province, warehouse_code, is_active, created_at`,
+      [is_active, id]
+    );
+
+    if (!r.rows?.length) return safeJson(res, 404, { ok: false, message: "Usuario no existe" });
+    return safeJson(res, 200, { ok: true, user: r.rows[0] });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+}
+
+async function adminToggleActive(req, res) {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return safeJson(res, 400, { ok: false, message: "id inválido" });
+
+    const r = await dbQuery(
+      `UPDATE app_users
+       SET is_active = NOT is_active
+       WHERE id=$1
+       RETURNING id, username, full_name, province, warehouse_code, is_active, created_at`,
+      [id]
+    );
+
+    if (!r.rows?.length) return safeJson(res, 404, { ok: false, message: "Usuario no existe" });
+    return safeJson(res, 200, { ok: true, user: r.rows[0] });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+}
+
+async function adminChangePin(req, res) {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return safeJson(res, 400, { ok: false, message: "id inválido" });
+
+    const pin = normText(req.body?.pin ?? req.body?.new_pin ?? req.body?.pass ?? "");
+    if (!pin) return safeJson(res, 400, { ok: false, message: "pin requerido" });
+    if (pin.length < 4) return safeJson(res, 400, { ok: false, message: "pin mínimo 4 dígitos" });
+
+    const pin_hash = await bcrypt.hash(pin, 10);
+
+    const r = await dbQuery(
+      `UPDATE app_users
+       SET pin_hash=$1
+       WHERE id=$2
+       RETURNING id, username, full_name, province, warehouse_code, is_active, created_at`,
+      [pin_hash, id]
+    );
+
+    if (!r.rows?.length) return safeJson(res, 404, { ok: false, message: "Usuario no existe" });
+    return safeJson(res, 200, { ok: true, user: r.rows[0] });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+}
+
+async function adminDeleteUser(req, res) {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return safeJson(res, 400, { ok: false, message: "id inválido" });
+
+    const r = await dbQuery(`DELETE FROM app_users WHERE id=$1 RETURNING id, username`, [id]);
+    if (!r.rows?.length) return safeJson(res, 404, { ok: false, message: "Usuario no existe" });
+
+    return safeJson(res, 200, { ok: true, deleted: r.rows[0] });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+}
+
+// Rutas principales (REST)
+app.post("/api/admin/users", verifyAdmin, adminCreateUser);
+app.patch("/api/admin/users/:id/active", verifyAdmin, adminSetActive);
+app.patch("/api/admin/users/:id/pin", verifyAdmin, adminChangePin);
+app.delete("/api/admin/users/:id", verifyAdmin, adminDeleteUser);
+
+// Aliases (por si tu front usa otros paths)
+app.post("/api/admin/users/create", verifyAdmin, adminCreateUser);
+app.patch("/api/admin/users/:id/toggle", verifyAdmin, adminToggleActive);
+app.post("/api/admin/users/:id/change-pin", verifyAdmin, adminChangePin);
+
+/* =========================================================
    ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD)
    ✅ FIX DUPLICADOS:
    - orderby estable: DocDate desc, DocEntry desc
@@ -828,302 +983,7 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
     ItemCode: itemFull.ItemCode ?? code,
     ItemName: itemFull.ItemName ?? `Producto ${code}`,
     SalesUnit: itemFull.SalesUnit ?? "",
-    InventoryItem: itemFull.InventoryItem ?? null,
-  };
-
-  const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
-  const factorCaja = getSalesUomFactor(itemFull);
-  const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
-
-  let warehouseRow = null;
-  if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
-    warehouseRow =
-      itemFull.ItemWarehouseInfoCollection.find(
-        (w) => String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
-      ) || null;
-  }
-
-  const onHand = warehouseRow?.InStock != null ? Number(warehouseRow.InStock) : null;
-  const committed = warehouseRow?.Committed != null ? Number(warehouseRow.Committed) : null;
-  const ordered = warehouseRow?.Ordered != null ? Number(warehouseRow.Ordered) : null;
-
-  let available = null;
-  if (Number.isFinite(onHand) && Number.isFinite(committed)) available = onHand - committed;
-
-  return {
-    item,
-    price: priceCaja,
-    priceUnit,
-    factorCaja,
-    stock: {
-      warehouse: warehouseCode,
-      onHand: Number.isFinite(onHand) ? onHand : null,
-      committed: Number.isFinite(committed) ? committed : null,
-      ordered: Number.isFinite(ordered) ? ordered : null,
-      available: Number.isFinite(available) ? available : null,
-      hasStock: available != null ? available > 0 : null,
-    },
-  };
-}
-
-async function getOneItem(code, priceListNo, warehouseCode) {
-  const now = Date.now();
-  const key = `${code}::${warehouseCode}::${priceListNo}`;
-  const cached = ITEM_CACHE.get(key);
-  if (cached && now - cached.ts < ITEM_TTL_MS) return cached.data;
-
-  let itemFull;
-
-  try {
-    itemFull = await slFetch(
-      `/Items('${encodeURIComponent(code)}')` +
-        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection` +
-        `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
-    );
-  } catch {
-    try {
-      itemFull = await slFetch(
-        `/Items('${encodeURIComponent(code)}')` +
-          `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection`
-      );
-    } catch {
-      itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
-    }
-  }
-
-  if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
-    try {
-      const whInfo = await slFetch(
-        `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,Committed,Ordered`
-      );
-      if (Array.isArray(whInfo?.value)) itemFull.ItemWarehouseInfoCollection = whInfo.value;
-    } catch {}
-  }
-
-  const data = buildItemResponse(itemFull, code, priceListNo, warehouseCode);
-  ITEM_CACHE.set(key, { ts: now, data });
-  return data;
-}
-
-app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const code = String(req.params.code || "").trim();
-    if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
-
-    const warehouseCode = getWarehouseFromReq(req);
-    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
-
-    const r = await getOneItem(code, priceListNo, warehouseCode);
-
-    return res.json({
-      ok: true,
-      item: r.item,
-      warehouse: warehouseCode,
-      bodega: warehouseCode,
-      priceList: SAP_PRICE_LIST,
-      priceListNo,
-      price: Number(r.price ?? 0),
-      priceUnit: r.priceUnit,
-      factorCaja: r.factorCaja,
-      uom: r.item?.SalesUnit || "Caja",
-      stock: r.stock,
-      disponible: r?.stock?.available ?? null,
-      enStock: r?.stock?.hasStock ?? null,
-    });
-  } catch (err) {
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-app.get("/api/sap/items", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const codes = String(req.query.codes || "")
-      .split(",")
-      .map((x) => x.trim())
-      .filter(Boolean);
-
-    if (!codes.length) return res.status(400).json({ ok: false, message: "codes vacío" });
-
-    const warehouseCode = getWarehouseFromReq(req);
-    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
-
-    const CONCURRENCY = 5;
-    const items = {};
-    let i = 0;
-
-    async function worker() {
-      while (i < codes.length) {
-        const idx = i++;
-        const code = codes[idx];
-        try {
-          const r = await getOneItem(code, priceListNo, warehouseCode);
-          items[code] = {
-            ok: true,
-            name: r.item.ItemName,
-            unit: r.item.SalesUnit,
-            price: r.price,
-            priceUnit: r.priceUnit,
-            factorCaja: r.factorCaja,
-            stock: r.stock,
-            disponible: r?.stock?.available ?? null,
-            enStock: r?.stock?.hasStock ?? null,
-          };
-        } catch (e) {
-          items[code] = { ok: false, message: String(e.message || e) };
-        }
-      }
-    }
-
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-
-    return res.json({
-      ok: true,
-      warehouse: warehouseCode,
-      bodega: warehouseCode,
-      priceList: SAP_PRICE_LIST,
-      priceListNo,
-      items,
-    });
-  } catch (err) {
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const q = String(req.query?.q || "").trim();
-    const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
-
-    if (q.length < 2) return res.json({ ok: true, results: [] });
-
-    const safe = q.replace(/'/g, "''");
-
-    let r;
-    try {
-      r = await slFetch(
-        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=contains(CardName,'${safe}') or contains(CardCode,'${safe}')&$orderby=CardName asc&$top=${top}`
-      );
-    } catch {
-      r = await slFetch(
-        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=substringof('${safe}',CardName) or substringof('${safe}',CardCode)&$orderby=CardName asc&$top=${top}`
-      );
-    }
-
-    const values = Array.isArray(r?.value) ? r.value : [];
-    const results = values.map((x) => ({
-      CardCode: x.CardCode,
-      CardName: x.CardName,
-      Phone1: x.Phone1 || "",
-      EmailAddress: x.EmailAddress || "",
-    }));
-
-    return res.json({ ok: true, q, results });
-  } catch (err) {
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const code = String(req.params.code || "").trim();
-    if (!code) return res.status(400).json({ ok: false, message: "CardCode vacío." });
-
-    const bp = await slFetch(
-      `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Phone1,Phone2,EmailAddress,Address,City,Country,ZipCode`
-    );
-
-    const addrParts = [bp.Address, bp.City, bp.ZipCode, bp.Country].filter(Boolean).join(", ");
-
-    return res.json({
-      ok: true,
-      customer: {
-        CardCode: bp.CardCode,
-        CardName: bp.CardName,
-        Phone1: bp.Phone1,
-        Phone2: bp.Phone2,
-        EmailAddress: bp.EmailAddress,
-        Address: addrParts || bp.Address || "",
-      },
-    });
-  } catch (err) {
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-app.post("/api/sap/quote", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const cardCode = String(req.body?.cardCode || "").trim();
-    const comments = String(req.body?.comments || "").trim();
-    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
-
-    if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
-    if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
-
-    const warehouseCode = getWarehouseFromReq(req);
-
-    const DocumentLines = lines
-      .map((l) => ({
-        ItemCode: String(l.itemCode || "").trim(),
-        Quantity: Number(l.qty || 0),
-        WarehouseCode: warehouseCode,
-      }))
-      .filter((x) => x.ItemCode && x.Quantity > 0);
-
-    if (!DocumentLines.length)
-      return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
-
-    const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
-    const creator = req.user?.username || "unknown";
-    const province = String(req.user?.province || "").trim();
-
-    const sapComments = [
-      `[WEB PEDIDOS]`,
-      `[user:${creator}]`,
-      province ? `[prov:${province}]` : "",
-      warehouseCode ? `[wh:${warehouseCode}]` : "",
-      comments ? comments : "Cotización mercaderista",
-    ]
-      .filter(Boolean)
-      .join(" ");
-
-    const payload = {
-      CardCode: cardCode,
-      DocDate: docDate,
-      DocDueDate: docDate,
-      Comments: sapComments,
-      JournalMemo: "Cotización web mercaderistas",
-      DocumentLines,
-    };
-
-    const created = await slFetch(`/Quotations`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-
-    return res.json({
-      ok: true,
-      message: "Cotización creada",
-      docEntry: created.DocEntry,
-      docNum: created.DocNum,
-      warehouse: warehouseCode,
-      bodega: warehouseCode,
-    });
-  } catch (err) {
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* =========================================================
+   ull actual; el resto ya está en tu mensaje y no lo toqué.
    ✅ START
 ========================================================= */
 (async () => {
