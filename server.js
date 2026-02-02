@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import cors from "cors";
 import pg from "pg";
@@ -215,7 +216,7 @@ function verifyAdmin(req, res, next) {
 }
 
 /**
- * ✅ FIX #1: verifyUser rehidrata desde DB
+ * ✅ verifyUser rehidrata desde DB
  * - No dependes del warehouse_code viejo del JWT
  * - Valida is_active real
  */
@@ -264,7 +265,6 @@ async function verifyUser(req, res, next) {
         return res.status(401).json({ ok: false, message: "Usuario desactivado" });
       }
 
-      // ✅ usa datos reales de DB
       req.user = {
         typ: "user",
         uid: u.id,
@@ -388,16 +388,19 @@ function getWarehouseFromReq(req) {
 }
 
 /* =========================================================
-   ✅ Helpers: Comments -> usuario / cancelado
+   ✅ Helpers: parse user / entregado desde Comments
+   - "Entregado" se detecta por texto (case-insensitive)
+   - (si tu SAP lo guarda como etiqueta, igual lo captura)
 ========================================================= */
 function parseUserFromComments(comments = "") {
   const m = String(comments).match(/\[user:([^\]]+)\]/i);
-  return m ? String(m[1]).trim() : "";
+  return m ? String(m[1]).trim().toLowerCase() : "";
 }
 
-function isCancelledByCancelStatus(cancelStatus) {
-  const cs = String(cancelStatus || "").trim().toLowerCase();
-  return cs === "csyes";
+function isEntregadoFromComments(comments = "") {
+  const c = String(comments || "");
+  // Detecta: "Entregado", "[Entregado]", "ENTREGADO", etc.
+  return /\bentregado\b/i.test(c);
 }
 
 /* =========================================================
@@ -547,282 +550,168 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ENTREGADO (Cotizado vs Entregado) - ✅ FIX REAL
-   - Fast path: any() (si SAP lo soporta)
-   - Fallback: leer DocumentLines y verificar BaseType/BaseEntry
-   - Cache corto para rendimiento
+   ✅ ADMIN: DASHBOARD (cotizado vs entregado)
+   - Usa Comments para detectar "Entregado"
+   - Paginación interna en lotes de 500
 ========================================================= */
-const DELIVERED_CACHE = new Map(); // key: quoteDocEntry -> { ts, deliveredTotal }
-const DELIVERED_TTL_MS = 60 * 1000;
+async function fetchQuotationsPaged({ from = "", to = "", user = "" } = {}) {
+  const batch = 500;
+  let skip = 0;
+  let all = [];
 
-function addDaysISO(isoYYYYMMDD, days) {
-  const d = new Date(`${isoYYYYMMDD}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + Number(days || 0));
-  return d.toISOString().slice(0, 10);
-}
+  // filtro fecha
+  const filterParts = [];
+  if (from) filterParts.push(`DocDate ge '${from}'`);
+  if (to) filterParts.push(`DocDate le '${to}'`);
 
-async function slTry(path, options = {}) {
-  try {
-    const json = await slFetch(path, options);
-    return { ok: true, json };
-  } catch (e) {
-    return { ok: false, error: String(e?.message || e) };
-  }
-}
+  // filtro usuario (por etiqueta [user:xxx])
+  const u = String(user || "").trim().toLowerCase();
+  const userTag = u ? `[user:${u}]` : "";
 
-async function fetchPaged(entityPath, select, orderby, filter, top = 500, max = 5000) {
-  const out = [];
-  for (let skip = 0; skip < max; skip += top) {
-    const url =
-      `/${entityPath}?$select=${select}` +
-      (orderby ? `&$orderby=${encodeURIComponent(orderby)}` : "") +
-      (filter ? `&$filter=${encodeURIComponent(filter)}` : "") +
-      `&$top=${top}&$skip=${skip}`;
+  // SAP a veces no soporta contains en todas versiones -> fallback
+  const buildFilter = (fnName) => {
+    const parts = [...filterParts];
+    if (userTag) parts.push(`${fnName}(Comments,'${userTag.replace(/'/g, "''")}')`);
+    return parts.length ? `&$filter=${encodeURIComponent(parts.join(" and "))}` : "";
+  };
 
-    const r = await slFetch(url);
-    const vals = Array.isArray(r?.value) ? r.value : [];
-    if (!vals.length) break;
-    out.push(...vals);
-    if (vals.length < top) break;
-  }
-  return out;
-}
+  const SELECT = `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
 
-async function getQuotationHeader(docEntry) {
-  const r = await slFetch(
-    `/Quotations(${Number(docEntry)})?$select=DocEntry,DocNum,DocDate,CancelStatus,DocTotal`
-  );
-  return r || null;
-}
-
-/** Fast path (si any() funciona) */
-async function getOrdersBasedOnQuotationAny(quoteDocEntry) {
-  const filter = `DocumentLines/any(d: d/BaseType eq 23 and d/BaseEntry eq ${Number(quoteDocEntry)})`;
-  const r = await slFetch(
-    `/Orders?$select=DocEntry,DocNum,DocTotal,DocDate,CancelStatus&$filter=${encodeURIComponent(
-      filter
-    )}&$top=200`
-  );
-  return Array.isArray(r?.value) ? r.value : [];
-}
-
-/** Fallback: buscar Orders por rango de fecha y luego revisar DocumentLines(BaseType/BaseEntry) */
-async function getOrdersBasedOnQuotationFallback(quoteDocEntry) {
-  const q = await getQuotationHeader(quoteDocEntry);
-  const qDate = String(q?.DocDate || "").slice(0, 10);
-  if (!qDate) return [];
-
-  const from = addDaysISO(qDate, -45);
-  const to = addDaysISO(qDate, 45);
-
-  const orders = await fetchPaged(
-    "Orders",
-    "DocEntry,DocNum,DocTotal,DocDate,CancelStatus",
-    "DocDate desc,DocEntry desc",
-    `DocDate ge '${from}' and DocDate le '${to}'`,
-    500,
-    5000
-  );
-
-  const matches = [];
-  let idx = 0;
-  const CONC = 4;
-
-  async function worker() {
-    while (idx < orders.length) {
-      const i = idx++;
-      const o = orders[i];
-      const de = o?.DocEntry;
-      if (!de) continue;
-      if (isCancelledByCancelStatus(o?.CancelStatus)) continue;
-
-      const r = await slTry(
-        `/Orders(${Number(de)})?$select=DocEntry&$expand=DocumentLines($select=BaseType,BaseEntry)`
-      );
-      if (!r.ok) continue;
-
-      const lines = Array.isArray(r.json?.DocumentLines) ? r.json.DocumentLines : [];
-      const hit = lines.some(
-        (ln) => Number(ln?.BaseType) === 23 && Number(ln?.BaseEntry) === Number(quoteDocEntry)
-      );
-      if (hit) matches.push(o);
-    }
+  // ✅ IMPORTANTE: orden estable para evitar duplicados entre páginas:
+  // DocDate desc, DocEntry desc
+  async function onePage(filterStr) {
+    return slFetch(
+      `/Quotations?$select=${SELECT}` +
+        `&$orderby=DocDate desc,DocEntry desc&$top=${batch}&$skip=${skip}${filterStr}`
+    );
   }
 
-  await Promise.all(Array.from({ length: Math.min(CONC, orders.length || 1) }, worker));
-  return matches;
-}
+  let filterStr = buildFilter("contains");
+  let useContains = true;
 
-/** Fast path deliveries */
-async function getDeliveriesBasedOnOrderAny(orderDocEntry) {
-  const filter = `DocumentLines/any(d: d/BaseType eq 17 and d/BaseEntry eq ${Number(orderDocEntry)})`;
-  const r = await slFetch(
-    `/DeliveryNotes?$select=DocEntry,DocNum,DocTotal,DocDate,CancelStatus&$filter=${encodeURIComponent(
-      filter
-    )}&$top=500`
-  );
-  return Array.isArray(r?.value) ? r.value : [];
-}
-
-/** Fallback deliveries: buscar por rango de fecha y revisar líneas */
-async function getDeliveriesBasedOnOrderFallback(orderDocEntry, baseDateISO) {
-  const base = String(baseDateISO || "").slice(0, 10);
-  const from = base ? addDaysISO(base, -45) : "2000-01-01";
-  const to = base
-    ? addDaysISO(base, 45)
-    : addDaysISO(getDateISOInOffset(TZ_OFFSET_MIN), 1);
-
-  const dels = await fetchPaged(
-    "DeliveryNotes",
-    "DocEntry,DocNum,DocTotal,DocDate,CancelStatus",
-    "DocDate desc,DocEntry desc",
-    `DocDate ge '${from}' and DocDate le '${to}'`,
-    500,
-    5000
-  );
-
-  const matches = [];
-  let idx = 0;
-  const CONC = 4;
-
-  async function worker() {
-    while (idx < dels.length) {
-      const i = idx++;
-      const d = dels[i];
-      const de = d?.DocEntry;
-      if (!de) continue;
-      if (isCancelledByCancelStatus(d?.CancelStatus)) continue;
-
-      const r = await slTry(
-        `/DeliveryNotes(${Number(de)})?$select=DocEntry&$expand=DocumentLines($select=BaseType,BaseEntry)`
-      );
-      if (!r.ok) continue;
-
-      const lines = Array.isArray(r.json?.DocumentLines) ? r.json.DocumentLines : [];
-      const hit = lines.some(
-        (ln) => Number(ln?.BaseType) === 17 && Number(ln?.BaseEntry) === Number(orderDocEntry)
-      );
-      if (hit) matches.push(d);
-    }
-  }
-
-  await Promise.all(Array.from({ length: Math.min(CONC, dels.length || 1) }, worker));
-  return matches;
-}
-
-async function computeDeliveredForQuotation(quoteDocEntry) {
-  const key = String(quoteDocEntry);
-  const now = Date.now();
-  const cached = DELIVERED_CACHE.get(key);
-  if (cached && now - cached.ts < DELIVERED_TTL_MS) return cached.deliveredTotal;
-
-  let deliveredTotal = 0;
-
-  const qHead = await slTry(
-    `/Quotations(${Number(quoteDocEntry)})?$select=DocEntry,DocDate,CancelStatus`
-  );
-  if (!qHead.ok) {
-    DELIVERED_CACHE.set(key, { ts: now, deliveredTotal: 0 });
-    return 0;
-  }
-
-  const qDate = String(qHead.json?.DocDate || "").slice(0, 10);
-  const qCancelled = isCancelledByCancelStatus(qHead.json?.CancelStatus);
-  if (qCancelled) {
-    DELIVERED_CACHE.set(key, { ts: now, deliveredTotal: 0 });
-    return 0;
-  }
-
-  // 1) Orders: try any() primero
-  let orders = [];
-  const tryAnyOrders = await slTry(
-    `/Orders?$select=DocEntry,DocNum,DocTotal,DocDate,CancelStatus&$filter=${encodeURIComponent(
-      `DocumentLines/any(d: d/BaseType eq 23 and d/BaseEntry eq ${Number(quoteDocEntry)})`
-    )}&$top=200`
-  );
-
-  if (tryAnyOrders.ok) {
-    orders = Array.isArray(tryAnyOrders.json?.value) ? tryAnyOrders.json.value : [];
-  } else {
-    orders = await getOrdersBasedOnQuotationFallback(quoteDocEntry);
-  }
-
-  if (!orders.length) {
-    DELIVERED_CACHE.set(key, { ts: now, deliveredTotal: 0 });
-    return 0;
-  }
-
-  // 2) Deliveries por cada Order
-  let idx = 0;
-  const CONCURRENCY = 4;
-
-  async function worker() {
-    while (idx < orders.length) {
-      const i = idx++;
-      const o = orders[i];
-      const orderDocEntry = o?.DocEntry;
-      if (!orderDocEntry) continue;
-      if (isCancelledByCancelStatus(o?.CancelStatus)) continue;
-
-      const tryAnyDels = await slTry(
-        `/DeliveryNotes?$select=DocEntry,DocNum,DocTotal,DocDate,CancelStatus&$filter=${encodeURIComponent(
-          `DocumentLines/any(d: d/BaseType eq 17 and d/BaseEntry eq ${Number(orderDocEntry)})`
-        )}&$top=500`
-      );
-
-      let deliveries = [];
-      if (tryAnyDels.ok) {
-        deliveries = Array.isArray(tryAnyDels.json?.value) ? tryAnyDels.json.value : [];
+  while (true) {
+    let sap;
+    try {
+      sap = await onePage(filterStr);
+    } catch (e) {
+      // fallback si contains no existe
+      if (useContains && String(e.message || "").toLowerCase().includes("contains")) {
+        useContains = false;
+        filterStr = buildFilter("substringof");
+        sap = await onePage(filterStr);
       } else {
-        deliveries = await getDeliveriesBasedOnOrderFallback(orderDocEntry, qDate);
-      }
-
-      for (const d of deliveries) {
-        if (isCancelledByCancelStatus(d?.CancelStatus)) continue;
-        const n = Number(d?.DocTotal || 0);
-        if (Number.isFinite(n)) deliveredTotal += n;
+        throw e;
       }
     }
+
+    const values = Array.isArray(sap?.value) ? sap.value : [];
+    if (!values.length) break;
+
+    all.push(...values);
+
+    if (values.length < batch) break;
+    skip += batch;
+
+    // safety guard
+    if (skip > 20000) break;
   }
 
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, orders.length || 1) }, worker));
-
-  DELIVERED_CACHE.set(key, { ts: now, deliveredTotal });
-  return deliveredTotal;
+  return all;
 }
 
-function calcEntregaFields(montoCotizado, montoEntregado, isCancelled) {
-  const cot = Number(montoCotizado || 0);
-  const ent = Number(montoEntregado || 0);
+function mapQuoteRow(q) {
+  const fechaISO = String(q.DocDate || "").slice(0, 10);
 
-  const safeCot = Number.isFinite(cot) ? cot : 0;
-  const safeEnt = Number.isFinite(ent) ? ent : 0;
+  const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
+  const isCancelled = cancelStatus.toLowerCase() === "csyes";
 
-  const pendiente = Math.max(0, safeCot - safeEnt);
-  const pct = safeCot > 0 ? Math.min(100, Math.max(0, (safeEnt / safeCot) * 100)) : 0;
-
-  const estadoEntrega = isCancelled
+  const estado = isCancelled
     ? "Cancelled"
-    : safeCot > 0 && safeEnt >= safeCot - 0.01
-    ? "Entregado"
-    : safeEnt > 0
-    ? "Parcial"
-    : "No entregado";
+    : q.DocumentStatus === "bost_Open"
+    ? "Open"
+    : q.DocumentStatus === "bost_Close"
+    ? "Close"
+    : String(q.DocumentStatus || "");
+
+  const usuario = parseUserFromComments(q.Comments || "");
+  const entregado = !isCancelled && isEntregadoFromComments(q.Comments || "");
+
+  const montoCotizacion = Number(q.DocTotal || 0);
+  const montoEntregado = entregado ? montoCotizacion : 0;
 
   return {
-    montoEntregado: safeEnt,
-    montoPendiente: pendiente,
-    entregadoPct: pct,
-    entregado: estadoEntrega === "Entregado",
-    estadoEntrega,
+    docEntry: q.DocEntry,
+    docNum: q.DocNum,
+    cardCode: String(q.CardCode || "").trim(),
+    cardName: String(q.CardName || "").trim(),
+    montoCotizacion,
+    montoEntregado,
+    entregado,
+    fecha: fechaISO,
+    estado,
+    cancelStatus,
+    isCancelled,
+    usuario,
+    comments: q.Comments || "",
   };
 }
 
+app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const from = String(req.query?.from || "").trim();
+    const to = String(req.query?.to || "").trim();
+    const user = String(req.query?.user || "").trim().toLowerCase(); // opcional
+
+    const rows = await fetchQuotationsPaged({ from, to, user });
+    const quotes = rows.map(mapQuoteRow);
+
+    let cotizado = 0;
+    let entregado = 0;
+    let abiertas = 0;
+    let cerradas = 0;
+    let canceladas = 0;
+
+    for (const q of quotes) {
+      cotizado += Number(q.montoCotizacion || 0);
+      entregado += Number(q.montoEntregado || 0);
+
+      if (q.isCancelled) canceladas += 1;
+      else if (q.estado === "Open") abiertas += 1;
+      else if (q.estado === "Close") cerradas += 1;
+    }
+
+    return res.json({
+      ok: true,
+      from,
+      to,
+      user: user || "",
+      totals: {
+        cotizado,
+        entregado,
+        pendiente: Math.max(cotizado - entregado, 0),
+      },
+      counts: {
+        total: quotes.length,
+        abiertas,
+        cerradas,
+        canceladas,
+        entregadas: quotes.filter((x) => x.entregado).length,
+      },
+    });
+  } catch (e) {
+    console.error("❌ /api/admin/dashboard:", e.message);
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
 /* =========================================================
-   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)  ✅ CORREGIDO
-   - ✅ FIX DUPLICADO: orden estable (DocDate desc, DocEntry desc)
-   - ✅ DEDUPE por DocEntry
-   - ✅ AGREGA Entregado (cotizado vs entregado)
+   ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
+   - Paginación real (500 por página)
+   - Soporta skip/limit para el front
+   - ✅ FIX DUPLICADOS: orderby estable DocDate desc, DocEntry desc
+   - ✅ AGREGA: entregado + montoEntregado
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -847,267 +736,24 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const SELECT =
       `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
 
+    // ✅ orden estable para que NO se dupliquen entre páginas
     const sap = await slFetch(
       `/Quotations?$select=${SELECT}` +
         `&$orderby=DocDate desc,DocEntry desc&$top=${limit}&$skip=${skip}${sapFilter}`
     );
 
     const values = Array.isArray(sap?.value) ? sap.value : [];
-
-    // ✅ DEDUPE por DocEntry
-    const seen = new Set();
-    const deduped = [];
-    for (const q of values) {
-      const de = q?.DocEntry;
-      if (de == null) continue;
-      const k = String(de);
-      if (seen.has(k)) continue;
-      seen.add(k);
-      deduped.push(q);
-    }
-
-    // ✅ Entregado: calcular en paralelo (con cache)
-    const CONCURRENCY = 4;
-    let idx = 0;
-    const enriched = new Array(deduped.length);
-
-    async function worker() {
-      while (idx < deduped.length) {
-        const i = idx++;
-        const q = deduped[i];
-
-        const fechaISO = String(q.DocDate || "").slice(0, 10);
-
-        const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
-        const isCancelled = isCancelledByCancelStatus(cancelStatus);
-
-        const estado = isCancelled
-          ? "Cancelled"
-          : q.DocumentStatus === "bost_Open"
-          ? "Open"
-          : q.DocumentStatus === "bost_Close"
-          ? "Close"
-          : String(q.DocumentStatus || "");
-
-        const usuario = parseUserFromComments(q.Comments || "");
-
-        const montoCotizacion = Number(q.DocTotal || 0);
-
-        let montoEntregado = 0;
-        if (!isCancelled) {
-          try {
-            montoEntregado = await computeDeliveredForQuotation(q.DocEntry);
-          } catch {
-            montoEntregado = 0;
-          }
-        }
-
-        const entrega = calcEntregaFields(montoCotizacion, montoEntregado, isCancelled);
-
-        enriched[i] = {
-          docEntry: q.DocEntry,
-          docNum: q.DocNum,
-          cardCode: String(q.CardCode || "").trim(),
-          cardName: String(q.CardName || "").trim(),
-          montoCotizacion: Number(montoCotizacion || 0),
-          fecha: fechaISO,
-          estado,
-          cancelStatus,
-          isCancelled,
-          usuario,
-          comments: q.Comments || "",
-
-          // ✅ NUEVO (NO ROMPE LO EXISTENTE)
-          Entregado: entrega.estadoEntrega, // "Entregado" | "Parcial" | "No entregado" | "Cancelled"
-          montoEntregado: entrega.montoEntregado,
-          montoPendiente: entrega.montoPendiente,
-          entregadoPct: entrega.entregadoPct,
-          entregado: entrega.entregado,
-        };
-      }
-    }
-
-    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, deduped.length || 1) }, worker));
+    const quotes = values.map(mapQuoteRow);
 
     return res.json({
       ok: true,
       limit,
       skip,
-      count: enriched.length,
-      quotes: enriched.filter(Boolean),
+      count: quotes.length,
+      quotes,
     });
   } catch (err) {
     console.error("❌ /api/admin/quotes:", err.message);
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-/* =========================================================
-   ✅ ADMIN: DASHBOARD (MEJORA + ENTREGADO)
-   - Totales: cotizado / entregado / pendiente
-   - Por usuario y por día
-========================================================= */
-app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
-  try {
-    if (missingSapEnv()) {
-      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-    }
-
-    const from = String(req.query?.from || "").trim(); // YYYY-MM-DD
-    const to = String(req.query?.to || "").trim(); // YYYY-MM-DD
-    const userFilter = String(req.query?.user || req.query?.usuario || "").trim().toLowerCase();
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from2 = from || today;
-    const to2 = to || today;
-
-    const PAGE = 500;
-    const MAX_DOCS = 5000;
-
-    const filterParts = [];
-    if (from2) filterParts.push(`DocDate ge '${from2}'`);
-    if (to2) filterParts.push(`DocDate le '${to2}'`);
-    const sapFilter = filterParts.length
-      ? `&$filter=${encodeURIComponent(filterParts.join(" and "))}`
-      : "";
-
-    const SELECT =
-      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
-
-    let all = [];
-    for (let sk = 0; sk < MAX_DOCS; sk += PAGE) {
-      const sap = await slFetch(
-        `/Quotations?$select=${SELECT}` +
-          `&$orderby=DocDate desc,DocEntry desc&$top=${PAGE}&$skip=${sk}${sapFilter}`
-      );
-      const vals = Array.isArray(sap?.value) ? sap.value : [];
-      if (!vals.length) break;
-      all = all.concat(vals);
-      if (vals.length < PAGE) break;
-    }
-
-    const seen = new Set();
-    const quotes = [];
-    for (const q of all) {
-      const de = q?.DocEntry;
-      if (de == null) continue;
-      const k = String(de);
-      if (seen.has(k)) continue;
-      seen.add(k);
-
-      const usuario = parseUserFromComments(q.Comments || "");
-      if (userFilter && String(usuario || "").toLowerCase() !== userFilter) continue;
-
-      quotes.push(q);
-    }
-
-    const CONCURRENCY = 6;
-    let idx = 0;
-
-    let totalCotizado = 0;
-    let totalEntregado = 0;
-    let totalPendiente = 0;
-
-    let countCotizaciones = 0;
-    let countEntregadas = 0;
-    let countPendientes = 0;
-
-    const byUser = new Map();
-    const byDay = new Map();
-
-    async function worker() {
-      while (idx < quotes.length) {
-        const i = idx++;
-        const q = quotes[i];
-
-        const isCancelled = isCancelledByCancelStatus(q?.CancelStatus);
-        if (isCancelled) continue;
-
-        const fecha = String(q.DocDate || "").slice(0, 10);
-        const usuario = parseUserFromComments(q.Comments || "") || "(sin usuario)";
-        const cot = Number(q.DocTotal || 0);
-
-        let ent = 0;
-        try {
-          ent = await computeDeliveredForQuotation(q.DocEntry);
-        } catch {
-          ent = 0;
-        }
-
-        const entrega = calcEntregaFields(cot, ent, false);
-
-        totalCotizado += Number.isFinite(cot) ? cot : 0;
-        totalEntregado += Number.isFinite(ent) ? ent : 0;
-        totalPendiente += Number.isFinite(entrega.montoPendiente) ? entrega.montoPendiente : 0;
-
-        countCotizaciones += 1;
-        if (entrega.entregado) countEntregadas += 1;
-        else countPendientes += 1;
-
-        const ukey = String(usuario);
-        const u = byUser.get(ukey) || {
-          usuario: ukey,
-          count: 0,
-          cotizado: 0,
-          entregado: 0,
-          pendiente: 0,
-          entregadas: 0,
-          pendientes: 0,
-        };
-        u.count += 1;
-        u.cotizado += Number.isFinite(cot) ? cot : 0;
-        u.entregado += Number.isFinite(ent) ? ent : 0;
-        u.pendiente += Number.isFinite(entrega.montoPendiente) ? entrega.montoPendiente : 0;
-        if (entrega.entregado) u.entregadas += 1;
-        else u.pendientes += 1;
-        byUser.set(ukey, u);
-
-        const dkey = String(fecha);
-        const d = byDay.get(dkey) || {
-          fecha: dkey,
-          count: 0,
-          cotizado: 0,
-          entregado: 0,
-          pendiente: 0,
-          entregadas: 0,
-          pendientes: 0,
-        };
-        d.count += 1;
-        d.cotizado += Number.isFinite(cot) ? cot : 0;
-        d.entregado += Number.isFinite(ent) ? ent : 0;
-        d.pendiente += Number.isFinite(entrega.montoPendiente) ? entrega.montoPendiente : 0;
-        if (entrega.entregado) d.entregadas += 1;
-        else d.pendientes += 1;
-        byDay.set(dkey, d);
-      }
-    }
-
-    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, quotes.length || 1) }, worker));
-
-    const byUserArr = Array.from(byUser.values()).sort((a, b) => b.cotizado - a.cotizado);
-    const byDayArr = Array.from(byDay.values()).sort((a, b) => (a.fecha < b.fecha ? -1 : 1));
-
-    return res.json({
-      ok: true,
-      from: from2,
-      to: to2,
-      user: userFilter || "",
-      totals: {
-        cotizado: totalCotizado,
-        entregado: totalEntregado,
-        pendiente: totalPendiente,
-        entregadoPct: totalCotizado > 0 ? Math.min(100, (totalEntregado / totalCotizado) * 100) : 0,
-      },
-      counts: {
-        cotizaciones: countCotizaciones,
-        entregadas: countEntregadas,
-        pendientes: countPendientes,
-      },
-      byUser: byUserArr,
-      byDay: byDayArr,
-    });
-  } catch (err) {
-    console.error("❌ /api/admin/dashboard:", err.message);
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
@@ -1134,7 +780,7 @@ app.get("/api/admin/audit", verifyAdmin, async (req, res) => {
 
 /* =========================================================
    ✅ MERCADERISTAS: LOGIN
-   ⚠️ NO TOCADO
+   (Integrado tal cual del sistema anterior)
 ========================================================= */
 app.post("/api/auth/login", async (req, res) => {
   try {
@@ -1210,6 +856,61 @@ app.post("/api/auth/login", async (req, res) => {
 ========================================================= */
 app.get("/api/auth/me", verifyUser, async (req, res) => {
   return res.json({ ok: true, user: req.user });
+});
+
+/* =========================================================
+   ✅ MERCADERISTAS: DASHBOARD (sus cotizaciones)
+   - Totales del usuario logueado
+   - Cotizado vs Entregado (por Comments)
+========================================================= */
+app.get("/api/auth/dashboard", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const from = String(req.query?.from || "").trim();
+    const to = String(req.query?.to || "").trim();
+
+    const user = String(req.user?.username || "").trim().toLowerCase();
+    const rows = await fetchQuotationsPaged({ from, to, user });
+    const quotes = rows.map(mapQuoteRow);
+
+    let cotizado = 0;
+    let entregado = 0;
+    let abiertas = 0;
+    let cerradas = 0;
+    let canceladas = 0;
+
+    for (const q of quotes) {
+      cotizado += Number(q.montoCotizacion || 0);
+      entregado += Number(q.montoEntregado || 0);
+
+      if (q.isCancelled) canceladas += 1;
+      else if (q.estado === "Open") abiertas += 1;
+      else if (q.estado === "Close") cerradas += 1;
+    }
+
+    return res.json({
+      ok: true,
+      from,
+      to,
+      user,
+      totals: {
+        cotizado,
+        entregado,
+        pendiente: Math.max(cotizado - entregado, 0),
+      },
+      counts: {
+        total: quotes.length,
+        abiertas,
+        cerradas,
+        canceladas,
+        entregadas: quotes.filter((x) => x.entregado).length,
+      },
+    });
+  } catch (e) {
+    console.error("❌ /api/auth/dashboard:", e.message);
+    return res.status(500).json({ ok: false, message: e.message });
+  }
 });
 
 /* =========================================================
@@ -1297,9 +998,7 @@ function getSalesUomFactor(itemFull) {
 }
 
 /* =========================================================
-   ✅ FIX #2: Stock usando el patrón que A TI te funciona
-   - ItemWarehouseInfoCollection en $select (NO $expand)
-   - fallback si no viene colección
+   ✅ Stock usando el patrón que A TI te funciona
 ========================================================= */
 function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   const item = {
@@ -1386,7 +1085,7 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 }
 
 /* =========================================================
-   ✅ SAP: ITEM (warehouse dinámico) + ✅ disponible top-level
+   ✅ SAP: ITEM (warehouse dinámico) + disponible top-level
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -1558,7 +1257,6 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ SAP: CREAR COTIZACIÓN
-   ⚠️ NO TOCADO
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
@@ -1586,7 +1284,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
 
-    const creator = req.user?.username || "unknown";
+    const creator = String(req.user?.username || "unknown").trim().toLowerCase();
     const province = String(req.user?.province || "").trim();
 
     const sapComments = [
