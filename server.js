@@ -44,15 +44,16 @@ app.use(
 );
 
 /* =========================================================
-   ✅ DB (Postgres)
+   ✅ DB (Postgres)  ✅ FIX: SSL siempre si hay DATABASE_URL
 ========================================================= */
 const pool = new Pool({
   connectionString: DATABASE_URL || undefined,
-  ssl:
-    DATABASE_URL && DATABASE_URL.includes("sslmode")
-      ? { rejectUnauthorized: false }
-      : undefined,
+  // ✅ Supabase/Render normalmente requiere SSL
+  ssl: DATABASE_URL ? { rejectUnauthorized: false } : undefined,
+  max: 3,
 });
+
+pool.on("error", (err) => console.error("❌ DB pool error:", err.message));
 
 function hasDb() {
   return Boolean(DATABASE_URL);
@@ -153,16 +154,10 @@ function signToken(payload, ttl = "12h") {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: ttl });
 }
 
-/**
- * ✅ Integración MERCADERISTAS (del 2do código) SIN romper lo demás:
- * - El resto del API usa req.user.username / province / warehouse_code
- * - El front del 2do código usa typ/uid
- * => incluimos AMBOS en el JWT: role/id + typ/uid
- */
 function signUserToken(u, ttl = "30d") {
+  // ✅ incluye campos del 2do código (typ/uid) sin romper el 1ro (role/id)
   return signToken(
     {
-      // compat 1er código
       role: "user",
       id: u.id,
       username: u.username,
@@ -170,7 +165,6 @@ function signUserToken(u, ttl = "30d") {
       province: u.province || "",
       warehouse_code: u.warehouse_code || "",
 
-      // compat 2do código
       typ: "user",
       uid: u.id,
     },
@@ -199,10 +193,9 @@ function verifyAdmin(req, res, next) {
 }
 
 /**
- * ✅ Integración MERCADERISTAS (del 2do código):
- * - verifyUser rehidrata desde DB si existe (warehouse_code y is_active reales)
- * - acepta token "role:user" (1er) o "typ:user" (2do)
- * - deja req.user en formato del 1er código (para NO tocar endpoints SAP/quotes)
+ * ✅ FIX: verifyUser rehidrata desde DB (como tu 2do código)
+ * - evita warehouse_code viejo en JWT
+ * - valida is_active real
  */
 async function verifyUser(req, res, next) {
   const token = readBearer(req);
@@ -211,12 +204,11 @@ async function verifyUser(req, res, next) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
 
-    const isUserToken =
+    const isUser =
       decoded?.role === "user" || decoded?.typ === "user" || decoded?.uid || decoded?.id;
 
-    if (!isUserToken) return safeJson(res, 403, { ok: false, message: "Forbidden" });
+    if (!isUser) return safeJson(res, 403, { ok: false, message: "Forbidden" });
 
-    // ✅ rehidratar desde DB (si existe)
     if (hasDb()) {
       const uid = Number(decoded.id || decoded.uid || 0);
       let r = null;
@@ -231,8 +223,6 @@ async function verifyUser(req, res, next) {
         );
       } else {
         const uname = String(decoded.username || "").trim().toLowerCase();
-        if (!uname) return safeJson(res, 401, { ok: false, message: "Invalid token" });
-
         r = await dbQuery(
           `SELECT id, username, full_name, is_active, province, warehouse_code
            FROM app_users
@@ -246,7 +236,7 @@ async function verifyUser(req, res, next) {
       if (!u) return safeJson(res, 401, { ok: false, message: "Usuario no existe (DB)" });
       if (!u.is_active) return safeJson(res, 401, { ok: false, message: "Usuario desactivado" });
 
-      // ✅ asegurar bodega si está vacía (igual que el 2do código)
+      // ✅ set warehouse si está vacío
       let wh = String(u.warehouse_code || "").trim();
       if (!wh) {
         wh = provinceToWarehouse(u.province || "");
@@ -256,7 +246,6 @@ async function verifyUser(req, res, next) {
         } catch {}
       }
 
-      // ✅ mantener shape del 1er código
       req.user = {
         role: "user",
         id: u.id,
@@ -335,9 +324,21 @@ app.get("/api/health", async (req, res) => {
 
 /* =========================================================
    ✅ SAP Service Layer (Session cookie)
+   ✅ FIX: timeout para que NO se quede colgado
 ========================================================= */
 let SL_COOKIE = "";
 let SL_COOKIE_AT = 0;
+
+async function fetchWithTimeout(url, options = {}, ms = 20000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const r = await fetch(url, { ...options, signal: ctrl.signal });
+    return r;
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 async function slLogin() {
   const url = `${SAP_BASE_URL.replace(/\/$/, "")}/Login`;
@@ -347,11 +348,15 @@ async function slLogin() {
     Password: SAP_PASS,
   };
 
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const r = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    20000
+  );
 
   const txt = await r.text();
   let data = {};
@@ -386,15 +391,19 @@ async function slFetch(path, options = {}) {
 
   const method = String(options.method || "GET").toUpperCase();
 
-  const r = await fetch(url, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      Cookie: SL_COOKIE,
-      ...(options.headers || {}),
+  const r = await fetchWithTimeout(
+    url,
+    {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: SL_COOKIE,
+        ...(options.headers || {}),
+      },
+      body: options.body,
     },
-    body: options.body,
-  });
+    20000
+  );
 
   const txt = await r.text();
   let data = {};
@@ -562,13 +571,12 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
 }
 
 /* =========================================================
-   ✅ USER LOGIN (integrado: mercaderistas del 2do código)
+   ✅ USER LOGIN (Mercaderistas)
 ========================================================= */
 async function handleUserLogin(req, res) {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
 
-    // ✅ acepta username/pin (2do código) + compat user/pass (1er)
     const username = String(req.body?.username || req.body?.user || "").trim().toLowerCase();
     const pin = String(req.body?.pin || req.body?.pass || "").trim();
 
@@ -590,7 +598,6 @@ async function handleUserLogin(req, res) {
     const ok = await bcrypt.compare(pin, u.pin_hash);
     if (!ok) return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
 
-    // ✅ igual que el 2do código: si no hay bodega, calcúlala y guarda
     let wh = String(u.warehouse_code || "").trim();
     if (!wh) {
       wh = provinceToWarehouse(u.province || "");
@@ -601,7 +608,6 @@ async function handleUserLogin(req, res) {
     }
 
     const token = signUserToken(u, "30d");
-
     return safeJson(res, 200, {
       ok: true,
       token,
@@ -618,7 +624,6 @@ async function handleUserLogin(req, res) {
   }
 }
 
-// ✅ endpoints de login (quedan igual)
 app.post("/api/login", handleUserLogin);
 app.post("/api/auth/login", handleUserLogin);
 
@@ -644,7 +649,8 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN USERS (para scope)
+   ✅ ADMIN USERS (LIST / CREATE / DELETE / TOGGLE)
+   ✅ FIX: esto es lo que tu dashboard necesita para funcionar
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
@@ -654,7 +660,82 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
        FROM app_users
        ORDER BY id DESC`
     );
-    return safeJson(res, 200, { ok: true, users: r.rows });
+    return safeJson(res, 200, { ok: true, users: r.rows || [] });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+app.post("/api/admin/users", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
+    const username = String(req.body?.username || "").trim().toLowerCase();
+    const fullName = String(req.body?.fullName || req.body?.full_name || "").trim();
+    const pin = String(req.body?.pin || "").trim();
+    const province = String(req.body?.province || "").trim();
+    let warehouse_code = String(req.body?.warehouse_code || "").trim();
+
+    if (!username) return safeJson(res, 400, { ok: false, message: "username requerido" });
+    if (!pin || pin.length < 4) return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
+
+    if (!warehouse_code) warehouse_code = provinceToWarehouse(province);
+
+    const pin_hash = await bcrypt.hash(pin, 10);
+
+    const ins = await dbQuery(
+      `
+      INSERT INTO app_users(username, full_name, pin_hash, is_active, province, warehouse_code)
+      VALUES ($1,$2,$3,TRUE,$4,$5)
+      RETURNING id, username, full_name, is_active, province, warehouse_code, created_at;
+      `,
+      [username, fullName, pin_hash, province, warehouse_code]
+    );
+
+    return safeJson(res, 200, { ok: true, user: ins.rows[0] });
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (msg.includes("duplicate") || msg.includes("unique"))
+      return safeJson(res, 400, { ok: false, message: "Ese username ya existe" });
+    return safeJson(res, 500, { ok: false, message: msg });
+  }
+});
+
+app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
+    const id = Number(req.params.id || 0);
+    if (!id) return safeJson(res, 400, { ok: false, message: "id inválido" });
+
+    const r = await dbQuery(`DELETE FROM app_users WHERE id=$1 RETURNING id, username;`, [id]);
+    if (!r.rowCount) return safeJson(res, 404, { ok: false, message: "Usuario no encontrado" });
+
+    return safeJson(res, 200, { ok: true, message: "Usuario eliminado", user: r.rows[0] });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
+    const id = Number(req.params.id || 0);
+    if (!id) return safeJson(res, 400, { ok: false, message: "id inválido" });
+
+    const r = await dbQuery(
+      `
+      UPDATE app_users
+      SET is_active = NOT is_active
+      WHERE id=$1
+      RETURNING id, username, full_name, is_active, province, warehouse_code, created_at;
+      `,
+      [id]
+    );
+    if (!r.rowCount) return safeJson(res, 404, { ok: false, message: "Usuario no encontrado" });
+
+    return safeJson(res, 200, { ok: true, user: r.rows[0] });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
@@ -662,9 +743,7 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD)
-   ✅ FIX DUPLICADOS:
-   - orderby estable: DocDate desc, DocEntry desc
-   - dedupe por DocEntry en el scanner
+   ✅ FIX DUPLICADOS (ya lo tenías)
 ========================================================= */
 async function scanQuotes({
   f,
@@ -687,14 +766,12 @@ async function scanQuotes({
 
   const maxSapPages = includeTotal ? 200 : 50;
 
-  // ✅ Dedup global para evitar repetidos entre páginas SAP
   const seenDocEntry = new Set();
 
   for (let page = 0; page < maxSapPages; page++) {
     const raw = await slFetch(
       `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
         `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
-        // ✅ FIX: orden estable (sin esto, $skip duplica/omite)
         `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`
     );
 
@@ -706,7 +783,7 @@ async function scanQuotes({
     for (const q of rows) {
       const de = Number(q?.DocEntry);
       if (Number.isFinite(de)) {
-        if (seenDocEntry.has(de)) continue; // ✅ evita repetidos
+        if (seenDocEntry.has(de)) continue;
         seenDocEntry.add(de);
       }
 
@@ -829,6 +906,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
 /* =========================================================
    ✅ SAP: ITEM / ITEMS / CUSTOMERS / CUSTOMER / QUOTE
+   (igual que lo que ya tenías)
 ========================================================= */
 let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
 const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
