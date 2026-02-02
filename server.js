@@ -547,32 +547,169 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ENTREGADO (Cotizado vs Entregado) - SOLO SE AGREGA
-   - Usa trazabilidad SAP: Quotation(23) -> Order(17) -> Delivery(15)
-   - Cache corto para no pegarle tanto al Service Layer
+   ✅ ENTREGADO (Cotizado vs Entregado) - ✅ FIX REAL
+   - Fast path: any() (si SAP lo soporta)
+   - Fallback: leer DocumentLines y verificar BaseType/BaseEntry
+   - Cache corto para rendimiento
 ========================================================= */
 const DELIVERED_CACHE = new Map(); // key: quoteDocEntry -> { ts, deliveredTotal }
 const DELIVERED_TTL_MS = 60 * 1000;
 
+function addDaysISO(isoYYYYMMDD, days) {
+  // isoYYYYMMDD: "2026-02-02"
+  const d = new Date(`${isoYYYYMMDD}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + Number(days || 0));
+  return d.toISOString().slice(0, 10);
+}
+
+async function slTry(path, options = {}) {
+  try {
+    const json = await slFetch(path, options);
+    return { ok: true, json };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
+async function fetchPaged(entityPath, select, orderby, filter, top = 500, max = 5000) {
+  const out = [];
+  for (let skip = 0; skip < max; skip += top) {
+    const url =
+      `/${entityPath}?$select=${select}` +
+      (orderby ? `&$orderby=${encodeURIComponent(orderby)}` : "") +
+      (filter ? `&$filter=${encodeURIComponent(filter)}` : "") +
+      `&$top=${top}&$skip=${skip}`;
+
+    const r = await slFetch(url);
+    const vals = Array.isArray(r?.value) ? r.value : [];
+    if (!vals.length) break;
+    out.push(...vals);
+    if (vals.length < top) break;
+  }
+  return out;
+}
+
+async function getQuotationHeader(docEntry) {
+  const r = await slFetch(
+    `/Quotations(${Number(docEntry)})?$select=DocEntry,DocNum,DocDate,CancelStatus,DocTotal`
+  );
+  return r || null;
+}
+
+/** Fast path (si any() funciona) */
 async function getOrdersBasedOnQuotationAny(quoteDocEntry) {
-  // Intenta OData any() (rápido si tu Service Layer lo soporta)
   const filter = `DocumentLines/any(d: d/BaseType eq 23 and d/BaseEntry eq ${Number(quoteDocEntry)})`;
-  const sap = await slFetch(
+  const r = await slFetch(
     `/Orders?$select=DocEntry,DocNum,DocTotal,DocDate,CancelStatus&$filter=${encodeURIComponent(
       filter
     )}&$top=200`
   );
-  return Array.isArray(sap?.value) ? sap.value : [];
+  return Array.isArray(r?.value) ? r.value : [];
 }
 
+/** Fallback: buscar Orders por rango de fecha y luego revisar DocumentLines(BaseType/BaseEntry) */
+async function getOrdersBasedOnQuotationFallback(quoteDocEntry) {
+  const q = await getQuotationHeader(quoteDocEntry);
+  const qDate = String(q?.DocDate || "").slice(0, 10);
+  if (!qDate) return [];
+
+  // ventana razonable alrededor de la cotización
+  const from = addDaysISO(qDate, -45);
+  const to = addDaysISO(qDate, 45);
+
+  const orders = await fetchPaged(
+    "Orders",
+    "DocEntry,DocNum,DocTotal,DocDate,CancelStatus",
+    "DocDate desc,DocEntry desc",
+    `DocDate ge '${from}' and DocDate le '${to}'`,
+    500,
+    5000
+  );
+
+  // revisar líneas de cada Order (concurrency)
+  const matches = [];
+  let idx = 0;
+  const CONC = 4;
+
+  async function worker() {
+    while (idx < orders.length) {
+      const i = idx++;
+      const o = orders[i];
+      const de = o?.DocEntry;
+      if (!de) continue;
+      if (String(o?.CancelStatus || "").toLowerCase() === "csyes") continue;
+
+      const r = await slTry(
+        `/Orders(${Number(de)})?$select=DocEntry&$expand=DocumentLines($select=BaseType,BaseEntry)`
+      );
+      if (!r.ok) continue;
+
+      const lines = Array.isArray(r.json?.DocumentLines) ? r.json.DocumentLines : [];
+      const hit = lines.some(
+        (ln) => Number(ln?.BaseType) === 23 && Number(ln?.BaseEntry) === Number(quoteDocEntry)
+      );
+      if (hit) matches.push(o);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(CONC, orders.length || 1) }, worker));
+  return matches;
+}
+
+/** Fast path deliveries */
 async function getDeliveriesBasedOnOrderAny(orderDocEntry) {
   const filter = `DocumentLines/any(d: d/BaseType eq 17 and d/BaseEntry eq ${Number(orderDocEntry)})`;
-  const sap = await slFetch(
+  const r = await slFetch(
     `/DeliveryNotes?$select=DocEntry,DocNum,DocTotal,DocDate,CancelStatus&$filter=${encodeURIComponent(
       filter
     )}&$top=500`
   );
-  return Array.isArray(sap?.value) ? sap.value : [];
+  return Array.isArray(r?.value) ? r.value : [];
+}
+
+/** Fallback deliveries: buscar por rango de fecha y revisar líneas */
+async function getDeliveriesBasedOnOrderFallback(orderDocEntry, baseDateISO) {
+  // baseDateISO ayuda a recortar la búsqueda
+  const base = String(baseDateISO || "").slice(0, 10);
+  const from = base ? addDaysISO(base, -45) : "2000-01-01";
+  const to = base ? addDaysISO(base, 45) : addDaysISO(getDateISOInOffset(TZ_OFFSET_MIN), 1);
+
+  const dels = await fetchPaged(
+    "DeliveryNotes",
+    "DocEntry,DocNum,DocTotal,DocDate,CancelStatus",
+    "DocDate desc,DocEntry desc",
+    `DocDate ge '${from}' and DocDate le '${to}'`,
+    500,
+    5000
+  );
+
+  const matches = [];
+  let idx = 0;
+  const CONC = 4;
+
+  async function worker() {
+    while (idx < dels.length) {
+      const i = idx++;
+      const d = dels[i];
+      const de = d?.DocEntry;
+      if (!de) continue;
+      if (String(d?.CancelStatus || "").toLowerCase() === "csyes") continue;
+
+      const r = await slTry(
+        `/DeliveryNotes(${Number(de)})?$select=DocEntry&$expand=DocumentLines($select=BaseType,BaseEntry)`
+      );
+      if (!r.ok) continue;
+
+      const lines = Array.isArray(r.json?.DocumentLines) ? r.json.DocumentLines : [];
+      const hit = lines.some(
+        (ln) => Number(ln?.BaseType) === 17 && Number(ln?.BaseEntry) === Number(orderDocEntry)
+      );
+      if (hit) matches.push(d);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(CONC, dels.length || 1) }, worker));
+  return matches;
 }
 
 async function computeDeliveredForQuotation(quoteDocEntry) {
@@ -583,44 +720,76 @@ async function computeDeliveredForQuotation(quoteDocEntry) {
 
   let deliveredTotal = 0;
 
-  // 1) Buscar Sales Orders que vengan de la cotización
-  let orders = [];
-  try {
-    orders = await getOrdersBasedOnQuotationAny(quoteDocEntry);
-  } catch (eAny) {
-    // fallback: si any() no está soportado, no reventamos, solo marcamos 0
-    orders = [];
+  const qHead = await slTry(
+    `/Quotations(${Number(quoteDocEntry)})?$select=DocEntry,DocDate,CancelStatus`
+  );
+  if (!qHead.ok) {
+    DELIVERED_CACHE.set(key, { ts: now, deliveredTotal: 0 });
+    return 0;
+  }
+  const qDate = String(qHead.json?.DocDate || "").slice(0, 10);
+  const qCancelled = String(qHead.json?.CancelStatus || "").toLowerCase() === "csyes";
+  if (qCancelled) {
+    DELIVERED_CACHE.set(key, { ts: now, deliveredTotal: 0 });
+    return 0;
   }
 
-  // 2) Por cada Order, buscar Delivery Notes basadas en ese Order y sumar DocTotal
-  //    (excluye cancelados)
-  const CONCURRENCY = 4;
+  // 1) Orders: try any() primero
+  let orders = [];
+  const tryAnyOrders = await slTry(
+    `/Orders?$select=DocEntry,DocNum,DocTotal,DocDate,CancelStatus&$filter=${encodeURIComponent(
+      `DocumentLines/any(d: d/BaseType eq 23 and d/BaseEntry eq ${Number(quoteDocEntry)})`
+    )}&$top=200`
+  );
+
+  if (tryAnyOrders.ok) {
+    orders = Array.isArray(tryAnyOrders.json?.value) ? tryAnyOrders.json.value : [];
+  } else {
+    // fallback 100% compatible
+    orders = await getOrdersBasedOnQuotationFallback(quoteDocEntry);
+  }
+
+  if (!orders.length) {
+    DELIVERED_CACHE.set(key, { ts: now, deliveredTotal: 0 });
+    return 0;
+  }
+
+  // 2) Deliveries por cada Order
   let idx = 0;
+  const CONCURRENCY = 4;
 
   async function worker() {
     while (idx < orders.length) {
       const i = idx++;
       const o = orders[i];
       const orderDocEntry = o?.DocEntry;
-      const orderCancelled = isCancelledByCancelStatus(o?.CancelStatus);
-      if (!orderDocEntry || orderCancelled) continue;
+      if (!orderDocEntry) continue;
+      if (String(o?.CancelStatus || "").toLowerCase() === "csyes") continue;
 
-      try {
-        const dels = await getDeliveriesBasedOnOrderAny(orderDocEntry);
-        for (const d of dels) {
-          if (isCancelledByCancelStatus(d?.CancelStatus)) continue;
-          const n = Number(d?.DocTotal || 0);
-          if (Number.isFinite(n)) deliveredTotal += n;
-        }
-      } catch {
-        // si falla una orden, seguimos
+      // try any()
+      const tryAnyDels = await slTry(
+        `/DeliveryNotes?$select=DocEntry,DocNum,DocTotal,DocDate,CancelStatus&$filter=${encodeURIComponent(
+          `DocumentLines/any(d: d/BaseType eq 17 and d/BaseEntry eq ${Number(orderDocEntry)})`
+        )}&$top=500`
+      );
+
+      let deliveries = [];
+      if (tryAnyDels.ok) {
+        deliveries = Array.isArray(tryAnyDels.json?.value) ? tryAnyDels.json.value : [];
+      } else {
+        deliveries = await getDeliveriesBasedOnOrderFallback(orderDocEntry, qDate);
+      }
+
+      for (const d of deliveries) {
+        if (String(d?.CancelStatus || "").toLowerCase() === "csyes") continue;
+        const n = Number(d?.DocTotal || 0);
+        if (Number.isFinite(n)) deliveredTotal += n;
       }
     }
   }
 
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, orders.length || 1) }, worker));
 
-  // Guardar cache
   DELIVERED_CACHE.set(key, { ts: now, deliveredTotal });
   return deliveredTotal;
 }
