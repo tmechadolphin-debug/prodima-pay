@@ -111,6 +111,7 @@ function addDaysISO(iso, days) {
 function provinceToWarehouse(province) {
   const p = String(province || "").trim().toLowerCase();
   if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
+  if (p === "RCI" || p === "RCI" || ) return "01";
   if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera")
     return "500";
   if (
