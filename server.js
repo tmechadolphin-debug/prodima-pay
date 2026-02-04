@@ -31,6 +31,11 @@ const {
   SAP_WAREHOUSE = "300",
   SAP_PRICE_LIST = "Lista 02 Res. Com. Ind. Analitic",
   YAPPY_ALIAS = "@prodimasansae",
+
+  // ✅ NUEVO: listas de códigos permitidos por bodega (comma separated)
+  ACTIVE_CODES_200 = "",
+  ACTIVE_CODES_300 = "",
+  ACTIVE_CODES_500 = "",
 } = process.env;
 
 /* =========================================================
@@ -111,7 +116,6 @@ function addDaysISO(iso, days) {
 function provinceToWarehouse(province) {
   const p = String(province || "").trim().toLowerCase();
   if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
-  if (p === "RCI" || p === "RCI" || ) return "01";
   if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera")
     return "500";
   if (
@@ -141,6 +145,56 @@ function getWarehouseFromReq(req) {
   if (prov) return provinceToWarehouse(prov);
 
   return SAP_WAREHOUSE || "300";
+}
+
+/* =========================================================
+   ✅ NUEVO: Allowed items by warehouse (200/300/500)
+========================================================= */
+function parseCodesEnv(str) {
+  return String(str || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+// Puedes también ponerlos aquí fijo si no quieres env:
+const STATIC_ALLOWED = {
+  "200": [], // <-- si quieres fijo, pega aquí los 100
+  "300": [],
+  "500": [],
+};
+
+const ALLOWED_BY_WH = {
+  "200": parseCodesEnv(ACTIVE_CODES_200).length ? parseCodesEnv(ACTIVE_CODES_200) : STATIC_ALLOWED["200"],
+  "300": parseCodesEnv(ACTIVE_CODES_300).length ? parseCodesEnv(ACTIVE_CODES_300) : STATIC_ALLOWED["300"],
+  "500": parseCodesEnv(ACTIVE_CODES_500).length ? parseCodesEnv(ACTIVE_CODES_500) : STATIC_ALLOWED["500"],
+};
+
+function isRestrictedWarehouse(wh) {
+  return wh === "200" || wh === "300" || wh === "500";
+}
+
+function getAllowedSetForWh(wh) {
+  if (!isRestrictedWarehouse(wh)) return null;
+  const arr = Array.isArray(ALLOWED_BY_WH[wh]) ? ALLOWED_BY_WH[wh] : [];
+  return new Set(arr.map((x) => String(x).trim()));
+}
+
+function assertItemAllowedOrThrow(wh, itemCode) {
+  const code = String(itemCode || "").trim();
+  if (!code) throw new Error("ItemCode vacío");
+
+  if (!isRestrictedWarehouse(wh)) return true;
+
+  const set = getAllowedSetForWh(wh);
+  // ✅ si NO configuraste lista, por seguridad NO bloqueamos (para no tumbarte producción)
+  //    pero en tu caso DEBES configurarla para que sea estricto.
+  if (!set || set.size === 0) return true;
+
+  if (!set.has(code)) {
+    throw new Error(`ItemCode no permitido en bodega ${wh}: ${code}`);
+  }
+  return true;
 }
 
 /* =========================================================
@@ -244,6 +298,9 @@ app.get("/api/health", async (req, res) => {
     warehouse_default: SAP_WAREHOUSE,
     priceList: SAP_PRICE_LIST,
     db: hasDb() ? "on" : "off",
+    allowed_wh_200: (ALLOWED_BY_WH["200"] || []).length,
+    allowed_wh_300: (ALLOWED_BY_WH["300"] || []).length,
+    allowed_wh_500: (ALLOWED_BY_WH["500"] || []).length,
   });
 });
 
@@ -476,7 +533,7 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
 }
 
 /* =========================================================
-   ✅ USER LOGIN (unificado)
+   ✅ USER LOGIN (unificado)  (NO TOCADO)
 ========================================================= */
 async function handleUserLogin(req, res) {
   try {
@@ -540,7 +597,7 @@ app.get("/api/auth/me", verifyUser, async (req, res) =>
 );
 
 /* =========================================================
-   ✅ ADMIN LOGIN
+   ✅ ADMIN LOGIN (NO TOCADO)
 ========================================================= */
 app.post("/api/admin/login", async (req, res) => {
   const user = String(req.body?.user || "").trim();
@@ -554,7 +611,7 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN USERS (GET)
+   ✅ ADMIN USERS (GET/POST/PATCH/DELETE) (NO TOCADO)
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
@@ -570,23 +627,12 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   }
 });
 
-/* =========================================================
-   ✅ ADMIN USERS (POST / PATCH / DELETE)
-   - Necesarios para admin-usuarios.html:
-     POST   /api/admin/users
-     PATCH  /api/admin/users/:id/pin
-     PATCH  /api/admin/users/:id/toggle
-     DELETE /api/admin/users/:id
-========================================================= */
-
 function normalizeUsername(u) {
   const s = String(u || "").trim().toLowerCase();
-  // permite letras, numeros, guion, underscore y punto
   if (!s) return "";
   if (!/^[a-z0-9._-]{2,50}$/.test(s)) return "__INVALID__";
   return s;
 }
-
 function toIntId(x) {
   const n = Number(x);
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
@@ -613,7 +659,6 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
     }
 
     const warehouse_code = warehouse_code_in || provinceToWarehouse(province || "");
-
     const pin_hash = await bcrypt.hash(pin, 10);
 
     const q = await dbQuery(
@@ -625,7 +670,6 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
 
     return safeJson(res, 200, { ok: true, user: q.rows[0] });
   } catch (e) {
-    // unique violation
     if (String(e?.code) === "23505") {
       return safeJson(res, 409, { ok: false, message: "Ese username ya existe" });
     }
@@ -703,175 +747,7 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD)
-   ✅ FIX DUPLICADOS:
-   - orderby estable: DocDate desc, DocEntry desc
-   - dedupe por DocEntry en el scanner
-========================================================= */
-async function scanQuotes({
-  f,
-  t,
-  wantSkip,
-  wantLimit,
-  userFilter,
-  clientFilter,
-  includeTotal,
-}) {
-  const toPlus1 = addDaysISO(t, 1);
-  const batchTop = 200;
-
-  let skipSap = 0;
-  let totalFiltered = 0;
-  const pageRows = [];
-
-  const uFilter = String(userFilter || "").trim().toLowerCase();
-  const cFilter = String(clientFilter || "").trim().toLowerCase();
-
-  const maxSapPages = includeTotal ? 200 : 50;
-
-  // ✅ Dedup global para evitar repetidos entre páginas SAP
-  const seenDocEntry = new Set();
-
-  for (let page = 0; page < maxSapPages; page++) {
-    const raw = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
-        `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
-        // ✅ FIX: orden estable (sin esto, $skip duplica/omite)
-        `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`
-    );
-
-    const rows = Array.isArray(raw?.value) ? raw.value : [];
-    if (!rows.length) break;
-
-    skipSap += rows.length;
-
-    for (const q of rows) {
-      const de = Number(q?.DocEntry);
-      if (Number.isFinite(de)) {
-        if (seenDocEntry.has(de)) continue; // ✅ evita repetidos
-        seenDocEntry.add(de);
-      }
-
-      if (isCancelledLike(q)) continue;
-
-      const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
-      const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
-
-      if (uFilter && !String(usuario).toLowerCase().includes(uFilter)) continue;
-
-      if (cFilter) {
-        const cc = String(q.CardCode || "").toLowerCase();
-        const cn = String(q.CardName || "").toLowerCase();
-        if (!cc.includes(cFilter) && !cn.includes(cFilter)) continue;
-      }
-
-      const idx = totalFiltered;
-      totalFiltered++;
-
-      if (idx >= wantSkip && pageRows.length < wantLimit) {
-        pageRows.push({
-          docEntry: q.DocEntry,
-          docNum: q.DocNum,
-          cardCode: q.CardCode,
-          cardName: q.CardName,
-          fecha: String(q.DocDate || "").slice(0, 10),
-          estado: q.DocumentStatus || "",
-          cancelStatus: q.CancelStatus ?? "",
-          comments: q.Comments || "",
-          usuario,
-          warehouse: wh,
-          montoCotizacion: Number(q.DocTotal || 0),
-          montoEntregado: 0,
-          pendiente: Number(q.DocTotal || 0),
-        });
-      }
-    }
-
-    if (!includeTotal && pageRows.length >= wantLimit) break;
-  }
-
-  return { pageRows, totalFiltered };
-}
-
-app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
-  try {
-    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
-
-    const from = String(req.query?.from || "");
-    const to = String(req.query?.to || "");
-
-    const withDelivered = String(req.query?.withDelivered || "0") === "1";
-
-    const limitRaw =
-      req.query?.limit != null ? Number(req.query.limit) :
-      req.query?.top != null ? Number(req.query.top) : 20;
-
-    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
-
-    const pageRaw = req.query?.page != null ? Number(req.query.page) : 1;
-    const page = Math.max(1, Number.isFinite(pageRaw) ? pageRaw : 1);
-    const skip = (page - 1) * limit;
-
-    const includeTotal = String(req.query?.includeTotal || "0") === "1";
-
-    const userFilter = String(req.query?.user || "");
-    const clientFilter = String(req.query?.client || "");
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
-
-    const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
-    const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
-
-    const { pageRows, totalFiltered } = await scanQuotes({
-      f,
-      t,
-      wantSkip: skip,
-      wantLimit: limit,
-      userFilter,
-      clientFilter,
-      includeTotal,
-    });
-
-    if (withDelivered && pageRows.length) {
-      const CONC = 2;
-      let idx = 0;
-
-      async function worker() {
-        while (idx < pageRows.length) {
-          const i = idx++;
-          const q = pageRows[i];
-          try {
-            const tr = await traceQuote(q.docNum, f, t);
-            if (tr.ok) {
-              q.montoEntregado = Number(tr.totals?.totalEntregado || 0);
-              q.pendiente = Number(tr.totals?.pendiente || 0);
-            }
-          } catch {}
-          await sleep(25);
-        }
-      }
-      await Promise.all(Array.from({ length: CONC }, () => worker()));
-    }
-
-    return safeJson(res, 200, {
-      ok: true,
-      quotes: pageRows,
-      from: f,
-      to: t,
-      page,
-      limit,
-      total: includeTotal ? totalFiltered : null,
-      pageCount: includeTotal ? Math.max(1, Math.ceil(totalFiltered / limit)) : null,
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   ✅ SAP: ITEM / ITEMS / CUSTOMERS / CUSTOMER / QUOTE
-   (todo lo demás igual a tu código)
+   ✅ SAP: PRICE LIST cache + ITEM cache
 ========================================================= */
 let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
 const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
@@ -921,6 +797,7 @@ function getPriceFromPriceList(itemFull, priceListNo) {
   return Number.isFinite(price) ? price : null;
 }
 
+// Factor de CAJA (si SAP lo trae). Si no, devolvemos null.
 function getSalesUomFactor(itemFull) {
   const directFields = [
     itemFull?.SalesItemsPerUnit,
@@ -963,8 +840,14 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
     ItemName: itemFull.ItemName ?? `Producto ${code}`,
     SalesUnit: itemFull.SalesUnit ?? "",
     InventoryItem: itemFull.InventoryItem ?? null,
+    Valid: itemFull.Valid ?? null,
+    FrozenFor: itemFull.FrozenFor ?? null,
   };
 
+  // ✅ En tu pantalla debe mostrarse CAJA:
+  // - priceUnit: precio unitario si SAP lo trae así
+  // - factorCaja: multiplicador caja
+  // - price: precio CAJA (si no hay factor, queda igual al unit)
   const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
   const factorCaja = getSalesUomFactor(itemFull);
   const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
@@ -1011,14 +894,14 @@ async function getOneItem(code, priceListNo, warehouseCode) {
   try {
     itemFull = await slFetch(
       `/Items('${encodeURIComponent(code)}')` +
-        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection` +
+        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Valid,FrozenFor,ItemPrices,ItemWarehouseInfoCollection` +
         `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
     );
   } catch {
     try {
       itemFull = await slFetch(
         `/Items('${encodeURIComponent(code)}')` +
-          `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,ItemPrices,ItemWarehouseInfoCollection`
+          `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Valid,FrozenFor,ItemPrices,ItemWarehouseInfoCollection`
       );
     } catch {
       itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
@@ -1039,6 +922,19 @@ async function getOneItem(code, priceListNo, warehouseCode) {
   return data;
 }
 
+/* =========================================================
+   ✅ NUEVO: endpoint para que el frontend sepa la lista (opcional)
+========================================================= */
+app.get("/api/sap/allowed-items", verifyUser, async (req, res) => {
+  const wh = getWarehouseFromReq(req);
+  const set = getAllowedSetForWh(wh);
+  const list = set ? Array.from(set) : [];
+  return res.json({ ok: true, warehouse: wh, allowedCount: list.length, allowed: list });
+});
+
+/* =========================================================
+   ✅ SAP: ITEM (bloquea códigos NO permitidos en 200/300/500)
+========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
     if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
@@ -1047,6 +943,10 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
     if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
 
     const warehouseCode = getWarehouseFromReq(req);
+
+    // ✅ BLOQUEO por bodega
+    assertItemAllowedOrThrow(warehouseCode, code);
+
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
 
     const r = await getOneItem(code, priceListNo, warehouseCode);
@@ -1058,19 +958,24 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
       bodega: warehouseCode,
       priceList: SAP_PRICE_LIST,
       priceListNo,
+      // ✅ Precio CAJA
       price: Number(r.price ?? 0),
+      // ✅ si necesitas debug:
       priceUnit: r.priceUnit,
       factorCaja: r.factorCaja,
-      uom: r.item?.SalesUnit || "Caja",
+      uom: "Caja",
       stock: r.stock,
       disponible: r?.stock?.available ?? null,
       enStock: r?.stock?.hasStock ?? null,
     });
   } catch (err) {
-    return res.status(500).json({ ok: false, message: err.message });
+    return res.status(400).json({ ok: false, message: err.message });
   }
 });
 
+/* =========================================================
+   ✅ SAP: ITEMS (batch) (bloquea NO permitidos)
+========================================================= */
 app.get("/api/sap/items", verifyUser, async (req, res) => {
   try {
     if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
@@ -1083,6 +988,10 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
     if (!codes.length) return res.status(400).json({ ok: false, message: "codes vacío" });
 
     const warehouseCode = getWarehouseFromReq(req);
+
+    // ✅ BLOQUEO por bodega
+    for (const c of codes) assertItemAllowedOrThrow(warehouseCode, c);
+
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
 
     const CONCURRENCY = 5;
@@ -1098,9 +1007,9 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
           items[code] = {
             ok: true,
             name: r.item.ItemName,
-            unit: r.item.SalesUnit,
-            price: r.price,
-            priceUnit: r.priceUnit,
+            unit: "Caja",
+            price: r.price,         // CAJA
+            priceUnit: r.priceUnit, // debug
             factorCaja: r.factorCaja,
             stock: r.stock,
             disponible: r?.stock?.available ?? null,
@@ -1127,6 +1036,83 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
   }
 });
 
+/* =========================================================
+   ✅ NUEVO: SAP Items Search (sugerencias para productos)
+   GET /api/sap/items/search?q=texto&top=20
+   - Filtra activos (Valid=tYES y FrozenFor=tNO cuando exista)
+   - Filtra por allowlist si bodega 200/300/500
+========================================================= */
+app.get("/api/sap/items/search", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const q = String(req.query?.q || "").trim();
+    const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
+
+    if (q.length < 2) return res.json({ ok: true, q, results: [] });
+
+    const warehouseCode = getWarehouseFromReq(req);
+    const allowedSet = getAllowedSetForWh(warehouseCode);
+
+    const safe = q.replace(/'/g, "''");
+
+    // Buscamos más de top para poder filtrar por allowed y por activos
+    const preTop = Math.min(100, top * 5);
+
+    let raw;
+    try {
+      raw = await slFetch(
+        `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor` +
+          `&$filter=${encodeURIComponent(
+            `(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))`
+          )}` +
+          `&$orderby=ItemName asc&$top=${preTop}`
+      );
+    } catch {
+      // fallback para SL viejo
+      raw = await slFetch(
+        `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor` +
+          `&$filter=${encodeURIComponent(
+            `(substringof('${safe}',ItemCode) or substringof('${safe}',ItemName))`
+          )}` +
+          `&$orderby=ItemName asc&$top=${preTop}`
+      );
+    }
+
+    const values = Array.isArray(raw?.value) ? raw.value : [];
+
+    // Activo = Valid = tYES (si viene) y FrozenFor != tYES (si viene)
+    function isActiveSapItem(it) {
+      const v = String(it?.Valid ?? "").toLowerCase();
+      const f = String(it?.FrozenFor ?? "").toLowerCase();
+      const validOk = !v || v.includes("tyes") || v === "yes" || v === "true"; // si no viene, no bloqueamos
+      const frozenOk = !f || f.includes("tno") || f === "no" || f === "false";
+      return validOk && frozenOk;
+    }
+
+    let filtered = values
+      .filter((it) => it?.ItemCode)
+      .filter(isActiveSapItem);
+
+    if (allowedSet && allowedSet.size > 0) {
+      filtered = filtered.filter((it) => allowedSet.has(String(it.ItemCode).trim()));
+    }
+
+    const results = filtered.slice(0, top).map((it) => ({
+      ItemCode: it.ItemCode,
+      ItemName: it.ItemName,
+      SalesUnit: "Caja",
+    }));
+
+    return res.json({ ok: true, q, warehouse: warehouseCode, results });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+/* =========================================================
+   ✅ CUSTOMERS search / customer (igual a tu código)
+========================================================= */
 app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
   try {
     if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
@@ -1192,6 +1178,9 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
   }
 });
 
+/* =========================================================
+   ✅ QUOTE (BLOQUEA ItemCodes NO permitidos en 200/300/500)
+========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
     if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
@@ -1205,16 +1194,27 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     const warehouseCode = getWarehouseFromReq(req);
 
-    const DocumentLines = lines
+    // ✅ Filtra líneas válidas
+    const cleanLines = lines
       .map((l) => ({
         ItemCode: String(l.itemCode || "").trim(),
         Quantity: Number(l.qty || 0),
-        WarehouseCode: warehouseCode,
       }))
       .filter((x) => x.ItemCode && x.Quantity > 0);
 
-    if (!DocumentLines.length)
+    if (!cleanLines.length)
       return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
+
+    // ✅ BLOQUEO por bodega (aquí se evita que manden inactivos)
+    for (const ln of cleanLines) {
+      assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
+    }
+
+    const DocumentLines = cleanLines.map((ln) => ({
+      ItemCode: ln.ItemCode,
+      Quantity: ln.Quantity,
+      WarehouseCode: warehouseCode,
+    }));
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
@@ -1253,7 +1253,10 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       bodega: warehouseCode,
     });
   } catch (err) {
-    return res.status(500).json({ ok: false, message: err.message });
+    // si es bloqueo por allowlist, te lo mando como 400
+    const msg = String(err?.message || err);
+    const isAllow = msg.toLowerCase().includes("no permitido");
+    return res.status(isAllow ? 400 : 500).json({ ok: false, message: msg });
   }
 });
 
