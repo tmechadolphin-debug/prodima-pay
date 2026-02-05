@@ -1144,7 +1144,6 @@ async function scanQuotes({
     const raw = await slFetch(
       `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
         `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
-        // ✅ FIX: orden estable (sin esto, $skip duplica/omite)
         `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`
     );
 
@@ -1156,7 +1155,7 @@ async function scanQuotes({
     for (const q of rows) {
       const de = Number(q?.DocEntry);
       if (Number.isFinite(de)) {
-        if (seenDocEntry.has(de)) continue; // ✅ evita repetidos
+        if (seenDocEntry.has(de)) continue;
         seenDocEntry.add(de);
       }
 
@@ -1211,8 +1210,11 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
 
     const limitRaw =
-      req.query?.limit != null ? Number(req.query.limit) :
-      req.query?.top != null ? Number(req.query.top) : 20;
+      req.query?.limit != null
+        ? Number(req.query.limit)
+        : req.query?.top != null
+        ? Number(req.query.top)
+        : 20;
 
     const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
 
@@ -1259,6 +1261,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
           await sleep(25);
         }
       }
+
       await Promise.all(Array.from({ length: CONC }, () => worker()));
     }
 
