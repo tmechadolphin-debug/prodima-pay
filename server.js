@@ -1375,11 +1375,12 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     if (!cleanLines.length)
       return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
 
-    // ✅ BLOQUEO por bodega (aquí se evita que manden inactivos)
+    // ✅ BLOQUEO por bodega (allowlist)
     for (const ln of cleanLines) {
       assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
     }
 
+    // ✅ 1) Intento normal: fuerza WarehouseCode
     const DocumentLines = cleanLines.map((ln) => ({
       ItemCode: ln.ItemCode,
       Quantity: ln.Quantity,
@@ -1390,7 +1391,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     const creator = req.user?.username || "unknown";
     const province = String(req.user?.province || "").trim();
 
-    const sapComments = [
+    const baseComments = [
       `[WEB PEDIDOS]`,
       `[user:${creator}]`,
       province ? `[prov:${province}]` : "",
@@ -1404,26 +1405,60 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       CardCode: cardCode,
       DocDate: docDate,
       DocDueDate: docDate,
-      Comments: sapComments,
+      Comments: baseComments,
       JournalMemo: "Cotización web mercaderistas",
       DocumentLines,
     };
 
-    const created = await slFetch(`/Quotations`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
+    try {
+      const created = await slFetch(`/Quotations`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
 
-    return res.json({
-      ok: true,
-      message: "Cotización creada",
-      docEntry: created.DocEntry,
-      docNum: created.DocNum,
-      warehouse: warehouseCode,
-      bodega: warehouseCode,
-    });
+      return res.json({
+        ok: true,
+        message: "Cotización creada",
+        docEntry: created.DocEntry,
+        docNum: created.DocNum,
+        warehouse: warehouseCode,
+        bodega: warehouseCode,
+        fallback: false,
+      });
+    } catch (err1) {
+      const msg1 = String(err1?.message || err1);
+
+      // ✅ Si es el clásico -2028 (Item no matchea con bodega), reintenta sin WarehouseCode
+      const isNoMatch = msg1.includes("ODBC -2028") || msg1.toLowerCase().includes("no matching records found");
+
+      if (!isNoMatch) throw err1;
+
+      const payloadFallback = {
+        ...payload,
+        Comments: `${baseComments} [wh_fallback:1]`,
+        DocumentLines: cleanLines.map((ln) => ({
+          ItemCode: ln.ItemCode,
+          Quantity: ln.Quantity,
+          // 👈 SIN WarehouseCode para que SAP use el default/config del item
+        })),
+      };
+
+      const created2 = await slFetch(`/Quotations`, {
+        method: "POST",
+        body: JSON.stringify(payloadFallback),
+      });
+
+      return res.json({
+        ok: true,
+        message: "Cotización creada (fallback sin WarehouseCode por -2028)",
+        docEntry: created2.DocEntry,
+        docNum: created2.DocNum,
+        warehouse: warehouseCode,
+        bodega: warehouseCode,
+        fallback: true,
+      });
+    }
   } catch (err) {
-    // si es bloqueo por allowlist, te lo mando como 400
     const msg = String(err?.message || err);
     const isAllow = msg.toLowerCase().includes("no permitido");
     return res.status(isAllow ? 400 : 500).json({ ok: false, message: msg });
