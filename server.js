@@ -39,6 +39,12 @@ const {
 } = process.env;
 
 /* =========================================================
+   ✅ NUEVO: Norma de reparto DEFAULT (SAP)
+   - Se enviará en TODAS las líneas de artículos
+========================================================= */
+const DEFAULT_NORMA_REPARTO = "04;VTAS";
+
+/* =========================================================
    ✅ CORS
 ========================================================= */
 app.use(
@@ -1381,15 +1387,16 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     }
 
     // ✅ 1) Intento normal: fuerza WarehouseCode
-    const DEFAULT_NORMA_REPARTO = "04;VTAS";
-
     const DocumentLines = cleanLines.map((ln) => ({
-    ItemCode: ln.ItemCode,
-    Quantity: ln.Quantity,
-    WarehouseCode: warehouseCode,
-    CostingCode: DEFAULT_NORMA_REPARTO, // ✅ Norma de reparto
-    }));
+      ItemCode: ln.ItemCode,
+      Quantity: ln.Quantity,
+      WarehouseCode: warehouseCode,
 
+      // ✅ NUEVO: Norma de reparto por defecto en TODAS las líneas
+      // (en SAP B1 normalmente corresponde a "CostingCode" / "DistributionRule" según configuración)
+      CostingCode: DEFAULT_NORMA_REPARTO,
+      DistributionRule: DEFAULT_NORMA_REPARTO,
+    }));
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
@@ -1441,12 +1448,13 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         ...payload,
         Comments: `${baseComments} [wh_fallback:1]`,
         DocumentLines: cleanLines.map((ln) => ({
-        ItemCode: ln.ItemCode,
-        Quantity: ln.Quantity,
-        CostingCode: DEFAULT_NORMA_REPARTO, // ✅ Norma de reparto también en fallback
-  // 👈 SIN WarehouseCode
-})),
+          ItemCode: ln.ItemCode,
+          Quantity: ln.Quantity,
           // 👈 SIN WarehouseCode para que SAP use el default/config del item
+
+          // ✅ NUEVO: Norma de reparto por defecto en TODAS las líneas (también en fallback)
+          CostingCode: DEFAULT_NORMA_REPARTO,
+          DistributionRule: DEFAULT_NORMA_REPARTO,
         })),
       };
 
