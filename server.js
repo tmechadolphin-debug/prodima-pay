@@ -1182,85 +1182,134 @@ async function scanQuotes({
   return { pageRows, totalFiltered };
 }
 
-app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
+/* =========================================================
+   ✅ QUOTE (BLOQUEA ItemCodes NO permitidos en 200/300/500)
+========================================================= */
+app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
-    const from = String(req.query?.from || "");
-    const to = String(req.query?.to || "");
+    const cardCode = String(req.body?.cardCode || "").trim();
+    const comments = String(req.body?.comments || "").trim();
+    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
 
-    const withDelivered = String(req.query?.withDelivered || "0") === "1";
+    if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
+    if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
 
-    const limitRaw =
-      req.query?.limit != null
-        ? Number(req.query.limit)
-        : req.query?.top != null
-        ? Number(req.query.top)
-        : 20;
+    const warehouseCode = getWarehouseFromReq(req);
 
-    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
+    // ✅ Filtra líneas válidas
+    const cleanLines = lines
+      .map((l) => ({
+        ItemCode: String(l.itemCode || "").trim(),
+        Quantity: Number(l.qty || 0),
+      }))
+      .filter((x) => x.ItemCode && x.Quantity > 0);
 
-    const pageRaw = req.query?.page != null ? Number(req.query.page) : 1;
-    const page = Math.max(1, Number.isFinite(pageRaw) ? pageRaw : 1);
-    const skip = (page - 1) * limit;
+    if (!cleanLines.length)
+      return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
 
-    const includeTotal = String(req.query?.includeTotal || "0") === "1";
-
-    const userFilter = String(req.query?.user || "");
-    const clientFilter = String(req.query?.client || "");
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
-
-    const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
-    const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
-
-    const { pageRows, totalFiltered } = await scanQuotes({
-      f,
-      t,
-      wantSkip: skip,
-      wantLimit: limit,
-      userFilter,
-      clientFilter,
-      includeTotal,
-    });
-
-    if (withDelivered && pageRows.length) {
-      const CONC = 2;
-      let idx = 0;
-
-      async function worker() {
-        while (idx < pageRows.length) {
-          const i = idx++;
-          const q = pageRows[i];
-          try {
-            const tr = await traceQuote(q.docNum, f, t);
-            if (tr.ok) {
-              q.montoEntregado = Number(tr.totals?.totalEntregado || 0);
-              q.pendiente = Number(tr.totals?.pendiente || 0);
-            }
-          } catch {}
-          await sleep(25);
-        }
-      }
-
-      await Promise.all(Array.from({ length: CONC }, () => worker()));
+    // ✅ BLOQUEO por bodega (allowlist)
+    for (const ln of cleanLines) {
+      assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
     }
 
-    return safeJson(res, 200, {
-      ok: true,
-      quotes: pageRows,
-      from: f,
-      to: t,
-      page,
-      limit,
-      total: includeTotal ? totalFiltered : null,
-      pageCount: includeTotal ? Math.max(1, Math.ceil(totalFiltered / limit)) : null,
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
+    // ✅ 1) Intento normal: fuerza WarehouseCode
+    // ✅ ÚNICO CAMBIO: Norma de reparto por dimensiones:
+    //    Área de negocio (Dim1) = 04  -> CostingCode
+    //    Departamento  (Dim2) = VTAS -> CostingCode2
+    const DocumentLines = cleanLines.map((ln) => ({
+      ItemCode: ln.ItemCode,
+      Quantity: ln.Quantity,
+      WarehouseCode: warehouseCode,
+
+      // ✅ Norma de reparto = 04;VTAS (por dimensiones)
+      CostingCode: "04",
+      CostingCode2: "VTAS",
+    }));
+
+    const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
+    const creator = req.user?.username || "unknown";
+    const province = String(req.user?.province || "").trim();
+
+    const baseComments = [
+      `[WEB PEDIDOS]`,
+      `[user:${creator}]`,
+      province ? `[prov:${province}]` : "",
+      warehouseCode ? `[wh:${warehouseCode}]` : "",
+      comments ? comments : "Cotización mercaderista",
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    const payload = {
+      CardCode: cardCode,
+      DocDate: docDate,
+      DocDueDate: docDate,
+      Comments: baseComments,
+      JournalMemo: "Cotización web mercaderistas",
+      DocumentLines,
+    };
+
+    try {
+      const created = await slFetch(`/Quotations`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+
+      return res.json({
+        ok: true,
+        message: "Cotización creada",
+        docEntry: created.DocEntry,
+        docNum: created.DocNum,
+        warehouse: warehouseCode,
+        bodega: warehouseCode,
+        fallback: false,
+      });
+    } catch (err1) {
+      const msg1 = String(err1?.message || err1);
+
+      // ✅ Si es el clásico -2028 (Item no matchea con bodega), reintenta sin WarehouseCode
+      const isNoMatch = msg1.includes("ODBC -2028") || msg1.toLowerCase().includes("no matching records found");
+
+      if (!isNoMatch) throw err1;
+
+      const payloadFallback = {
+        ...payload,
+        Comments: `${baseComments} [wh_fallback:1]`,
+        DocumentLines: cleanLines.map((ln) => ({
+          ItemCode: ln.ItemCode,
+          Quantity: ln.Quantity,
+          // 👈 SIN WarehouseCode para que SAP use el default/config del item
+
+          // ✅ Norma de reparto = 04;VTAS (por dimensiones) TAMBIÉN EN FALLBACK
+          CostingCode: "04",
+          CostingCode2: "VTAS",
+        })),
+      };
+
+      const created2 = await slFetch(`/Quotations`, {
+        method: "POST",
+        body: JSON.stringify(payloadFallback),
+      });
+
+      return res.json({
+        ok: true,
+        message: "Cotización creada (fallback sin WarehouseCode por -2028)",
+        docEntry: created2.DocEntry,
+        docNum: created2.DocNum,
+        warehouse: warehouseCode,
+        bodega: warehouseCode,
+        fallback: true,
+      });
+    }
+  } catch (err) {
+    const msg = String(err?.message || err);
+    const isAllow = msg.toLowerCase().includes("no permitido");
+    return res.status(isAllow ? 400 : 500).json({ ok: false, message: msg });
   }
 });
+
 
 /* =========================================================
    ✅ CUSTOMERS search / customer (igual a tu código)
