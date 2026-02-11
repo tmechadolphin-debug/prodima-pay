@@ -1381,11 +1381,15 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     }
 
     // ✅ 1) Intento normal: fuerza WarehouseCode
+    const DEFAULT_NORMA_REPARTO = "04;VTAS";
+
     const DocumentLines = cleanLines.map((ln) => ({
-      ItemCode: ln.ItemCode,
-      Quantity: ln.Quantity,
-      WarehouseCode: warehouseCode,
+    ItemCode: ln.ItemCode,
+    Quantity: ln.Quantity,
+    WarehouseCode: warehouseCode,
+    CostingCode: DEFAULT_NORMA_REPARTO, // ✅ Norma de reparto
     }));
+
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
@@ -1437,8 +1441,11 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         ...payload,
         Comments: `${baseComments} [wh_fallback:1]`,
         DocumentLines: cleanLines.map((ln) => ({
-          ItemCode: ln.ItemCode,
-          Quantity: ln.Quantity,
+        ItemCode: ln.ItemCode,
+        Quantity: ln.Quantity,
+        CostingCode: DEFAULT_NORMA_REPARTO, // ✅ Norma de reparto también en fallback
+  // 👈 SIN WarehouseCode
+})),
           // 👈 SIN WarehouseCode para que SAP use el default/config del item
         })),
       };
