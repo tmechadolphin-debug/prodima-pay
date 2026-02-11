@@ -39,12 +39,6 @@ const {
 } = process.env;
 
 /* =========================================================
-   ✅ NUEVO: Norma de reparto DEFAULT (SAP)
-   - Se enviará en TODAS las líneas de artículos
-========================================================= */
-const DEFAULT_NORMA_REPARTO = "04;VTAS";
-
-/* =========================================================
    ✅ CORS
 ========================================================= */
 app.use(
@@ -850,10 +844,6 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
     FrozenFor: itemFull.FrozenFor ?? null,
   };
 
-  // ✅ En tu pantalla debe mostrarse CAJA:
-  // - priceUnit: precio unitario si SAP lo trae así
-  // - factorCaja: multiplicador caja
-  // - price: precio CAJA (si no hay factor, queda igual al unit)
   const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
   const factorCaja = getSalesUomFactor(itemFull);
   const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
@@ -950,7 +940,6 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 
     const warehouseCode = getWarehouseFromReq(req);
 
-    // ✅ BLOQUEO por bodega
     assertItemAllowedOrThrow(warehouseCode, code);
 
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
@@ -964,9 +953,7 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
       bodega: warehouseCode,
       priceList: SAP_PRICE_LIST,
       priceListNo,
-      // ✅ Precio CAJA
       price: Number(r.price ?? 0),
-      // ✅ si necesitas debug:
       priceUnit: r.priceUnit,
       factorCaja: r.factorCaja,
       uom: "Caja",
@@ -995,7 +982,6 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
 
     const warehouseCode = getWarehouseFromReq(req);
 
-    // ✅ BLOQUEO por bodega
     for (const c of codes) assertItemAllowedOrThrow(warehouseCode, c);
 
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
@@ -1014,8 +1000,8 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
             ok: true,
             name: r.item.ItemName,
             unit: "Caja",
-            price: r.price,         // CAJA
-            priceUnit: r.priceUnit, // debug
+            price: r.price,
+            priceUnit: r.priceUnit,
             factorCaja: r.factorCaja,
             stock: r.stock,
             disponible: r?.stock?.available ?? null,
@@ -1044,9 +1030,6 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ NUEVO: SAP Items Search (sugerencias para productos)
-   GET /api/sap/items/search?q=texto&top=20
-   - Filtra activos (Valid=tYES y FrozenFor=tNO cuando exista)
-   - Filtra por allowlist si bodega 200/300/500
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
@@ -1062,7 +1045,6 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const safe = q.replace(/'/g, "''");
 
-    // Buscamos más de top para poder filtrar por allowed y por activos
     const preTop = Math.min(100, top * 5);
 
     let raw;
@@ -1075,7 +1057,6 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
           `&$orderby=ItemName asc&$top=${preTop}`
       );
     } catch {
-      // fallback para SL viejo
       raw = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor` +
           `&$filter=${encodeURIComponent(
@@ -1087,11 +1068,10 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const values = Array.isArray(raw?.value) ? raw.value : [];
 
-    // Activo = Valid = tYES (si viene) y FrozenFor != tYES (si viene)
     function isActiveSapItem(it) {
       const v = String(it?.Valid ?? "").toLowerCase();
       const f = String(it?.FrozenFor ?? "").toLowerCase();
-      const validOk = !v || v.includes("tyes") || v === "yes" || v === "true"; // si no viene, no bloqueamos
+      const validOk = !v || v.includes("tyes") || v === "yes" || v === "true";
       const frozenOk = !f || f.includes("tno") || f === "no" || f === "false";
       return validOk && frozenOk;
     }
@@ -1118,9 +1098,6 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD)
-   ✅ FIX DUPLICADOS:
-   - orderby estable: DocDate desc, DocEntry desc
-   - dedupe por DocEntry en el scanner
 ========================================================= */
 async function scanQuotes({
   f,
@@ -1143,7 +1120,6 @@ async function scanQuotes({
 
   const maxSapPages = includeTotal ? 200 : 50;
 
-  // ✅ Dedup global para evitar repetidos entre páginas SAP
   const seenDocEntry = new Set();
 
   for (let page = 0; page < maxSapPages; page++) {
@@ -1370,7 +1346,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     const warehouseCode = getWarehouseFromReq(req);
 
-    // ✅ Filtra líneas válidas
     const cleanLines = lines
       .map((l) => ({
         ItemCode: String(l.itemCode || "").trim(),
@@ -1381,7 +1356,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     if (!cleanLines.length)
       return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
 
-    // ✅ BLOQUEO por bodega (allowlist)
     for (const ln of cleanLines) {
       assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
     }
@@ -1392,10 +1366,8 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       Quantity: ln.Quantity,
       WarehouseCode: warehouseCode,
 
-      // ✅ NUEVO: Norma de reparto por defecto en TODAS las líneas
-      // (en SAP B1 normalmente corresponde a "CostingCode" / "DistributionRule" según configuración)
-      CostingCode: DEFAULT_NORMA_REPARTO,
-      DistributionRule: DEFAULT_NORMA_REPARTO,
+      // ✅ ÚNICO CAMBIO: Norma de reparto (DIM 04) para que SAP muestre 04;VTAS
+      CostingCode4: "VTAS",
     }));
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
@@ -1439,8 +1411,8 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     } catch (err1) {
       const msg1 = String(err1?.message || err1);
 
-      // ✅ Si es el clásico -2028 (Item no matchea con bodega), reintenta sin WarehouseCode
-      const isNoMatch = msg1.includes("ODBC -2028") || msg1.toLowerCase().includes("no matching records found");
+      const isNoMatch =
+        msg1.includes("ODBC -2028") || msg1.toLowerCase().includes("no matching records found");
 
       if (!isNoMatch) throw err1;
 
@@ -1450,11 +1422,10 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         DocumentLines: cleanLines.map((ln) => ({
           ItemCode: ln.ItemCode,
           Quantity: ln.Quantity,
-          // 👈 SIN WarehouseCode para que SAP use el default/config del item
 
-          // ✅ NUEVO: Norma de reparto por defecto en TODAS las líneas (también en fallback)
-          CostingCode: DEFAULT_NORMA_REPARTO,
-          DistributionRule: DEFAULT_NORMA_REPARTO,
+          // ✅ ÚNICO CAMBIO: Norma de reparto (DIM 04) para que SAP muestre 04;VTAS
+          CostingCode4: "VTAS",
+          // 👈 SIN WarehouseCode para que SAP use el default/config del item
         })),
       };
 
