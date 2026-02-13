@@ -288,6 +288,15 @@ function isCancelledLike(q) {
 }
 
 /* =========================================================
+   ✅ NORMA DE REPARTO (DEFAULT)  ✅✅✅
+   - Dim 1 (Área de negocio): 04
+   - Dim 2 (Departamento): VTAS
+   - Se aplica en TODAS las líneas al crear la cotización
+========================================================= */
+const DEFAULT_COSTINGCODE_DIM1 = "04";
+const DEFAULT_COSTINGCODE_DIM2 = "VTAS";
+
+/* =========================================================
    ✅ HEALTH
 ========================================================= */
 app.get("/api/health", async (req, res) => {
@@ -1350,6 +1359,7 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ QUOTE (BLOQUEA ItemCodes NO permitidos en 200/300/500)
+   ✅ + NORMA DE REPARTO EN TODAS LAS LÍNEAS (04;VTAS)
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
@@ -1381,10 +1391,15 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     }
 
     // ✅ 1) Intento normal: fuerza WarehouseCode
+    // ✅ + NORMA DE REPARTO (04;VTAS) en TODAS las líneas
     const DocumentLines = cleanLines.map((ln) => ({
       ItemCode: ln.ItemCode,
       Quantity: ln.Quantity,
       WarehouseCode: warehouseCode,
+
+      // ✅ Norma de reparto (Dim 1 / Dim 2)
+      CostingCode: DEFAULT_COSTINGCODE_DIM1,   // Área de negocio = 04
+      CostingCode2: DEFAULT_COSTINGCODE_DIM2,  // Departamento = VTAS
     }));
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
@@ -1436,10 +1451,15 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       const payloadFallback = {
         ...payload,
         Comments: `${baseComments} [wh_fallback:1]`,
+        // ✅ SIN WarehouseCode, PERO MANTIENE NORMA DE REPARTO (04;VTAS)
         DocumentLines: cleanLines.map((ln) => ({
           ItemCode: ln.ItemCode,
           Quantity: ln.Quantity,
           // 👈 SIN WarehouseCode para que SAP use el default/config del item
+
+          // ✅ Norma de reparto (Dim 1 / Dim 2)
+          CostingCode: DEFAULT_COSTINGCODE_DIM1,   // Área de negocio = 04
+          CostingCode2: DEFAULT_COSTINGCODE_DIM2,  // Departamento = VTAS
         })),
       };
 
