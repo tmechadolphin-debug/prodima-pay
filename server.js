@@ -542,6 +542,64 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
 }
 
 /* =========================================================
+   ✅ (NUEVO) Item Group cache + helpers
+   - NO cambia nada existente: solo agrega datos cuando pides withGroups=1
+========================================================= */
+const ITEM_GROUP_CODE_TO_NAME = new Map(); // groupCode -> groupName
+const ITEM_CODE_TO_GROUP_NAME = new Map(); // itemCode -> groupName
+const GROUP_TTL_MS = 24 * 60 * 60 * 1000;
+const GROUP_CACHE_AT = new Map(); // key -> ts
+
+function cacheFresh(key, ttl) {
+  const ts = GROUP_CACHE_AT.get(key);
+  return ts && Date.now() - ts < ttl;
+}
+function cacheStamp(key) {
+  GROUP_CACHE_AT.set(key, Date.now());
+}
+
+async function getGroupNameByGroupCode(groupCode) {
+  const code = Number(groupCode);
+  if (!Number.isFinite(code)) return "";
+
+  const key = `G:${code}`;
+  if (ITEM_GROUP_CODE_TO_NAME.has(code) && cacheFresh(key, GROUP_TTL_MS)) {
+    return ITEM_GROUP_CODE_TO_NAME.get(code) || "";
+  }
+
+  // SAP B1 SL: ItemGroups(GroupCode, GroupName)
+  const r = await slFetch(
+    `/ItemGroups?$select=GroupCode,GroupName&$filter=${encodeURIComponent(`GroupCode eq ${code}`)}&$top=1`
+  );
+  const arr = Array.isArray(r?.value) ? r.value : [];
+  const name = String(arr?.[0]?.GroupName || "").trim();
+
+  ITEM_GROUP_CODE_TO_NAME.set(code, name);
+  cacheStamp(key);
+  return name;
+}
+
+async function getGroupNameByItemCode(itemCode) {
+  const code = String(itemCode || "").trim();
+  if (!code) return "";
+
+  const key = `I:${code}`;
+  if (ITEM_CODE_TO_GROUP_NAME.has(code) && cacheFresh(key, GROUP_TTL_MS)) {
+    return ITEM_CODE_TO_GROUP_NAME.get(code) || "";
+  }
+
+  // SAP B1 SL: Items('CODE') -> ItemsGroupCode
+  const it = await slFetch(`/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemsGroupCode`);
+  const gcode = it?.ItemsGroupCode;
+
+  const gname = await getGroupNameByGroupCode(gcode);
+
+  ITEM_CODE_TO_GROUP_NAME.set(code, gname);
+  cacheStamp(key);
+  return gname;
+}
+
+/* =========================================================
    ✅ USER LOGIN (unificado)  (NO TOCADO)
 ========================================================= */
 async function handleUserLogin(req, res) {
@@ -1047,9 +1105,6 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ NUEVO: SAP Items Search (sugerencias para productos)
-   GET /api/sap/items/search?q=texto&top=20
-   - Filtra activos (Valid=tYES y FrozenFor=tNO cuando exista)
-   - Filtra por allowlist si bodega 200/300/500
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
@@ -1199,6 +1254,8 @@ async function scanQuotes({
           montoCotizacion: Number(q.DocTotal || 0),
           montoEntregado: 0,
           pendiente: Number(q.DocTotal || 0),
+          // 👇 NO se agrega nada aquí para no tocar lo que ya sirve.
+          // lines se agregará SOLO si pides withGroups=1 (ver endpoint)
         });
       }
     }
@@ -1217,6 +1274,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const to = String(req.query?.to || "");
 
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
+    const withGroups = String(req.query?.withGroups || "0") === "1"; // ✅ NUEVO
 
     const limitRaw =
       req.query?.limit != null
@@ -1252,6 +1310,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       includeTotal,
     });
 
+    // ✅ Entregado (NO TOCADO)
     if (withDelivered && pageRows.length) {
       const CONC = 2;
       let idx = 0;
@@ -1272,6 +1331,57 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       }
 
       await Promise.all(Array.from({ length: CONC }, () => worker()));
+    }
+
+    // ✅ NUEVO: Grupos por artículo (solo si withGroups=1)
+    // - NO afecta nada si no lo pides
+    // - Agrega q.lines: [{ItemCode, LineTotal, ItmsGrpNam}]
+    if (withGroups && pageRows.length) {
+      const CONC = 4;
+      let idx = 0;
+
+      async function workerGroups() {
+        while (idx < pageRows.length) {
+          const i = idx++;
+          const q = pageRows[i];
+
+          try {
+            const full = await slFetch(
+              `/Quotations(${Number(q.docEntry)})` +
+                `?$select=DocEntry` +
+                `&$expand=DocumentLines($select=ItemCode,LineTotal)`
+            );
+
+            const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+
+            const outLines = [];
+            for (const ln of lines) {
+              const code = String(ln?.ItemCode || "").trim();
+              if (!code) continue;
+
+              const grp = await getGroupNameByItemCode(code);
+
+              outLines.push({
+                ItemCode: code,
+                LineTotal: Number(ln?.LineTotal || 0),
+                ItmsGrpNam: grp, // 👈 nombre de grupo para tu frontend
+              });
+            }
+
+            q.lines = outLines;
+
+            // (opcional, no rompe nada): si todas las líneas son mismo grupo
+            const uniq = new Set(outLines.map((x) => x.ItmsGrpNam).filter(Boolean));
+            if (uniq.size === 1) q.itemGroup = Array.from(uniq)[0];
+          } catch {
+            // si falla SAP, no agrega q.lines y no rompe lo demás
+          }
+
+          await sleep(20);
+        }
+      }
+
+      await Promise.all(Array.from({ length: CONC }, () => workerGroups()));
     }
 
     return safeJson(res, 200, {
