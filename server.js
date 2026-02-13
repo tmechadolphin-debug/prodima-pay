@@ -159,7 +159,7 @@ function parseCodesEnv(str) {
 
 // Puedes también ponerlos aquí fijo si no quieres env:
 const STATIC_ALLOWED = {
-  "200": [], // <-- si quieres fijo, pega aquí los 100
+  "200": [],
   "300": [],
   "500": [],
 };
@@ -187,8 +187,6 @@ function assertItemAllowedOrThrow(wh, itemCode) {
   if (!isRestrictedWarehouse(wh)) return true;
 
   const set = getAllowedSetForWh(wh);
-  // ✅ si NO configuraste lista, por seguridad NO bloqueamos (para no tumbarte producción)
-  //    pero en tu caso DEBES configurarla para que sea estricto.
   if (!set || set.size === 0) return true;
 
   if (!set.has(code)) {
@@ -288,10 +286,7 @@ function isCancelledLike(q) {
 }
 
 /* =========================================================
-   ✅ NORMA DE REPARTO (DEFAULT)  ✅✅✅
-   - Dim 1 (Área de negocio): 04
-   - Dim 2 (Departamento): VTAS
-   - Se aplica en TODAS las líneas al crear la cotización
+   ✅ NORMA DE REPARTO (DEFAULT)
 ========================================================= */
 const DEFAULT_COSTINGCODE_DIM1 = "04";
 const DEFAULT_COSTINGCODE_DIM2 = "VTAS";
@@ -543,7 +538,6 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
 
 /* =========================================================
    ✅ (NUEVO) Item Group cache + helpers
-   - NO cambia nada existente: solo agrega datos cuando pides withGroups=1
 ========================================================= */
 const ITEM_GROUP_CODE_TO_NAME = new Map(); // groupCode -> groupName
 const ITEM_CODE_TO_GROUP_NAME = new Map(); // itemCode -> groupName
@@ -567,7 +561,6 @@ async function getGroupNameByGroupCode(groupCode) {
     return ITEM_GROUP_CODE_TO_NAME.get(code) || "";
   }
 
-  // SAP B1 SL: ItemGroups(GroupCode, GroupName)
   const r = await slFetch(
     `/ItemGroups?$select=GroupCode,GroupName&$filter=${encodeURIComponent(`GroupCode eq ${code}`)}&$top=1`
   );
@@ -588,7 +581,6 @@ async function getGroupNameByItemCode(itemCode) {
     return ITEM_CODE_TO_GROUP_NAME.get(code) || "";
   }
 
-  // SAP B1 SL: Items('CODE') -> ItemsGroupCode
   const it = await slFetch(`/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemsGroupCode`);
   const gcode = it?.ItemsGroupCode;
 
@@ -600,7 +592,7 @@ async function getGroupNameByItemCode(itemCode) {
 }
 
 /* =========================================================
-   ✅ USER LOGIN (unificado)  (NO TOCADO)
+   ✅ USER LOGIN (NO TOCADO)
 ========================================================= */
 async function handleUserLogin(req, res) {
   try {
@@ -678,7 +670,7 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN USERS (GET/POST/PATCH/DELETE) (NO TOCADO)
+   ✅ ADMIN USERS (NO TOCADO)
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
@@ -864,7 +856,6 @@ function getPriceFromPriceList(itemFull, priceListNo) {
   return Number.isFinite(price) ? price : null;
 }
 
-// Factor de CAJA (si SAP lo trae). Si no, devolvemos null.
 function getSalesUomFactor(itemFull) {
   const directFields = [
     itemFull?.SalesItemsPerUnit,
@@ -911,10 +902,6 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
     FrozenFor: itemFull.FrozenFor ?? null,
   };
 
-  // ✅ En tu pantalla debe mostrarse CAJA:
-  // - priceUnit: precio unitario si SAP lo trae así
-  // - factorCaja: multiplicador caja
-  // - price: precio CAJA (si no hay factor, queda igual al unit)
   const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
   const factorCaja = getSalesUomFactor(itemFull);
   const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
@@ -1000,7 +987,7 @@ app.get("/api/sap/allowed-items", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: ITEM (bloquea códigos NO permitidos en 200/300/500)
+   ✅ SAP: ITEM (bloquea códigos NO permitidos)
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -1011,7 +998,6 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 
     const warehouseCode = getWarehouseFromReq(req);
 
-    // ✅ BLOQUEO por bodega
     assertItemAllowedOrThrow(warehouseCode, code);
 
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
@@ -1025,9 +1011,7 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
       bodega: warehouseCode,
       priceList: SAP_PRICE_LIST,
       priceListNo,
-      // ✅ Precio CAJA
       price: Number(r.price ?? 0),
-      // ✅ si necesitas debug:
       priceUnit: r.priceUnit,
       factorCaja: r.factorCaja,
       uom: "Caja",
@@ -1041,7 +1025,7 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: ITEMS (batch) (bloquea NO permitidos)
+   ✅ SAP: ITEMS (batch)
 ========================================================= */
 app.get("/api/sap/items", verifyUser, async (req, res) => {
   try {
@@ -1056,7 +1040,6 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
 
     const warehouseCode = getWarehouseFromReq(req);
 
-    // ✅ BLOQUEO por bodega
     for (const c of codes) assertItemAllowedOrThrow(warehouseCode, c);
 
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
@@ -1075,8 +1058,8 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
             ok: true,
             name: r.item.ItemName,
             unit: "Caja",
-            price: r.price,         // CAJA
-            priceUnit: r.priceUnit, // debug
+            price: r.price,
+            priceUnit: r.priceUnit,
             factorCaja: r.factorCaja,
             stock: r.stock,
             disponible: r?.stock?.available ?? null,
@@ -1104,7 +1087,7 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ NUEVO: SAP Items Search (sugerencias para productos)
+   ✅ NUEVO: SAP Items Search
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
@@ -1119,8 +1102,6 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
     const allowedSet = getAllowedSetForWh(warehouseCode);
 
     const safe = q.replace(/'/g, "''");
-
-    // Buscamos más de top para poder filtrar por allowed y por activos
     const preTop = Math.min(100, top * 5);
 
     let raw;
@@ -1133,7 +1114,6 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
           `&$orderby=ItemName asc&$top=${preTop}`
       );
     } catch {
-      // fallback para SL viejo
       raw = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor` +
           `&$filter=${encodeURIComponent(
@@ -1145,11 +1125,10 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const values = Array.isArray(raw?.value) ? raw.value : [];
 
-    // Activo = Valid = tYES (si viene) y FrozenFor != tYES (si viene)
     function isActiveSapItem(it) {
       const v = String(it?.Valid ?? "").toLowerCase();
       const f = String(it?.FrozenFor ?? "").toLowerCase();
-      const validOk = !v || v.includes("tyes") || v === "yes" || v === "true"; // si no viene, no bloqueamos
+      const validOk = !v || v.includes("tyes") || v === "yes" || v === "true";
       const frozenOk = !f || f.includes("tno") || f === "no" || f === "false";
       return validOk && frozenOk;
     }
@@ -1176,9 +1155,6 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD)
-   ✅ FIX DUPLICADOS:
-   - orderby estable: DocDate desc, DocEntry desc
-   - dedupe por DocEntry en el scanner
 ========================================================= */
 async function scanQuotes({
   f,
@@ -1201,7 +1177,6 @@ async function scanQuotes({
 
   const maxSapPages = includeTotal ? 200 : 50;
 
-  // ✅ Dedup global para evitar repetidos entre páginas SAP
   const seenDocEntry = new Set();
 
   for (let page = 0; page < maxSapPages; page++) {
@@ -1254,8 +1229,6 @@ async function scanQuotes({
           montoCotizacion: Number(q.DocTotal || 0),
           montoEntregado: 0,
           pendiente: Number(q.DocTotal || 0),
-          // 👇 NO se agrega nada aquí para no tocar lo que ya sirve.
-          // lines se agregará SOLO si pides withGroups=1 (ver endpoint)
         });
       }
     }
@@ -1266,6 +1239,50 @@ async function scanQuotes({
   return { pageRows, totalFiltered };
 }
 
+/* =========================================================
+   ✅ FIX: detecta grupos con varios params (para tu dashboard)
+========================================================= */
+function wantsGroups(req) {
+  const q = req.query || {};
+  const v = (x) => String(x ?? "").trim().toLowerCase();
+  return (
+    v(q.withGroups) === "1" ||
+    v(q.groups) === "1" ||
+    v(q.includeGroups) === "1" ||
+    v(q.dashboard) === "1" ||
+    v(q.mode) === "dashboard"
+  );
+}
+
+/* =========================================================
+   ✅ helper: resolver grupos por lista de itemcodes con concurrencia
+========================================================= */
+async function resolveGroupsForItemCodes(itemCodes) {
+  const unique = Array.from(new Set(itemCodes.map((x) => String(x || "").trim()).filter(Boolean)));
+  if (!unique.length) return new Map();
+
+  const out = new Map();
+  const CONC = 8;
+  let idx = 0;
+
+  async function worker() {
+    while (idx < unique.length) {
+      const i = idx++;
+      const code = unique[i];
+      try {
+        const g = await getGroupNameByItemCode(code);
+        out.set(code, g || "");
+      } catch {
+        out.set(code, "");
+      }
+      await sleep(5);
+    }
+  }
+
+  await Promise.all(Array.from({ length: CONC }, worker));
+  return out;
+}
+
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
@@ -1274,7 +1291,9 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const to = String(req.query?.to || "");
 
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
-    const withGroups = String(req.query?.withGroups || "0") === "1"; // ✅ NUEVO
+
+    // ✅ FIX: ahora sí “engancha” el dashboard aunque no mande withGroups exacto
+    const withGroups = wantsGroups(req);
 
     const limitRaw =
       req.query?.limit != null
@@ -1333,9 +1352,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       await Promise.all(Array.from({ length: CONC }, () => worker()));
     }
 
-    // ✅ NUEVO: Grupos por artículo (solo si withGroups=1)
-    // - NO afecta nada si no lo pides
-    // - Agrega q.lines: [{ItemCode, LineTotal, ItmsGrpNam}]
+    // ✅ Grupos por artículo (FIX + optimizado)
     if (withGroups && pageRows.length) {
       const CONC = 4;
       let idx = 0;
@@ -1353,31 +1370,33 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
             );
 
             const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+            const codes = lines.map((ln) => String(ln?.ItemCode || "").trim()).filter(Boolean);
+
+            const mapGroups = await resolveGroupsForItemCodes(codes);
 
             const outLines = [];
             for (const ln of lines) {
               const code = String(ln?.ItemCode || "").trim();
               if (!code) continue;
 
-              const grp = await getGroupNameByItemCode(code);
+              const grp = mapGroups.get(code) || "";
 
               outLines.push({
                 ItemCode: code,
                 LineTotal: Number(ln?.LineTotal || 0),
-                ItmsGrpNam: grp, // 👈 nombre de grupo para tu frontend
+                ItmsGrpNam: grp,
               });
             }
 
             q.lines = outLines;
 
-            // (opcional, no rompe nada): si todas las líneas son mismo grupo
             const uniq = new Set(outLines.map((x) => x.ItmsGrpNam).filter(Boolean));
             if (uniq.size === 1) q.itemGroup = Array.from(uniq)[0];
           } catch {
-            // si falla SAP, no agrega q.lines y no rompe lo demás
+            // no rompe nada
           }
 
-          await sleep(20);
+          await sleep(15);
         }
       }
 
@@ -1400,7 +1419,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ CUSTOMERS search / customer (igual a tu código)
+   ✅ CUSTOMERS (igual)
 ========================================================= */
 app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
   try {
@@ -1468,8 +1487,7 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ QUOTE (BLOQUEA ItemCodes NO permitidos en 200/300/500)
-   ✅ + NORMA DE REPARTO EN TODAS LAS LÍNEAS (04;VTAS)
+   ✅ QUOTE (BLOQUEA + NORMA DE REPARTO)
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
@@ -1484,7 +1502,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     const warehouseCode = getWarehouseFromReq(req);
 
-    // ✅ Filtra líneas válidas
     const cleanLines = lines
       .map((l) => ({
         ItemCode: String(l.itemCode || "").trim(),
@@ -1495,21 +1512,16 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     if (!cleanLines.length)
       return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
 
-    // ✅ BLOQUEO por bodega (allowlist)
     for (const ln of cleanLines) {
       assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
     }
 
-    // ✅ 1) Intento normal: fuerza WarehouseCode
-    // ✅ + NORMA DE REPARTO (04;VTAS) en TODAS las líneas
     const DocumentLines = cleanLines.map((ln) => ({
       ItemCode: ln.ItemCode,
       Quantity: ln.Quantity,
       WarehouseCode: warehouseCode,
-
-      // ✅ Norma de reparto (Dim 1 / Dim 2)
-      CostingCode: DEFAULT_COSTINGCODE_DIM1,   // Área de negocio = 04
-      CostingCode2: DEFAULT_COSTINGCODE_DIM2,  // Departamento = VTAS
+      CostingCode: DEFAULT_COSTINGCODE_DIM1,
+      CostingCode2: DEFAULT_COSTINGCODE_DIM2,
     }));
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
@@ -1553,23 +1565,20 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     } catch (err1) {
       const msg1 = String(err1?.message || err1);
 
-      // ✅ Si es el clásico -2028 (Item no matchea con bodega), reintenta sin WarehouseCode
-      const isNoMatch = msg1.includes("ODBC -2028") || msg1.toLowerCase().includes("no matching records found");
+      const isNoMatch =
+        msg1.includes("ODBC -2028") ||
+        msg1.toLowerCase().includes("no matching records found");
 
       if (!isNoMatch) throw err1;
 
       const payloadFallback = {
         ...payload,
         Comments: `${baseComments} [wh_fallback:1]`,
-        // ✅ SIN WarehouseCode, PERO MANTIENE NORMA DE REPARTO (04;VTAS)
         DocumentLines: cleanLines.map((ln) => ({
           ItemCode: ln.ItemCode,
           Quantity: ln.Quantity,
-          // 👈 SIN WarehouseCode para que SAP use el default/config del item
-
-          // ✅ Norma de reparto (Dim 1 / Dim 2)
-          CostingCode: DEFAULT_COSTINGCODE_DIM1,   // Área de negocio = 04
-          CostingCode2: DEFAULT_COSTINGCODE_DIM2,  // Departamento = VTAS
+          CostingCode: DEFAULT_COSTINGCODE_DIM1,
+          CostingCode2: DEFAULT_COSTINGCODE_DIM2,
         })),
       };
 
