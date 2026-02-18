@@ -1459,9 +1459,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
           const q = pageRows[i];
 
           try {
-            const full = await slFetch(
-              `/Quotations(${Number(q.docEntry)})?$select=DocEntry&$expand=DocumentLines($select=ItemCode,LineTotal)`
-            );
+            const full = await slFetch(`/Quotations(${Number(q.docEntry)})`);
 
             const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
             const codes = lines.map((ln) => String(ln?.ItemCode || "").trim()).filter(Boolean);
@@ -1575,7 +1573,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       DocumentLines,
     };
 
-    try {
+       try {
       const created = await slFetch(`/Quotations`, {
         method: "POST",
         body: JSON.stringify(payload),
@@ -1588,7 +1586,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         docNum: created.DocNum,
         warehouse: warehouseCode,
         bodega: warehouseCode,
-        fallback: false,
+        fallback: "none",
       });
     } catch (err1) {
       const msg1 = String(err1?.message || err1);
@@ -1599,39 +1597,67 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
       if (!isNoMatch) throw err1;
 
-      const payloadFallback = {
-        ...payload,
-        Comments: `${baseComments} [wh_fallback:1]`,
-        DocumentLines: cleanLines.map((ln) => ({
-          ItemCode: ln.ItemCode,
-          Quantity: ln.Quantity,
-          CostingCode: DEFAULT_COSTINGCODE_DIM1,
-          CostingCode2: DEFAULT_COSTINGCODE_DIM2,
-        })),
-      };
+      // 1) Fallback A: sin WarehouseCode
+      try {
+        const payloadFallbackA = {
+          ...payload,
+          Comments: `${baseComments} [wh_fallback:1]`,
+          DocumentLines: cleanLines.map((ln) => ({
+            ItemCode: ln.ItemCode,
+            Quantity: ln.Quantity,
+            CostingCode: DEFAULT_COSTINGCODE_DIM1,
+            CostingCode2: DEFAULT_COSTINGCODE_DIM2,
+          })),
+        };
 
-      const created2 = await slFetch(`/Quotations`, {
-        method: "POST",
-        body: JSON.stringify(payloadFallback),
-      });
+        const createdA = await slFetch(`/Quotations`, {
+          method: "POST",
+          body: JSON.stringify(payloadFallbackA),
+        });
 
-      return res.json({
-        ok: true,
-        message: "Cotización creada (fallback sin WarehouseCode por -2028)",
-        docEntry: created2.DocEntry,
-        docNum: created2.DocNum,
-        warehouse: warehouseCode,
-        bodega: warehouseCode,
-        fallback: true,
-      });
+        return res.json({
+          ok: true,
+          message: "Cotización creada (fallback sin WarehouseCode)",
+          docEntry: createdA.DocEntry,
+          docNum: createdA.DocNum,
+          warehouse: warehouseCode,
+          bodega: warehouseCode,
+          fallback: "no_warehouse",
+        });
+      } catch (errA) {
+        const msgA = String(errA?.message || errA);
+        const isNoMatchA =
+          msgA.includes("ODBC -2028") ||
+          msgA.toLowerCase().includes("no matching records found");
+
+        if (!isNoMatchA) throw errA;
+
+        // 2) Fallback B: sin WarehouseCode y sin CostingCode(s)
+        const payloadFallbackB = {
+          ...payload,
+          Comments: `${baseComments} [wh_fallback:1] [cc_fallback:1]`,
+          DocumentLines: cleanLines.map((ln) => ({
+            ItemCode: ln.ItemCode,
+            Quantity: ln.Quantity,
+          })),
+        };
+
+        const createdB = await slFetch(`/Quotations`, {
+          method: "POST",
+          body: JSON.stringify(payloadFallbackB),
+        });
+
+        return res.json({
+          ok: true,
+          message: "Cotización creada (fallback sin WarehouseCode y sin Norma de reparto)",
+          docEntry: createdB.DocEntry,
+          docNum: createdB.DocNum,
+          warehouse: warehouseCode,
+          bodega: warehouseCode,
+          fallback: "no_warehouse_no_costing",
+        });
+      }
     }
-  } catch (err) {
-    const msg = String(err?.message || err);
-    const isAllow = msg.toLowerCase().includes("no permitido");
-    return res.status(isAllow ? 400 : 500).json({ ok: false, message: msg });
-  }
-});
-
 
 /* =========================================================
    ✅ START
