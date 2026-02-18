@@ -1113,6 +1113,73 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
+/* =========================================================
+   ✅ CUSTOMERS search / customer (igual a tu código)
+========================================================= */
+app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const q = String(req.query?.q || "").trim();
+    const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
+
+    if (q.length < 2) return res.json({ ok: true, results: [] });
+
+    const safe = q.replace(/'/g, "''");
+
+    let r;
+    try {
+      r = await slFetch(
+        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=contains(CardName,'${safe}') or contains(CardCode,'${safe}')&$orderby=CardName asc&$top=${top}`
+      );
+    } catch {
+      r = await slFetch(
+        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=substringof('${safe}',CardName) or substringof('${safe}',CardCode)&$orderby=CardName asc&$top=${top}`
+      );
+    }
+
+    const values = Array.isArray(r?.value) ? r.value : [];
+    const results = values.map((x) => ({
+      CardCode: x.CardCode,
+      CardName: x.CardName,
+      Phone1: x.Phone1 || "",
+      EmailAddress: x.EmailAddress || "",
+    }));
+
+    return res.json({ ok: true, q, results });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const code = String(req.params.code || "").trim();
+    if (!code) return res.status(400).json({ ok: false, message: "CardCode vacío." });
+
+    const bp = await slFetch(
+      `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Phone1,Phone2,EmailAddress,Address,City,Country,ZipCode`
+    );
+
+    const addrParts = [bp.Address, bp.City, bp.ZipCode, bp.Country].filter(Boolean).join(", ");
+
+    return res.json({
+      ok: true,
+      customer: {
+        CardCode: bp.CardCode,
+        CardName: bp.CardName,
+        Phone1: bp.Phone1,
+        Phone2: bp.Phone2,
+        EmailAddress: bp.EmailAddress,
+        Address: addrParts || bp.Address || "",
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
 
 /* =========================================================
    ✅ NUEVO: SAP Items Search
