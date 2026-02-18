@@ -3,6 +3,8 @@ import cors from "cors";
 import pg from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import fs from "fs";
+import path from "path";
 
 const { Pool } = pg;
 
@@ -36,6 +38,11 @@ const {
   ACTIVE_CODES_200 = "",
   ACTIVE_CODES_300 = "",
   ACTIVE_CODES_500 = "",
+
+  // ✅ NUEVO: catálogo local (desc + precio CAJA) — ruta opcional
+  // Soporta TSV o CSV. Ejemplo TSV:
+  //  ItemCode<TAB>ItemName<TAB>PriceCaja
+  LOCAL_CATALOG_PATH = "./catalog.tsv",
 } = process.env;
 
 /* =========================================================
@@ -288,6 +295,94 @@ function isCancelledLike(q) {
 }
 
 /* =========================================================
+   ✅ NUEVO: CATÁLOGO LOCAL (desc + precio CAJA)
+   - NO depende de SAP
+   - Soporta TSV o CSV simple
+========================================================= */
+const LOCAL_CATALOG = new Map(); // code -> { code, name, priceCaja }
+
+function parsePriceNumber(v) {
+  const s = String(v ?? "").trim();
+  if (!s) return null;
+  // quita $ y comas, soporta (123.45) como negativo si viniera
+  const clean = s.replace(/\$/g, "").replace(/,/g, "").trim();
+  const neg = /^\(.*\)$/.test(clean);
+  const num = Number(clean.replace(/[()]/g, ""));
+  if (!Number.isFinite(num)) return null;
+  return neg ? -num : num;
+}
+
+function loadLocalCatalog() {
+  try {
+    const p = path.resolve(process.cwd(), LOCAL_CATALOG_PATH || "./catalog.tsv");
+    if (!fs.existsSync(p)) {
+      console.log(`Local catalog not found (skip): ${p}`);
+      return;
+    }
+    const raw = fs.readFileSync(p, "utf8");
+    const lines = raw.split(/\r?\n/).filter((x) => x.trim().length);
+    if (!lines.length) return;
+
+    // detect delimiter
+    const first = lines[0];
+    const delim = first.includes("\t") ? "\t" : ",";
+
+    // si tiene header, lo toleramos
+    // esperamos: ItemCode | ItemName | PriceCaja
+    for (let i = 0; i < lines.length; i++) {
+      const row = lines[i];
+      const cols = row.split(delim).map((x) => x.trim());
+      if (!cols.length) continue;
+
+      // header detect
+      if (i === 0) {
+        const h = cols.join(" ").toLowerCase();
+        if (h.includes("itemcode") && (h.includes("itemname") || h.includes("description") || h.includes("desc"))) {
+          continue;
+        }
+      }
+
+      const code = String(cols[0] || "").trim();
+      if (!code) continue;
+
+      const name = String(cols[1] || "").trim();
+      const priceCaja = parsePriceNumber(cols[2]);
+
+      LOCAL_CATALOG.set(code, {
+        code,
+        name,
+        priceCaja,
+      });
+    }
+
+    console.log(`Local catalog loaded ✅ (${LOCAL_CATALOG.size} items) from ${p}`);
+  } catch (e) {
+    console.log(`Local catalog load error (skip): ${e.message}`);
+  }
+}
+
+function getLocalItem(code) {
+  const c = String(code || "").trim();
+  if (!c) return null;
+  return LOCAL_CATALOG.get(c) || null;
+}
+
+function searchLocalItems(q, top = 20) {
+  const s = String(q || "").trim().toLowerCase();
+  if (s.length < 2) return [];
+  const out = [];
+  for (const v of LOCAL_CATALOG.values()) {
+    const code = String(v.code || "");
+    const name = String(v.name || "");
+    if (code.toLowerCase().includes(s) || name.toLowerCase().includes(s)) {
+      out.push(v);
+      if (out.length >= top) break;
+    }
+  }
+  return out;
+}
+
+/* =========================================================
    ✅ HEALTH
 ========================================================= */
 app.get("/api/health", async (req, res) => {
@@ -301,6 +396,7 @@ app.get("/api/health", async (req, res) => {
     allowed_wh_200: (ALLOWED_BY_WH["200"] || []).length,
     allowed_wh_300: (ALLOWED_BY_WH["300"] || []).length,
     allowed_wh_500: (ALLOWED_BY_WH["500"] || []).length,
+    local_catalog: LOCAL_CATALOG.size,
   });
 });
 
@@ -747,7 +843,142 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
+   ✅ SAP: STOCK ONLY (sin precio, sin descripción)
+========================================================= */
+const STOCK_CACHE = new Map();
+const STOCK_TTL_MS = 2 * 60 * 1000;
+
+function stockCacheGet(key) {
+  const it = STOCK_CACHE.get(key);
+  if (!it) return null;
+  if (Date.now() - it.ts > STOCK_TTL_MS) {
+    STOCK_CACHE.delete(key);
+    return null;
+  }
+  return it.data;
+}
+function stockCacheSet(key, data) {
+  STOCK_CACHE.set(key, { ts: Date.now(), data });
+}
+
+async function getStockOnlyFromSap(code, warehouseCode) {
+  const key = `${code}::${warehouseCode}`;
+  const cached = stockCacheGet(key);
+  if (cached) return cached;
+
+  let itemFull;
+  try {
+    itemFull = await slFetch(
+      `/Items('${encodeURIComponent(code)}')?$select=ItemCode&$expand=ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered)`
+    );
+  } catch {
+    const whInfo = await slFetch(
+      `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,Committed,Ordered`
+    );
+    itemFull = { ItemCode: code, ItemWarehouseInfoCollection: Array.isArray(whInfo?.value) ? whInfo.value : [] };
+  }
+
+  let warehouseRow = null;
+  if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
+    warehouseRow =
+      itemFull.ItemWarehouseInfoCollection.find(
+        (w) => String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
+      ) || null;
+  }
+
+  const onHand = warehouseRow?.InStock != null ? Number(warehouseRow.InStock) : null;
+  const committed = warehouseRow?.Committed != null ? Number(warehouseRow.Committed) : null;
+  const ordered = warehouseRow?.Ordered != null ? Number(warehouseRow.Ordered) : null;
+
+  let available = null;
+  if (Number.isFinite(onHand) && Number.isFinite(committed)) available = onHand - committed;
+
+  const data = {
+    warehouse: warehouseCode,
+    onHand: Number.isFinite(onHand) ? onHand : null,
+    committed: Number.isFinite(committed) ? committed : null,
+    ordered: Number.isFinite(ordered) ? ordered : null,
+    available: Number.isFinite(available) ? available : null,
+    hasStock: available != null ? available > 0 : null,
+  };
+
+  stockCacheSet(key, data);
+  return data;
+}
+
+app.get("/api/sap/stock/:code", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const code = String(req.params.code || "").trim();
+    if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
+
+    const warehouseCode = getWarehouseFromReq(req);
+
+    // ✅ Respeta tu allowlist por bodega (si aplica)
+    assertItemAllowedOrThrow(warehouseCode, code);
+
+    const stock = await getStockOnlyFromSap(code, warehouseCode);
+
+    return res.json({
+      ok: true,
+      itemCode: code,
+      warehouse: warehouseCode,
+      bodega: warehouseCode,
+      stock,
+      disponible: stock.available ?? null,
+      enStock: stock.hasStock ?? null,
+    });
+  } catch (err) {
+    return res.status(400).json({ ok: false, message: err.message });
+  }
+});
+
+/* =========================================================
+   ✅ NUEVO: endpoints de catálogo local (desc + precio CAJA)
+========================================================= */
+app.get("/api/local/item/:code", verifyUser, async (req, res) => {
+  try {
+    const code = String(req.params.code || "").trim();
+    if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
+
+    const it = getLocalItem(code);
+    if (!it) return res.json({ ok: true, found: false, item: { ItemCode: code, ItemName: `Producto ${code}` }, price: null });
+
+    return res.json({
+      ok: true,
+      found: true,
+      item: { ItemCode: it.code, ItemName: it.name || `Producto ${it.code}` },
+      price: it.priceCaja != null ? Number(it.priceCaja) : null,
+      uom: "Caja",
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+app.get("/api/local/items/search", verifyUser, async (req, res) => {
+  try {
+    const q = String(req.query?.q || "").trim();
+    const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
+    if (q.length < 2) return res.json({ ok: true, q, results: [] });
+
+    const results = searchLocalItems(q, top).map((x) => ({
+      ItemCode: x.code,
+      ItemName: x.name || `Producto ${x.code}`,
+      price: x.priceCaja != null ? Number(x.priceCaja) : null,
+      SalesUnit: "Caja",
+    }));
+
+    return res.json({ ok: true, q, results });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
    ✅ SAP: PRICE LIST cache + ITEM cache
+   (SE DEJA TAL CUAL, pero el frontend ya no depende de precio/desc SAP)
 ========================================================= */
 let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
 const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
@@ -844,10 +1075,6 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
     FrozenFor: itemFull.FrozenFor ?? null,
   };
 
-  // ✅ En tu pantalla debe mostrarse CAJA:
-  // - priceUnit: precio unitario si SAP lo trae así
-  // - factorCaja: multiplicador caja
-  // - price: precio CAJA (si no hay factor, queda igual al unit)
   const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
   const factorCaja = getSalesUomFactor(itemFull);
   const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
@@ -933,7 +1160,9 @@ app.get("/api/sap/allowed-items", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: ITEM (bloquea códigos NO permitidos en 200/300/500)
+   ✅ SAP: ITEM
+   ✅ AJUSTE: descripción + precio vienen del CATÁLOGO LOCAL
+   ✅ stock viene de SAP
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -947,26 +1176,27 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
     // ✅ BLOQUEO por bodega
     assertItemAllowedOrThrow(warehouseCode, code);
 
-    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
+    // ✅ LOCAL: desc + precio
+    const local = getLocalItem(code);
+    const itemLocal = {
+      ItemCode: code,
+      ItemName: local?.name ? String(local.name) : `Producto ${code}`,
+    };
+    const priceCaja = local?.priceCaja != null ? Number(local.priceCaja) : null;
 
-    const r = await getOneItem(code, priceListNo, warehouseCode);
+    // ✅ SAP: stock
+    const stock = await getStockOnlyFromSap(code, warehouseCode);
 
     return res.json({
       ok: true,
-      item: r.item,
+      item: itemLocal,
       warehouse: warehouseCode,
       bodega: warehouseCode,
-      priceList: SAP_PRICE_LIST,
-      priceListNo,
-      // ✅ Precio CAJA
-      price: Number(r.price ?? 0),
-      // ✅ si necesitas debug:
-      priceUnit: r.priceUnit,
-      factorCaja: r.factorCaja,
       uom: "Caja",
-      stock: r.stock,
-      disponible: r?.stock?.available ?? null,
-      enStock: r?.stock?.hasStock ?? null,
+      price: priceCaja, // <-- SOLO local
+      stock,
+      disponible: stock.available ?? null,
+      enStock: stock.hasStock ?? null,
     });
   } catch (err) {
     return res.status(400).json({ ok: false, message: err.message });
@@ -974,7 +1204,8 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: ITEMS (batch) (bloquea NO permitidos)
+   ✅ SAP: ITEMS (batch)
+   ✅ AJUSTE: desc + precio local; stock SAP
 ========================================================= */
 app.get("/api/sap/items", verifyUser, async (req, res) => {
   try {
@@ -992,9 +1223,7 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
     // ✅ BLOQUEO por bodega
     for (const c of codes) assertItemAllowedOrThrow(warehouseCode, c);
 
-    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
-
-    const CONCURRENCY = 5;
+    const CONCURRENCY = 6;
     const items = {};
     let i = 0;
 
@@ -1003,17 +1232,16 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
         const idx = i++;
         const code = codes[idx];
         try {
-          const r = await getOneItem(code, priceListNo, warehouseCode);
+          const local = getLocalItem(code);
+          const stock = await getStockOnlyFromSap(code, warehouseCode);
           items[code] = {
             ok: true,
-            name: r.item.ItemName,
+            name: local?.name ? String(local.name) : `Producto ${code}`,
             unit: "Caja",
-            price: r.price,         // CAJA
-            priceUnit: r.priceUnit, // debug
-            factorCaja: r.factorCaja,
-            stock: r.stock,
-            disponible: r?.stock?.available ?? null,
-            enStock: r?.stock?.hasStock ?? null,
+            price: local?.priceCaja != null ? Number(local.priceCaja) : null,
+            stock,
+            disponible: stock.available ?? null,
+            enStock: stock.hasStock ?? null,
           };
         } catch (e) {
           items[code] = { ok: false, message: String(e.message || e) };
@@ -1027,8 +1255,6 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
       ok: true,
       warehouse: warehouseCode,
       bodega: warehouseCode,
-      priceList: SAP_PRICE_LIST,
-      priceListNo,
       items,
     });
   } catch (err) {
@@ -1038,9 +1264,7 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ NUEVO: SAP Items Search (sugerencias para productos)
-   GET /api/sap/items/search?q=texto&top=20
-   - Filtra activos (Valid=tYES y FrozenFor=tNO cuando exista)
-   - Filtra por allowlist si bodega 200/300/500
+   (queda igual a tu lógica, pero tú puedes usar /api/local/items/search si prefieres)
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
@@ -1056,7 +1280,6 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const safe = q.replace(/'/g, "''");
 
-    // Buscamos más de top para poder filtrar por allowed y por activos
     const preTop = Math.min(100, top * 5);
 
     let raw;
@@ -1069,7 +1292,6 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
           `&$orderby=ItemName asc&$top=${preTop}`
       );
     } catch {
-      // fallback para SL viejo
       raw = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor` +
           `&$filter=${encodeURIComponent(
@@ -1081,11 +1303,10 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const values = Array.isArray(raw?.value) ? raw.value : [];
 
-    // Activo = Valid = tYES (si viene) y FrozenFor != tYES (si viene)
     function isActiveSapItem(it) {
       const v = String(it?.Valid ?? "").toLowerCase();
       const f = String(it?.FrozenFor ?? "").toLowerCase();
-      const validOk = !v || v.includes("tyes") || v === "yes" || v === "true"; // si no viene, no bloqueamos
+      const validOk = !v || v.includes("tyes") || v === "yes" || v === "true";
       const frozenOk = !f || f.includes("tno") || f === "no" || f === "false";
       return validOk && frozenOk;
     }
@@ -1111,10 +1332,66 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
+   ✅ NUEVO: Resolver usuario SAP (para que aparezca prodim-juan.soto)
+   - Si NO existe [user:...] en Comments, usa UserSign -> Users -> UserCode
+========================================================= */
+const SAP_USER_CACHE = new Map(); // key InternalKey -> { userCode, ts }
+const SAP_USER_TTL_MS = 6 * 60 * 60 * 1000;
+
+function sapUserCacheGet(k) {
+  const it = SAP_USER_CACHE.get(k);
+  if (!it) return null;
+  if (Date.now() - it.ts > SAP_USER_TTL_MS) {
+    SAP_USER_CACHE.delete(k);
+    return null;
+  }
+  return it.userCode;
+}
+function sapUserCacheSet(k, userCode) {
+  SAP_USER_CACHE.set(k, { ts: Date.now(), userCode });
+}
+
+async function sapResolveUserCodeByUserSign(userSign) {
+  const k = Number(userSign);
+  if (!Number.isFinite(k) || k < 0) return "";
+  const cached = sapUserCacheGet(k);
+  if (cached) return cached;
+
+  // Intento 1 (común): entity Users con InternalKey
+  try {
+    const r = await slFetch(
+      `/Users?$select=InternalKey,UserCode,UserName&$filter=${encodeURIComponent(`InternalKey eq ${k}`)}&$top=1`
+    );
+    const arr = Array.isArray(r?.value) ? r.value : [];
+    const code = String(arr?.[0]?.UserCode || "").trim();
+    if (code) {
+      sapUserCacheSet(k, code);
+      return code;
+    }
+  } catch {}
+
+  // Intento 2: por si tu SL expone UsersInfo o Users (variaciones raras)
+  try {
+    const r2 = await slFetch(
+      `/UsersInfo?$select=InternalKey,UserCode&$filter=${encodeURIComponent(`InternalKey eq ${k}`)}&$top=1`
+    );
+    const arr2 = Array.isArray(r2?.value) ? r2.value : [];
+    const code2 = String(arr2?.[0]?.UserCode || "").trim();
+    if (code2) {
+      sapUserCacheSet(k, code2);
+      return code2;
+    }
+  } catch {}
+
+  return "";
+}
+
+/* =========================================================
    ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD)
-   ✅ FIX DUPLICADOS:
-   - orderby estable: DocDate desc, DocEntry desc
-   - dedupe por DocEntry en el scanner
+   ✅ AJUSTE MÍNIMO:
+   - agrega UserSign al select
+   - si no hay [user:...] toma UserSign -> UserCode
+   (no toca tu estructura del dashboard/histórico)
 ========================================================= */
 async function scanQuotes({
   f,
@@ -1142,7 +1419,7 @@ async function scanQuotes({
 
   for (let page = 0; page < maxSapPages; page++) {
     const raw = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
+      `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments,UserSign` +
         `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
         `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`
     );
@@ -1161,7 +1438,18 @@ async function scanQuotes({
 
       if (isCancelledLike(q)) continue;
 
-      const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
+      let usuario = parseUserFromComments(q.Comments || "");
+
+      // ✅ SI NO hay [user:...] => resuelve desde SAP para que salga prodim-juan.soto
+      if (!usuario) {
+        try {
+          const resolved = await sapResolveUserCodeByUserSign(q?.UserSign);
+          if (resolved) usuario = resolved;
+        } catch {}
+      }
+
+      if (!usuario) usuario = "sin_user";
+
       const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
 
       if (uFilter && !String(usuario).toLowerCase().includes(uFilter)) continue;
@@ -1475,6 +1763,9 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
   } catch (e) {
     console.error("DB init error:", e.message);
   }
+
+  // ✅ carga catálogo local una vez al inicio
+  loadLocalCatalog();
 
   app.listen(Number(PORT), () => {
     console.log(`Server listening on :${PORT}`);
