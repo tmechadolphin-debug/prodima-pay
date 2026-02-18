@@ -1283,13 +1283,6 @@ async function resolveGroupsForItemCodes(itemCodes) {
   return out;
 }
 
-/* =========================================================
-   ✅ FIXES en /api/admin/quotes
-   - Soporta skip/top (tu front usa paginación así)
-   - withGroups = wantsGroups(req) (como ya lo tienes)
-   - NO traga errores de grupos: devuelve q.groupError para ver qué pasó
-========================================================= */
-
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
@@ -1298,9 +1291,10 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const to = String(req.query?.to || "");
 
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
+
+    // ✅ FIX: ahora sí “engancha” el dashboard aunque no mande withGroups exacto
     const withGroups = wantsGroups(req);
 
-    // ✅ limit: respeta limit, si no, usa top, si no, default 20
     const limitRaw =
       req.query?.limit != null
         ? Number(req.query.limit)
@@ -1308,19 +1302,11 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         ? Number(req.query.top)
         : 20;
 
-    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 20));
+    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
 
-    // ✅ FIX: skip/top real (si viene skip manda paginado correcto)
-    // prioridad: skip explícito -> page -> 0
     const pageRaw = req.query?.page != null ? Number(req.query.page) : 1;
-    const page = Math.max(1, Number.isFinite(pageRaw) ? Math.trunc(pageRaw) : 1);
-
-    const skipRaw =
-      req.query?.skip != null
-        ? Number(req.query.skip)
-        : (page - 1) * limit;
-
-    const skip = Math.max(0, Number.isFinite(skipRaw) ? Math.trunc(skipRaw) : 0);
+    const page = Math.max(1, Number.isFinite(pageRaw) ? pageRaw : 1);
+    const skip = (page - 1) * limit;
 
     const includeTotal = String(req.query?.includeTotal || "0") === "1";
 
@@ -1333,7 +1319,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
     const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
 
-    // ✅ scanQuotes usa wantSkip / wantLimit
     const { pageRows, totalFiltered } = await scanQuotes({
       f,
       t,
@@ -1344,7 +1329,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       includeTotal,
     });
 
-    // ✅ Entregado
+    // ✅ Entregado (NO TOCADO)
     if (withDelivered && pageRows.length) {
       const CONC = 2;
       let idx = 0;
@@ -1367,7 +1352,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       await Promise.all(Array.from({ length: CONC }, () => worker()));
     }
 
-    // ✅ Grupos por artículo
+    // ✅ Grupos por artículo (FIX + optimizado)
     if (withGroups && pageRows.length) {
       const CONC = 4;
       let idx = 0;
@@ -1385,9 +1370,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
             );
 
             const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
-            const codes = lines
-              .map((ln) => String(ln?.ItemCode || "").trim())
-              .filter(Boolean);
+            const codes = lines.map((ln) => String(ln?.ItemCode || "").trim()).filter(Boolean);
 
             const mapGroups = await resolveGroupsForItemCodes(codes);
 
@@ -1407,13 +1390,10 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
             q.lines = outLines;
 
-            // si solo hay 1 grupo en toda la cotización, lo ponemos en encabezado
             const uniq = new Set(outLines.map((x) => x.ItmsGrpNam).filter(Boolean));
             if (uniq.size === 1) q.itemGroup = Array.from(uniq)[0];
-          } catch (e) {
-            // ✅ FIX: NO tragar el error
-            q.groupError = String(e?.message || e);
-            console.error("withGroups error:", { docEntry: q.docEntry, docNum: q.docNum, err: q.groupError });
+          } catch {
+            // no rompe nada
           }
 
           await sleep(15);
@@ -1423,18 +1403,13 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       await Promise.all(Array.from({ length: CONC }, () => workerGroups()));
     }
 
-    // ✅ page y pageCount (si usas includeTotal), pero paginación real por skip/top también funciona
     return safeJson(res, 200, {
       ok: true,
       quotes: pageRows,
       from: f,
       to: t,
-
-      // info de paginado
-      page,         // si llamas por page
+      page,
       limit,
-      skip,         // si llamas por skip/top
-
       total: includeTotal ? totalFiltered : null,
       pageCount: includeTotal ? Math.max(1, Math.ceil(totalFiltered / limit)) : null,
     });
