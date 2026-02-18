@@ -36,6 +36,10 @@ const {
   ACTIVE_CODES_200 = "",
   ACTIVE_CODES_300 = "",
   ACTIVE_CODES_500 = "",
+
+  // ✅ NUEVO (SOLO PARA ESTE CAMBIO): usuarios que pueden escoger bodega desde el frontend
+  // Ej: "soto, admin1, supervisor"
+  ADMIN_WAREHOUSE_USERS = "soto",
 } = process.env;
 
 /* =========================================================
@@ -131,7 +135,41 @@ function provinceToWarehouse(province) {
   return SAP_WAREHOUSE || "300";
 }
 
+/* =========================================================
+   ✅ NUEVO: usuarios que pueden escoger bodega desde UI
+========================================================= */
+function parseAdminUsersEnv(str) {
+  return String(str || "")
+    .split(",")
+    .map((x) => x.trim().toLowerCase())
+    .filter(Boolean);
+}
+const ADMIN_WH_USERS = new Set(parseAdminUsersEnv(ADMIN_WAREHOUSE_USERS));
+
+function canOverrideWarehouse(req) {
+  const uname = String(req.user?.username || "").trim().toLowerCase();
+  return uname && ADMIN_WH_USERS.has(uname);
+}
+
+function normalizeWh(x) {
+  const wh = String(x || "").trim();
+  // permite 200/300/500/01 (si quieres permitir más, agrega aquí)
+  if (!wh) return "";
+  if (!/^(200|300|500|01)$/i.test(wh)) return "";
+  return wh;
+}
+
 function getWarehouseFromReq(req) {
+  // ✅ override SOLO para usuarios admin definidos
+  if (canOverrideWarehouse(req)) {
+    const whQuery = normalizeWh(req.query?.warehouse || req.query?.wh || "");
+    if (whQuery) return whQuery;
+
+    const whHeader = normalizeWh(req.headers["x-warehouse"] || "");
+    if (whHeader) return whHeader;
+  }
+
+  // comportamiento original (prioridad del token)
   const whToken = String(req.user?.warehouse_code || "").trim();
   if (whToken) return whToken;
 
@@ -305,6 +343,8 @@ app.get("/api/health", async (req, res) => {
     allowed_wh_200: (ALLOWED_BY_WH["200"] || []).length,
     allowed_wh_300: (ALLOWED_BY_WH["300"] || []).length,
     allowed_wh_500: (ALLOWED_BY_WH["500"] || []).length,
+    // ✅ debug útil
+    admin_wh_users: Array.from(ADMIN_WH_USERS),
   });
 });
 
@@ -539,10 +579,10 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
 /* =========================================================
    ✅ (NUEVO) Item Group cache + helpers
 ========================================================= */
-const ITEM_GROUP_CODE_TO_NAME = new Map(); // groupCode -> groupName
-const ITEM_CODE_TO_GROUP_NAME = new Map(); // itemCode -> groupName
+const ITEM_GROUP_CODE_TO_NAME = new Map();
+const ITEM_CODE_TO_GROUP_NAME = new Map();
 const GROUP_TTL_MS = 24 * 60 * 60 * 1000;
-const GROUP_CACHE_AT = new Map(); // key -> ts
+const GROUP_CACHE_AT = new Map();
 
 function cacheFresh(key, ttl) {
   const ts = GROUP_CACHE_AT.get(key);
@@ -592,7 +632,7 @@ async function getGroupNameByItemCode(itemCode) {
 }
 
 /* =========================================================
-   ✅ USER LOGIN (NO TOCADO)
+   ✅ USER LOGIN (unificado)
 ========================================================= */
 async function handleUserLogin(req, res) {
   try {
@@ -656,7 +696,7 @@ app.get("/api/auth/me", verifyUser, async (req, res) =>
 );
 
 /* =========================================================
-   ✅ ADMIN LOGIN (NO TOCADO)
+   ✅ ADMIN LOGIN
 ========================================================= */
 app.post("/api/admin/login", async (req, res) => {
   const user = String(req.body?.user || "").trim();
@@ -670,7 +710,7 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN USERS (NO TOCADO)
+   ✅ ADMIN USERS (GET/POST/PATCH/DELETE)
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
@@ -977,7 +1017,7 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 }
 
 /* =========================================================
-   ✅ NUEVO: endpoint para que el frontend sepa la lista (opcional)
+   ✅ endpoint para allowed-items
 ========================================================= */
 app.get("/api/sap/allowed-items", verifyUser, async (req, res) => {
   const wh = getWarehouseFromReq(req);
@@ -987,7 +1027,7 @@ app.get("/api/sap/allowed-items", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: ITEM (bloquea códigos NO permitidos)
+   ✅ SAP: ITEM
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -1001,7 +1041,6 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
     assertItemAllowedOrThrow(warehouseCode, code);
 
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
-
     const r = await getOneItem(code, priceListNo, warehouseCode);
 
     return res.json({
@@ -1025,7 +1064,7 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: ITEMS (batch)
+   ✅ SAP: ITEMS batch
 ========================================================= */
 app.get("/api/sap/items", verifyUser, async (req, res) => {
   try {
@@ -1087,7 +1126,7 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ NUEVO: SAP Items Search
+   ✅ SAP Items Search
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
@@ -1176,7 +1215,6 @@ async function scanQuotes({
   const cFilter = String(clientFilter || "").trim().toLowerCase();
 
   const maxSapPages = includeTotal ? 200 : 50;
-
   const seenDocEntry = new Set();
 
   for (let page = 0; page < maxSapPages; page++) {
@@ -1239,50 +1277,6 @@ async function scanQuotes({
   return { pageRows, totalFiltered };
 }
 
-/* =========================================================
-   ✅ FIX: detecta grupos con varios params (para tu dashboard)
-========================================================= */
-function wantsGroups(req) {
-  const q = req.query || {};
-  const v = (x) => String(x ?? "").trim().toLowerCase();
-  return (
-    v(q.withGroups) === "1" ||
-    v(q.groups) === "1" ||
-    v(q.includeGroups) === "1" ||
-    v(q.dashboard) === "1" ||
-    v(q.mode) === "dashboard"
-  );
-}
-
-/* =========================================================
-   ✅ helper: resolver grupos por lista de itemcodes con concurrencia
-========================================================= */
-async function resolveGroupsForItemCodes(itemCodes) {
-  const unique = Array.from(new Set(itemCodes.map((x) => String(x || "").trim()).filter(Boolean)));
-  if (!unique.length) return new Map();
-
-  const out = new Map();
-  const CONC = 8;
-  let idx = 0;
-
-  async function worker() {
-    while (idx < unique.length) {
-      const i = idx++;
-      const code = unique[i];
-      try {
-        const g = await getGroupNameByItemCode(code);
-        out.set(code, g || "");
-      } catch {
-        out.set(code, "");
-      }
-      await sleep(5);
-    }
-  }
-
-  await Promise.all(Array.from({ length: CONC }, worker));
-  return out;
-}
-
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
@@ -1291,9 +1285,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const to = String(req.query?.to || "");
 
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
-
-    // ✅ FIX: ahora sí “engancha” el dashboard aunque no mande withGroups exacto
-    const withGroups = wantsGroups(req);
+    const withGroups = String(req.query?.withGroups || "0") === "1";
 
     const limitRaw =
       req.query?.limit != null
@@ -1329,7 +1321,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       includeTotal,
     });
 
-    // ✅ Entregado (NO TOCADO)
     if (withDelivered && pageRows.length) {
       const CONC = 2;
       let idx = 0;
@@ -1352,7 +1343,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       await Promise.all(Array.from({ length: CONC }, () => worker()));
     }
 
-    // ✅ Grupos por artículo (FIX + optimizado)
     if (withGroups && pageRows.length) {
       const CONC = 4;
       let idx = 0;
@@ -1370,16 +1360,13 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
             );
 
             const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
-            const codes = lines.map((ln) => String(ln?.ItemCode || "").trim()).filter(Boolean);
-
-            const mapGroups = await resolveGroupsForItemCodes(codes);
 
             const outLines = [];
             for (const ln of lines) {
               const code = String(ln?.ItemCode || "").trim();
               if (!code) continue;
 
-              const grp = mapGroups.get(code) || "";
+              const grp = await getGroupNameByItemCode(code);
 
               outLines.push({
                 ItemCode: code,
@@ -1392,11 +1379,9 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
             const uniq = new Set(outLines.map((x) => x.ItmsGrpNam).filter(Boolean));
             if (uniq.size === 1) q.itemGroup = Array.from(uniq)[0];
-          } catch {
-            // no rompe nada
-          }
+          } catch {}
 
-          await sleep(15);
+          await sleep(20);
         }
       }
 
@@ -1419,7 +1404,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ CUSTOMERS (igual)
+   ✅ CUSTOMERS search / customer
 ========================================================= */
 app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
   try {
@@ -1487,7 +1472,7 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ QUOTE (BLOQUEA + NORMA DE REPARTO)
+   ✅ QUOTE
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
@@ -1512,6 +1497,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     if (!cleanLines.length)
       return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
 
+    // ✅ BLOQUEO por bodega (allowlist)
     for (const ln of cleanLines) {
       assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
     }
@@ -1520,6 +1506,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       ItemCode: ln.ItemCode,
       Quantity: ln.Quantity,
       WarehouseCode: warehouseCode,
+
       CostingCode: DEFAULT_COSTINGCODE_DIM1,
       CostingCode2: DEFAULT_COSTINGCODE_DIM2,
     }));
@@ -1564,10 +1551,13 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       });
     } catch (err1) {
       const msg1 = String(err1?.message || err1);
+      const m = msg1.toLowerCase();
 
       const isNoMatch =
-        msg1.includes("ODBC -2028") ||
-        msg1.toLowerCase().includes("no matching records found");
+        m.includes("-2028") ||
+        m.includes("odbc") ||
+        m.includes("no matching records found") ||
+        m.includes("matching records");
 
       if (!isNoMatch) throw err1;
 
@@ -1577,6 +1567,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         DocumentLines: cleanLines.map((ln) => ({
           ItemCode: ln.ItemCode,
           Quantity: ln.Quantity,
+
           CostingCode: DEFAULT_COSTINGCODE_DIM1,
           CostingCode2: DEFAULT_COSTINGCODE_DIM2,
         })),
