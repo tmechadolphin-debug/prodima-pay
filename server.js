@@ -137,7 +137,7 @@ function provinceToWarehouse(province) {
 ========================================================= */
 const WAREHOUSE_ADMIN_USERS = new Set(
   [
-    "soto", // ✅ ejemplo solicitado
+    "soto","test","liliana","respinosa","daniel11",// ✅ ejemplo solicitado
     // "otroadmin",
   ].map((x) => String(x).trim().toLowerCase())
 );
@@ -1250,11 +1250,93 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD)
+   ✅ FIX DUPLICADOS:
+   - orderby estable: DocDate desc, DocEntry desc
+   - dedupe por DocEntry en el scanner
 ========================================================= */
-/* ... (EL RESTO DE TU ADMIN QUOTES / CUSTOMERS / QUOTE / START QUEDA IGUAL)
-   No lo pego otra vez aquí porque tú lo pegaste completo y no pediste cambios en esa sección.
-   ✅ OJO: En tu código real, deja TODO lo demás exactamente como lo tienes.
-*/
+async function scanQuotes({
+  f,
+  t,
+  wantSkip,
+  wantLimit,
+  userFilter,
+  clientFilter,
+  includeTotal,
+}) {
+  const toPlus1 = addDaysISO(t, 1);
+  const batchTop = 200;
+
+  let skipSap = 0;
+  let totalFiltered = 0;
+  const pageRows = [];
+
+  const uFilter = String(userFilter || "").trim().toLowerCase();
+  const cFilter = String(clientFilter || "").trim().toLowerCase();
+
+  const maxSapPages = includeTotal ? 200 : 50;
+
+  // ✅ Dedup global para evitar repetidos entre páginas SAP
+  const seenDocEntry = new Set();
+
+  for (let page = 0; page < maxSapPages; page++) {
+    const raw = await slFetch(
+      `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
+        `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
+        `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`
+    );
+
+    const rows = Array.isArray(raw?.value) ? raw.value : [];
+    if (!rows.length) break;
+
+    skipSap += rows.length;
+
+    for (const q of rows) {
+      const de = Number(q?.DocEntry);
+      if (Number.isFinite(de)) {
+        if (seenDocEntry.has(de)) continue;
+        seenDocEntry.add(de);
+      }
+
+      if (isCancelledLike(q)) continue;
+
+      const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
+      const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
+
+      if (uFilter && !String(usuario).toLowerCase().includes(uFilter)) continue;
+
+      if (cFilter) {
+        const cc = String(q.CardCode || "").toLowerCase();
+        const cn = String(q.CardName || "").toLowerCase();
+        if (!cc.includes(cFilter) && !cn.includes(cFilter)) continue;
+      }
+
+      const idx = totalFiltered;
+      totalFiltered++;
+
+      if (idx >= wantSkip && pageRows.length < wantLimit) {
+        pageRows.push({
+          docEntry: q.DocEntry,
+          docNum: q.DocNum,
+          cardCode: q.CardCode,
+          cardName: q.CardName,
+          fecha: String(q.DocDate || "").slice(0, 10),
+          estado: q.DocumentStatus || "",
+          cancelStatus: q.CancelStatus ?? "",
+          comments: q.Comments || "",
+          usuario,
+          warehouse: wh,
+          montoCotizacion: Number(q.DocTotal || 0),
+          montoEntregado: 0,
+          pendiente: Number(q.DocTotal || 0),
+        });
+      }
+    }
+
+    if (!includeTotal && pageRows.length >= wantLimit) break;
+  }
+
+  return { pageRows, totalFiltered };
+}
 
 /* =========================================================
    ✅ QUOTE (BLOQUEA + NORMA DE REPARTO)
