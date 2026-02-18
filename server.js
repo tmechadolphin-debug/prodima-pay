@@ -1250,10 +1250,269 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD)
-   ✅ FIX DUPLICADOS:
-   - orderby estable: DocDate desc, DocEntry desc
-   - dedupe por DocEntry en el scanner
 ========================================================= */
+async function scanQuotes({
+  f,
+  t,
+  wantSkip,
+  wantLimit,
+  userFilter,
+  clientFilter,
+  includeTotal,
+}) {
+  const toPlus1 = addDaysISO(t, 1);
+  const batchTop = 200;
+
+  let skipSap = 0;
+  let totalFiltered = 0;
+  const pageRows = [];
+
+  const uFilter = String(userFilter || "").trim().toLowerCase();
+  const cFilter = String(clientFilter || "").trim().toLowerCase();
+
+  const maxSapPages = includeTotal ? 200 : 50;
+  const seenDocEntry = new Set();
+
+  for (let page = 0; page < maxSapPages; page++) {
+    const raw = await slFetch(
+      `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
+        `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
+        `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`
+    );
+
+    const rows = Array.isArray(raw?.value) ? raw.value : [];
+    if (!rows.length) break;
+
+    skipSap += rows.length;
+
+    for (const q of rows) {
+      const de = Number(q?.DocEntry);
+      if (Number.isFinite(de)) {
+        if (seenDocEntry.has(de)) continue;
+        seenDocEntry.add(de);
+      }
+
+      if (isCancelledLike(q)) continue;
+
+      const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
+      const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
+
+      if (uFilter && !String(usuario).toLowerCase().includes(uFilter)) continue;
+
+      if (cFilter) {
+        const cc = String(q.CardCode || "").toLowerCase();
+        const cn = String(q.CardName || "").toLowerCase();
+        if (!cc.includes(cFilter) && !cn.includes(cFilter)) continue;
+      }
+
+      const idx = totalFiltered;
+      totalFiltered++;
+
+      if (idx >= wantSkip && pageRows.length < wantLimit) {
+        pageRows.push({
+          docEntry: q.DocEntry,
+          docNum: q.DocNum,
+          cardCode: q.CardCode,
+          cardName: q.CardName,
+          fecha: String(q.DocDate || "").slice(0, 10),
+          estado: q.DocumentStatus || "",
+          cancelStatus: q.CancelStatus ?? "",
+          comments: q.Comments || "",
+          usuario,
+          warehouse: wh,
+          montoCotizacion: Number(q.DocTotal || 0),
+          montoEntregado: 0,
+          pendiente: Number(q.DocTotal || 0),
+        });
+      }
+    }
+
+    if (!includeTotal && pageRows.length >= wantLimit) break;
+  }
+
+  return { pageRows, totalFiltered };
+}
+
+/* =========================================================
+   ✅ FIX: detecta grupos con varios params (para tu dashboard)
+========================================================= */
+function wantsGroups(req) {
+  const q = req.query || {};
+  const v = (x) => String(x ?? "").trim().toLowerCase();
+  return (
+    v(q.withGroups) === "1" ||
+    v(q.groups) === "1" ||
+    v(q.includeGroups) === "1" ||
+    v(q.dashboard) === "1" ||
+    v(q.mode) === "dashboard"
+  );
+}
+
+/* =========================================================
+   ✅ helper: resolver grupos por lista de itemcodes con concurrencia
+========================================================= */
+async function resolveGroupsForItemCodes(itemCodes) {
+  const unique = Array.from(new Set(itemCodes.map((x) => String(x || "").trim()).filter(Boolean)));
+  if (!unique.length) return new Map();
+
+  const out = new Map();
+  const CONC = 8;
+  let idx = 0;
+
+  async function worker() {
+    while (idx < unique.length) {
+      const i = idx++;
+      const code = unique[i];
+      try {
+        const g = await getGroupNameByItemCode(code);
+        out.set(code, g || "");
+      } catch {
+        out.set(code, "");
+      }
+      await sleep(5);
+    }
+  }
+
+  await Promise.all(Array.from({ length: CONC }, worker));
+  return out;
+}
+
+app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    const from = String(req.query?.from || "");
+    const to = String(req.query?.to || "");
+
+    const withDelivered = String(req.query?.withDelivered || "0") === "1";
+    const withGroups = wantsGroups(req);
+
+    const limitRaw =
+      req.query?.limit != null
+        ? Number(req.query.limit)
+        : req.query?.top != null
+        ? Number(req.query.top)
+        : 20;
+
+    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 20));
+
+    const pageRaw = req.query?.page != null ? Number(req.query.page) : 1;
+    const page = Math.max(1, Number.isFinite(pageRaw) ? Math.trunc(pageRaw) : 1);
+
+    const skipRaw =
+      req.query?.skip != null
+        ? Number(req.query.skip)
+        : (page - 1) * limit;
+
+    const skip = Math.max(0, Number.isFinite(skipRaw) ? Math.trunc(skipRaw) : 0);
+
+    const includeTotal = String(req.query?.includeTotal || "0") === "1";
+
+    const userFilter = String(req.query?.user || "");
+    const clientFilter = String(req.query?.client || "");
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const defaultFrom = addDaysISO(today, -30);
+
+    const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
+    const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
+
+    const { pageRows, totalFiltered } = await scanQuotes({
+      f,
+      t,
+      wantSkip: skip,
+      wantLimit: limit,
+      userFilter,
+      clientFilter,
+      includeTotal,
+    });
+
+    if (withDelivered && pageRows.length) {
+      const CONC = 2;
+      let idx = 0;
+
+      async function worker() {
+        while (idx < pageRows.length) {
+          const i = idx++;
+          const q = pageRows[i];
+          try {
+            const tr = await traceQuote(q.docNum, f, t);
+            if (tr.ok) {
+              q.montoEntregado = Number(tr.totals?.totalEntregado || 0);
+              q.pendiente = Number(tr.totals?.pendiente || 0);
+            }
+          } catch {}
+          await sleep(25);
+        }
+      }
+
+      await Promise.all(Array.from({ length: CONC }, () => worker()));
+    }
+
+    if (withGroups && pageRows.length) {
+      const CONC = 4;
+      let idx = 0;
+
+      async function workerGroups() {
+        while (idx < pageRows.length) {
+          const i = idx++;
+          const q = pageRows[i];
+
+          try {
+            const full = await slFetch(
+              `/Quotations(${Number(q.docEntry)})?$select=DocEntry&$expand=DocumentLines($select=ItemCode,LineTotal)`
+            );
+
+            const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+            const codes = lines.map((ln) => String(ln?.ItemCode || "").trim()).filter(Boolean);
+
+            const mapGroups = await resolveGroupsForItemCodes(codes);
+
+            const outLines = [];
+            for (const ln of lines) {
+              const code = String(ln?.ItemCode || "").trim();
+              if (!code) continue;
+
+              const grp = mapGroups.get(code) || "";
+
+              outLines.push({
+                ItemCode: code,
+                LineTotal: Number(ln?.LineTotal || 0),
+                ItmsGrpNam: grp,
+              });
+            }
+
+            q.lines = outLines;
+
+            const uniq = new Set(outLines.map((x) => x.ItmsGrpNam).filter(Boolean));
+            if (uniq.size === 1) q.itemGroup = Array.from(uniq)[0];
+          } catch (e) {
+            q.groupError = String(e?.message || e);
+            console.error("withGroups error:", { docEntry: q.docEntry, docNum: q.docNum, err: q.groupError });
+          }
+
+          await sleep(15);
+        }
+      }
+
+      await Promise.all(Array.from({ length: CONC }, () => workerGroups()));
+    }
+
+    return safeJson(res, 200, {
+      ok: true,
+      quotes: pageRows,
+      from: f,
+      to: t,
+      page,
+      limit,
+      skip,
+      total: includeTotal ? totalFiltered : null,
+      pageCount: includeTotal ? Math.max(1, Math.ceil(totalFiltered / limit)) : null,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
 
 /* =========================================================
    ✅ QUOTE (BLOQUEA + NORMA DE REPARTO)
