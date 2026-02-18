@@ -116,13 +116,7 @@ function addDaysISO(iso, days) {
 function provinceToWarehouse(province) {
   const p = String(province || "").trim().toLowerCase();
   if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
-  if (
-    p === "veraguas" ||
-    p === "coclé" ||
-    p === "cocle" ||
-    p === "los santos" ||
-    p === "herrera"
-  )
+  if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera")
     return "500";
   if (
     p === "panamá" ||
@@ -139,11 +133,13 @@ function provinceToWarehouse(province) {
 
 /* =========================================================
    ✅ (NUEVO) Usuarios que pueden escoger bodega
+   - agrega aquí los usernames que son administradores de bodega
 ========================================================= */
 const WAREHOUSE_ADMIN_USERS = new Set(
-  ["soto", "test", "liliana", "respinosa", "daniel11"].map((x) =>
-    String(x).trim().toLowerCase()
-  )
+  [
+    "soto","test","liliana","respinosa","daniel11",// ✅ ejemplo solicitado
+    // "otroadmin",
+  ].map((x) => String(x).trim().toLowerCase())
 );
 
 function canChooseAnyWarehouse(req) {
@@ -154,6 +150,7 @@ function canChooseAnyWarehouse(req) {
 function normalizeWhCode(wh) {
   const s = String(wh || "").trim();
   if (!s) return "";
+  // permite 01, 200, 300, 500, etc (1-6 dígitos)
   if (!/^\d{1,6}$/.test(s)) return "";
   return s;
 }
@@ -168,7 +165,7 @@ function getWarehouseFromReq(req) {
     if (whHeader) return whHeader;
   }
 
-  // ✅ Usuario normal: NO acepta override por query/header
+  // ✅ Usuario normal: NO acepta override por query/header (evita bypass)
   const whToken = normalizeWhCode(req.user?.warehouse_code || "");
   if (whToken) return whToken;
 
@@ -179,7 +176,7 @@ function getWarehouseFromReq(req) {
 }
 
 /* =========================================================
-   ✅ Allowed items by warehouse (200/300/500)
+   ✅ NUEVO: Allowed items by warehouse (200/300/500)
 ========================================================= */
 function parseCodesEnv(str) {
   return String(str || "")
@@ -196,15 +193,9 @@ const STATIC_ALLOWED = {
 };
 
 const ALLOWED_BY_WH = {
-  "200": parseCodesEnv(ACTIVE_CODES_200).length
-    ? parseCodesEnv(ACTIVE_CODES_200)
-    : STATIC_ALLOWED["200"],
-  "300": parseCodesEnv(ACTIVE_CODES_300).length
-    ? parseCodesEnv(ACTIVE_CODES_300)
-    : STATIC_ALLOWED["300"],
-  "500": parseCodesEnv(ACTIVE_CODES_500).length
-    ? parseCodesEnv(ACTIVE_CODES_500)
-    : STATIC_ALLOWED["500"],
+  "200": parseCodesEnv(ACTIVE_CODES_200).length ? parseCodesEnv(ACTIVE_CODES_200) : STATIC_ALLOWED["200"],
+  "300": parseCodesEnv(ACTIVE_CODES_300).length ? parseCodesEnv(ACTIVE_CODES_300) : STATIC_ALLOWED["300"],
+  "500": parseCodesEnv(ACTIVE_CODES_500).length ? parseCodesEnv(ACTIVE_CODES_500) : STATIC_ALLOWED["500"],
 };
 
 function isRestrictedWarehouse(wh) {
@@ -518,7 +509,9 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
   for (const o of orderCandidates) {
     const od = await sapGetByDocEntry("Orders", o.DocEntry);
     const lines = Array.isArray(od?.DocumentLines) ? od.DocumentLines : [];
-    const linked = lines.some((l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry);
+    const linked = lines.some(
+      (l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry
+    );
     if (linked) orders.push(od);
     await sleep(30);
   }
@@ -540,7 +533,9 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
     for (const d of delCandidates) {
       const dd = await sapGetByDocEntry("DeliveryNotes", d.DocEntry);
       const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
-      const linked = lines.some((l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry)));
+      const linked = lines.some(
+        (l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry))
+      );
       if (linked) {
         const de = Number(dd.DocEntry);
         if (!seen.has(de)) {
@@ -570,12 +565,12 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
 }
 
 /* =========================================================
-   ✅ Item Group cache + helpers
+   ✅ (NUEVO) Item Group cache + helpers
 ========================================================= */
-const ITEM_GROUP_CODE_TO_NAME = new Map();
-const ITEM_CODE_TO_GROUP_NAME = new Map();
+const ITEM_GROUP_CODE_TO_NAME = new Map(); // groupCode -> groupName
+const ITEM_CODE_TO_GROUP_NAME = new Map(); // itemCode -> groupName
 const GROUP_TTL_MS = 24 * 60 * 60 * 1000;
-const GROUP_CACHE_AT = new Map();
+const GROUP_CACHE_AT = new Map(); // key -> ts
 
 function cacheFresh(key, ttl) {
   const ts = GROUP_CACHE_AT.get(key);
@@ -625,7 +620,7 @@ async function getGroupNameByItemCode(itemCode) {
 }
 
 /* =========================================================
-   ✅ USER LOGIN
+   ✅ USER LOGIN (NO TOCADO)
 ========================================================= */
 async function handleUserLogin(req, res) {
   try {
@@ -634,7 +629,8 @@ async function handleUserLogin(req, res) {
     const username = String(req.body?.username || req.body?.user || "").trim().toLowerCase();
     const pin = String(req.body?.pin || req.body?.pass || "").trim();
 
-    if (!username || !pin) return safeJson(res, 400, { ok: false, message: "username y pin requeridos" });
+    if (!username || !pin)
+      return safeJson(res, 400, { ok: false, message: "username y pin requeridos" });
 
     const r = await dbQuery(
       `SELECT id, username, full_name, pin_hash, province, warehouse_code, is_active
@@ -680,11 +676,15 @@ async function handleUserLogin(req, res) {
 app.post("/api/login", handleUserLogin);
 app.post("/api/auth/login", handleUserLogin);
 
-app.get("/api/me", verifyUser, async (req, res) => safeJson(res, 200, { ok: true, user: req.user }));
-app.get("/api/auth/me", verifyUser, async (req, res) => safeJson(res, 200, { ok: true, user: req.user }));
+app.get("/api/me", verifyUser, async (req, res) =>
+  safeJson(res, 200, { ok: true, user: req.user })
+);
+app.get("/api/auth/me", verifyUser, async (req, res) =>
+  safeJson(res, 200, { ok: true, user: req.user })
+);
 
 /* =========================================================
-   ✅ ADMIN LOGIN
+   ✅ ADMIN LOGIN (NO TOCADO)
 ========================================================= */
 app.post("/api/admin/login", async (req, res) => {
   const user = String(req.body?.user || "").trim();
@@ -698,7 +698,7 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN USERS
+   ✅ ADMIN USERS (NO TOCADO)
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
@@ -736,7 +736,10 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
     const warehouse_code_in = String(req.body?.warehouse_code || req.body?.warehouse || "").trim();
 
     if (!username || username === "__INVALID__") {
-      return safeJson(res, 400, { ok: false, message: "Username inválido. Usa letras/números y . _ - (mín 2)." });
+      return safeJson(res, 400, {
+        ok: false,
+        message: "Username inválido. Usa letras/números y . _ - (mín 2).",
+      });
     }
     if (!pin || pin.length < 4) {
       return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
@@ -769,7 +772,9 @@ app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
     if (!id) return safeJson(res, 400, { ok: false, message: "ID inválido" });
 
     const pin = String(req.body?.pin || "").trim();
-    if (!pin || pin.length < 4) return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
+    if (!pin || pin.length < 4) {
+      return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
+    }
 
     const pin_hash = await bcrypt.hash(pin, 10);
 
@@ -815,7 +820,11 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
     const id = toIntId(req.params.id);
     if (!id) return safeJson(res, 400, { ok: false, message: "ID inválido" });
 
-    const r = await dbQuery(`DELETE FROM app_users WHERE id=$1 RETURNING id`, [id]);
+    const r = await dbQuery(
+      `DELETE FROM app_users WHERE id=$1
+       RETURNING id`,
+      [id]
+    );
 
     if (!r.rows?.length) return safeJson(res, 404, { ok: false, message: "Usuario no existe" });
     return safeJson(res, 200, { ok: true });
@@ -964,28 +973,31 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 
   let itemFull;
 
-  // ✅ 1) Primero sin expand (rápido)
   try {
     itemFull = await slFetch(
       `/Items('${encodeURIComponent(code)}')` +
-        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Valid,FrozenFor,ItemPrices,ItemWarehouseInfoCollection,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage,SalesPackagingUnit`
+        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Valid,FrozenFor,ItemPrices,ItemWarehouseInfoCollection` +
+        `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
     );
   } catch {
-    itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
+    try {
+      itemFull = await slFetch(
+        `/Items('${encodeURIComponent(code)}')` +
+          `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Valid,FrozenFor,ItemPrices,ItemWarehouseInfoCollection`
+      );
+    } catch {
+      itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
+    }
   }
 
-  // ✅ 2) Solo si NO hay factor, ahí sí expand (lento) como fallback
-  if (getSalesUomFactor(itemFull) == null) {
+  if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
     try {
-      const itemFull2 = await slFetch(
-        `/Items('${encodeURIComponent(code)}')` +
-          `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Valid,FrozenFor,ItemPrices,ItemWarehouseInfoCollection,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage,SalesPackagingUnit` +
-          `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
+      const whInfo = await slFetch(
+        `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,Committed,Ordered`
       );
-      itemFull = itemFull2;
+      if (Array.isArray(whInfo?.value)) itemFull.ItemWarehouseInfoCollection = whInfo.value;
     } catch {}
   }
-
 
   const data = buildItemResponse(itemFull, code, priceListNo, warehouseCode);
   ITEM_CACHE.set(key, { ts: now, data });
@@ -993,7 +1005,7 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 }
 
 /* =========================================================
-   ✅ allowed-items
+   ✅ NUEVO: endpoint para que el frontend sepa la lista (opcional)
 ========================================================= */
 app.get("/api/sap/allowed-items", verifyUser, async (req, res) => {
   const wh = getWarehouseFromReq(req);
@@ -1003,7 +1015,7 @@ app.get("/api/sap/allowed-items", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: ITEM
+   ✅ SAP: ITEM (bloquea códigos NO permitidos)
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -1017,6 +1029,7 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
     assertItemAllowedOrThrow(warehouseCode, code);
 
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
+
     const r = await getOneItem(code, priceListNo, warehouseCode);
 
     return res.json({
@@ -1100,9 +1113,8 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
     return res.status(500).json({ ok: false, message: err.message });
   }
 });
-
 /* =========================================================
-   ✅ CUSTOMERS
+   ✅ CUSTOMERS search / customer (igual a tu código)
 ========================================================= */
 app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
   try {
@@ -1170,7 +1182,7 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP Items Search
+   ✅ NUEVO: SAP Items Search
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
@@ -1191,13 +1203,17 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
     try {
       raw = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor` +
-          `&$filter=${encodeURIComponent(`(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))`)}` +
+          `&$filter=${encodeURIComponent(
+            `(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))`
+          )}` +
           `&$orderby=ItemName asc&$top=${preTop}`
       );
     } catch {
       raw = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor` +
-          `&$filter=${encodeURIComponent(`(substringof('${safe}',ItemCode) or substringof('${safe}',ItemName))`)}` +
+          `&$filter=${encodeURIComponent(
+            `(substringof('${safe}',ItemCode) or substringof('${safe}',ItemName))`
+          )}` +
           `&$orderby=ItemName asc&$top=${preTop}`
       );
     }
@@ -1212,7 +1228,9 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
       return validOk && frozenOk;
     }
 
-    let filtered = values.filter((it) => it?.ItemCode).filter(isActiveSapItem);
+    let filtered = values
+      .filter((it) => it?.ItemCode)
+      .filter(isActiveSapItem);
 
     if (allowedSet && allowedSet.size > 0) {
       filtered = filtered.filter((it) => allowedSet.has(String(it.ItemCode).trim()));
@@ -1233,7 +1251,15 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 /* =========================================================
    ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD)
 ========================================================= */
-async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter, includeTotal }) {
+async function scanQuotes({
+  f,
+  t,
+  wantSkip,
+  wantLimit,
+  userFilter,
+  clientFilter,
+  includeTotal,
+}) {
   const toPlus1 = addDaysISO(t, 1);
   const batchTop = 200;
 
@@ -1307,16 +1333,24 @@ async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter,
   return { pageRows, totalFiltered };
 }
 
+/* =========================================================
+   ✅ FIX: detecta grupos con varios params (para tu dashboard)
+========================================================= */
 function wantsGroups(req) {
   const q = req.query || {};
   const v = (x) => String(x ?? "").trim().toLowerCase();
   return (
     v(q.withGroups) === "1" ||
     v(q.groups) === "1" ||
-    v(q.includeGroups) === "1"
+    v(q.includeGroups) === "1" ||
+    v(q.dashboard) === "1" ||
+    v(q.mode) === "dashboard"
   );
 }
 
+/* =========================================================
+   ✅ helper: resolver grupos por lista de itemcodes con concurrencia
+========================================================= */
 async function resolveGroupsForItemCodes(itemCodes) {
   const unique = Array.from(new Set(itemCodes.map((x) => String(x || "").trim()).filter(Boolean)));
   if (!unique.length) return new Map();
@@ -1365,7 +1399,11 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const pageRaw = req.query?.page != null ? Number(req.query.page) : 1;
     const page = Math.max(1, Number.isFinite(pageRaw) ? Math.trunc(pageRaw) : 1);
 
-    const skipRaw = req.query?.skip != null ? Number(req.query.skip) : (page - 1) * limit;
+    const skipRaw =
+      req.query?.skip != null
+        ? Number(req.query.skip)
+        : (page - 1) * limit;
+
     const skip = Math.max(0, Number.isFinite(skipRaw) ? Math.trunc(skipRaw) : 0);
 
     const includeTotal = String(req.query?.includeTotal || "0") === "1";
@@ -1411,7 +1449,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       await Promise.all(Array.from({ length: CONC }, () => worker()));
     }
 
-    // ✅ FIX: NO usar $expand=DocumentLines (en tu SAP rompe con 400)
     if (withGroups && pageRows.length) {
       const CONC = 4;
       let idx = 0;
@@ -1422,7 +1459,10 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
           const q = pageRows[i];
 
           try {
-            const full = await slFetch(`/Quotations(${Number(q.docEntry)})`);
+            const full = await slFetch(
+              `/Quotations(${Number(q.docEntry)})?$select=DocEntry&$expand=DocumentLines($select=ItemCode,LineTotal)`
+            );
+
             const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
             const codes = lines.map((ln) => String(ln?.ItemCode || "").trim()).filter(Boolean);
 
@@ -1434,6 +1474,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
               if (!code) continue;
 
               const grp = mapGroups.get(code) || "";
+
               outLines.push({
                 ItemCode: code,
                 LineTotal: Number(ln?.LineTotal || 0),
@@ -1447,11 +1488,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
             if (uniq.size === 1) q.itemGroup = Array.from(uniq)[0];
           } catch (e) {
             q.groupError = String(e?.message || e);
-            console.error("withGroups error:", {
-              docEntry: q.docEntry,
-              docNum: q.docNum,
-              err: q.groupError,
-            });
+            console.error("withGroups error:", { docEntry: q.docEntry, docNum: q.docNum, err: q.groupError });
           }
 
           await sleep(15);
@@ -1478,7 +1515,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ QUOTE (BLOQUEA + NORMA DE REPARTO) + FIX -2028 (doble fallback)
+   ✅ QUOTE (BLOQUEA + NORMA DE REPARTO)
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
@@ -1538,7 +1575,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       DocumentLines,
     };
 
-    // ✅ INTENTO NORMAL
     try {
       const created = await slFetch(`/Quotations`, {
         method: "POST",
@@ -1552,7 +1588,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         docNum: created.DocNum,
         warehouse: warehouseCode,
         bodega: warehouseCode,
-        fallback: "none",
+        fallback: false,
       });
     } catch (err1) {
       const msg1 = String(err1?.message || err1);
@@ -1563,66 +1599,31 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
       if (!isNoMatch) throw err1;
 
-      // ✅ FALLBACK A: sin WarehouseCode
-      try {
-        const payloadFallbackA = {
-          ...payload,
-          Comments: `${baseComments} [wh_fallback:1]`,
-          DocumentLines: cleanLines.map((ln) => ({
-            ItemCode: ln.ItemCode,
-            Quantity: ln.Quantity,
-            CostingCode: DEFAULT_COSTINGCODE_DIM1,
-            CostingCode2: DEFAULT_COSTINGCODE_DIM2,
-          })),
-        };
+      const payloadFallback = {
+        ...payload,
+        Comments: `${baseComments} [wh_fallback:1]`,
+        DocumentLines: cleanLines.map((ln) => ({
+          ItemCode: ln.ItemCode,
+          Quantity: ln.Quantity,
+          CostingCode: DEFAULT_COSTINGCODE_DIM1,
+          CostingCode2: DEFAULT_COSTINGCODE_DIM2,
+        })),
+      };
 
-        const createdA = await slFetch(`/Quotations`, {
-          method: "POST",
-          body: JSON.stringify(payloadFallbackA),
-        });
+      const created2 = await slFetch(`/Quotations`, {
+        method: "POST",
+        body: JSON.stringify(payloadFallback),
+      });
 
-        return res.json({
-          ok: true,
-          message: "Cotización creada (fallback sin WarehouseCode)",
-          docEntry: createdA.DocEntry,
-          docNum: createdA.DocNum,
-          warehouse: warehouseCode,
-          bodega: warehouseCode,
-          fallback: "no_warehouse",
-        });
-      } catch (errA) {
-        const msgA = String(errA?.message || errA);
-        const isNoMatchA =
-          msgA.includes("ODBC -2028") ||
-          msgA.toLowerCase().includes("no matching records found");
-
-        if (!isNoMatchA) throw errA;
-
-        // ✅ FALLBACK B: sin WarehouseCode y sin CostingCode(s)
-        const payloadFallbackB = {
-          ...payload,
-          Comments: `${baseComments} [wh_fallback:1] [cc_fallback:1]`,
-          DocumentLines: cleanLines.map((ln) => ({
-            ItemCode: ln.ItemCode,
-            Quantity: ln.Quantity,
-          })),
-        };
-
-        const createdB = await slFetch(`/Quotations`, {
-          method: "POST",
-          body: JSON.stringify(payloadFallbackB),
-        });
-
-        return res.json({
-          ok: true,
-          message: "Cotización creada (fallback sin WarehouseCode y sin Norma de reparto)",
-          docEntry: createdB.DocEntry,
-          docNum: createdB.DocNum,
-          warehouse: warehouseCode,
-          bodega: warehouseCode,
-          fallback: "no_warehouse_no_costing",
-        });
-      }
+      return res.json({
+        ok: true,
+        message: "Cotización creada (fallback sin WarehouseCode por -2028)",
+        docEntry: created2.DocEntry,
+        docNum: created2.DocNum,
+        warehouse: warehouseCode,
+        bodega: warehouseCode,
+        fallback: true,
+      });
     }
   } catch (err) {
     const msg = String(err?.message || err);
@@ -1630,6 +1631,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     return res.status(isAllow ? 400 : 500).json({ ok: false, message: msg });
   }
 });
+
 
 /* =========================================================
    ✅ START
