@@ -1544,14 +1544,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
     }
 
-    const DocumentLines = cleanLines.map((ln) => ({
-      ItemCode: ln.ItemCode,
-      Quantity: ln.Quantity,
-      WarehouseCode: warehouseCode,
-      CostingCode: DEFAULT_COSTINGCODE_DIM1,
-      CostingCode2: DEFAULT_COSTINGCODE_DIM2,
-    }));
-
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
     const province = String(req.user?.province || "").trim();
@@ -1566,20 +1558,43 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       .filter(Boolean)
       .join(" ");
 
-    const payload = {
+    const isNoMatchErr = (err) => {
+      const msg = String(err?.message || err);
+      return (
+        msg.includes("ODBC -2028") ||
+        msg.toLowerCase().includes("no matching records found") ||
+        msg.toLowerCase().includes("no se encontraron registros")
+      );
+    };
+
+    // Builders (para reintentos sin tocar el resto del sistema)
+    const buildLines = ({ includeWarehouse, includeCosting }) =>
+      cleanLines.map((ln) => {
+        const out = {
+          ItemCode: ln.ItemCode,
+          Quantity: ln.Quantity,
+        };
+        if (includeWarehouse) out.WarehouseCode = warehouseCode;
+        if (includeCosting) {
+          out.CostingCode = DEFAULT_COSTINGCODE_DIM1;
+          out.CostingCode2 = DEFAULT_COSTINGCODE_DIM2;
+        }
+        return out;
+      });
+
+    const buildPayload = ({ includeWarehouse, includeCosting, tag }) => ({
       CardCode: cardCode,
       DocDate: docDate,
       DocDueDate: docDate,
-      Comments: baseComments,
+      Comments: tag ? `${baseComments} ${tag}` : baseComments,
       JournalMemo: "Cotización web mercaderistas",
-      DocumentLines,
-    };
+      DocumentLines: buildLines({ includeWarehouse, includeCosting }),
+    });
 
+    // 1) Intento normal: Warehouse + Norma de reparto
     try {
-      const created = await slFetch(`/Quotations`, {
-        method: "POST",
-        body: JSON.stringify(payload),
-      });
+      const payload1 = buildPayload({ includeWarehouse: true, includeCosting: true, tag: "" });
+      const created = await slFetch(`/Quotations`, { method: "POST", body: JSON.stringify(payload1) });
 
       return res.json({
         ok: true,
@@ -1588,42 +1603,75 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         docNum: created.DocNum,
         warehouse: warehouseCode,
         bodega: warehouseCode,
-        fallback: false,
+        fallback: 0,
       });
     } catch (err1) {
-      const msg1 = String(err1?.message || err1);
+      if (!isNoMatchErr(err1)) throw err1;
 
-      const isNoMatch =
-        msg1.includes("ODBC -2028") ||
-        msg1.toLowerCase().includes("no matching records found");
+      // 2) Fallback: Warehouse SÍ, pero SIN Norma de reparto (CostingCode/CostingCode2)
+      try {
+        const payload2 = buildPayload({
+          includeWarehouse: true,
+          includeCosting: false,
+          tag: "[fallback:no_costing:1]",
+        });
 
-      if (!isNoMatch) throw err1;
+        const created2 = await slFetch(`/Quotations`, { method: "POST", body: JSON.stringify(payload2) });
 
-      const payloadFallback = {
-        ...payload,
-        Comments: `${baseComments} [wh_fallback:1]`,
-        DocumentLines: cleanLines.map((ln) => ({
-          ItemCode: ln.ItemCode,
-          Quantity: ln.Quantity,
-          CostingCode: DEFAULT_COSTINGCODE_DIM1,
-          CostingCode2: DEFAULT_COSTINGCODE_DIM2,
-        })),
-      };
+        return res.json({
+          ok: true,
+          message: "Cotización creada (fallback sin Norma de reparto por -2028)",
+          docEntry: created2.DocEntry,
+          docNum: created2.DocNum,
+          warehouse: warehouseCode,
+          bodega: warehouseCode,
+          fallback: 1,
+        });
+      } catch (err2) {
+        if (!isNoMatchErr(err2)) throw err2;
 
-      const created2 = await slFetch(`/Quotations`, {
-        method: "POST",
-        body: JSON.stringify(payloadFallback),
-      });
+        // 3) Fallback: SIN WarehouseCode, con Norma de reparto (tu fallback original)
+        try {
+          const payload3 = buildPayload({
+            includeWarehouse: false,
+            includeCosting: true,
+            tag: "[fallback:no_wh:1]",
+          });
 
-      return res.json({
-        ok: true,
-        message: "Cotización creada (fallback sin WarehouseCode por -2028)",
-        docEntry: created2.DocEntry,
-        docNum: created2.DocNum,
-        warehouse: warehouseCode,
-        bodega: warehouseCode,
-        fallback: true,
-      });
+          const created3 = await slFetch(`/Quotations`, { method: "POST", body: JSON.stringify(payload3) });
+
+          return res.json({
+            ok: true,
+            message: "Cotización creada (fallback sin WarehouseCode por -2028)",
+            docEntry: created3.DocEntry,
+            docNum: created3.DocNum,
+            warehouse: warehouseCode,
+            bodega: warehouseCode,
+            fallback: 2,
+          });
+        } catch (err3) {
+          if (!isNoMatchErr(err3)) throw err3;
+
+          // 4) Último fallback: SIN WarehouseCode y SIN Norma de reparto
+          const payload4 = buildPayload({
+            includeWarehouse: false,
+            includeCosting: false,
+            tag: "[fallback:no_wh:1][fallback:no_costing:1]",
+          });
+
+          const created4 = await slFetch(`/Quotations`, { method: "POST", body: JSON.stringify(payload4) });
+
+          return res.json({
+            ok: true,
+            message: "Cotización creada (fallback sin WarehouseCode y sin Norma de reparto por -2028)",
+            docEntry: created4.DocEntry,
+            docNum: created4.DocNum,
+            warehouse: warehouseCode,
+            bodega: warehouseCode,
+            fallback: 3,
+          });
+        }
+      }
     }
   } catch (err) {
     const msg = String(err?.message || err);
@@ -1631,7 +1679,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     return res.status(isAllow ? 400 : 500).json({ ok: false, message: msg });
   }
 });
-
 
 /* =========================================================
    ✅ START
