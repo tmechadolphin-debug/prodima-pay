@@ -288,79 +288,6 @@ function isCancelledLike(q) {
 }
 
 /* =========================================================
-   ✅ ✅ ✅ NUEVO: CATÁLOGO LOCAL (DESCRIPCIÓN + PRECIO CAJA)
-   - NO toca dashboard/login/histórico
-   - Solo agrega lookup local para devolver ItemName y price (caja)
-   - Pega aquí tu lista completa en formato TSV:
-     CODIGO<TAB>DESCRIPCION<...><TAB>PRECIO_CAJA_ULTIMA_COLUMNA
-========================================================= */
-function normalizeLocal(s) {
-  return String(s || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .trim();
-}
-
-const LOCAL_CATALOG_TSV = `
-0110	Salsa China Low Sodium 24/10.5	Lista de Precios 99 2018	1.440000	CAJA	24.000000	34.56000000000
-0424	Salsa Condimentada 24 oz. 12 unidades/caja.	Lista de Precios 99 2018	2.150000	CAJA	12.000000	25.80000000000
-` // 👈 REEMPLAZA este bloque por tu lista completa (puede ser enorme)
-  .trim();
-
-function buildLocalCatalogMap(tsv) {
-  const map = new Map();
-  const rows = String(tsv || "")
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean);
-
-  for (const row of rows) {
-    const cols = row.split("\t").map((x) => x.trim());
-    if (cols.length < 2) continue;
-
-    const code = String(cols[0] || "").trim();
-    const desc = String(cols[1] || "").trim();
-    const last = cols[cols.length - 1];
-    const priceCaja = Number(last);
-
-    if (!code) continue;
-
-    map.set(code, {
-      code,
-      desc,
-      priceCaja: Number.isFinite(priceCaja) ? priceCaja : null,
-      _hay: normalizeLocal(code + " " + desc),
-    });
-  }
-  return map;
-}
-
-const LOCAL_CATALOG = buildLocalCatalogMap(LOCAL_CATALOG_TSV);
-
-function localGetByCode(code) {
-  return LOCAL_CATALOG.get(String(code || "").trim()) || null;
-}
-
-// (Opcional) búsqueda local por texto, útil si algún día quieres usarla.
-function localSearch(q, limit = 20) {
-  const nq = normalizeLocal(q);
-  if (nq.length < 2) return [];
-  const out = [];
-  for (const it of LOCAL_CATALOG.values()) {
-    if (it._hay.includes(nq)) out.push(it);
-  }
-  // prioriza códigos que empiezan con lo escrito
-  out.sort((a, b) => {
-    const aStart = normalizeLocal(a.code).startsWith(nq) ? 0 : 1;
-    const bStart = normalizeLocal(b.code).startsWith(nq) ? 0 : 1;
-    if (aStart !== bStart) return aStart - bStart;
-    return String(a.desc || "").localeCompare(String(b.desc || ""));
-  });
-  return out.slice(0, Math.max(1, Math.min(50, Number(limit) || 20)));
-}
-
-/* =========================================================
    ✅ HEALTH
 ========================================================= */
 app.get("/api/health", async (req, res) => {
@@ -374,7 +301,6 @@ app.get("/api/health", async (req, res) => {
     allowed_wh_200: (ALLOWED_BY_WH["200"] || []).length,
     allowed_wh_300: (ALLOWED_BY_WH["300"] || []).length,
     allowed_wh_500: (ALLOWED_BY_WH["500"] || []).length,
-    localCatalogCount: LOCAL_CATALOG.size, // ✅ solo informativo
   });
 });
 
@@ -1008,7 +934,6 @@ app.get("/api/sap/allowed-items", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ SAP: ITEM (bloquea códigos NO permitidos en 200/300/500)
-   ✅ NUEVO: aplica CATÁLOGO LOCAL a ItemName y price (CAJA)
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -1026,14 +951,6 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 
     const r = await getOneItem(code, priceListNo, warehouseCode);
 
-    // ✅ NUEVO: override desde catálogo local (solo descripción + precio)
-    const local = localGetByCode(code);
-    const localName = local?.desc ? String(local.desc) : null;
-    const localPrice = local?.priceCaja != null ? Number(local.priceCaja) : null;
-
-    if (localName) r.item.ItemName = localName;
-    const finalPrice = Number.isFinite(localPrice) ? localPrice : r.price;
-
     return res.json({
       ok: true,
       item: r.item,
@@ -1041,8 +958,8 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
       bodega: warehouseCode,
       priceList: SAP_PRICE_LIST,
       priceListNo,
-      // ✅ Precio CAJA (local si existe, sino SAP)
-      price: Number(finalPrice ?? 0),
+      // ✅ Precio CAJA
+      price: Number(r.price ?? 0),
       // ✅ si necesitas debug:
       priceUnit: r.priceUnit,
       factorCaja: r.factorCaja,
@@ -1058,7 +975,6 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ SAP: ITEMS (batch) (bloquea NO permitidos)
-   ✅ NUEVO: aplica CATÁLOGO LOCAL a name + price por cada item
 ========================================================= */
 app.get("/api/sap/items", verifyUser, async (req, res) => {
   try {
@@ -1088,20 +1004,11 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
         const code = codes[idx];
         try {
           const r = await getOneItem(code, priceListNo, warehouseCode);
-
-          // ✅ NUEVO: override desde catálogo local
-          const local = localGetByCode(code);
-          const localName = local?.desc ? String(local.desc) : null;
-          const localPrice = local?.priceCaja != null ? Number(local.priceCaja) : null;
-
-          const nameFinal = localName || r.item.ItemName;
-          const priceFinal = Number.isFinite(localPrice) ? localPrice : r.price;
-
           items[code] = {
             ok: true,
-            name: nameFinal,
+            name: r.item.ItemName,
             unit: "Caja",
-            price: priceFinal,      // CAJA (local si existe)
+            price: r.price,         // CAJA
             priceUnit: r.priceUnit, // debug
             factorCaja: r.factorCaja,
             stock: r.stock,
@@ -1134,7 +1041,6 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
    GET /api/sap/items/search?q=texto&top=20
    - Filtra activos (Valid=tYES y FrozenFor=tNO cuando exista)
    - Filtra por allowlist si bodega 200/300/500
-   ✅ NUEVO: mezcla resultados LOCAL (primero) + SAP (después)
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
@@ -1148,20 +1054,9 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
     const warehouseCode = getWarehouseFromReq(req);
     const allowedSet = getAllowedSetForWh(warehouseCode);
 
-    // ✅ NUEVO: resultados locales
-    let localResults = localSearch(q, top * 2).map((it) => ({
-      ItemCode: it.code,
-      ItemName: it.desc,
-      SalesUnit: "Caja",
-    }));
-
-    if (allowedSet && allowedSet.size > 0) {
-      localResults = localResults.filter((it) => allowedSet.has(String(it.ItemCode).trim()));
-    }
-
-    // (tu búsqueda SAP queda igual, solo que ahora se combina)
     const safe = q.replace(/'/g, "''");
 
+    // Buscamos más de top para poder filtrar por allowed y por activos
     const preTop = Math.min(100, top * 5);
 
     let raw;
@@ -1174,6 +1069,7 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
           `&$orderby=ItemName asc&$top=${preTop}`
       );
     } catch {
+      // fallback para SL viejo
       raw = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor` +
           `&$filter=${encodeURIComponent(
@@ -1185,10 +1081,11 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const values = Array.isArray(raw?.value) ? raw.value : [];
 
+    // Activo = Valid = tYES (si viene) y FrozenFor != tYES (si viene)
     function isActiveSapItem(it) {
       const v = String(it?.Valid ?? "").toLowerCase();
       const f = String(it?.FrozenFor ?? "").toLowerCase();
-      const validOk = !v || v.includes("tyes") || v === "yes" || v === "true";
+      const validOk = !v || v.includes("tyes") || v === "yes" || v === "true"; // si no viene, no bloqueamos
       const frozenOk = !f || f.includes("tno") || f === "no" || f === "false";
       return validOk && frozenOk;
     }
@@ -1201,22 +1098,11 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
       filtered = filtered.filter((it) => allowedSet.has(String(it.ItemCode).trim()));
     }
 
-    const sapResults = filtered.slice(0, top * 2).map((it) => {
-      // ✅ NUEVO: si el código existe local, usa el nombre local
-      const local = localGetByCode(it.ItemCode);
-      return {
-        ItemCode: it.ItemCode,
-        ItemName: local?.desc ? local.desc : it.ItemName,
-        SalesUnit: "Caja",
-      };
-    });
-
-    // ✅ merge sin duplicados (local primero)
-    const map = new Map();
-    for (const it of localResults) map.set(String(it.ItemCode), it);
-    for (const it of sapResults) if (!map.has(String(it.ItemCode))) map.set(String(it.ItemCode), it);
-
-    const results = Array.from(map.values()).slice(0, top);
+    const results = filtered.slice(0, top).map((it) => ({
+      ItemCode: it.ItemCode,
+      ItemName: it.ItemName,
+      SalesUnit: "Caja",
+    }));
 
     return res.json({ ok: true, q, warehouse: warehouseCode, results });
   } catch (err) {
