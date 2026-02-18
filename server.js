@@ -188,6 +188,7 @@ function assertItemAllowedOrThrow(wh, itemCode) {
 
   const set = getAllowedSetForWh(wh);
   // ✅ si NO configuraste lista, por seguridad NO bloqueamos (para no tumbarte producción)
+  //    pero en tu caso DEBES configurarla para que sea estricto.
   if (!set || set.size === 0) return true;
 
   if (!set.has(code)) {
@@ -287,88 +288,6 @@ function isCancelledLike(q) {
 }
 
 /* =========================================================
-   ✅ NUEVO: CATÁLOGO + STOCK LOCAL (SIN SAP)
-   - Catálogo TSV: ItemCode<TAB>Description<...><TAB>PriceCaja(última columna)
-   - Stock TSV: ItemCode<TAB>Warehouse<TAB>Available
-========================================================= */
-function normStr(s) {
-  return String(s || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .trim();
-}
-
-// Pega aquí tu MISMO TSV de catálogo (el mismo que en el HTML)
-const LOCAL_CATALOG_TSV = `
-${""}
-`.trim();
-
-// Pega aquí tu TSV de stock local
-const LOCAL_STOCK_TSV = `
-${""}
-`.trim();
-
-function buildCatalogMapFromTSV(tsv) {
-  const map = new Map();
-  const lines = String(tsv || "")
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean);
-
-  for (const row of lines) {
-    const cols = row.split("\t").map((x) => x.trim());
-    if (cols.length < 2) continue;
-
-    const code = String(cols[0] || "").trim();
-    const desc = String(cols[1] || "").trim();
-    const last = cols[cols.length - 1];
-    const priceCaja = Number(last);
-
-    if (!code) continue;
-    map.set(code, {
-      code,
-      desc,
-      priceCaja: Number.isFinite(priceCaja) ? priceCaja : 0,
-      _n_desc: normStr(desc),
-      _n_code: normStr(code),
-    });
-  }
-  return map;
-}
-
-function buildStockMapFromTSV(tsv) {
-  const map = new Map();
-  const lines = String(tsv || "")
-    .split("\n")
-    .map((x) => x.trim())
-    .filter(Boolean);
-
-  for (const row of lines) {
-    const cols = row.split("\t").map((x) => x.trim());
-    if (cols.length < 3) continue;
-    const code = String(cols[0] || "").trim();
-    const wh = String(cols[1] || "").trim();
-    const avail = Number(cols[2]);
-    if (!code || !wh) continue;
-    map.set(`${wh}::${code}`, Number.isFinite(avail) ? avail : 0);
-  }
-  return map;
-}
-
-const LOCAL_CATALOG_MAP = buildCatalogMapFromTSV(LOCAL_CATALOG_TSV);
-const LOCAL_STOCK_MAP = buildStockMapFromTSV(LOCAL_STOCK_TSV);
-
-function getLocalCatalogItem(code) {
-  return LOCAL_CATALOG_MAP.get(String(code || "").trim()) || null;
-}
-function getLocalAvailable(wh, code) {
-  const k = `${String(wh || "").trim()}::${String(code || "").trim()}`;
-  if (!LOCAL_STOCK_MAP.has(k)) return null;
-  return Number(LOCAL_STOCK_MAP.get(k));
-}
-
-/* =========================================================
    ✅ HEALTH
 ========================================================= */
 app.get("/api/health", async (req, res) => {
@@ -382,14 +301,11 @@ app.get("/api/health", async (req, res) => {
     allowed_wh_200: (ALLOWED_BY_WH["200"] || []).length,
     allowed_wh_300: (ALLOWED_BY_WH["300"] || []).length,
     allowed_wh_500: (ALLOWED_BY_WH["500"] || []).length,
-    local_catalog_count: LOCAL_CATALOG_MAP.size,
-    local_stock_count: LOCAL_STOCK_MAP.size,
   });
 });
 
 /* =========================================================
    ✅ SAP Service Layer (Session cookie)
-   (NO TOCADO)
 ========================================================= */
 let SL_COOKIE = "";
 let SL_COOKIE_AT = 0;
@@ -472,7 +388,7 @@ async function slFetch(path, options = {}) {
 }
 
 /* =========================================================
-   ✅ SAP helpers (NO TOCADO)
+   ✅ SAP helpers
 ========================================================= */
 async function sapGetFirstByDocNum(entity, docNum, select) {
   const n = Number(docNum);
@@ -499,7 +415,7 @@ async function sapGetByDocEntry(entity, docEntry, select) {
 }
 
 /* =========================================================
-   ✅ TRACE logic + cache (NO TOCADO)
+   ✅ TRACE logic + cache
 ========================================================= */
 const TRACE_CACHE = new Map();
 const TRACE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -831,6 +747,182 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
+   ✅ SAP: PRICE LIST cache + ITEM cache
+========================================================= */
+let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
+const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
+
+const ITEM_CACHE = new Map();
+const ITEM_TTL_MS = 10 * 60 * 1000;
+
+async function getPriceListNoByNameCached(name) {
+  const now = Date.now();
+
+  if (
+    PRICE_LIST_CACHE.name === name &&
+    PRICE_LIST_CACHE.no !== null &&
+    now - PRICE_LIST_CACHE.ts < PRICE_LIST_TTL_MS
+  ) {
+    return PRICE_LIST_CACHE.no;
+  }
+
+  const safe = name.replace(/'/g, "''");
+  let no = null;
+
+  try {
+    const r1 = await slFetch(
+      `/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`
+    );
+    if (r1?.value?.length) no = r1.value[0].PriceListNo;
+  } catch {}
+
+  if (no === null) {
+    try {
+      const r2 = await slFetch(`/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`);
+      if (r2?.value?.length) no = r2.value[0].PriceListNo;
+    } catch {}
+  }
+
+  PRICE_LIST_CACHE = { name, no, ts: now };
+  return no;
+}
+
+function getPriceFromPriceList(itemFull, priceListNo) {
+  const listNo = Number(priceListNo);
+  const row = Array.isArray(itemFull?.ItemPrices)
+    ? itemFull.ItemPrices.find((p) => Number(p?.PriceList) === listNo)
+    : null;
+
+  const price = row && row.Price != null ? Number(row.Price) : null;
+  return Number.isFinite(price) ? price : null;
+}
+
+// Factor de CAJA (si SAP lo trae). Si no, devolvemos null.
+function getSalesUomFactor(itemFull) {
+  const directFields = [
+    itemFull?.SalesItemsPerUnit,
+    itemFull?.SalesQtyPerPackUnit,
+    itemFull?.SalesQtyPerPackage,
+    itemFull?.SalesPackagingUnit,
+  ];
+
+  for (const v of directFields) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+
+  const coll = itemFull?.ItemUnitOfMeasurementCollection;
+  if (!Array.isArray(coll) || !coll.length) return null;
+
+  let row =
+    coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("sales")) ||
+    coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("iut_sales")) ||
+    null;
+
+  if (!row) row = coll.find((x) => Number(x?.BaseQuantity) > 1) || null;
+  if (!row) return null;
+
+  const b = Number(row?.BaseQuantity ?? row?.BaseQty ?? null);
+  const a = Number(row?.AlternateQuantity ?? row?.AltQty ?? row?.AlternativeQuantity ?? null);
+
+  if (Number.isFinite(b) && b > 0 && Number.isFinite(a) && a > 0) {
+    const f = b / a;
+    return Number.isFinite(f) && f > 0 ? f : null;
+  }
+  if (Number.isFinite(b) && b > 0) return b;
+
+  return null;
+}
+
+function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
+  const item = {
+    ItemCode: itemFull.ItemCode ?? code,
+    ItemName: itemFull.ItemName ?? `Producto ${code}`,
+    SalesUnit: itemFull.SalesUnit ?? "",
+    InventoryItem: itemFull.InventoryItem ?? null,
+    Valid: itemFull.Valid ?? null,
+    FrozenFor: itemFull.FrozenFor ?? null,
+  };
+
+  // ✅ En tu pantalla debe mostrarse CAJA:
+  // - priceUnit: precio unitario si SAP lo trae así
+  // - factorCaja: multiplicador caja
+  // - price: precio CAJA (si no hay factor, queda igual al unit)
+  const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
+  const factorCaja = getSalesUomFactor(itemFull);
+  const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
+
+  let warehouseRow = null;
+  if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
+    warehouseRow =
+      itemFull.ItemWarehouseInfoCollection.find(
+        (w) => String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
+      ) || null;
+  }
+
+  const onHand = warehouseRow?.InStock != null ? Number(warehouseRow.InStock) : null;
+  const committed = warehouseRow?.Committed != null ? Number(warehouseRow.Committed) : null;
+  const ordered = warehouseRow?.Ordered != null ? Number(warehouseRow.Ordered) : null;
+
+  let available = null;
+  if (Number.isFinite(onHand) && Number.isFinite(committed)) available = onHand - committed;
+
+  return {
+    item,
+    price: priceCaja,
+    priceUnit,
+    factorCaja,
+    stock: {
+      warehouse: warehouseCode,
+      onHand: Number.isFinite(onHand) ? onHand : null,
+      committed: Number.isFinite(committed) ? committed : null,
+      ordered: Number.isFinite(ordered) ? ordered : null,
+      available: Number.isFinite(available) ? available : null,
+      hasStock: available != null ? available > 0 : null,
+    },
+  };
+}
+
+async function getOneItem(code, priceListNo, warehouseCode) {
+  const now = Date.now();
+  const key = `${code}::${warehouseCode}::${priceListNo}`;
+  const cached = ITEM_CACHE.get(key);
+  if (cached && now - cached.ts < ITEM_TTL_MS) return cached.data;
+
+  let itemFull;
+
+  try {
+    itemFull = await slFetch(
+      `/Items('${encodeURIComponent(code)}')` +
+        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Valid,FrozenFor,ItemPrices,ItemWarehouseInfoCollection` +
+        `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
+    );
+  } catch {
+    try {
+      itemFull = await slFetch(
+        `/Items('${encodeURIComponent(code)}')` +
+          `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Valid,FrozenFor,ItemPrices,ItemWarehouseInfoCollection`
+      );
+    } catch {
+      itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
+    }
+  }
+
+  if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
+    try {
+      const whInfo = await slFetch(
+        `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,Committed,Ordered`
+      );
+      if (Array.isArray(whInfo?.value)) itemFull.ItemWarehouseInfoCollection = whInfo.value;
+    } catch {}
+  }
+
+  const data = buildItemResponse(itemFull, code, priceListNo, warehouseCode);
+  ITEM_CACHE.set(key, { ts: now, data });
+  return data;
+}
+
+/* =========================================================
    ✅ NUEVO: endpoint para que el frontend sepa la lista (opcional)
 ========================================================= */
 app.get("/api/sap/allowed-items", verifyUser, async (req, res) => {
@@ -841,49 +933,40 @@ app.get("/api/sap/allowed-items", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ CAMBIO CLAVE: /api/sap/item/:code -> SOLO LOCAL
+   ✅ SAP: ITEM (bloquea códigos NO permitidos en 200/300/500)
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
 
     const warehouseCode = getWarehouseFromReq(req);
 
-    // ✅ BLOQUEO por bodega (igual que antes)
+    // ✅ BLOQUEO por bodega
     assertItemAllowedOrThrow(warehouseCode, code);
 
-    // ✅ SOLO LOCAL
-    const it = getLocalCatalogItem(code);
-    if (!it) return res.status(404).json({ ok: false, message: `No existe en catálogo local: ${code}` });
+    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
 
-    const available = getLocalAvailable(warehouseCode, code);
+    const r = await getOneItem(code, priceListNo, warehouseCode);
 
     return res.json({
       ok: true,
-      item: {
-        ItemCode: code,
-        ItemName: it.desc || `Producto ${code}`,
-        SalesUnit: "Caja",
-      },
+      item: r.item,
       warehouse: warehouseCode,
       bodega: warehouseCode,
-      priceList: "LOCAL",
-      priceListNo: null,
-      price: Number(it.priceCaja || 0), // precio CAJA local
-      priceUnit: null,
-      factorCaja: null,
+      priceList: SAP_PRICE_LIST,
+      priceListNo,
+      // ✅ Precio CAJA
+      price: Number(r.price ?? 0),
+      // ✅ si necesitas debug:
+      priceUnit: r.priceUnit,
+      factorCaja: r.factorCaja,
       uom: "Caja",
-      stock: {
-        warehouse: warehouseCode,
-        onHand: null,
-        committed: null,
-        ordered: null,
-        available: available,
-        hasStock: available != null ? available > 0 : null,
-      },
-      disponible: available,
-      enStock: available != null ? available > 0 : null,
+      stock: r.stock,
+      disponible: r?.stock?.available ?? null,
+      enStock: r?.stock?.hasStock ?? null,
     });
   } catch (err) {
     return res.status(400).json({ ok: false, message: err.message });
@@ -891,10 +974,78 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ CAMBIO CLAVE: /api/sap/items/search -> SOLO LOCAL
+   ✅ SAP: ITEMS (batch) (bloquea NO permitidos)
+========================================================= */
+app.get("/api/sap/items", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const codes = String(req.query.codes || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+
+    if (!codes.length) return res.status(400).json({ ok: false, message: "codes vacío" });
+
+    const warehouseCode = getWarehouseFromReq(req);
+
+    // ✅ BLOQUEO por bodega
+    for (const c of codes) assertItemAllowedOrThrow(warehouseCode, c);
+
+    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
+
+    const CONCURRENCY = 5;
+    const items = {};
+    let i = 0;
+
+    async function worker() {
+      while (i < codes.length) {
+        const idx = i++;
+        const code = codes[idx];
+        try {
+          const r = await getOneItem(code, priceListNo, warehouseCode);
+          items[code] = {
+            ok: true,
+            name: r.item.ItemName,
+            unit: "Caja",
+            price: r.price,         // CAJA
+            priceUnit: r.priceUnit, // debug
+            factorCaja: r.factorCaja,
+            stock: r.stock,
+            disponible: r?.stock?.available ?? null,
+            enStock: r?.stock?.hasStock ?? null,
+          };
+        } catch (e) {
+          items[code] = { ok: false, message: String(e.message || e) };
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+    return res.json({
+      ok: true,
+      warehouse: warehouseCode,
+      bodega: warehouseCode,
+      priceList: SAP_PRICE_LIST,
+      priceListNo,
+      items,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+/* =========================================================
+   ✅ NUEVO: SAP Items Search (sugerencias para productos)
+   GET /api/sap/items/search?q=texto&top=20
+   - Filtra activos (Valid=tYES y FrozenFor=tNO cuando exista)
+   - Filtra por allowlist si bodega 200/300/500
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
     const q = String(req.query?.q || "").trim();
     const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
 
@@ -903,35 +1054,57 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
     const warehouseCode = getWarehouseFromReq(req);
     const allowedSet = getAllowedSetForWh(warehouseCode);
 
-    const nq = normStr(q);
+    const safe = q.replace(/'/g, "''");
 
-    const out = [];
-    for (const v of LOCAL_CATALOG_MAP.values()) {
-      if (!v?.code) continue;
+    // Buscamos más de top para poder filtrar por allowed y por activos
+    const preTop = Math.min(100, top * 5);
 
-      if (allowedSet && allowedSet.size > 0) {
-        if (!allowedSet.has(String(v.code).trim())) continue;
-      }
-
-      const hay = `${v._n_code} ${v._n_desc}`;
-      if (hay.includes(nq)) {
-        out.push({
-          ItemCode: v.code,
-          ItemName: v.desc,
-          SalesUnit: "Caja",
-        });
-      }
+    let raw;
+    try {
+      raw = await slFetch(
+        `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor` +
+          `&$filter=${encodeURIComponent(
+            `(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))`
+          )}` +
+          `&$orderby=ItemName asc&$top=${preTop}`
+      );
+    } catch {
+      // fallback para SL viejo
+      raw = await slFetch(
+        `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor` +
+          `&$filter=${encodeURIComponent(
+            `(substringof('${safe}',ItemCode) or substringof('${safe}',ItemName))`
+          )}` +
+          `&$orderby=ItemName asc&$top=${preTop}`
+      );
     }
 
-    // orden simple: primero los que empiezan por código
-    out.sort((a, b) => {
-      const aStart = normStr(a.ItemCode).startsWith(nq) ? 0 : 1;
-      const bStart = normStr(b.ItemCode).startsWith(nq) ? 0 : 1;
-      if (aStart !== bStart) return aStart - bStart;
-      return String(a.ItemName || "").localeCompare(String(b.ItemName || ""));
-    });
+    const values = Array.isArray(raw?.value) ? raw.value : [];
 
-    return res.json({ ok: true, q, warehouse: warehouseCode, results: out.slice(0, top) });
+    // Activo = Valid = tYES (si viene) y FrozenFor != tYES (si viene)
+    function isActiveSapItem(it) {
+      const v = String(it?.Valid ?? "").toLowerCase();
+      const f = String(it?.FrozenFor ?? "").toLowerCase();
+      const validOk = !v || v.includes("tyes") || v === "yes" || v === "true"; // si no viene, no bloqueamos
+      const frozenOk = !f || f.includes("tno") || f === "no" || f === "false";
+      return validOk && frozenOk;
+    }
+
+    let filtered = values
+      .filter((it) => it?.ItemCode)
+      .filter(isActiveSapItem);
+
+    if (allowedSet && allowedSet.size > 0) {
+      filtered = filtered.filter((it) => allowedSet.has(String(it.ItemCode).trim()));
+    }
+
+    const results = filtered.slice(0, top).map((it) => ({
+      ItemCode: it.ItemCode,
+      ItemName: it.ItemName,
+      SalesUnit: "Caja",
+    }));
+
+    return res.json({ ok: true, q, warehouse: warehouseCode, results });
   } catch (err) {
     return res.status(500).json({ ok: false, message: err.message });
   }
@@ -939,7 +1112,9 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD)
-   (NO TOCADO)
+   ✅ FIX DUPLICADOS:
+   - orderby estable: DocDate desc, DocEntry desc
+   - dedupe por DocEntry en el scanner
 ========================================================= */
 async function scanQuotes({
   f,
@@ -962,6 +1137,7 @@ async function scanQuotes({
 
   const maxSapPages = includeTotal ? 200 : 50;
 
+  // ✅ Dedup global para evitar repetidos entre páginas SAP
   const seenDocEntry = new Set();
 
   for (let page = 0; page < maxSapPages; page++) {
@@ -1105,7 +1281,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ CUSTOMERS search / customer (NO TOCADO)
+   ✅ CUSTOMERS search / customer (igual a tu código)
 ========================================================= */
 app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
   try {
@@ -1173,7 +1349,7 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ QUOTE (NO TOCADO) - sigue en SAP
+   ✅ QUOTE (BLOQUEA ItemCodes NO permitidos en 200/300/500)
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
@@ -1188,6 +1364,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     const warehouseCode = getWarehouseFromReq(req);
 
+    // ✅ Filtra líneas válidas
     const cleanLines = lines
       .map((l) => ({
         ItemCode: String(l.itemCode || "").trim(),
@@ -1198,10 +1375,12 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     if (!cleanLines.length)
       return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
 
+    // ✅ BLOQUEO por bodega (allowlist)
     for (const ln of cleanLines) {
       assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
     }
 
+    // ✅ 1) Intento normal: fuerza WarehouseCode
     const DocumentLines = cleanLines.map((ln) => ({
       ItemCode: ln.ItemCode,
       Quantity: ln.Quantity,
@@ -1249,6 +1428,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     } catch (err1) {
       const msg1 = String(err1?.message || err1);
 
+      // ✅ Si es el clásico -2028 (Item no matchea con bodega), reintenta sin WarehouseCode
       const isNoMatch = msg1.includes("ODBC -2028") || msg1.toLowerCase().includes("no matching records found");
 
       if (!isNoMatch) throw err1;
@@ -1259,6 +1439,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         DocumentLines: cleanLines.map((ln) => ({
           ItemCode: ln.ItemCode,
           Quantity: ln.Quantity,
+          // 👈 SIN WarehouseCode para que SAP use el default/config del item
         })),
       };
 
