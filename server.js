@@ -964,31 +964,28 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 
   let itemFull;
 
+  // ✅ 1) Primero sin expand (rápido)
   try {
     itemFull = await slFetch(
       `/Items('${encodeURIComponent(code)}')` +
-        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Valid,FrozenFor,ItemPrices,ItemWarehouseInfoCollection` +
-        `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
+        `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Valid,FrozenFor,ItemPrices,ItemWarehouseInfoCollection,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage,SalesPackagingUnit`
     );
   } catch {
-    try {
-      itemFull = await slFetch(
-        `/Items('${encodeURIComponent(code)}')` +
-          `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Valid,FrozenFor,ItemPrices,ItemWarehouseInfoCollection`
-      );
-    } catch {
-      itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
-    }
+    itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
   }
 
-  if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
+  // ✅ 2) Solo si NO hay factor, ahí sí expand (lento) como fallback
+  if (getSalesUomFactor(itemFull) == null) {
     try {
-      const whInfo = await slFetch(
-        `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,Committed,Ordered`
+      const itemFull2 = await slFetch(
+        `/Items('${encodeURIComponent(code)}')` +
+          `?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Valid,FrozenFor,ItemPrices,ItemWarehouseInfoCollection,SalesItemsPerUnit,SalesQtyPerPackUnit,SalesQtyPerPackage,SalesPackagingUnit` +
+          `&$expand=ItemUnitOfMeasurementCollection($select=UoMType,UoMCode,UoMEntry,BaseQuantity,AlternateQuantity)`
       );
-      if (Array.isArray(whInfo?.value)) itemFull.ItemWarehouseInfoCollection = whInfo.value;
+      itemFull = itemFull2;
     } catch {}
   }
+
 
   const data = buildItemResponse(itemFull, code, priceListNo, warehouseCode);
   ITEM_CACHE.set(key, { ts: now, data });
@@ -1316,9 +1313,7 @@ function wantsGroups(req) {
   return (
     v(q.withGroups) === "1" ||
     v(q.groups) === "1" ||
-    v(q.includeGroups) === "1" ||
-    v(q.dashboard) === "1" ||
-    v(q.mode) === "dashboard"
+    v(q.includeGroups) === "1"
   );
 }
 
