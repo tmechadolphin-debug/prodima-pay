@@ -1280,11 +1280,12 @@ async function scanQuotes({
 }
 
 /* =========================================================
-   ✅ ADMIN QUOTES (RÁPIDO + PAGINACIÓN REAL)
-   - Soporta top/skip (tu front) y también limit/page (opcional)
-   - NO escanea miles de registros: solo trae la "página" de SAP
+   ✅ ADMIN QUOTES (RÁPIDO + 100 POR DEFECTO)
+   - Paginación REAL: top/skip (preferido) o limit/page (opcional)
+   - Default: 100 resultados por llamada (si el front no manda top/limit)
+   - NO escanea miles: solo trae esa página desde SAP
    - Filtros: from/to + user/client (en SAP si se puede)
-   - withDelivered=1 (opcional) calcula entregado/pendiente con traceQuote (más lento)
+   - withDelivered=1 (opcional) calcula entregado/pendiente por traceQuote (más lento)
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -1292,7 +1293,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
 
-    // ✅ fechas (con defaults)
+    // ✅ Fechas (con defaults)
     const from = String(req.query?.from || "").trim();
     const to = String(req.query?.to || "").trim();
 
@@ -1303,30 +1304,36 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
     const toPlus1 = addDaysISO(t, 1);
 
-    // ✅ filtros
+    // ✅ Filtros
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
 
     // ======================================================
-    // ✅ PAGINACIÓN COMPATIBLE (top/skip del front + limit/page opcional)
-    // Prioridad:
-    // 1) si vienen top/skip -> usamos esos tal cual
-    // 2) si no, usamos limit/page
+    // ✅ PAGINACIÓN COMPATIBLE (top/skip o limit/page)
+    // ✅ Default: 100 por llamada
+    // Reglas:
+    // - Si viene top => usamos top
+    // - Si NO viene top, pero viene limit => usamos limit
+    // - Si no viene ninguno => 100
+    // - skip: si viene, se usa; si no, sale de page
     // ======================================================
     const hasTop = req.query?.top != null && String(req.query.top).trim() !== "";
-    const hasSkip = req.query?.skip != null && String(req.query.skip).trim() !== "";
+    const hasLimit = req.query?.limit != null && String(req.query.limit).trim() !== "";
 
-    // top / limit (cap 200 para SAP)
+    // ✅ default 100
     const topRaw = hasTop
       ? Number(req.query.top)
-      : req.query?.limit != null
+      : hasLimit
       ? Number(req.query.limit)
-      : 200;
+      : 100;
 
-    const top = Math.max(1, Math.min(200, Number.isFinite(topRaw) ? Math.trunc(topRaw) : 200));
+    // SAP aguanta $top alto, pero nosotros capeamos para no matar el SL
+    const top = Math.max(1, Math.min(200, Number.isFinite(topRaw) ? Math.trunc(topRaw) : 100));
 
     // skip
+    const hasSkip = req.query?.skip != null && String(req.query.skip).trim() !== "";
     let skip = 0;
+
     if (hasSkip) {
       const sk = Number(req.query.skip);
       skip = Number.isFinite(sk) && sk >= 0 ? Math.trunc(sk) : 0;
@@ -1337,8 +1344,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     }
 
     // ======================================================
-    // ✅ filtro SAP (intentamos contains, si falla usamos substringof)
-    // Nota: filtrar por Comments (user) puede funcionar, depende tu Service Layer
+    // ✅ filtro SAP (intentamos contains, si falla substringof)
     // ======================================================
     const baseDateFilter = `DocDate ge '${f}' and DocDate lt '${toPlus1}'`;
 
@@ -1361,7 +1367,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
       if (userFilter) {
         const safe = esc(userFilter);
-        // buscamos el texto en comments (ej: [user:soto])
         sapFilter += useContains
           ? ` and contains(Comments,'${safe}')`
           : ` and substringof('${safe}',Comments)`;
@@ -1384,8 +1389,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const values = Array.isArray(raw?.value) ? raw.value : [];
 
     // ======================================================
-    // ✅ map + filtros finales (canceladas, parse user/wh)
-    // (si SAP no soporta bien contains/substringof en Comments, aquí igual filtramos)
+    // ✅ map + filtros finales
     // ======================================================
     let quotes = values
       .filter((q) => !isCancelledLike(q))
@@ -1410,7 +1414,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         };
       });
 
-    // filtro final por user/client (por si SAP no lo aplicó bien)
+    // ✅ filtros finales por si SAP no filtró bien Comments/CardName
     if (userFilter) {
       quotes = quotes.filter((q) => String(q.usuario || "").toLowerCase().includes(userFilter));
     }
@@ -1423,11 +1427,10 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     }
 
     // ======================================================
-    // ✅ withDelivered (opcional): calcula entregado/pendiente por traceQuote
-    // OJO: esto hace llamadas extra a SAP, úsalo solo cuando lo necesites.
+    // ✅ withDelivered (opcional)
     // ======================================================
     if (withDelivered && quotes.length) {
-      const CONC = 2; // sube a 3 si SAP aguanta
+      const CONC = 2;
       let idx = 0;
 
       async function worker() {
@@ -1448,17 +1451,15 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       await Promise.all(Array.from({ length: CONC }, () => worker()));
     }
 
-    // ✅ respuesta compatible con tu front
     return safeJson(res, 200, {
       ok: true,
       quotes,
       from: f,
       to: t,
-      top,
-      skip,
-      limit: top, // por compat
-      page: Math.floor(skip / top) + 1, // por compat
-      // total/pageCount quedan null (contar total real en SAP requiere query aparte)
+      top,      // ✅ tamaño real usado
+      skip,     // ✅ offset real usado
+      limit: top,
+      page: Math.floor(skip / top) + 1,
       total: null,
       pageCount: null,
     });
