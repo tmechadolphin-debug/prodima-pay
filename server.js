@@ -29,7 +29,7 @@ const {
   SAP_PASS = "",
 
   SAP_WAREHOUSE = "300",
-  SAP_PRICE_LIST = "Lista 02 Res. Com. Ind. Analitic",
+  SAP_PRICE_LIST = "Lista de Precios 99 2018",
   YAPPY_ALIAS = "@prodimasansae",
 
   // ✅ NUEVO: listas de códigos permitidos por bodega (comma separated)
