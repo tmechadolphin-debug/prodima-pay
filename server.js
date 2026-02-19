@@ -1307,25 +1307,52 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
 
+/* =========================================================
+   ✅ ADMIN QUOTES (RÁPIDO + MIN 100)
+   - Paginación REAL en SAP ($top/$skip)
+   - Default top=100 (cap 200)
+   - Filtros: from/to en SAP
+   - user/client: intenta en SAP (contains -> substringof)
+   - Relleno controlado: si tras filtrar quedan < top, trae hasta 3 páginas extra
+   - includeTotal: NO escanea todo (si lo necesitas real, es caro)
+========================================================= */
+app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    const withDelivered = String(req.query?.withDelivered || "0") === "1";
+    const includeTotal = String(req.query?.includeTotal || "0") === "1";
+
+    // ✅ fechas (defaults)
+    const from = String(req.query?.from || "").trim();
+    const to = String(req.query?.to || "").trim();
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const defaultFrom = addDaysISO(today, -90); // 👈 recomendado: más que 30 para que haya 100+
+
+    const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
+    const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
+    const toPlus1 = addDaysISO(t, 1);
+
+    // ✅ filtros texto
+    const userFilter = String(req.query?.user || "").trim().toLowerCase();
+    const clientFilter = String(req.query?.client || "").trim().toLowerCase();
+
     // ======================================================
-    // ✅ PAGINACIÓN COMPATIBLE (top/skip del front + limit/page opcional)
-    // Prioridad:
-    // 1) si vienen top/skip -> usamos esos tal cual
-    // 2) si no, usamos limit/page
+    // ✅ paginación compatible top/skip + limit/page
+    // default TOP = 100
     // ======================================================
     const hasTop = req.query?.top != null && String(req.query.top).trim() !== "";
     const hasSkip = req.query?.skip != null && String(req.query.skip).trim() !== "";
 
-    // top / limit (cap 200 para SAP)
     const topRaw = hasTop
       ? Number(req.query.top)
       : req.query?.limit != null
       ? Number(req.query.limit)
-      : 200;
+      : 100;
 
-    const top = Math.max(1, Math.min(200, Number.isFinite(topRaw) ? Math.trunc(topRaw) : 200));
+    const top = Math.max(1, Math.min(200, Number.isFinite(topRaw) ? Math.trunc(topRaw) : 100));
 
-    // skip
     let skip = 0;
     if (hasSkip) {
       const sk = Number(req.query.skip);
@@ -1336,12 +1363,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       skip = (page - 1) * top;
     }
 
-    // ======================================================
-    // ✅ filtro SAP (intentamos contains, si falla usamos substringof)
-    // Nota: filtrar por Comments (user) puede funcionar, depende tu Service Layer
-    // ======================================================
-    const baseDateFilter = `DocDate ge '${f}' and DocDate lt '${toPlus1}'`;
-
     function esc(v) {
       return String(v || "").replace(/'/g, "''");
     }
@@ -1349,7 +1370,9 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const SELECT =
       "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments";
 
-    async function fetchWithFilter(useContains) {
+    const baseDateFilter = `DocDate ge '${f}' and DocDate lt '${toPlus1}'`;
+
+    async function fetchPage({ useContains, topN, skipN }) {
       let sapFilter = baseDateFilter;
 
       if (clientFilter) {
@@ -1359,9 +1382,10 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
           : ` and (substringof('${safe}',CardCode) or substringof('${safe}',CardName))`;
       }
 
+      // OJO: filtrar Comments en SAP a veces limita o falla; si te “mata” resultados,
+      // puedes comentar este bloque y dejarlo solo para el filtro final.
       if (userFilter) {
         const safe = esc(userFilter);
-        // buscamos el texto en comments (ej: [user:soto])
         sapFilter += useContains
           ? ` and contains(Comments,'${safe}')`
           : ` and substringof('${safe}',Comments)`;
@@ -1370,64 +1394,92 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       return slFetch(
         `/Quotations?$select=${SELECT}` +
           `&$filter=${encodeURIComponent(sapFilter)}` +
-          `&$orderby=DocDate desc,DocEntry desc&$top=${top}&$skip=${skip}`
+          `&$orderby=DocDate desc,DocEntry desc` +
+          `&$top=${topN}&$skip=${skipN}`
       );
     }
 
-    let raw;
-    try {
-      raw = await fetchWithFilter(true);
-    } catch {
-      raw = await fetchWithFilter(false);
+    // ======================================================
+    // ✅ 1) Trae una página grande (hasta 200) para tener material
+    // y luego hacemos "relleno" si tras filtrar no llegamos a top.
+    // ======================================================
+    const batchSize = 200; // máximo recomendado en Service Layer
+    let collected = [];
+    let fetchSkip = skip;
+    let attempts = 0;
+    const maxExtraFetches = 3; // 👈 evita escaneos eternos
+
+    while (collected.length < top && attempts <= maxExtraFetches) {
+      attempts++;
+
+      let raw;
+      try {
+        raw = await fetchPage({ useContains: true, topN: batchSize, skipN: fetchSkip });
+      } catch {
+        raw = await fetchPage({ useContains: false, topN: batchSize, skipN: fetchSkip });
+      }
+
+      const values = Array.isArray(raw?.value) ? raw.value : [];
+      if (!values.length) break;
+
+      // map + filtros finales
+      let rows = values
+        .filter((q) => !isCancelledLike(q))
+        .map((q) => {
+          const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
+          const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
+
+          return {
+            docEntry: q.DocEntry,
+            docNum: q.DocNum,
+            cardCode: String(q.CardCode || "").trim(),
+            cardName: String(q.CardName || "").trim(),
+            montoCotizacion: Number(q.DocTotal || 0),
+            fecha: String(q.DocDate || "").slice(0, 10),
+            estado: q.DocumentStatus || "",
+            cancelStatus: q.CancelStatus ?? "",
+            comments: q.Comments || "",
+            usuario,
+            warehouse: wh,
+            montoEntregado: 0,
+            pendiente: Number(q.DocTotal || 0),
+          };
+        });
+
+      // si SAP no aplicó bien los filtros o el parser cambia, reforzamos aquí:
+      if (userFilter) {
+        rows = rows.filter((r) => {
+          const u = String(r.usuario || "").toLowerCase();
+          const c = String(r.comments || "").toLowerCase();
+          return u.includes(userFilter) || c.includes(userFilter);
+        });
+      }
+      if (clientFilter) {
+        rows = rows.filter((r) => {
+          const cc = String(r.cardCode || "").toLowerCase();
+          const cn = String(r.cardName || "").toLowerCase();
+          return cc.includes(clientFilter) || cn.includes(clientFilter);
+        });
+      }
+
+      collected.push(...rows);
+
+      // siguiente "page" en SAP
+      fetchSkip += batchSize;
+
+      // si SAP ya no da más páginas, se corta
+      if (values.length < batchSize) break;
     }
 
-    const values = Array.isArray(raw?.value) ? raw.value : [];
+    // recorta a la cantidad pedida
+    let quotes = collected.slice(0, top);
 
     // ======================================================
-    // ✅ map + filtros finales (canceladas, parse user/wh)
-    // (si SAP no soporta bien contains/substringof en Comments, aquí igual filtramos)
-    // ======================================================
-    let quotes = values
-      .filter((q) => !isCancelledLike(q))
-      .map((q) => {
-        const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
-        const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
-
-        return {
-          docEntry: q.DocEntry,
-          docNum: q.DocNum,
-          cardCode: String(q.CardCode || "").trim(),
-          cardName: String(q.CardName || "").trim(),
-          fecha: String(q.DocDate || "").slice(0, 10),
-          estado: q.DocumentStatus || "",
-          cancelStatus: q.CancelStatus ?? "",
-          comments: q.Comments || "",
-          usuario,
-          warehouse: wh,
-          montoCotizacion: Number(q.DocTotal || 0),
-          montoEntregado: 0,
-          pendiente: Number(q.DocTotal || 0),
-        };
-      });
-
-    // filtro final por user/client (por si SAP no lo aplicó bien)
-    if (userFilter) {
-      quotes = quotes.filter((q) => String(q.usuario || "").toLowerCase().includes(userFilter));
-    }
-    if (clientFilter) {
-      quotes = quotes.filter((q) => {
-        const cc = String(q.cardCode || "").toLowerCase();
-        const cn = String(q.cardName || "").toLowerCase();
-        return cc.includes(clientFilter) || cn.includes(clientFilter);
-      });
-    }
-
-    // ======================================================
-    // ✅ withDelivered (opcional): calcula entregado/pendiente por traceQuote
-    // OJO: esto hace llamadas extra a SAP, úsalo solo cuando lo necesites.
+    // ✅ withDelivered (opcional): esto SIEMPRE será lo más lento
+    // úsalo solo cuando el usuario lo activa.
     // ======================================================
     if (withDelivered && quotes.length) {
-      const CONC = 2; // sube a 3 si SAP aguanta
+      const CONC = 2;
       let idx = 0;
 
       async function worker() {
@@ -1448,7 +1500,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       await Promise.all(Array.from({ length: CONC }, () => worker()));
     }
 
-    // ✅ respuesta compatible con tu front
     return safeJson(res, 200, {
       ok: true,
       quotes,
@@ -1456,16 +1507,17 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       to: t,
       top,
       skip,
-      limit: top, // por compat
-      page: Math.floor(skip / top) + 1, // por compat
-      // total/pageCount quedan null (contar total real en SAP requiere query aparte)
-      total: null,
-      pageCount: null,
+      limit: top,
+      page: Math.floor(skip / top) + 1,
+      // total real es caro; no lo calculamos aquí
+      total: includeTotal ? null : null,
+      pageCount: includeTotal ? null : null,
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
+
 
 
 /* =========================================================
