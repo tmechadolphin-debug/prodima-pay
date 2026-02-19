@@ -36,6 +36,13 @@ const {
   ACTIVE_CODES_200 = "",
   ACTIVE_CODES_300 = "",
   ACTIVE_CODES_500 = "",
+
+  // ✅ NUEVO: usuarios que pueden elegir cualquier bodega (comma separated)
+  // Ej: "soto,liliana,daniel11,respinosa,test"
+  ADMIN_FREE_WHS_USERS = "soto,liliana,daniel11,respinosa,test",
+
+  // ✅ NUEVO: fallback bodegas (si SAP no responde)
+  WAREHOUSE_FALLBACK = "200,300,500,01",
 } = process.env;
 
 /* =========================================================
@@ -132,52 +139,57 @@ function provinceToWarehouse(province) {
 }
 
 /* =========================================================
-   ✅ NUEVO (server): Admins que pueden escoger cualquier bodega
-   - NO cambia logins ni conexiones
-   - Solo habilita override de bodega por query/header para estos users
+   ✅ NUEVO: Admin users que pueden elegir bodega libre
 ========================================================= */
-const ADMIN_FREE_WHS = new Set(["soto", "liliana", "daniel11", "respinosa", "test"]);
+function parseCsvSet(str) {
+  return new Set(
+    String(str || "")
+      .split(",")
+      .map((x) => x.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+const ADMIN_FREE_WHS_SET = parseCsvSet(ADMIN_FREE_WHS_USERS);
 
-function isAdminFreeWHS(req) {
-  const u = String(req.user?.username || "")
-    .trim()
-    .toLowerCase();
-  return ADMIN_FREE_WHS.has(u);
+function canOverrideWarehouse(req) {
+  const u = String(req.user?.username || "").trim().toLowerCase();
+  return u && ADMIN_FREE_WHS_SET.has(u);
 }
 
-const VALID_WHS = new Set(["200", "300", "500", "01"]);
-
-function normalizeWh(x) {
-  const w = String(x || "").trim();
-  if (!w) return "";
-  return VALID_WHS.has(w) ? w : "";
-}
-
-function getWarehouseFromReq(req) {
-  // ✅ Si es admin con bodega libre, permitimos override por query/header
-  if (isAdminFreeWHS(req)) {
-    const whQuery = normalizeWh(req.query?.warehouse || req.query?.wh);
-    if (whQuery) return whQuery;
-
-    const whHeader = normalizeWh(req.headers["x-warehouse"]);
-    if (whHeader) return whHeader;
-  }
-
-  // ✅ Default normal: bodega del usuario (token/DB)
-  const whToken = normalizeWh(req.user?.warehouse_code);
+function getWarehouseFromUserToken(req) {
+  const whToken = String(req.user?.warehouse_code || "").trim();
   if (whToken) return whToken;
-
-  // (se mantiene tu lógica original como fallback)
-  const whQuery = String(req.query?.warehouse || req.query?.wh || "").trim();
-  if (whQuery) return whQuery;
-
-  const whHeader = String(req.headers["x-warehouse"] || "").trim();
-  if (whHeader) return whHeader;
 
   const prov = String(req.user?.province || "").trim();
   if (prov) return provinceToWarehouse(prov);
 
   return SAP_WAREHOUSE || "300";
+}
+
+function getRequestedWarehouse(req) {
+  // body (tu HTML manda whsCode / WhsCode / warehouse)
+  const fromBody = String(req.body?.whsCode || req.body?.WhsCode || req.body?.warehouse || "").trim();
+  if (fromBody) return fromBody;
+
+  // query
+  const whQuery = String(req.query?.warehouse || req.query?.wh || "").trim();
+  if (whQuery) return whQuery;
+
+  // header
+  const whHeader = String(req.headers["x-warehouse"] || "").trim();
+  if (whHeader) return whHeader;
+
+  return "";
+}
+
+function getWarehouseFromReq(req) {
+  // ✅ Seguridad: SOLO los usuarios del set pueden sobreescribir bodega por header/query/body
+  if (req.user && canOverrideWarehouse(req)) {
+    const requested = getRequestedWarehouse(req);
+    if (requested) return requested;
+  }
+  // ✅ Usuario normal: SIEMPRE usa su bodega fija
+  return getWarehouseFromUserToken(req);
 }
 
 /* =========================================================
@@ -221,7 +233,6 @@ function assertItemAllowedOrThrow(wh, itemCode) {
 
   const set = getAllowedSetForWh(wh);
   // ✅ si NO configuraste lista, por seguridad NO bloqueamos (para no tumbarte producción)
-  //    pero en tu caso DEBES configurarla para que sea estricto.
   if (!set || set.size === 0) return true;
 
   if (!set.has(code)) {
@@ -334,6 +345,7 @@ app.get("/api/health", async (req, res) => {
     allowed_wh_200: (ALLOWED_BY_WH["200"] || []).length,
     allowed_wh_300: (ALLOWED_BY_WH["300"] || []).length,
     allowed_wh_500: (ALLOWED_BY_WH["500"] || []).length,
+    admin_free_whs_users: Array.from(ADMIN_FREE_WHS_SET).length,
   });
 });
 
@@ -878,9 +890,6 @@ function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   };
 
   // ✅ En tu pantalla debe mostrarse CAJA:
-  // - priceUnit: precio unitario si SAP lo trae así
-  // - factorCaja: multiplicador caja
-  // - price: precio CAJA (si no hay factor, queda igual al unit)
   const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
   const factorCaja = getSalesUomFactor(itemFull);
   const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
@@ -966,6 +975,52 @@ app.get("/api/sap/allowed-items", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
+   ✅ NUEVO: Warehouses list (para tu HTML)
+   GET /api/sap/warehouses
+========================================================= */
+app.get("/api/sap/warehouses", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      const fb = String(WAREHOUSE_FALLBACK || "300")
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      return res.json({ ok: true, warehouses: fb.map((w) => ({ WarehouseCode: w })) });
+    }
+
+    // Intento real
+    let raw;
+    try {
+      raw = await slFetch(`/Warehouses?$select=WarehouseCode,WarehouseName&$orderby=WarehouseCode asc&$top=200`);
+    } catch {
+      // fallback nombre del campo a veces WhsCode
+      raw = await slFetch(`/Warehouses?$select=WhsCode,WhsName&$orderby=WhsCode asc&$top=200`);
+    }
+
+    const values = Array.isArray(raw?.value) ? raw.value : [];
+
+    const warehouses = values
+      .map((w) => ({
+        WarehouseCode: w?.WarehouseCode || w?.WhsCode || w?.whsCode || w?.Code || "",
+        WarehouseName: w?.WarehouseName || w?.WhsName || w?.whsName || w?.Name || "",
+      }))
+      .filter((w) => String(w.WarehouseCode || "").trim());
+
+    if (!warehouses.length) {
+      const fb = String(WAREHOUSE_FALLBACK || "300")
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      return res.json({ ok: true, warehouses: fb.map((w) => ({ WarehouseCode: w, WarehouseName: "" })) });
+    }
+
+    return res.json({ ok: true, warehouses });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: String(err.message || err) });
+  }
+});
+
+/* =========================================================
    ✅ SAP: ITEM (bloquea códigos NO permitidos en 200/300/500)
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
@@ -1041,7 +1096,7 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
             ok: true,
             name: r.item.ItemName,
             unit: "Caja",
-            price: r.price, // CAJA
+            price: r.price,         // CAJA
             priceUnit: r.priceUnit, // debug
             factorCaja: r.factorCaja,
             stock: r.stock,
@@ -1071,9 +1126,6 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ NUEVO: SAP Items Search (sugerencias para productos)
-   GET /api/sap/items/search?q=texto&top=20
-   - Filtra activos (Valid=tYES y FrozenFor=tNO cuando exista)
-   - Filtra por allowlist si bodega 200/300/500
 ========================================================= */
 app.get("/api/sap/items/search", verifyUser, async (req, res) => {
   try {
@@ -1089,7 +1141,6 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const safe = q.replace(/'/g, "''");
 
-    // Buscamos más de top para poder filtrar por allowed y por activos
     const preTop = Math.min(100, top * 5);
 
     let raw;
@@ -1102,7 +1153,6 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
           `&$orderby=ItemName asc&$top=${preTop}`
       );
     } catch {
-      // fallback para SL viejo
       raw = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor` +
           `&$filter=${encodeURIComponent(
@@ -1114,16 +1164,17 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
     const values = Array.isArray(raw?.value) ? raw.value : [];
 
-    // Activo = Valid = tYES (si viene) y FrozenFor != tYES (si viene)
     function isActiveSapItem(it) {
       const v = String(it?.Valid ?? "").toLowerCase();
       const f = String(it?.FrozenFor ?? "").toLowerCase();
-      const validOk = !v || v.includes("tyes") || v === "yes" || v === "true"; // si no viene, no bloqueamos
+      const validOk = !v || v.includes("tyes") || v === "yes" || v === "true";
       const frozenOk = !f || f.includes("tno") || f === "no" || f === "false";
       return validOk && frozenOk;
     }
 
-    let filtered = values.filter((it) => it?.ItemCode).filter(isActiveSapItem);
+    let filtered = values
+      .filter((it) => it?.ItemCode)
+      .filter(isActiveSapItem);
 
     if (allowedSet && allowedSet.size > 0) {
       filtered = filtered.filter((it) => allowedSet.has(String(it.ItemCode).trim()));
@@ -1143,11 +1194,17 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD)
-   ✅ FIX DUPLICADOS:
-   - orderby estable: DocDate desc, DocEntry desc
-   - dedupe por DocEntry en el scanner
+   ✅ FIX DUPLICADOS
 ========================================================= */
-async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter, includeTotal }) {
+async function scanQuotes({
+  f,
+  t,
+  wantSkip,
+  wantLimit,
+  userFilter,
+  clientFilter,
+  includeTotal,
+}) {
   const toPlus1 = addDaysISO(t, 1);
   const batchTop = 200;
 
@@ -1160,7 +1217,6 @@ async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter,
 
   const maxSapPages = includeTotal ? 200 : 50;
 
-  // ✅ Dedup global para evitar repetidos entre páginas SAP
   const seenDocEntry = new Set();
 
   for (let page = 0; page < maxSapPages; page++) {
@@ -1387,7 +1443,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     const warehouseCode = getWarehouseFromReq(req);
 
-    // ✅ Filtra líneas válidas
     const cleanLines = lines
       .map((l) => ({
         ItemCode: String(l.itemCode || "").trim(),
@@ -1398,12 +1453,10 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     if (!cleanLines.length)
       return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
 
-    // ✅ BLOQUEO por bodega (allowlist)
     for (const ln of cleanLines) {
       assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
     }
 
-    // ✅ 1) Intento normal: fuerza WarehouseCode
     const DocumentLines = cleanLines.map((ln) => ({
       ItemCode: ln.ItemCode,
       Quantity: ln.Quantity,
@@ -1415,11 +1468,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     const province = String(req.user?.province || "").trim();
 
     const baseComments = [
-      `[WEB PEDIDOS]`,
       `[user:${creator}]`,
-      province ? `[prov:${province}]` : "",
-      warehouseCode ? `[wh:${warehouseCode}]` : "",
-      comments ? comments : "Cotización mercaderista",
     ]
       .filter(Boolean)
       .join(" ");
@@ -1450,11 +1499,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       });
     } catch (err1) {
       const msg1 = String(err1?.message || err1);
-
-      // ✅ Si es el clásico -2028 (Item no matchea con bodega), reintenta sin WarehouseCode
-      const isNoMatch =
-        msg1.includes("ODBC -2028") || msg1.toLowerCase().includes("no matching records found");
-
+      const isNoMatch = msg1.includes("ODBC -2028") || msg1.toLowerCase().includes("no matching records found");
       if (!isNoMatch) throw err1;
 
       const payloadFallback = {
@@ -1463,7 +1508,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         DocumentLines: cleanLines.map((ln) => ({
           ItemCode: ln.ItemCode,
           Quantity: ln.Quantity,
-          // 👈 SIN WarehouseCode para que SAP use el default/config del item
         })),
       };
 
