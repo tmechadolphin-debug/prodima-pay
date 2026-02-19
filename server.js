@@ -1279,21 +1279,13 @@ async function scanQuotes({
   return { pageRows, totalFiltered };
 }
 
-/* =========================================================
-   ✅ ADMIN QUOTES (RÁPIDO + 100 POR DEFECTO)
-   - Paginación REAL: top/skip (preferido) o limit/page (opcional)
-   - Default: 100 resultados por llamada (si el front no manda top/limit)
-   - NO escanea miles: solo trae esa página desde SAP
-   - Filtros: from/to + user/client (en SAP si se puede)
-   - withDelivered=1 (opcional) calcula entregado/pendiente por traceQuote (más lento)
-========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
 
-    // ✅ Fechas (con defaults)
+    // ✅ Fechas
     const from = String(req.query?.from || "").trim();
     const to = String(req.query?.to || "").trim();
 
@@ -1304,33 +1296,25 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
     const toPlus1 = addDaysISO(t, 1);
 
-    // ✅ Filtros
+    // ✅ Filtros (limpiados)
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
 
-    // ======================================================
-    // ✅ PAGINACIÓN COMPATIBLE (top/skip o limit/page)
-    // ✅ Default: 100 por llamada
-    // Reglas:
-    // - Si viene top => usamos top
-    // - Si NO viene top, pero viene limit => usamos limit
-    // - Si no viene ninguno => 100
-    // - skip: si viene, se usa; si no, sale de page
-    // ======================================================
+    const uFilter = userFilter && userFilter !== "all" ? userFilter : "";
+    const cFilter = clientFilter && clientFilter !== "all" ? clientFilter : "";
+
+    // ✅ Paginación (DEFAULT 100)
     const hasTop = req.query?.top != null && String(req.query.top).trim() !== "";
     const hasLimit = req.query?.limit != null && String(req.query.limit).trim() !== "";
 
-    // ✅ default 100
     const topRaw = hasTop
       ? Number(req.query.top)
       : hasLimit
       ? Number(req.query.limit)
       : 100;
 
-    // SAP aguanta $top alto, pero nosotros capeamos para no matar el SL
     const top = Math.max(1, Math.min(200, Number.isFinite(topRaw) ? Math.trunc(topRaw) : 100));
 
-    // skip
     const hasSkip = req.query?.skip != null && String(req.query.skip).trim() !== "";
     let skip = 0;
 
@@ -1343,14 +1327,12 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       skip = (page - 1) * top;
     }
 
-    // ======================================================
-    // ✅ filtro SAP (intentamos contains, si falla substringof)
-    // ======================================================
-    const baseDateFilter = `DocDate ge '${f}' and DocDate lt '${toPlus1}'`;
-
+    // ✅ build filter
     function esc(v) {
       return String(v || "").replace(/'/g, "''");
     }
+
+    const baseDateFilter = `DocDate ge '${f}' and DocDate lt '${toPlus1}'`;
 
     const SELECT =
       "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments";
@@ -1358,15 +1340,17 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     async function fetchWithFilter(useContains) {
       let sapFilter = baseDateFilter;
 
-      if (clientFilter) {
-        const safe = esc(clientFilter);
+      // ✅ client filter (CardCode/CardName) - esto casi siempre funciona
+      if (cFilter) {
+        const safe = esc(cFilter);
         sapFilter += useContains
           ? ` and (contains(CardCode,'${safe}') or contains(CardName,'${safe}'))`
           : ` and (substringof('${safe}',CardCode) or substringof('${safe}',CardName))`;
       }
 
-      if (userFilter) {
-        const safe = esc(userFilter);
+      // ✅ user filter (Comments) - depende del SL, lo intentamos pero NO recortamos luego
+      if (uFilter) {
+        const safe = esc(uFilter);
         sapFilter += useContains
           ? ` and contains(Comments,'${safe}')`
           : ` and substringof('${safe}',Comments)`;
@@ -1388,9 +1372,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const values = Array.isArray(raw?.value) ? raw.value : [];
 
-    // ======================================================
-    // ✅ map + filtros finales
-    // ======================================================
+    // ✅ map (NO recortes al final para no bajar de 100)
     let quotes = values
       .filter((q) => !isCancelledLike(q))
       .map((q) => {
@@ -1414,21 +1396,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         };
       });
 
-    // ✅ filtros finales por si SAP no filtró bien Comments/CardName
-    if (userFilter) {
-      quotes = quotes.filter((q) => String(q.usuario || "").toLowerCase().includes(userFilter));
-    }
-    if (clientFilter) {
-      quotes = quotes.filter((q) => {
-        const cc = String(q.cardCode || "").toLowerCase();
-        const cn = String(q.cardName || "").toLowerCase();
-        return cc.includes(clientFilter) || cn.includes(clientFilter);
-      });
-    }
-
-    // ======================================================
     // ✅ withDelivered (opcional)
-    // ======================================================
     if (withDelivered && quotes.length) {
       const CONC = 2;
       let idx = 0;
@@ -1456,8 +1424,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       quotes,
       from: f,
       to: t,
-      top,      // ✅ tamaño real usado
-      skip,     // ✅ offset real usado
+      top,
+      skip,
       limit: top,
       page: Math.floor(skip / top) + 1,
       total: null,
@@ -1468,74 +1436,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   }
 });
 
-
-/* =========================================================
-   ✅ CUSTOMERS search / customer (igual a tu código)
-========================================================= */
-app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const q = String(req.query?.q || "").trim();
-    const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
-
-    if (q.length < 2) return res.json({ ok: true, results: [] });
-
-    const safe = q.replace(/'/g, "''");
-
-    let r;
-    try {
-      r = await slFetch(
-        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=contains(CardName,'${safe}') or contains(CardCode,'${safe}')&$orderby=CardName asc&$top=${top}`
-      );
-    } catch {
-      r = await slFetch(
-        `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=substringof('${safe}',CardName) or substringof('${safe}',CardCode)&$orderby=CardName asc&$top=${top}`
-      );
-    }
-
-    const values = Array.isArray(r?.value) ? r.value : [];
-    const results = values.map((x) => ({
-      CardCode: x.CardCode,
-      CardName: x.CardName,
-      Phone1: x.Phone1 || "",
-      EmailAddress: x.EmailAddress || "",
-    }));
-
-    return res.json({ ok: true, q, results });
-  } catch (err) {
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
-
-app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
-  try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
-
-    const code = String(req.params.code || "").trim();
-    if (!code) return res.status(400).json({ ok: false, message: "CardCode vacío." });
-
-    const bp = await slFetch(
-      `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Phone1,Phone2,EmailAddress,Address,City,Country,ZipCode`
-    );
-
-    const addrParts = [bp.Address, bp.City, bp.ZipCode, bp.Country].filter(Boolean).join(", ");
-
-    return res.json({
-      ok: true,
-      customer: {
-        CardCode: bp.CardCode,
-        CardName: bp.CardName,
-        Phone1: bp.Phone1,
-        Phone2: bp.Phone2,
-        EmailAddress: bp.EmailAddress,
-        Address: addrParts || bp.Address || "",
-      },
-    });
-  } catch (err) {
-    return res.status(500).json({ ok: false, message: err.message });
-  }
-});
 
 /* =========================================================
    ✅ QUOTE (BLOQUEA ItemCodes NO permitidos en 200/300/500)
