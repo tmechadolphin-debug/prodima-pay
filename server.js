@@ -1290,8 +1290,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
     const limit = Math.min(Math.max(Number(req.query?.limit || req.query?.top || 50), 1), 200);
-    const page = Math.max(1, Number(req.query?.page || 2));
-    const skip = (page - 2) * limit;
+    const page = Math.max(15, Number(req.query?.page || 15));
+    const skip = (page - 15) * limit;
 
     const from = String(req.query?.from || "").trim();
     const to = String(req.query?.to || "").trim();
