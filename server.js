@@ -1279,85 +1279,121 @@ async function scanQuotes({
   return { pageRows, totalFiltered };
 }
 
+/* =========================================================
+   ✅ ADMIN QUOTES (RÁPIDO) HISTÓRICO + DASHBOARD
+   - Paginación REAL en SAP ($top/$skip)
+   - Mantiene filtros por fecha
+   - Soporta filtros opcionales user/client
+========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
-    const from = String(req.query?.from || "");
-    const to = String(req.query?.to || "");
-
-    const withDelivered = String(req.query?.withDelivered || "0") === "1";
-
-    const limitRaw =
-      req.query?.limit != null
-        ? Number(req.query.limit)
-        : req.query?.top != null
-        ? Number(req.query.top)
-        : 20;
-
-    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
-
-    const pageRaw = req.query?.page != null ? Number(req.query.page) : 1;
-    const page = Math.max(1, Number.isFinite(pageRaw) ? pageRaw : 1);
+    const limit = Math.min(Math.max(Number(req.query?.limit || req.query?.top || 50), 1), 200);
+    const page = Math.max(1, Number(req.query?.page || 1));
     const skip = (page - 1) * limit;
 
-    const includeTotal = String(req.query?.includeTotal || "0") === "1";
-
-    const userFilter = String(req.query?.user || "");
-    const clientFilter = String(req.query?.client || "");
+    const from = String(req.query?.from || "").trim();
+    const to = String(req.query?.to || "").trim();
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const defaultFrom = addDaysISO(today, -30);
 
     const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
     const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
+    const toPlus1 = addDaysISO(t, 1);
 
-    const { pageRows, totalFiltered } = await scanQuotes({
-      f,
-      t,
-      wantSkip: skip,
-      wantLimit: limit,
-      userFilter,
-      clientFilter,
-      includeTotal,
-    });
+    const userFilter = String(req.query?.user || "").trim().toLowerCase();
+    const clientFilter = String(req.query?.client || "").trim().toLowerCase();
 
-    if (withDelivered && pageRows.length) {
-      const CONC = 2;
-      let idx = 0;
+    // ✅ Filtros en SAP (lo más posible)
+    // Nota: Service Layer a veces soporta contains(), si no, cae a substringof()
+    const baseDateFilter = `DocDate ge '${f}' and DocDate lt '${toPlus1}'`;
 
-      async function worker() {
-        while (idx < pageRows.length) {
-          const i = idx++;
-          const q = pageRows[i];
-          try {
-            const tr = await traceQuote(q.docNum, f, t);
-            if (tr.ok) {
-              q.montoEntregado = Number(tr.totals?.totalEntregado || 0);
-              q.pendiente = Number(tr.totals?.pendiente || 0);
-            }
-          } catch {}
-          await sleep(25);
-        }
+    let sapFilter = baseDateFilter;
+
+    // clientFilter lo intentamos por CardCode/CardName
+    // userFilter depende de Comments, lo intentamos también
+    if (clientFilter) {
+      const safe = clientFilter.replace(/'/g, "''");
+      sapFilter += ` and (contains(CardCode,'${safe}') or contains(CardName,'${safe}'))`;
+    }
+    if (userFilter) {
+      const safe = userFilter.replace(/'/g, "''");
+      sapFilter += ` and contains(Comments,'${safe}')`;
+    }
+
+    const SELECT =
+      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
+
+    let sap;
+    try {
+      sap = await slFetch(
+        `/Quotations?$select=${SELECT}` +
+          `&$filter=${encodeURIComponent(sapFilter)}` +
+          `&$orderby=DocDate desc,DocEntry desc&$top=${limit}&$skip=${skip}`
+      );
+    } catch (e1) {
+      // fallback substringof si contains falla
+      let sapFilter2 = baseDateFilter;
+      if (clientFilter) {
+        const safe = clientFilter.replace(/'/g, "''");
+        sapFilter2 += ` and (substringof('${safe}',CardCode) or substringof('${safe}',CardName))`;
+      }
+      if (userFilter) {
+        const safe = userFilter.replace(/'/g, "''");
+        sapFilter2 += ` and substringof('${safe}',Comments)`;
       }
 
-      await Promise.all(Array.from({ length: CONC }, () => worker()));
+      sap = await slFetch(
+        `/Quotations?$select=${SELECT}` +
+          `&$filter=${encodeURIComponent(sapFilter2)}` +
+          `&$orderby=DocDate desc,DocEntry desc&$top=${limit}&$skip=${skip}`
+      );
     }
+
+    const values = Array.isArray(sap?.value) ? sap.value : [];
+
+    const quotes = values
+      .filter((q) => !isCancelledLike(q))
+      .map((q) => {
+        const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
+        const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
+
+        return {
+          docEntry: q.DocEntry,
+          docNum: q.DocNum,
+          cardCode: String(q.CardCode || "").trim(),
+          cardName: String(q.CardName || "").trim(),
+          montoCotizacion: Number(q.DocTotal || 0),
+          fecha: String(q.DocDate || "").slice(0, 10),
+          estado: q.DocumentStatus || "",
+          cancelStatus: q.CancelStatus ?? "",
+          comments: q.Comments || "",
+          usuario,
+          warehouse: wh,
+          // (si luego quieres conDelivered, lo haces en otra llamada)
+          montoEntregado: 0,
+          pendiente: Number(q.DocTotal || 0),
+        };
+      });
 
     return safeJson(res, 200, {
       ok: true,
-      quotes: pageRows,
+      quotes,
       from: f,
       to: t,
       page,
       limit,
-      total: includeTotal ? totalFiltered : null,
-      pageCount: includeTotal ? Math.max(1, Math.ceil(totalFiltered / limit)) : null,
+      // total/pageCount en SAP requiere conteo aparte (caro), mejor no hacerlo aquí
+      total: null,
+      pageCount: null,
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
+
 
 /* =========================================================
    ✅ CUSTOMERS search / customer (igual a tu código)
