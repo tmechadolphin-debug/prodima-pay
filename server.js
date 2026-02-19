@@ -1318,38 +1318,43 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
     const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
 
-    // 🔥 Construcción dinámica del filtro OData
+    const toPlus1 = addDaysISO(t, 1);
+
+    /* 🔥 FILTRO REAL SIN DUPLICADOS */
     let filterParts = [
       `DocDate ge '${f}'`,
-      `DocDate le '${t}'`,
-      `Canceled eq 'tNO'`
+      `DocDate lt '${toPlus1}'`,
+      `CancelStatus eq 'csNo'`
     ];
 
-    if (userFilter) {
-      filterParts.push(`SalesPersonCode eq ${Number(userFilter)}`);
-    }
-
     if (clientFilter) {
-      filterParts.push(`CardCode eq '${clientFilter}'`);
+      filterParts.push(`CardCode eq '${clientFilter.replace(/'/g, "''")}'`);
     }
 
     const filter = filterParts.join(" and ");
 
-    // 🚀 Query directo optimizado a SAP
-    const url =
+    const path =
       `/Quotations?` +
-      `$select=DocEntry,DocNum,DocDate,CardCode,CardName,DocTotal,SalesPersonCode` +
+      `$select=DocEntry,DocNum,DocDate,CardCode,CardName,DocTotal,DocumentStatus,CancelStatus,Comments` +
       `&$filter=${encodeURIComponent(filter)}` +
-      `&$orderby=DocDate desc, DocNum desc` +
+      `&$orderby=DocDate desc,DocEntry desc` +
       `&$top=${limit}` +
       `&$skip=${skip}` +
       (includeTotal ? `&$count=true` : "");
 
-    const sap = await getSapClient();
-    const response = await sap.get(url);
+    /* ✅ USAMOS TU slFetch EXISTENTE */
+    const response = await slFetch(path);
 
-    const quotes = response.data.value || [];
-    const total = includeTotal ? response.data["@odata.count"] : null;
+    const quotesRaw = Array.isArray(response?.value) ? response.value : [];
+
+    /* 🔥 Filtro adicional por usuario en comments */
+    const quotes = quotesRaw.filter(q => {
+      if (!userFilter) return true;
+      const usuario = parseUserFromComments(q.Comments || "");
+      return String(usuario).toLowerCase().includes(userFilter.toLowerCase());
+    });
+
+    const total = includeTotal ? response?.["@odata.count"] ?? null : null;
 
     return safeJson(res, 200, {
       ok: true,
@@ -1370,7 +1375,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
-
 
 /* =========================================================
    ✅ CUSTOMERS search / customer (igual a tu código)
