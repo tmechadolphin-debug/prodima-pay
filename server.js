@@ -1300,16 +1300,16 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const skip = (page - 1) * limit;
 
     /* ============================
-       FECHAS (MES ACTUAL POR DEFECTO)
+       FECHAS (MES ACTUAL)
     ============================ */
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
-
-    const from = String(req.query?.from || "").trim();
-    const to = String(req.query?.to || "").trim();
 
     function firstDayOfMonth(dateStr) {
       return dateStr.substring(0, 7) + "-01";
     }
+
+    const from = String(req.query?.from || "").trim();
+    const to = String(req.query?.to || "").trim();
 
     const defaultFrom = firstDayOfMonth(today);
 
@@ -1317,40 +1317,34 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
 
     /* ============================
-       FILTROS
+       🔥 FILTRO MÁS AMPLIO POSIBLE
+       (DocDate OR TaxDate)
     ============================ */
-    const userFilter = String(req.query?.user || "").trim().toLowerCase();
-    const clientFilter = String(req.query?.client || "").trim().toLowerCase();
-
     let sapFilter =
-      `DocDate ge '${f}' and DocDate le '${t}' and CancelStatus eq 'csNo'`;
+      `(DocDate ge '${f}' and DocDate le '${t}') ` +
+      `or (TaxDate ge '${f}' and TaxDate le '${t}')`;
 
-    if (clientFilter) {
-      const safe = clientFilter.replace(/'/g, "''");
-      sapFilter += ` and (contains(CardCode,'${safe}') or contains(CardName,'${safe}'))`;
-    }
-
-    if (userFilter) {
-      const safe = userFilter.replace(/'/g, "''");
-      sapFilter += ` and contains(Comments,'${safe}')`;
-    }
+    console.log("SAP FILTER:", sapFilter);
 
     const SELECT =
-      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
+      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,TaxDate,DocumentStatus,CancelStatus,Comments`;
 
     /* ============================
-       1️⃣ OBTENER PÁGINA
+       TRAER DATA
     ============================ */
     const sap = await slFetch(
       `/Quotations?$select=${SELECT}` +
         `&$filter=${encodeURIComponent(sapFilter)}` +
-        `&$orderby=DocDate desc,DocEntry desc` +
+        `&$orderby=DocEntry desc` +
         `&$top=${limit}&$skip=${skip}`
     );
 
     const values = Array.isArray(sap?.value) ? sap.value : [];
 
-    const quotes = values.map((q) => {
+    // 🔥 filtramos canceladas AQUÍ, no en SAP
+    const filtered = values.filter(q => q.CancelStatus !== "csYes");
+
+    const quotes = filtered.map((q) => {
       const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
       const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
 
@@ -1362,14 +1356,13 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         montoCotizacion: Number(q.DocTotal || 0),
         fecha: String(q.DocDate || "").slice(0, 10),
         estado: q.DocumentStatus || "",
-        comments: q.Comments || "",
         usuario,
         warehouse: wh,
       };
     });
 
     /* ============================
-       2️⃣ TOTAL REAL
+       TOTAL REAL
     ============================ */
     let total = null;
     let pageCount = null;
