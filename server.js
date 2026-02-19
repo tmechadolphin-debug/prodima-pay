@@ -1280,11 +1280,11 @@ async function scanQuotes({
 }
 
 /* =========================================================
-   ✅ ADMIN QUOTES PRO - RÁPIDO + TOTAL REAL + MES ACTUAL
-   - Paginación REAL en SAP ($top/$skip)
+   ✅ ADMIN QUOTES PRO FINAL - MES COMPLETO REAL
+   - Filtro fecha robusto con hora
+   - Paginación real SAP
    - Total real con $count
-   - Mes actual por defecto
-   - Filtros opcionales user/client
+   - Escalable
 ========================================================= */
 
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
@@ -1293,25 +1293,22 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
     /* ============================
-       📌 Paginación segura
+       📌 PAGINACIÓN
     ============================ */
     const limit = Math.min(Math.max(Number(req.query?.limit || 20), 1), 200);
     const page = Math.max(1, Number(req.query?.page || 1));
     const skip = (page - 1) * limit;
 
     /* ============================
-       📅 Fechas (MES ACTUAL por defecto)
+       📅 FECHAS (MES ACTUAL POR DEFECTO)
     ============================ */
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+
     const from = String(req.query?.from || "").trim();
     const to = String(req.query?.to || "").trim();
 
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-
     function firstDayOfMonth(dateStr) {
-      const d = new Date(dateStr);
-      return new Date(d.getFullYear(), d.getMonth(), 1)
-        .toISOString()
-        .slice(0, 10);
+      return dateStr.substring(0, 7) + "-01";
     }
 
     const defaultFrom = firstDayOfMonth(today);
@@ -1319,15 +1316,20 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
     const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
 
-    const toPlus1 = addDaysISO(t, 1);
+    // 🔥 IMPORTANTE: usar hora explícita
+    const dateFrom = `${f}T00:00:00`;
+    const dateTo = `${t}T23:59:59`;
 
     /* ============================
-       🔍 Filtros opcionales
+       🔍 FILTROS OPCIONALES
     ============================ */
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
 
-    let sapFilter = `DocDate ge '${f}' and DocDate lt '${toPlus1}' and CancelStatus eq 'csNo'`;
+    let sapFilter =
+      `DocDate ge datetime'${dateFrom}' ` +
+      `and DocDate le datetime'${dateTo}' ` +
+      `and CancelStatus eq 'csNo'`;
 
     if (clientFilter) {
       const safe = clientFilter.replace(/'/g, "''");
@@ -1343,7 +1345,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
 
     /* ============================
-       📦 1️⃣ Obtener página actual
+       📦 1️⃣ OBTENER PÁGINA
     ============================ */
     const sap = await slFetch(
       `/Quotations?$select=${SELECT}` +
@@ -1373,7 +1375,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     });
 
     /* ============================
-       📊 2️⃣ Obtener TOTAL real (rápido)
+       📊 2️⃣ TOTAL REAL
     ============================ */
     let total = null;
     let pageCount = null;
@@ -1386,7 +1388,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       total = Number(countRes || 0);
       pageCount = Math.max(1, Math.ceil(total / limit));
     } catch {
-      // Si $count no está habilitado en tu Service Layer
       total = null;
       pageCount = null;
     }
@@ -1405,7 +1406,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
-
 
 /* =========================================================
    ✅ CUSTOMERS search / customer (igual a tu código)
