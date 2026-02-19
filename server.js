@@ -1291,87 +1291,114 @@ async function scanQuotes({
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
-    if (missingSapEnv()) {
+    if (missingSapEnv())
       return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    /* ============================
+       PAGINACIÓN
+    ============================ */
+    const limit = Math.min(Math.max(Number(req.query?.limit || 20), 1), 200);
+    const page = Math.max(1, Number(req.query?.page || 1));
+    const skip = (page - 1) * limit;
+
+    /* ============================
+       FECHAS (MES ACTUAL POR DEFECTO)
+    ============================ */
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+
+    const from = String(req.query?.from || "").trim();
+    const to = String(req.query?.to || "").trim();
+
+    function firstDayOfMonth(dateStr) {
+      return dateStr.substring(0, 7) + "-01";
     }
 
-    const from = String(req.query?.from || "");
-    const to = String(req.query?.to || "");
-    const userFilter = String(req.query?.user || "").trim();
-    const clientFilter = String(req.query?.client || "").trim();
-
-    const page = Math.max(1, Number(req.query?.page || 1));
-    const limit = Math.max(1, Math.min(200, Number(req.query?.limit || 20)));
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
+    const defaultFrom = firstDayOfMonth(today);
 
     const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
     const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
 
-    /* ===============================
-       🔥 FILTRO FECHA CORRECTO SAP
-    ================================ */
+    /* ============================
+       FILTROS
+    ============================ */
+    const userFilter = String(req.query?.user || "").trim().toLowerCase();
+    const clientFilter = String(req.query?.client || "").trim().toLowerCase();
 
-    let filter =
-      `DocDate ge datetime'${f}T00:00:00' and ` +
-      `DocDate le datetime'${t}T23:59:59' and ` +
-      `CancelStatus eq 'csNo'`;
+    let sapFilter =
+      `DocDate ge '${f}' and DocDate le '${t}' and CancelStatus eq 'csNo'`;
 
     if (clientFilter) {
-      filter += ` and CardCode eq '${clientFilter.replace(/'/g, "''")}'`;
+      const safe = clientFilter.replace(/'/g, "''");
+      sapFilter += ` and (contains(CardCode,'${safe}') or contains(CardName,'${safe}'))`;
     }
-
-    const path =
-      `/Quotations?` +
-      `$select=DocEntry,DocNum,DocDate,CardCode,CardName,DocTotal,DocumentStatus,CancelStatus,Comments` +
-      `&$filter=${encodeURIComponent(filter)}` +
-      `&$orderby=DocDate desc,DocEntry desc`;
-
-    /* ===============================
-       🚀 TRAEMOS TODO EL RANGO
-    ================================ */
-
-    const response = await slFetch(path);
-    let quotes = Array.isArray(response?.value) ? response.value : [];
-
-    /* ===============================
-       👤 FILTRO POR USUARIO [usr=]
-    ================================ */
 
     if (userFilter) {
-      quotes = quotes.filter(q => {
-        const usuario = parseUserFromComments(q.Comments || "");
-        return (
-          usuario &&
-          usuario.toLowerCase() === userFilter.toLowerCase()
-        );
-      });
+      const safe = userFilter.replace(/'/g, "''");
+      sapFilter += ` and contains(Comments,'${safe}')`;
     }
 
-    /* ===============================
-       📄 PAGINACIÓN LOCAL
-    ================================ */
+    const SELECT =
+      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
 
-    const total = quotes.length;
-    const start = (page - 1) * limit;
-    const end = start + limit;
+    /* ============================
+       1️⃣ OBTENER PÁGINA
+    ============================ */
+    const sap = await slFetch(
+      `/Quotations?$select=${SELECT}` +
+        `&$filter=${encodeURIComponent(sapFilter)}` +
+        `&$orderby=DocDate desc,DocEntry desc` +
+        `&$top=${limit}&$skip=${skip}`
+    );
 
-    const paginated = quotes.slice(start, end);
+    const values = Array.isArray(sap?.value) ? sap.value : [];
+
+    const quotes = values.map((q) => {
+      const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
+      const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
+
+      return {
+        docEntry: q.DocEntry,
+        docNum: q.DocNum,
+        cardCode: String(q.CardCode || "").trim(),
+        cardName: String(q.CardName || "").trim(),
+        montoCotizacion: Number(q.DocTotal || 0),
+        fecha: String(q.DocDate || "").slice(0, 10),
+        estado: q.DocumentStatus || "",
+        comments: q.Comments || "",
+        usuario,
+        warehouse: wh,
+      };
+    });
+
+    /* ============================
+       2️⃣ TOTAL REAL
+    ============================ */
+    let total = null;
+    let pageCount = null;
+
+    try {
+      const countRes = await slFetch(
+        `/Quotations/$count?$filter=${encodeURIComponent(sapFilter)}`
+      );
+
+      total = Number(countRes || 0);
+      pageCount = Math.max(1, Math.ceil(total / limit));
+    } catch {
+      total = null;
+      pageCount = null;
+    }
 
     return safeJson(res, 200, {
       ok: true,
-      quotes: paginated,
-      total,
-      page,
-      limit,
-      pageCount: Math.max(1, Math.ceil(total / limit)),
+      quotes,
       from: f,
       to: t,
+      page,
+      limit,
+      total,
+      pageCount,
     });
-
   } catch (e) {
-    console.error("Quotes error:", e.message);
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
