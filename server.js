@@ -1297,8 +1297,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const from = String(req.query?.from || "");
     const to = String(req.query?.to || "");
-    const userFilter = String(req.query?.user || "");
-    const clientFilter = String(req.query?.client || "");
+    const userFilter = String(req.query?.user || "").trim();
+    const clientFilter = String(req.query?.client || "").trim();
 
     const page = Math.max(1, Number(req.query?.page || 1));
     const limit = Math.max(1, Math.min(200, Number(req.query?.limit || 20)));
@@ -1333,19 +1333,19 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     ================================ */
 
     const response = await slFetch(path);
-
     let quotes = Array.isArray(response?.value) ? response.value : [];
 
     /* ===============================
-       👤 FILTRO POR USUARIO SISTEMA
+       👤 FILTRO POR USUARIO [usr=]
     ================================ */
 
     if (userFilter) {
       quotes = quotes.filter(q => {
         const usuario = parseUserFromComments(q.Comments || "");
-        return String(usuario)
-          .toLowerCase()
-          .includes(userFilter.toLowerCase());
+        return (
+          usuario &&
+          usuario.toLowerCase() === userFilter.toLowerCase()
+        );
       });
     }
 
