@@ -1297,20 +1297,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const userFilter = String(req.query?.user || "");
     const clientFilter = String(req.query?.client || "");
 
-    const limitRaw =
-      req.query?.limit != null
-        ? Number(req.query.limit)
-        : req.query?.top != null
-        ? Number(req.query.top)
-        : 20;
-
-    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
-
-    const pageRaw = req.query?.page != null ? Number(req.query.page) : 1;
-    const page = Math.max(1, Number.isFinite(pageRaw) ? pageRaw : 1);
-    const skip = (page - 1) * limit;
-
-    const includeTotal = String(req.query?.includeTotal || "0") === "1";
+    const page = Math.max(1, Number(req.query?.page || 1));
+    const limit = Math.max(1, Math.min(200, Number(req.query?.limit || 20)));
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const defaultFrom = addDaysISO(today, -30);
@@ -1318,56 +1306,65 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
     const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
 
-    const toPlus1 = addDaysISO(t, 1);
+    /* ===============================
+       🔥 FILTRO FECHA CORRECTO SAP
+    ================================ */
 
-    /* 🔥 FILTRO REAL SIN DUPLICADOS */
-    let filterParts = [
-      `DocDate ge '${f}'`,
-      `DocDate lt '${toPlus1}'`,
-      `CancelStatus eq 'csNo'`
-    ];
+    let filter =
+      `DocDate ge datetime'${f}T00:00:00' and ` +
+      `DocDate le datetime'${t}T23:59:59' and ` +
+      `CancelStatus eq 'csNo'`;
 
     if (clientFilter) {
-      filterParts.push(`CardCode eq '${clientFilter.replace(/'/g, "''")}'`);
+      filter += ` and CardCode eq '${clientFilter.replace(/'/g, "''")}'`;
     }
-
-    const filter = filterParts.join(" and ");
 
     const path =
       `/Quotations?` +
       `$select=DocEntry,DocNum,DocDate,CardCode,CardName,DocTotal,DocumentStatus,CancelStatus,Comments` +
       `&$filter=${encodeURIComponent(filter)}` +
-      `&$orderby=DocDate desc,DocEntry desc` +
-      `&$top=${limit}` +
-      `&$skip=${skip}` +
-      (includeTotal ? `&$count=true` : "");
+      `&$orderby=DocDate desc,DocEntry desc`;
 
-    /* ✅ USAMOS TU slFetch EXISTENTE */
+    /* ===============================
+       🚀 TRAEMOS TODO EL RANGO
+    ================================ */
+
     const response = await slFetch(path);
 
-    const quotesRaw = Array.isArray(response?.value) ? response.value : [];
+    let quotes = Array.isArray(response?.value) ? response.value : [];
 
-    /* 🔥 Filtro adicional por usuario en comments */
-    const quotes = quotesRaw.filter(q => {
-      if (!userFilter) return true;
-      const usuario = parseUserFromComments(q.Comments || "");
-      return String(usuario).toLowerCase().includes(userFilter.toLowerCase());
-    });
+    /* ===============================
+       👤 FILTRO POR USUARIO SISTEMA
+    ================================ */
 
-    const total = includeTotal ? response?.["@odata.count"] ?? null : null;
+    if (userFilter) {
+      quotes = quotes.filter(q => {
+        const usuario = parseUserFromComments(q.Comments || "");
+        return String(usuario)
+          .toLowerCase()
+          .includes(userFilter.toLowerCase());
+      });
+    }
+
+    /* ===============================
+       📄 PAGINACIÓN LOCAL
+    ================================ */
+
+    const total = quotes.length;
+    const start = (page - 1) * limit;
+    const end = start + limit;
+
+    const paginated = quotes.slice(start, end);
 
     return safeJson(res, 200, {
       ok: true,
-      quotes,
-      from: f,
-      to: t,
+      quotes: paginated,
+      total,
       page,
       limit,
-      total,
-      pageCount:
-        includeTotal && total
-          ? Math.max(1, Math.ceil(total / limit))
-          : null,
+      pageCount: Math.max(1, Math.ceil(total / limit)),
+      from: f,
+      to: t,
     });
 
   } catch (e) {
