@@ -1286,84 +1286,111 @@ async function scanQuotes({
    - Total real con $count
    - Escalable
 ========================================================= */
-
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv())
       return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
+    /* ============================
+       PAGINACIÓN
+    ============================ */
     const limit = Math.min(Math.max(Number(req.query?.limit || 20), 1), 200);
     const page = Math.max(1, Number(req.query?.page || 1));
     const skip = (page - 1) * limit;
 
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    /* ============================
+       FECHAS (MES ACTUAL POR DEFECTO)
+    ============================ */
+const today = getDateISOInOffset(TZ_OFFSET_MIN);
+const defaultFrom = addDaysISO(today, -30);
 
-    function firstDayOfMonth(dateStr) {
-      return dateStr.substring(0, 7) + "-01";
+const from = String(req.query?.from || "").trim();
+const to = String(req.query?.to || "").trim();
+
+const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
+const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
+
+
+    /* ============================
+       FILTROS
+    ============================ */
+    const userFilter = String(req.query?.user || "").trim().toLowerCase();
+    const clientFilter = String(req.query?.client || "").trim().toLowerCase();
+
+    let sapFilter =
+      `DocDate ge '${f}' and DocDate le '${t}' and CancelStatus eq 'csNo'`;
+
+    if (clientFilter) {
+      const safe = clientFilter.replace(/'/g, "''");
+      sapFilter += ` and (contains(CardCode,'${safe}') or contains(CardName,'${safe}'))`;
     }
 
-    const defaultFrom = firstDayOfMonth(today);
-
-    const f = defaultFrom;
-    const t = today;
-
-    const sapFilter =
-      `DocDate ge '${f}' and DocDate le '${t}'`;
+    if (userFilter) {
+      const safe = userFilter.replace(/'/g, "''");
+      sapFilter += ` and contains(Comments,'${safe}')`;
+    }
 
     const SELECT =
       `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
 
     /* ============================
-       1️⃣ QUOTATIONS
+       1️⃣ OBTENER PÁGINA
     ============================ */
-    const quotations = await slFetch(
+    const sap = await slFetch(
       `/Quotations?$select=${SELECT}` +
-        `&$filter=${encodeURIComponent(sapFilter)}`
+        `&$filter=${encodeURIComponent(sapFilter)}` +
+        `&$orderby=DocDate desc,DocEntry desc` +
+        `&$top=${limit}&$skip=${skip}`
     );
+
+    const values = Array.isArray(sap?.value) ? sap.value : [];
+
+    const quotes = values.map((q) => {
+      const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
+      const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
+
+      return {
+        docEntry: q.DocEntry,
+        docNum: q.DocNum,
+        cardCode: String(q.CardCode || "").trim(),
+        cardName: String(q.CardName || "").trim(),
+        montoCotizacion: Number(q.DocTotal || 0),
+        fecha: String(q.DocDate || "").slice(0, 10),
+        estado: q.DocumentStatus || "",
+        comments: q.Comments || "",
+        usuario,
+        warehouse: wh,
+      };
+    });
 
     /* ============================
-       2️⃣ DRAFTS (COTIZACIONES)
+       2️⃣ TOTAL REAL
     ============================ */
-    const drafts = await slFetch(
-      `/Drafts?$select=${SELECT},DocObjectCode` +
-        `&$filter=${encodeURIComponent(
-          `DocObjectCode eq 'oQuotations' and ${sapFilter}`
-        )}`
-    );
+    let total = null;
+    let pageCount = null;
 
-    const q1 = Array.isArray(quotations?.value) ? quotations.value : [];
-    const q2 = Array.isArray(drafts?.value) ? drafts.value : [];
+    try {
+      const countRes = await slFetch(
+        `/Quotations/$count?$filter=${encodeURIComponent(sapFilter)}`
+      );
 
-    // Unimos ambas listas
-    const all = [...q1, ...q2];
-
-    // Ordenamos por DocDate descendente
-    all.sort((a, b) => new Date(b.DocDate) - new Date(a.DocDate));
-
-    const paged = all.slice(skip, skip + limit);
-
-    const quotes = paged.map((q) => ({
-      docEntry: q.DocEntry,
-      docNum: q.DocNum,
-      cardCode: q.CardCode,
-      cardName: q.CardName,
-      montoCotizacion: Number(q.DocTotal || 0),
-      fecha: String(q.DocDate || "").slice(0, 10),
-      estado: q.DocumentStatus || "Draft",
-    }));
-
-    const total = all.length;
-    const pageCount = Math.ceil(total / limit);
+      total = Number(countRes || 0);
+      pageCount = Math.max(1, Math.ceil(total / limit));
+    } catch {
+      total = null;
+      pageCount = null;
+    }
 
     return safeJson(res, 200, {
       ok: true,
       quotes,
-      total,
-      pageCount,
+      from: f,
+      to: t,
       page,
       limit,
+      total,
+      pageCount,
     });
-
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
