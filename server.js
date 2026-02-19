@@ -309,9 +309,12 @@ function sleep(ms) {
 }
 
 function parseUserFromComments(comments) {
-  const m = String(comments || "").match(/\[user:([^\]]+)\]/i);
-  return m ? String(m[1]).trim() : "";
+  if (!comments) return null;
+
+  const match = comments.match(/\[usr=([^\]]+)\]/i);
+  return match ? match[1].trim() : null;
 }
+
 function parseWhFromComments(comments) {
   const m = String(comments || "").match(/\[wh:([^\]]+)\]/i);
   return m ? String(m[1]).trim() : "";
