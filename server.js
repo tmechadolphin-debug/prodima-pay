@@ -1293,14 +1293,14 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
     /* ============================
-       📌 PAGINACIÓN
+       PAGINACIÓN
     ============================ */
     const limit = Math.min(Math.max(Number(req.query?.limit || 20), 1), 200);
     const page = Math.max(1, Number(req.query?.page || 1));
     const skip = (page - 1) * limit;
 
     /* ============================
-       📅 FECHAS (MES ACTUAL POR DEFECTO)
+       FECHAS (MES ACTUAL POR DEFECTO)
     ============================ */
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
 
@@ -1316,20 +1316,14 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
     const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
 
-    // 🔥 IMPORTANTE: usar hora explícita
-    const dateFrom = `${f}T00:00:00`;
-    const dateTo = `${t}T23:59:59`;
-
     /* ============================
-       🔍 FILTROS OPCIONALES
+       FILTROS
     ============================ */
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
 
     let sapFilter =
-      `DocDate ge datetime'${dateFrom}' ` +
-      `and DocDate le datetime'${dateTo}' ` +
-      `and CancelStatus eq 'csNo'`;
+      `DocDate ge '${f}' and DocDate le '${t}' and CancelStatus eq 'csNo'`;
 
     if (clientFilter) {
       const safe = clientFilter.replace(/'/g, "''");
@@ -1345,7 +1339,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
 
     /* ============================
-       📦 1️⃣ OBTENER PÁGINA
+       1️⃣ OBTENER PÁGINA
     ============================ */
     const sap = await slFetch(
       `/Quotations?$select=${SELECT}` +
@@ -1375,7 +1369,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     });
 
     /* ============================
-       📊 2️⃣ TOTAL REAL
+       2️⃣ TOTAL REAL
     ============================ */
     let total = null;
     let pageCount = null;
@@ -1406,6 +1400,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
+
 
 /* =========================================================
    ✅ CUSTOMERS search / customer (igual a tu código)
