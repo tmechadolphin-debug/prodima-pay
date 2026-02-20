@@ -1,3 +1,14 @@
+/**
+ * PRODIMA ADMIN API (OPTIMIZADO)
+ * - /api/admin/quotes: paginado real con page/limit y crawler SAP por páginas
+ * - /api/admin/dashboard: KPIs rápidos + entregado con "cap" (no tumba el server)
+ * - scope=created: filtra solo cotizaciones de usuarios creados en app_users
+ *
+ * Requisitos:
+ * - Node 18+ (Render usa Node 22 ok)
+ * - Postgres con tabla app_users (id, username, full_name, pin_hash, is_active, province, warehouse_code, created_at)
+ */
+
 import express from "express";
 import cors from "cors";
 import pg from "pg";
@@ -33,121 +44,64 @@ const {
 } = process.env;
 
 /* =========================================================
-   ✅ CORS (importante: Authorization)
+   ✅ CORS
 ========================================================= */
 app.use(
   cors({
-    origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
-    credentials: false,
+    origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN.split(",").map((s) => s.trim()),
+    credentials: true,
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-app.options("*", cors());
 
 /* =========================================================
-   ✅ DB (Postgres)
+   ✅ DB
 ========================================================= */
-const pool = new Pool({
-  connectionString: DATABASE_URL || undefined,
-  ssl:
-    DATABASE_URL && DATABASE_URL.includes("sslmode")
-      ? { rejectUnauthorized: false }
-      : undefined,
-});
-
-function hasDb() {
-  return Boolean(DATABASE_URL);
-}
+const pool =
+  DATABASE_URL && String(DATABASE_URL).trim()
+    ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
+    : null;
 
 async function dbQuery(text, params = []) {
+  if (!pool) throw new Error("DB apagada (DATABASE_URL vacío)");
   return pool.query(text, params);
 }
 
-async function ensureDb() {
-  if (!hasDb()) return;
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS app_users (
-      id SERIAL PRIMARY KEY,
-      username TEXT UNIQUE NOT NULL,
-      full_name TEXT DEFAULT '',
-      pin_hash TEXT NOT NULL,
-      province TEXT DEFAULT '',
-      warehouse_code TEXT DEFAULT '',
-      is_active BOOLEAN DEFAULT TRUE,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-}
-
 /* =========================================================
-   ✅ Helpers
+   ✅ Utils
 ========================================================= */
-function safeJson(res, status, obj) {
-  res.status(status).json(obj);
-}
-
-function signToken(payload, ttl = "12h") {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: ttl });
-}
-
-function readBearer(req) {
-  const auth = String(req.headers.authorization || "");
-  const m = auth.match(/^Bearer\s+(.+)$/i);
-  return m ? m[1] : "";
-}
-
-function verifyAdmin(req, res, next) {
-  const token = readBearer(req);
-  if (!token) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
-
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded?.role !== "admin") return safeJson(res, 403, { ok: false, message: "Forbidden" });
-    req.admin = decoded;
-    next();
-  } catch {
-    return safeJson(res, 401, { ok: false, message: "Invalid token" });
-  }
-}
-
-function missingSapEnv() {
-  return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
+function safeJson(res, code, obj) {
+  return res.status(code).json(obj);
 }
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/* =========================================================
-   ✅ Time helpers (Panamá UTC-5)
-========================================================= */
-const TZ_OFFSET_MIN = -300;
-
-function getDateISOInOffset(offsetMin = 0) {
-  const now = new Date();
-  const ms = now.getTime() + now.getTimezoneOffset() * 60_000 + Number(offsetMin) * 60_000;
-  const d = new Date(ms);
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
+function nowMs() {
+  return Date.now();
 }
 
-function addDaysISO(iso, days) {
-  const d = new Date(String(iso || "").slice(0, 10));
-  if (Number.isNaN(d.getTime())) return "";
-  d.setDate(d.getDate() + Number(days || 0));
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
+function pickInt(v, def, min, max) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return def;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
 }
 
-/* =========================================================
-   ✅ Parse helpers
-========================================================= */
+function toYmd(d) {
+  try {
+    const dt = new Date(d);
+    if (Number.isNaN(dt.getTime())) return "";
+    const y = dt.getFullYear();
+    const m = String(dt.getMonth() + 1).padStart(2, "0");
+    const dd = String(dt.getDate()).padStart(2, "0");
+    return `${y}-${m}-${dd}`;
+  } catch {
+    return "";
+  }
+}
+
 function parseUserFromComments(comments) {
   const m = String(comments || "").match(/\[user:([^\]]+)\]/i);
   return m ? String(m[1]).trim() : "";
@@ -158,75 +112,52 @@ function parseWhFromComments(comments) {
   return m ? String(m[1]).trim() : "";
 }
 
-function isCancelledLike(q) {
-  const cancelVal = q?.CancelStatus ?? q?.cancelStatus ?? q?.Cancelled ?? q?.cancelled ?? "";
-  const cancelRaw = String(cancelVal).trim().toLowerCase();
-  const commLower = String(q?.Comments || q?.comments || "").toLowerCase();
-  return (
-    cancelRaw === "csyes" ||
-    cancelRaw === "yes" ||
-    cancelRaw === "true" ||
-    cancelRaw.includes("csyes") ||
-    cancelRaw.includes("cancel") ||
-    commLower.includes("[cancel") ||
-    commLower.includes("cancelad")
-  );
+/* =========================================================
+   ✅ Auth (Admin)
+========================================================= */
+function signAdminToken() {
+  return jwt.sign({ role: "admin" }, JWT_SECRET, { expiresIn: "30d" });
+}
+
+function verifyAdmin(req, res, next) {
+  try {
+    const h = String(req.headers.authorization || "");
+    const m = h.match(/^Bearer\s+(.+)$/i);
+    if (!m) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
+
+    const token = m[1];
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded || decoded.role !== "admin") return safeJson(res, 401, { ok: false, message: "Invalid token" });
+
+    req.admin = decoded;
+    next();
+  } catch {
+    return safeJson(res, 401, { ok: false, message: "Invalid token" });
+  }
 }
 
 /* =========================================================
-   ✅ HEALTH
+   ✅ SAP Service Layer helper (B1)
+   - Login cachea cookies por un rato
 ========================================================= */
-app.get("/api/health", async (req, res) => {
-  safeJson(res, 200, {
-    ok: true,
-    app: "admin-api",
-    message: "✅ PRODIMA ADMIN API activa",
-    db: hasDb() ? "on" : "off",
-    priceList: SAP_PRICE_LIST,
-    warehouse_default: SAP_WAREHOUSE,
-  });
-});
+let sapSession = {
+  cookies: "",
+  exp: 0,
+};
 
-/* =========================================================
-   ✅ ADMIN LOGIN
-========================================================= */
-app.post("/api/admin/login", async (req, res) => {
-  const user = String(req.body?.user || "").trim();
-  const pass = String(req.body?.pass || "").trim();
+function missingSapEnv() {
+  return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
+}
 
-  if (user !== ADMIN_USER || pass !== ADMIN_PASS) {
-    return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
-  }
-  const token = signToken({ role: "admin", user }, "12h");
-  return safeJson(res, 200, { ok: true, token });
-});
+async function sapLogin() {
+  if (sapSession.cookies && sapSession.exp > nowMs()) return sapSession.cookies;
 
-/* =========================================================
-   ✅ ADMIN USERS
-========================================================= */
-app.get("/api/admin/users", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
-    const r = await dbQuery(
-      `SELECT id, username, full_name, province, warehouse_code, is_active, created_at
-       FROM app_users
-       ORDER BY id DESC`
-    );
-    return safeJson(res, 200, { ok: true, users: r.rows });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   ✅ SAP Service Layer (cookie)
-========================================================= */
-let SL_COOKIE = "";
-let SL_COOKIE_AT = 0;
-
-async function slLogin() {
-  const url = `${SAP_BASE_URL.replace(/\/$/, "")}/Login`;
-  const body = { CompanyDB: SAP_COMPANYDB, UserName: SAP_USER, Password: SAP_PASS };
+  const url = `${SAP_BASE_URL.replace(/\/+$/, "")}/Login`;
+  const body = {
+    CompanyDB: SAP_COMPANYDB,
+    UserName: SAP_USER,
+    Password: SAP_PASS,
+  };
 
   const r = await fetch(url, {
     method: "POST",
@@ -235,512 +166,666 @@ async function slLogin() {
   });
 
   const txt = await r.text();
-  let data = {};
-  try { data = JSON.parse(txt); } catch {}
-
-  if (!r.ok) {
-    throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
-  }
+  if (!r.ok) throw new Error(`SAP Login error ${r.status}: ${txt.slice(0, 200)}`);
 
   const setCookie = r.headers.get("set-cookie") || "";
-  const cookies = [];
-  for (const part of setCookie.split(",")) {
-    const s = part.trim();
-    if (s.startsWith("B1SESSION=") || s.startsWith("ROUTEID=")) cookies.push(s.split(";")[0]);
-  }
-  SL_COOKIE = cookies.join("; ");
-  SL_COOKIE_AT = Date.now();
-  return true;
+  // Render/Node: a veces viene varios set-cookie en una sola string
+  const cookies = setCookie
+    .split(",")
+    .map((x) => x.split(";")[0].trim())
+    .filter((x) => x.includes("="))
+    .join("; ");
+
+  sapSession.cookies = cookies;
+  sapSession.exp = nowMs() + 1000 * 60 * 25; // 25 min
+  return cookies;
 }
 
-async function slFetch(path, options = {}) {
-  if (missingSapEnv()) throw new Error("Missing SAP env");
+async function slFetch(path, { method = "GET", body = null } = {}) {
+  if (missingSapEnv()) throw new Error("Faltan variables SAP");
 
-  if (!SL_COOKIE || Date.now() - SL_COOKIE_AT > 25 * 60 * 1000) {
-    await slLogin();
-  }
+  const base = SAP_BASE_URL.replace(/\/+$/, "");
+  const url = path.startsWith("http") ? path : `${base}${path.startsWith("/") ? "" : "/"}${path}`;
 
-  const base = SAP_BASE_URL.replace(/\/$/, "");
-  const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
-
-  const method = String(options.method || "GET").toUpperCase();
+  const cookies = await sapLogin();
 
   const r = await fetch(url, {
     method,
     headers: {
       "Content-Type": "application/json",
-      Cookie: SL_COOKIE,
-      ...(options.headers || {}),
+      Cookie: cookies,
     },
-    body: options.body,
+    body: body ? JSON.stringify(body) : null,
   });
 
-  const txt = await r.text();
-  let data = {};
-  try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+  // si sesión expira, reintenta una vez
+  if (r.status === 401 || r.status === 403) {
+    sapSession = { cookies: "", exp: 0 };
+    const cookies2 = await sapLogin();
+    const r2 = await fetch(url, {
+      method,
+      headers: { "Content-Type": "application/json", Cookie: cookies2 },
+      body: body ? JSON.stringify(body) : null,
+    });
 
-  if (!r.ok) {
-    if (r.status === 401 || r.status === 403) {
-      SL_COOKIE = "";
-      await slLogin();
-      return slFetch(path, options);
-    }
-    throw new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
+    const data2 = await r2.json().catch(async () => ({ _raw: await r2.text() }));
+    if (!r2.ok) throw new Error(`SAP error ${r2.status}: ${JSON.stringify(data2).slice(0, 280)}`);
+    return data2;
   }
 
+  const data = await r.json().catch(async () => ({ _raw: await r.text() }));
+  if (!r.ok) throw new Error(`SAP error ${r.status}: ${JSON.stringify(data).slice(0, 280)}`);
   return data;
 }
 
 /* =========================================================
-   ✅ Scope: users creados
+   ✅ Cache (in-memory)
 ========================================================= */
-async function getCreatedUsersSet() {
-  if (!hasDb()) return new Set();
-  const r = await dbQuery(`SELECT username FROM app_users WHERE is_active=TRUE`);
-  return new Set(
-    (r.rows || []).map((x) => String(x.username || "").trim().toLowerCase()).filter(Boolean)
-  );
+const CACHE = new Map();
+function cacheGet(key) {
+  const it = CACHE.get(key);
+  if (!it) return null;
+  if (it.exp && it.exp < nowMs()) {
+    CACHE.delete(key);
+    return null;
+  }
+  return it.val;
+}
+function cacheSet(key, val, ttlMs = 1000 * 60 * 5) {
+  CACHE.set(key, { val, exp: nowMs() + ttlMs });
 }
 
 /* =========================================================
-   ✅ TRACE OPTIMIZADO (2 llamadas grandes con $expand)
+   ✅ USERS (app_users)
 ========================================================= */
-const TRACE_CACHE = new Map();
-const TRACE_TTL_MS = 6 * 60 * 60 * 1000;
+async function getCreatedUsernamesSet() {
+  const key = "created_users_set";
+  const cached = cacheGet(key);
+  if (cached) return cached;
 
-function cacheGet(key) {
-  const it = TRACE_CACHE.get(key);
-  if (!it) return null;
-  if (Date.now() - it.at > TRACE_TTL_MS) {
-    TRACE_CACHE.delete(key);
-    return null;
+  if (!pool) {
+    const empty = new Set();
+    cacheSet(key, empty, 1000 * 30);
+    return empty;
   }
-  return it.data;
+
+  const r = await dbQuery(`SELECT username FROM app_users WHERE username IS NOT NULL`);
+  const set = new Set(r.rows.map((x) => String(x.username || "").trim().toLowerCase()).filter(Boolean));
+  cacheSet(key, set, 1000 * 60 * 2); // 2 min
+  return set;
 }
 
-function cacheSet(key, data) {
-  TRACE_CACHE.set(key, { at: Date.now(), data });
-}
-
-async function sapGetFirstByDocNum(entity, docNum, select) {
-  const n = Number(docNum);
-  if (!Number.isFinite(n) || n <= 0) throw new Error("DocNum inválido");
-  const parts = [];
-  if (select) parts.push(`$select=${encodeURIComponent(select)}`);
-  parts.push(`$filter=${encodeURIComponent(`DocNum eq ${n}`)}`);
-  parts.push(`$top=1`);
-  const path = `/${entity}?${parts.join("&")}`;
-  const r = await slFetch(path);
-  const arr = Array.isArray(r?.value) ? r.value : [];
-  return arr[0] || null;
-}
-
-async function traceQuoteFast(quoteDocNum, fromOverride, toOverride) {
-  const cacheKey = `QDOCNUM:${quoteDocNum}`;
+/* =========================================================
+   ✅ TRACE: Quote -> Orders -> Deliveries
+   - Cache por docNum para no recalcular
+========================================================= */
+async function traceQuote(quoteDocNum) {
+  const cacheKey = `TRACE:${quoteDocNum}`;
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
 
-  const quoteHead = await sapGetFirstByDocNum(
-    "Quotations",
-    quoteDocNum,
-    "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments"
-  );
-  if (!quoteHead) {
-    const out = { ok: false, message: "Cotización no encontrada" };
-    cacheSet(cacheKey, out);
-    return out;
-  }
+  // 1) Encontrar Orders referenciando a esa Quote
+  // Nota: hay varias formas; aquí usamos DocumentLines.BaseEntry/BaseType si está disponible.
+  // Si tu SAP no soporta este query, lo ajustamos luego, pero esta es la base.
+  const orders = await slFetch(
+    `/Orders?$select=DocEntry,DocNum,DocTotal,DocDate&$filter=DocumentLines/any(d:d/BaseType eq 23 and d/BaseRef eq '${quoteDocNum}')`
+  ).then((x) => x.value || []);
 
-  const quoteDocEntry = Number(quoteHead.DocEntry);
-  const cardCode = String(quoteHead.CardCode || "").trim();
-  const quoteDate = String(quoteHead.DocDate || "").slice(0, 10);
-
-  // 🔥 rango para trace (más ancho pero no infinito)
-  const from =
-    /^\d{4}-\d{2}-\d{2}$/.test(String(fromOverride || ""))
-      ? String(fromOverride)
-      : addDaysISO(quoteDate, -90);
-
-  const to =
-    /^\d{4}-\d{2}-\d{2}$/.test(String(toOverride || ""))
-      ? String(toOverride)
-      : addDaysISO(quoteDate, 120);
-
-  const toPlus1 = addDaysISO(to, 1);
-
-  // 1) Orders con DocumentLines expandidas (1 llamada)
-  const ordersResp = await slFetch(
-    `/Orders?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode` +
-      `&$expand=DocumentLines($select=BaseType,BaseEntry)` +
-      `&$filter=${encodeURIComponent(
-        `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
-      )}` +
-      `&$orderby=DocDate desc,DocEntry desc&$top=200`
-  );
-  const orders = Array.isArray(ordersResp?.value) ? ordersResp.value : [];
-
-  const linkedOrderDocEntries = new Set();
+  // 2) Por cada Order, buscar Deliveries que lo referencien
+  let deliveries = [];
   for (const o of orders) {
-    const lines = Array.isArray(o?.DocumentLines) ? o.DocumentLines : [];
-    const linked = lines.some(
-      (l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry
-    );
-    if (linked) linkedOrderDocEntries.add(Number(o.DocEntry));
+    const oDocNum = o.DocNum;
+    const dels = await slFetch(
+      `/DeliveryNotes?$select=DocEntry,DocNum,DocTotal,DocDate&$filter=DocumentLines/any(d:d/BaseType eq 17 and d/BaseRef eq '${oDocNum}')`
+    ).then((x) => x.value || []);
+    deliveries = deliveries.concat(dels);
+    await sleep(40);
   }
 
-  // Si no hay orders linkeadas, no hay entregas
-  const totalCotizado = Number(quoteHead.DocTotal || 0);
-  if (linkedOrderDocEntries.size === 0) {
-    const out = {
-      ok: true,
-      totals: { totalCotizado, totalEntregado: 0, pendiente: Number(totalCotizado.toFixed(2)) },
-    };
-    cacheSet(cacheKey, out);
-    return out;
-  }
+  const totalEntregado = deliveries.reduce((a, d) => a + Number(d?.DocTotal || 0), 0);
 
-  // 2) DeliveryNotes con DocumentLines expandidas (1 llamada)
-  const delResp = await slFetch(
-    `/DeliveryNotes?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode` +
-      `&$expand=DocumentLines($select=BaseType,BaseEntry)` +
-      `&$filter=${encodeURIComponent(
-        `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
-      )}` +
-      `&$orderby=DocDate desc,DocEntry desc&$top=300`
-  );
-  const dels = Array.isArray(delResp?.value) ? delResp.value : [];
+  const out = {
+    ok: true,
+    quoteDocNum,
+    orders,
+    deliveries,
+    totals: { totalEntregado: Number(totalEntregado.toFixed(2)) },
+  };
 
-  let totalEntregado = 0;
-  for (const d of dels) {
-    const lines = Array.isArray(d?.DocumentLines) ? d.DocumentLines : [];
-    const linked = lines.some(
-      (l) => Number(l?.BaseType) === 17 && linkedOrderDocEntries.has(Number(l?.BaseEntry))
-    );
-    if (linked) totalEntregado += Number(d?.DocTotal || 0);
-  }
-
-  const pendiente = Number((totalCotizado - totalEntregado).toFixed(2));
-  const out = { ok: true, totals: { totalCotizado, totalEntregado, pendiente } };
-  cacheSet(cacheKey, out);
+  cacheSet(cacheKey, out, 1000 * 60 * 15); // 15 min
   return out;
 }
 
 /* =========================================================
-   ✅ CRAWLER OPTIMIZADO:
-   - deja de leer SAP cuando ya tiene lo necesario
+   ✅ QUOTES crawler (SAP Quotations)
+   - Escanea páginas de SAP hasta llenar la página requerida (page/limit)
+   - Soporta filtros: user/client, from/to opcionales
+   - scope=created filtra por app_users
 ========================================================= */
-async function crawlQuotesOptimized({
+async function scanQuotesPaged({
   from,
   to,
-  maxPages = 100,
-  sapPageSize = 200,
-  scope = "all", // all | created
-  userFilter = "",
-  clientFilter = "",
-  needCount = 200, // ✅ cuántas filas necesitamos juntar para responder
-  hardCap = 5000,  // ✅ por seguridad, no acumular infinito
+  page,
+  limit,
+  maxPages,
+  userFilter,
+  clientFilter,
+  scope,
+  withDelivered,
 }) {
-  const toPlus1 = addDaysISO(to, 1);
+  const wantSkip = (page - 1) * limit;
+  const wantLimit = limit;
 
   const uFilter = String(userFilter || "").trim().toLowerCase();
   const cFilter = String(clientFilter || "").trim().toLowerCase();
 
-  const createdSet = scope === "created" ? await getCreatedUsersSet() : null;
+  const createdSet = scope === "created" ? await getCreatedUsernamesSet() : null;
 
-  let skipSap = 0;
-  const seenDocEntry = new Set();
-  const out = [];
-  let excluded = 0;
+  // ODATA: si mandas from/to, filtramos DocDate
+  const filters = [];
+  if (from) filters.push(`DocDate ge '${from}'`);
+  if (to) filters.push(`DocDate le '${to}'`);
 
-  for (let page = 0; page < maxPages; page++) {
-    const raw = await slFetch(
+  const baseFilter = filters.length ? `&$filter=${encodeURIComponent(filters.join(" and "))}` : "";
+
+  const pageRows = [];
+  let totalMatched = 0;
+  let scannedPages = 0;
+
+  const TOP = 50; // recomendado para SAP SL
+  for (let p = 0; p < maxPages; p++) {
+    const skip = p * TOP;
+    scannedPages++;
+
+    const data = await slFetch(
       `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
-        `&$filter=${encodeURIComponent(`DocDate ge '${from}' and DocDate lt '${toPlus1}'`)}` +
-        `&$orderby=DocDate desc,DocEntry desc&$top=${sapPageSize}&$skip=${skipSap}`
+        `&$orderby=DocDate desc, DocNum desc&$top=${TOP}&$skip=${skip}${baseFilter}`
     );
 
-    const rows = Array.isArray(raw?.value) ? raw.value : [];
+    const rows = data?.value || [];
     if (!rows.length) break;
 
-    skipSap += rows.length;
-
     for (const q of rows) {
-      const de = Number(q?.DocEntry);
-      if (Number.isFinite(de)) {
-        if (seenDocEntry.has(de)) continue;
-        seenDocEntry.add(de);
+      // user/wh viene en Comments [user:xxx][wh:300]
+      const comments = q.Comments || "";
+      const usuario = parseUserFromComments(comments);
+      const wh = parseWhFromComments(comments);
+
+      // filtros
+      if (uFilter) {
+        const u = String(usuario || "").toLowerCase();
+        if (!u.includes(uFilter)) continue;
       }
-
-      if (isCancelledLike(q)) {
-        excluded++;
-        continue;
-      }
-
-      const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
-      const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
-
-      if (createdSet) {
-        const u = String(usuario || "").trim().toLowerCase();
-        if (!u || u === "sin_user" || !createdSet.has(u)) {
-          excluded++;
-          continue;
-        }
-      }
-
-      if (uFilter && !String(usuario).toLowerCase().includes(uFilter)) {
-        excluded++;
-        continue;
-      }
-
       if (cFilter) {
         const cc = String(q.CardCode || "").toLowerCase();
         const cn = String(q.CardName || "").toLowerCase();
-        if (!cc.includes(cFilter) && !cn.includes(cFilter)) {
-          excluded++;
-          continue;
-        }
+        if (!cc.includes(cFilter) && !cn.includes(cFilter)) continue;
+      }
+      if (scope === "created") {
+        const u = String(usuario || "").trim().toLowerCase();
+        if (!u || !createdSet.has(u)) continue;
       }
 
-      out.push({
-        docEntry: q.DocEntry,
-        docNum: q.DocNum,
-        cardCode: String(q.CardCode || "").trim(),
-        cardName: String(q.CardName || "").trim(),
-        fecha: String(q.DocDate || "").slice(0, 10),
-        estado: q.DocumentStatus || "",
-        cancelStatus: q.CancelStatus ?? "",
-        comments: q.Comments || "",
-        usuario,
-        warehouse: wh,
-        montoCotizacion: Number(q.DocTotal || 0),
-        montoEntregado: 0,
-        pendiente: Number(q.DocTotal || 0),
-      });
+      const idx = totalMatched;
+      totalMatched++;
 
-      if (out.length >= needCount) break;
-      if (out.length >= hardCap) break;
+      // solo guardamos lo necesario para la página actual
+      if (idx >= wantSkip && pageRows.length < wantLimit) {
+        pageRows.push({
+          docEntry: q.DocEntry,
+          docNum: q.DocNum,
+          cardCode: q.CardCode,
+          cardName: q.CardName,
+          fecha: String(q.DocDate || "").slice(0, 10),
+          estado: q.DocumentStatus || "",
+          cancelStatus: q.CancelStatus ?? "",
+          comments: comments,
+          usuario: usuario || "",
+          warehouse: wh || "",
+          montoCotizacion: Number(q.DocTotal || 0),
+          montoEntregado: 0,
+          pendiente: Number(q.DocTotal || 0),
+        });
+      }
+
+      if (pageRows.length >= wantLimit) break;
     }
 
-    if (out.length >= needCount) break;
-    if (out.length >= hardCap) break;
-
-    await sleep(10);
+    if (pageRows.length >= wantLimit) break;
   }
 
-  return { quotes: out, excluded, createdUsersCount: createdSet ? createdSet.size : null };
+  // ✅ Entregado SOLO para lo que vas a retornar (no para todo el universo)
+  if (withDelivered && pageRows.length) {
+    const CONC = 3; // concurrencia moderada
+    let idx = 0;
+
+    async function worker() {
+      while (idx < pageRows.length) {
+        const i = idx++;
+        const r = pageRows[i];
+        try {
+          const tr = await traceQuote(r.docNum);
+          if (tr?.ok) {
+            const ent = Number(tr?.totals?.totalEntregado || 0);
+            r.montoEntregado = ent;
+            r.pendiente = Number((Number(r.montoCotizacion || 0) - ent).toFixed(2));
+          }
+        } catch {
+          // no rompe
+        }
+        await sleep(25);
+      }
+    }
+
+    await Promise.all(Array.from({ length: CONC }, () => worker()));
+  }
+
+  // hasMore: si todavía no llegamos al final del universo
+  const hasMore = totalMatched > wantSkip + pageRows.length ? true : scannedPages >= maxPages ? false : true;
+
+  return {
+    ok: true,
+    page,
+    limit,
+    maxPages,
+    totalMatched, // total match encontrado durante scan (parcial; sirve como guía)
+    hasMore,
+    quotes: pageRows,
+  };
 }
 
 /* =========================================================
-   ✅ /api/admin/quotes (Histórico)
-   - rápido: solo junta lo necesario para la página solicitada
-   - entregado: solo para la página visible
+   ✅ DASHBOARD
+   - KPIs rápidos: escanea hasta needCount cotizaciones (scope + filtros básicos)
+   - Entregado: opcional y limitado por deliveredCap para evitar 502/hangs
 ========================================================= */
+async function buildDashboard({
+  from,
+  to,
+  scope,
+  maxPages,
+  needCount,
+  withDelivered,
+  deliveredCap,
+}) {
+  const createdSet = scope === "created" ? await getCreatedUsernamesSet() : null;
+
+  const filters = [];
+  if (from) filters.push(`DocDate ge '${from}'`);
+  if (to) filters.push(`DocDate le '${to}'`);
+  const baseFilter = filters.length ? `&$filter=${encodeURIComponent(filters.join(" and "))}` : "";
+
+  const TOP = 50;
+
+  // agregaciones
+  let count = 0;
+  let totalCot = 0;
+  let totalEnt = 0;
+
+  // para breakdowns rápidos
+  const byUserAmt = new Map();
+  const byUserCnt = new Map();
+  const byWhAmt = new Map();
+  const byWhCnt = new Map();
+  const byClientAmt = new Map();
+  const byMonthAmt = new Map();
+  const byMonthCnt = new Map();
+
+  // guardamos docNum de una muestra para entregado (cap)
+  const sampleForDelivered = [];
+
+  function add(map, k, v) {
+    map.set(k, Number(map.get(k) || 0) + Number(v || 0));
+  }
+
+  for (let p = 0; p < maxPages; p++) {
+    const skip = p * TOP;
+
+    const data = await slFetch(
+      `/Quotations?$select=DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
+        `&$orderby=DocDate desc, DocNum desc&$top=${TOP}&$skip=${skip}${baseFilter}`
+    );
+
+    const rows = data?.value || [];
+    if (!rows.length) break;
+
+    for (const q of rows) {
+      const comments = q.Comments || "";
+      const usuario = parseUserFromComments(comments);
+      const wh = parseWhFromComments(comments);
+
+      if (scope === "created") {
+        const u = String(usuario || "").trim().toLowerCase();
+        if (!u || !createdSet.has(u)) continue;
+      }
+
+      // Dashboard: omitimos canceladas (tal como tu UI dice)
+      const cancel = String(q.CancelStatus ?? "").toLowerCase();
+      const isCancelled =
+        cancel.includes("csyes") ||
+        String(q.DocumentStatus || "").toLowerCase().includes("cancel") ||
+        String(comments || "").toLowerCase().includes("cancelad");
+
+      if (isCancelled) continue;
+
+      const docTotal = Number(q.DocTotal || 0);
+
+      count += 1;
+      totalCot += docTotal;
+
+      const uKey = usuario || "sin_user";
+      const wKey = wh || "sin_wh";
+      const cKey = (q.CardName || q.CardCode || "sin_cliente").trim();
+
+      add(byUserAmt, uKey, docTotal);
+      add(byUserCnt, uKey, 1);
+      add(byWhAmt, wKey, docTotal);
+      add(byWhCnt, wKey, 1);
+      add(byClientAmt, cKey, docTotal);
+
+      const fecha = String(q.DocDate || "").slice(0, 10);
+      const mes = /^\d{4}-\d{2}-\d{2}$/.test(fecha) ? fecha.slice(0, 7) : "sin_mes";
+      add(byMonthAmt, mes, docTotal);
+      add(byMonthCnt, mes, 1);
+
+      if (withDelivered && sampleForDelivered.length < deliveredCap) {
+        sampleForDelivered.push({ docNum: q.DocNum, cot: docTotal });
+      }
+
+      if (count >= needCount) break;
+    }
+
+    if (count >= needCount) break;
+  }
+
+  let deliveredPartial = false;
+
+  if (withDelivered && sampleForDelivered.length) {
+    // Entregado limitado (cap)
+    deliveredPartial = count > sampleForDelivered.length;
+
+    const CONC = 3;
+    let idx = 0;
+
+    async function worker() {
+      while (idx < sampleForDelivered.length) {
+        const i = idx++;
+        const it = sampleForDelivered[i];
+        try {
+          const tr = await traceQuote(it.docNum);
+          if (tr?.ok) totalEnt += Number(tr?.totals?.totalEntregado || 0);
+        } catch {}
+        await sleep(25);
+      }
+    }
+
+    await Promise.all(Array.from({ length: CONC }, () => worker()));
+  }
+
+  const fill = totalCot > 0 ? (totalEnt / totalCot) * 100 : 0;
+
+  function topMap(map, n = 12) {
+    return Array.from(map.entries())
+      .map(([k, v]) => ({ key: k, value: Number(v || 0) }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, n);
+  }
+
+  function topMapCount(mapAmt, mapCnt, n = 12) {
+    const cnt = new Map(mapCnt);
+    return Array.from(mapAmt.entries())
+      .map(([k, v]) => ({ key: k, value: Number(v || 0), count: Number(cnt.get(k) || 0) }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, n);
+  }
+
+  const months = Array.from(byMonthAmt.entries())
+    .map(([k, v]) => ({ month: k, amount: Number(v || 0), count: Number(byMonthCnt.get(k) || 0) }))
+    .sort((a, b) => String(a.month).localeCompare(String(b.month)));
+
+  return {
+    ok: true,
+    kpis: {
+      totalCotizaciones: count,
+      montoTotalCotizado: Number(totalCot.toFixed(2)),
+      montoTotalEntregado: Number(totalEnt.toFixed(2)),
+      fillRatePct: Number(fill.toFixed(1)),
+    },
+    deliveredPartial,
+    tops: {
+      users: topMapCount(byUserAmt, byUserCnt, 12),
+      warehouses: topMapCount(byWhAmt, byWhCnt, 12),
+      clients: topMap(byClientAmt, 12),
+    },
+    months,
+  };
+}
+
+/* =========================================================
+   ✅ ROUTES
+========================================================= */
+app.get("/api/health", async (req, res) => {
+  let db = "off";
+  try {
+    if (pool) {
+      await dbQuery("select 1 as ok");
+      db = "on";
+    }
+  } catch {
+    db = "off";
+  }
+  return res.json({
+    ok: true,
+    app: "admin-api",
+    message: "✅ PRODIMA ADMIN API activa",
+    db,
+    priceList: SAP_PRICE_LIST,
+    warehouse_default: SAP_WAREHOUSE,
+  });
+});
+
+app.post("/api/admin/login", async (req, res) => {
+  try {
+    const user = String(req.body?.user || "");
+    const pass = String(req.body?.pass || "");
+    if (user !== ADMIN_USER || pass !== ADMIN_PASS)
+      return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
+
+    const token = signAdminToken();
+    return res.json({ ok: true, token });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: "Login error" });
+  }
+});
+
+/* --------------------------
+   USERS CRUD (app_users)
+-------------------------- */
+app.get("/api/admin/users", verifyAdmin, async (req, res) => {
+  try {
+    if (!pool) return res.json({ ok: true, users: [] });
+
+    const r = await dbQuery(
+      `SELECT id, username, full_name, is_active, province, warehouse_code, created_at
+       FROM app_users
+       ORDER BY id DESC`
+    );
+    return res.json({ ok: true, users: r.rows });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+function provinceToWarehouse(province) {
+  const p = String(province || "").trim().toLowerCase();
+  if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
+  if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera") return "500";
+  if (p === "panamá" || p === "panama" || p === "panamá oeste" || p === "panama oeste" || p === "colón" || p === "colon") return "300";
+  if (p === "rci") return "01";
+  return String(SAP_WAREHOUSE || "300");
+}
+
+app.post("/api/admin/users", verifyAdmin, async (req, res) => {
+  try {
+    if (!pool) return safeJson(res, 400, { ok: false, message: "DB apagada" });
+
+    const username = String(req.body?.username || "").trim().toLowerCase();
+    const fullName = String(req.body?.fullName || req.body?.full_name || "").trim();
+    const pin = String(req.body?.pin || "").trim();
+    const province = String(req.body?.province || "").trim();
+    if (!username) return safeJson(res, 400, { ok: false, message: "Username requerido" });
+    if (!pin || pin.length < 4) return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
+
+    const wh = provinceToWarehouse(province);
+    const pinHash = await bcrypt.hash(pin, 10);
+
+    const r = await dbQuery(
+      `INSERT INTO app_users (username, full_name, pin_hash, is_active, province, warehouse_code)
+       VALUES ($1,$2,$3,true,$4,$5)
+       RETURNING id, username, full_name, is_active, province, warehouse_code, created_at`,
+      [username, fullName, pinHash, province, wh]
+    );
+
+    CACHE.delete("created_users_set"); // refrescar scope
+    return res.json({ ok: true, user: r.rows[0] });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
+  try {
+    if (!pool) return safeJson(res, 400, { ok: false, message: "DB apagada" });
+
+    const id = Number(req.params.id);
+    const r0 = await dbQuery(`SELECT is_active FROM app_users WHERE id=$1`, [id]);
+    if (!r0.rows.length) return safeJson(res, 404, { ok: false, message: "No existe" });
+
+    const next = !r0.rows[0].is_active;
+    const r = await dbQuery(
+      `UPDATE app_users SET is_active=$2 WHERE id=$1
+       RETURNING id, username, full_name, is_active, province, warehouse_code, created_at`,
+      [id, next]
+    );
+
+    CACHE.delete("created_users_set");
+    return res.json({ ok: true, user: r.rows[0] });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
+  try {
+    if (!pool) return safeJson(res, 400, { ok: false, message: "DB apagada" });
+
+    const id = Number(req.params.id);
+    const pin = String(req.body?.pin || "").trim();
+    if (!pin || pin.length < 4) return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
+
+    const pinHash = await bcrypt.hash(pin, 10);
+    await dbQuery(`UPDATE app_users SET pin_hash=$2 WHERE id=$1`, [id, pinHash]);
+
+    return res.json({ ok: true });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
+  try {
+    if (!pool) return safeJson(res, 400, { ok: false, message: "DB apagada" });
+
+    const id = Number(req.params.id);
+    await dbQuery(`DELETE FROM app_users WHERE id=$1`, [id]);
+
+    CACHE.delete("created_users_set");
+    return res.json({ ok: true });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+/* --------------------------
+   QUOTES (Histórico)
+   GET /api/admin/quotes?page=1&limit=50&maxPages=100&scope=created|all&withDelivered=1
+-------------------------- */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
+    const from = String(req.query?.from || "").slice(0, 10);
+    const to = String(req.query?.to || "").slice(0, 10);
+
+    const page = pickInt(req.query?.page, 1, 1, 5000);
+    const limit = pickInt(req.query?.limit, 50, 1, 200); // SAP-friendly
+    const maxPages = pickInt(req.query?.maxPages, 100, 1, 500);
+
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
 
-    // Nota: no obligo rango, pero pongo defaults razonables.
-    // Si tu UI manda vacío, igual trae bastante.
-    const from =
-      /^\d{4}-\d{2}-\d{2}$/.test(String(req.query?.from || ""))
-        ? String(req.query.from)
-        : "2016-01-01";
+    const scopeRaw = String(req.query?.scope || "all").toLowerCase();
+    const scope = scopeRaw === "created" ? "created" : "all";
 
-    const to =
-      /^\d{4}-\d{2}-\d{2}$/.test(String(req.query?.to || ""))
-        ? String(req.query.to)
-        : getDateISOInOffset(TZ_OFFSET_MIN);
+    const user = String(req.query?.user || "");
+    const client = String(req.query?.client || "");
 
-    const page = Math.max(1, Number(req.query?.page || 1));
-    const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 200);
-
-    const maxPages = Math.min(Math.max(Number(req.query?.maxPages || 100), 1), 250);
-    const scope = String(req.query?.scope || "all").toLowerCase() === "created" ? "created" : "all";
-    const userFilter = String(req.query?.user || "").trim();
-    const clientFilter = String(req.query?.client || "").trim();
-
-    // ✅ SOLO juntamos lo que necesitamos para esa página + buffer
-    const needCount = page * limit + 50;
-
-    const { quotes, excluded, createdUsersCount } = await crawlQuotesOptimized({
-      from,
-      to,
-      maxPages,
-      sapPageSize: 200,
-      scope,
-      userFilter,
-      clientFilter,
-      needCount,
-      hardCap: 8000,
-    });
-
-    const totalKnown = quotes.length; // total “conocido” (hasta donde leímos)
-    const start = (page - 1) * limit;
-    const slice = quotes.slice(start, start + limit);
-
-    // ✅ Entregado solo para la página (rápido)
-    if (withDelivered && slice.length) {
-      const CONC = 3;
-      let idx = 0;
-
-      async function worker() {
-        while (idx < slice.length) {
-          const i = idx++;
-          const q = slice[i];
-          try {
-            const tr = await traceQuoteFast(q.docNum, from, to);
-            if (tr.ok) {
-              q.montoEntregado = Number(tr.totals?.totalEntregado || 0);
-              q.pendiente = Number(tr.totals?.pendiente || 0);
-            }
-          } catch {}
-          await sleep(10);
-        }
-      }
-
-      await Promise.all(Array.from({ length: CONC }, worker));
-    }
-
-    return safeJson(res, 200, {
-      ok: true,
-      mode: "crawler_pro",
-      scope,
-      from,
-      to,
-      maxPages,
-      withDelivered,
+    const out = await scanQuotesPaged({
+      from: from || "",
+      to: to || "",
       page,
       limit,
-      totalKnown,
-      excluded,
-      createdUsersCount,
-      quotes: slice,
+      maxPages,
+      userFilter: user,
+      clientFilter: client,
+      scope,
+      withDelivered,
     });
+
+    return res.json(out);
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
   }
 });
 
-/* =========================================================
-   ✅ /api/admin/dashboard
-   - rápido: usa una muestra suficientemente grande
-   - entregado: por defecto solo calcula para N cotizaciones
-========================================================= */
+/* --------------------------
+   DASHBOARD
+   GET /api/admin/dashboard?needCount=800&maxPages=100&scope=created|all&withDelivered=1&deliveredCap=200
+-------------------------- */
 app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
+    const from = String(req.query?.from || "").slice(0, 10);
+    const to = String(req.query?.to || "").slice(0, 10);
+
+    const maxPages = pickInt(req.query?.maxPages, 100, 1, 500);
+    const needCount = pickInt(req.query?.needCount, 800, 50, 5000);
+
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
+    const deliveredCap = pickInt(req.query?.deliveredCap, 150, 0, 600);
 
-    const from =
-      /^\d{4}-\d{2}-\d{2}$/.test(String(req.query?.from || ""))
-        ? String(req.query.from)
-        : "2016-01-01";
+    const scopeRaw = String(req.query?.scope || "all").toLowerCase();
+    const scope = scopeRaw === "created" ? "created" : "all";
 
-    const to =
-      /^\d{4}-\d{2}-\d{2}$/.test(String(req.query?.to || ""))
-        ? String(req.query.to)
-        : getDateISOInOffset(TZ_OFFSET_MIN);
-
-    const maxPages = Math.min(Math.max(Number(req.query?.maxPages || 100), 1), 250);
-    const scope = String(req.query?.scope || "all").toLowerCase() === "created" ? "created" : "all";
-
-    const userFilter = String(req.query?.user || "").trim();
-    const clientFilter = String(req.query?.client || "").trim();
-
-    // ✅ Dashboard no necesita 10,000 filas para renderizar: tomamos una muestra grande
-    // Puedes subir needCount si quieres (ej: 2000) pero 800 es buen balance
-    const needCount = Math.min(Math.max(Number(req.query?.needCount || 800), 200), 3000);
-
-    const { quotes, excluded, createdUsersCount } = await crawlQuotesOptimized({
-      from,
-      to,
-      maxPages,
-      sapPageSize: 200,
+    const out = await buildDashboard({
+      from: from || "",
+      to: to || "",
       scope,
-      userFilter,
-      clientFilter,
-      needCount,
-      hardCap: 12000,
-    });
-
-    const totalCotizado = quotes.reduce((a, q) => a + Number(q.montoCotizacion || 0), 0);
-
-    let totalEntregado = 0;
-
-    // ✅ PRO: limitar entregado para que no se muera
-    const deliveredCap = Math.min(Math.max(Number(req.query?.deliveredCap || 150), 0), 1000);
-
-    let deliveredComputed = 0;
-    let deliveredPartial = false;
-
-    if (withDelivered && quotes.length && deliveredCap > 0) {
-      const work = quotes.slice(0, Math.min(deliveredCap, quotes.length));
-      deliveredPartial = work.length < quotes.length;
-
-      const CONC = 3;
-      let idx = 0;
-
-      async function worker() {
-        while (idx < work.length) {
-          const i = idx++;
-          const q = work[i];
-          try {
-            const tr = await traceQuoteFast(q.docNum, from, to);
-            if (tr.ok) totalEntregado += Number(tr.totals?.totalEntregado || 0);
-          } catch {}
-          deliveredComputed++;
-          await sleep(10);
-        }
-      }
-
-      await Promise.all(Array.from({ length: CONC }, worker));
-    }
-
-    const pendiente = Number((Number(totalCotizado) - Number(totalEntregado)).toFixed(2));
-    const fillRate = totalCotizado > 0 ? Number(((totalEntregado / totalCotizado) * 100).toFixed(2)) : 0;
-
-    return safeJson(res, 200, {
-      ok: true,
-      mode: "dashboard_pro",
-      scope,
-      from,
-      to,
       maxPages,
       needCount,
       withDelivered,
       deliveredCap,
-      deliveredComputed,
-      deliveredPartial,
-      excluded,
-      createdUsersCount,
-      kpis: {
-        totalCotizaciones: quotes.length,
-        montoTotalCotizado: Number(totalCotizado.toFixed(2)),
-        montoTotalEntregado: Number(totalEntregado.toFixed(2)),
-        pendiente,
-        fillRatePct: fillRate,
-      },
     });
+
+    return res.json(out);
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
   }
 });
 
 /* =========================================================
    ✅ START
 ========================================================= */
-(async () => {
-  try {
-    await ensureDb();
-    console.log(hasDb() ? "DB ready ✅" : "DB not configured (skipped init) ⚠️");
-  } catch (e) {
-    console.error("DB init error:", e.message);
-  }
-
-  app.listen(Number(PORT), () => {
-    console.log(`Admin server listening on :${PORT}`);
-  });
-})();
+app.listen(PORT, () => {
+  console.log(`✅ PRODIMA admin-api listening on :${PORT}`);
+});
