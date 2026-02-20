@@ -30,9 +30,6 @@ const {
 
   SAP_WAREHOUSE = "300",
   SAP_PRICE_LIST = "Lista de Precios 99 2018",
-
-  // Panamá UTC-5
-  TZ_OFFSET_MIN = "-300",
 } = process.env;
 
 /* =========================================================
@@ -82,7 +79,7 @@ async function ensureDb() {
 }
 
 /* =========================================================
-   ✅ Helpers (dates, json, auth)
+   ✅ Helpers
 ========================================================= */
 function safeJson(res, status, obj) {
   res.status(status).json(obj);
@@ -116,9 +113,15 @@ function missingSapEnv() {
   return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /* =========================================================
    ✅ Time helpers (Panamá UTC-5)
 ========================================================= */
+const TZ_OFFSET_MIN = -300;
+
 function getDateISOInOffset(offsetMin = 0) {
   const now = new Date();
   const ms =
@@ -140,10 +143,6 @@ function addDaysISO(iso, days) {
   return `${y}-${m}-${dd}`;
 }
 
-function firstDayOfMonth(dateStr) {
-  return String(dateStr || "").substring(0, 7) + "-01";
-}
-
 /* =========================================================
    ✅ Parse helpers (Comments)
 ========================================================= */
@@ -151,12 +150,15 @@ function parseUserFromComments(comments) {
   const m = String(comments || "").match(/\[user:([^\]]+)\]/i);
   return m ? String(m[1]).trim() : "";
 }
+
 function parseWhFromComments(comments) {
   const m = String(comments || "").match(/\[wh:([^\]]+)\]/i);
   return m ? String(m[1]).trim() : "";
 }
+
 function isCancelledLike(q) {
-  const cancelVal = q?.CancelStatus ?? q?.cancelStatus ?? q?.Cancelled ?? q?.cancelled ?? "";
+  const cancelVal =
+    q?.CancelStatus ?? q?.cancelStatus ?? q?.Cancelled ?? q?.cancelled ?? "";
   const cancelRaw = String(cancelVal).trim().toLowerCase();
   const commLower = String(q?.Comments || q?.comments || "").toLowerCase();
   return (
@@ -192,7 +194,9 @@ async function slLogin() {
 
   const txt = await r.text();
   let data = {};
-  try { data = JSON.parse(txt); } catch {}
+  try {
+    data = JSON.parse(txt);
+  } catch {}
 
   if (!r.ok) {
     throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
@@ -233,7 +237,11 @@ async function slFetch(path, options = {}) {
 
   const txt = await r.text();
   let data = {};
-  try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+  try {
+    data = JSON.parse(txt);
+  } catch {
+    data = { raw: txt };
+  }
 
   if (!r.ok) {
     if (r.status === 401 || r.status === 403) {
@@ -277,7 +285,7 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN USERS (GET/POST/PATCH/DELETE)
+   ✅ ADMIN USERS (NO TOCADO)
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
@@ -301,6 +309,7 @@ function normalizeUsername(u) {
   if (!/^[a-z0-9._-]{2,50}$/.test(s)) return "__INVALID__";
   return s;
 }
+
 function toIntId(x) {
   const n = Number(x);
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
@@ -410,84 +419,63 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD)
-   ✅ FIX: usa DocDate lt (to + 1 día)
-   ✅ FIX: dedupe DocEntry
+   ✅ ADMIN QUOTES (CRAWLER)
+   - Lee muchas páginas (maxPages) de SAP
+   - Filtra en servidor
+   - Pagina para el frontend
 ========================================================= */
-app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
-  try {
-    if (missingSapEnv())
-      return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+async function crawlQuotesFromSap({
+  from,
+  to,
+  maxPages,
+  batchTop,
+  userFilter,
+  clientFilter,
+}) {
+  const f = String(from);
+  const t = String(to);
+  const toPlus1 = addDaysISO(t, 1);
 
-    // paginación
-    const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 200);
-    const page = Math.max(1, Number(req.query?.page || 1));
-    const skip = (page - 1) * limit;
+  let skipSap = 0;
+  const all = [];
+  const seenDocEntry = new Set();
 
-    // fechas: por defecto este mes hasta hoy (Panamá)
-    const today = getDateISOInOffset(Number(TZ_OFFSET_MIN));
-    const fromIn = String(req.query?.from || "").trim();
-    const toIn = String(req.query?.to || "").trim();
+  const uFilter = String(userFilter || "").trim().toLowerCase();
+  const cFilter = String(clientFilter || "").trim().toLowerCase();
 
-    const defaultFrom = firstDayOfMonth(today);
-
-    const f = /^\d{4}-\d{2}-\d{2}$/.test(fromIn) ? fromIn : defaultFrom;
-    const t = /^\d{4}-\d{2}-\d{2}$/.test(toIn) ? toIn : today;
-
-    // ✅ clave: para incluir todo el día "t"
-    const toPlus1 = addDaysISO(t, 1);
-
-    // filtros
-    const userFilter = String(req.query?.user || "").trim().toLowerCase();
-    const clientFilter = String(req.query?.client || "").trim().toLowerCase();
-
-    // filtro base SAP
-    // ✅ DocDate ge f AND DocDate lt toPlus1 (NO le)
-    let sapFilter = `DocDate ge '${f}' and DocDate lt '${toPlus1}'`;
-
-    // intenta filtrar cancelados desde SAP (rápido), pero igual filtramos robusto luego
-    sapFilter += ` and CancelStatus eq 'csNo'`;
-
-    if (clientFilter) {
-      const safe = clientFilter.replace(/'/g, "''");
-      sapFilter += ` and (contains(CardCode,'${safe}') or contains(CardName,'${safe}'))`;
-    }
-    if (userFilter) {
-      const safe = userFilter.replace(/'/g, "''");
-      // Comments incluye [user:...]
-      sapFilter += ` and contains(Comments,'${safe}')`;
-    }
-
-    const SELECT =
-      `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
-
-    // 1) página
-    const sap = await slFetch(
-      `/Quotations?$select=${encodeURIComponent(SELECT)}` +
-        `&$filter=${encodeURIComponent(sapFilter)}` +
-        `&$orderby=DocDate desc,DocEntry desc` +
-        `&$top=${limit}&$skip=${skip}`
+  for (let page = 0; page < maxPages; page++) {
+    const raw = await slFetch(
+      `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
+        `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
+        `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`
     );
 
-    const values = Array.isArray(sap?.value) ? sap.value : [];
+    const rows = Array.isArray(raw?.value) ? raw.value : [];
+    if (!rows.length) break;
 
-    // dedupe por DocEntry (por si SAP repite)
-    const seen = new Set();
-    const quotes = [];
-    for (const q of values) {
+    skipSap += rows.length;
+
+    for (const q of rows) {
       const de = Number(q?.DocEntry);
       if (Number.isFinite(de)) {
-        if (seen.has(de)) continue;
-        seen.add(de);
+        if (seenDocEntry.has(de)) continue;
+        seenDocEntry.add(de);
       }
 
-      // filtro robusto cancel
       if (isCancelledLike(q)) continue;
 
       const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
       const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
 
-      quotes.push({
+      if (uFilter && !String(usuario).toLowerCase().includes(uFilter)) continue;
+
+      if (cFilter) {
+        const cc = String(q.CardCode || "").toLowerCase();
+        const cn = String(q.CardName || "").toLowerCase();
+        if (!cc.includes(cFilter) && !cn.includes(cFilter)) continue;
+      }
+
+      all.push({
         docEntry: q.DocEntry,
         docNum: q.DocNum,
         cardCode: String(q.CardCode || "").trim(),
@@ -502,27 +490,66 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       });
     }
 
-    // 2) total ($count)
-    let total = null;
-    let pageCount = null;
-    try {
-      const countRes = await slFetch(`/Quotations/$count?$filter=${encodeURIComponent(sapFilter)}`);
-      total = Number(countRes || 0);
-      pageCount = Math.max(1, Math.ceil(total / limit));
-    } catch {
-      total = null;
-      pageCount = null;
+    // pequeño respiro para no saturar SAP
+    await sleep(25);
+  }
+
+  return all;
+}
+
+app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) {
+      return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
     }
+
+    // ✅ Paginación frontend
+    const limit = Math.min(Math.max(Number(req.query?.limit || 50), 1), 200);
+    const page = Math.max(1, Number(req.query?.page || 1));
+    const wantSkip = (page - 1) * limit;
+
+    // ✅ “Sin rango” práctico: por defecto desde 2016-01-01 hasta hoy
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const fromIn = String(req.query?.from || "").trim();
+    const toIn = String(req.query?.to || "").trim();
+
+    const f = /^\d{4}-\d{2}-\d{2}$/.test(fromIn) ? fromIn : "2016-01-01";
+    const t = /^\d{4}-\d{2}-\d{2}$/.test(toIn) ? toIn : today;
+
+    // ✅ Control de “cuántas páginas de SAP leer”
+    // Ej: maxPages=100 => hasta 100*200=20,000 registros
+    const maxPages = Math.min(Math.max(Number(req.query?.maxPages || 100), 1), 300);
+    const batchTop = 200;
+
+    const userFilter = String(req.query?.user || "").trim().toLowerCase();
+    const clientFilter = String(req.query?.client || "").trim().toLowerCase();
+
+    // 1) Crawl grande
+    const all = await crawlQuotesFromSap({
+      from: f,
+      to: t,
+      maxPages,
+      batchTop,
+      userFilter,
+      clientFilter,
+    });
+
+    // 2) Pagina aquí (ya filtrado)
+    const total = all.length;
+    const pageCount = Math.max(1, Math.ceil(total / limit));
+    const quotes = all.slice(wantSkip, wantSkip + limit);
 
     return safeJson(res, 200, {
       ok: true,
-      quotes,
+      mode: "crawler",
       from: f,
       to: t,
+      maxPages,
       page,
       limit,
       total,
       pageCount,
+      quotes,
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
