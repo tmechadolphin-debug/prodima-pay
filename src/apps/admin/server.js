@@ -1,3 +1,6 @@
+// server.js (SOLO ADMIN-USUARIOS + HISTÓRICO/DASHBOARD) ✅ RÁPIDO + ✅ ENTREGADO
+// ✅ IMPORTANTE: NO incluye nada de “página de pedidos” (login user, items, customers, crear quote, etc.)
+
 import express from "express";
 import cors from "cors";
 import pg from "pg";
@@ -21,13 +24,13 @@ const ADMIN_USER = process.env.ADMIN_USER || "PRODIMA";
 const ADMIN_PASS = process.env.ADMIN_PASS || "ADMINISTRADOR";
 const JWT_SECRET = process.env.JWT_SECRET || "prodima_change_this_secret";
 
-// SAP
+// ---- SAP ----
 const SAP_BASE_URL = process.env.SAP_BASE_URL || "";
 const SAP_COMPANYDB = process.env.SAP_COMPANYDB || "";
 const SAP_USER = process.env.SAP_USER || "";
 const SAP_PASS = process.env.SAP_PASS || "";
 
-// TZ (Panamá -300)
+// ---- Timezone Fix (Panamá) ----
 const TZ_OFFSET_MIN = Number(process.env.TZ_OFFSET_MIN || -300);
 
 /* =========================================================
@@ -43,7 +46,7 @@ app.use(
 app.options("*", cors());
 
 /* =========================================================
-   ✅ DB
+   ✅ DB Pool
 ========================================================= */
 let pool = null;
 
@@ -54,11 +57,13 @@ function hasDb() {
 function getPool() {
   if (!pool) {
     if (!DATABASE_URL) throw new Error("DATABASE_URL no está configurado.");
+
     pool = new Pool({
       connectionString: DATABASE_URL,
       ssl: { rejectUnauthorized: false },
       max: 3,
     });
+
     pool.on("error", (err) => console.error("❌ DB pool error:", err.message));
   }
   return pool;
@@ -69,6 +74,9 @@ async function dbQuery(text, params = []) {
   return p.query(text, params);
 }
 
+/* =========================================================
+   ✅ DB Schema
+========================================================= */
 async function ensureSchema() {
   if (!hasDb()) {
     console.log("⚠️ DATABASE_URL no configurado (DB deshabilitada)");
@@ -118,7 +126,7 @@ function verifyAdmin(req, res, next) {
 }
 
 /* =========================================================
-   ✅ Time helpers
+   ✅ Time helpers (Panamá UTC-5)
 ========================================================= */
 function getDateISOInOffset(offsetMinutes = -300) {
   const now = new Date();
@@ -127,6 +135,7 @@ function getDateISOInOffset(offsetMinutes = -300) {
   const local = new Date(localMs);
   return local.toISOString().slice(0, 10);
 }
+
 function addDaysISO(iso, days) {
   const d = new Date(String(iso || "").slice(0, 10));
   if (Number.isNaN(d.getTime())) return "";
@@ -138,7 +147,7 @@ function addDaysISO(iso, days) {
 }
 
 /* =========================================================
-   ✅ SAP Service Layer cookie + fetch with timeout
+   ✅ SAP Helpers (Service Layer Cookie + Timeout)
 ========================================================= */
 function missingSapEnv() {
   return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
@@ -162,11 +171,8 @@ async function slLogin() {
     body: JSON.stringify(payload),
   });
 
-  const text = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`Login SAP falló (${res.status}): ${text}`);
-  }
+  const t = await res.text();
+  if (!res.ok) throw new Error(`Login SAP falló (${res.status}): ${t}`);
 
   const setCookie = res.headers.get("set-cookie");
   if (!setCookie) throw new Error("No se recibió cookie del Service Layer.");
@@ -233,7 +239,6 @@ function parseWhFromComments(comments = "") {
   const m = String(comments).match(/\[wh:([^\]]+)\]/i);
   return m ? String(m[1]).trim() : "";
 }
-
 function isCancelledLike(q) {
   const cancelVal = q?.CancelStatus ?? q?.cancelStatus ?? q?.Cancelled ?? q?.cancelled ?? "";
   const cancelRaw = String(cancelVal).trim().toLowerCase();
@@ -253,13 +258,10 @@ function isCancelledLike(q) {
 }
 
 /* =========================================================
-   ✅ TRACE (Entregado) - protegido para no colgar Render
-   - Solo calcula sobre la página actual
-   - Concurrencia baja
-   - Timeouts
+   ✅ TRACE (Entregado) con protecciones anti "pending"
 ========================================================= */
 const TRACE_CACHE = new Map();
-const TRACE_TTL_MS = 2 * 60 * 60 * 1000; // 2h
+const TRACE_TTL_MS = 2 * 60 * 60 * 1000;
 
 function cacheGet(key) {
   const it = TRACE_CACHE.get(key);
@@ -292,7 +294,6 @@ async function sapGetFirstByDocNum(entity, docNum, select) {
 async function sapGetByDocEntry(entity, docEntry, select) {
   const n = Number(docEntry);
   if (!Number.isFinite(n) || n <= 0) throw new Error("DocEntry inválido");
-
   let path = `/${entity}(${n})`;
   if (select) path += `?$select=${encodeURIComponent(select)}`;
   return slFetch(path, {}, 20000);
@@ -303,7 +304,6 @@ async function traceDeliveredForQuote(docNum, from, to) {
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
 
-  // 1) Obtener quote
   const head = await sapGetFirstByDocNum(
     "Quotations",
     docNum,
@@ -319,11 +319,11 @@ async function traceDeliveredForQuote(docNum, from, to) {
   const quoteDocEntry = Number(quote.DocEntry);
   const cardCode = String(quote.CardCode || "").trim();
 
-  const f = /^\d{4}-\d{2}-\d{2}$/.test(String(from || "")) ? String(from) : addDaysISO(String(quote.DocDate || "").slice(0, 10), -7);
-  const t = /^\d{4}-\d{2}-\d{2}$/.test(String(to || "")) ? String(to) : addDaysISO(String(quote.DocDate || "").slice(0, 10), 30);
+  const quoteDate = String(quote.DocDate || "").slice(0, 10);
+  const f = /^\d{4}-\d{2}-\d{2}$/.test(String(from || "")) ? String(from) : addDaysISO(quoteDate, -7);
+  const t = /^\d{4}-\d{2}-\d{2}$/.test(String(to || "")) ? String(to) : addDaysISO(quoteDate, 30);
   const toPlus1 = addDaysISO(t, 1);
 
-  // 2) Buscar Orders del cliente en ventana
   const ordersList = await slFetch(
     `/Orders?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,DocumentStatus,CancelStatus,Comments` +
       `&$filter=${encodeURIComponent(
@@ -333,11 +333,9 @@ async function traceDeliveredForQuote(docNum, from, to) {
     {},
     20000
   );
-
   const orderCandidates = Array.isArray(ordersList?.value) ? ordersList.value : [];
 
   const orderDocEntries = [];
-  // 🔒 Para no explotar, cap de revisión
   const MAX_ORDER_CHECK = 35;
 
   for (let i = 0; i < Math.min(orderCandidates.length, MAX_ORDER_CHECK); i++) {
@@ -348,7 +346,6 @@ async function traceDeliveredForQuote(docNum, from, to) {
     if (linked) orderDocEntries.push(Number(od.DocEntry));
   }
 
-  // 3) Buscar DeliveryNotes del cliente y comprobar baseEntry vs orders
   let totalEntregado = 0;
 
   if (orderDocEntries.length) {
@@ -400,6 +397,7 @@ app.get("/api/health", async (req, res) => {
     message: "✅ PRODIMA API activa (ADMIN)",
     db: hasDb() ? "on" : "off",
     sap: missingSapEnv() ? "off" : "on",
+    today: getDateISOInOffset(TZ_OFFSET_MIN),
   });
 });
 
@@ -425,7 +423,7 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: USERS CRUD (igual que tu viejo)
+   ✅ ADMIN: USERS
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
@@ -450,6 +448,7 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
     const username = String(req.body?.username || "").trim().toLowerCase();
     const fullName = String(req.body?.fullName || req.body?.full_name || "").trim();
     const pin = String(req.body?.pin || "").trim();
+
     const province = String(req.body?.province || "").trim();
     const warehouse_code = String(req.body?.warehouse_code || "").trim();
 
@@ -513,10 +512,10 @@ app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
 
     const pin_hash = await bcrypt.hash(pin, 10);
 
-    const r = await dbQuery(
-      `UPDATE app_users SET pin_hash=$1 WHERE id=$2 RETURNING id`,
-      [pin_hash, id]
-    );
+    const r = await dbQuery(`UPDATE app_users SET pin_hash=$1 WHERE id=$2 RETURNING id`, [
+      pin_hash,
+      id,
+    ]);
 
     if (!r.rowCount) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
 
@@ -543,10 +542,10 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: HISTÓRICO (rápido) + ENTREGADO opcional
-   - Paginación real con top/skip
-   - withDelivered=1 calcula entregado SOLO para esa página
-   - Protecciones anti "pending"
+   ✅ ADMIN: QUOTES (RÁPIDO) + ENTREGADO opcional
+   - Soporta limit/skip (front)
+   - ✅ FIX: YA NO FILTRA canceladas antes de responder
+   - Dashboard puede ignorarlas en UI
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -557,15 +556,14 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
 
-    // 🔒 Si piden entregado, NO permitimos 500 porque se muere Render
+    // 🔒 Si piden entregado, cap para evitar que Render quede pending
     const limit = withDelivered
-      ? Math.min(Math.max(limitBase, 1), 60)   // <= 60 con entregado
-      : Math.min(Math.max(limitBase, 1), 500); // <= 500 normal
+      ? Math.min(Math.max(limitBase, 1), 60)
+      : Math.min(Math.max(limitBase, 1), 500);
 
     const from = String(req.query?.from || "").trim();
     const to = String(req.query?.to || "").trim();
 
-    // Service Layer: mejor usar lt toPlus1 para evitar problemas con "le" (inclusive)
     const filterParts = [];
     if (from) filterParts.push(`DocDate ge '${from}'`);
     if (to) filterParts.push(`DocDate lt '${addDaysISO(to, 1)}'`);
@@ -586,69 +584,71 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const values = Array.isArray(sap?.value) ? sap.value : [];
 
-    const quotes = values
-      .filter((q) => !isCancelledLike(q))
-      .map((q) => {
-        const fechaISO = String(q.DocDate || "").slice(0, 10);
-        const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
+    // ✅ FIX: NO filtramos canceladas. Solo marcamos isCancelled.
+    const quotes = values.map((q) => {
+      const fechaISO = String(q.DocDate || "").slice(0, 10);
+      const cancelStatus = String(q.CancelStatus || "").trim();
+      const isCancelled = isCancelledLike(q) || cancelStatus.toLowerCase() === "csyes";
 
-        const estado =
-          cancelStatus.toLowerCase() === "csyes"
-            ? "Cancelled"
-            : q.DocumentStatus === "bost_Open"
-            ? "Open"
-            : q.DocumentStatus === "bost_Close"
-            ? "Close"
-            : String(q.DocumentStatus || "");
+      const estado = isCancelled
+        ? "Cancelled"
+        : q.DocumentStatus === "bost_Open"
+        ? "Open"
+        : q.DocumentStatus === "bost_Close"
+        ? "Close"
+        : String(q.DocumentStatus || "");
 
-        const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
-        const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
+      const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
+      const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
 
-        return {
-          docEntry: q.DocEntry,
-          docNum: q.DocNum,
-          cardCode: String(q.CardCode || "").trim(),
-          cardName: String(q.CardName || "").trim(),
-          montoCotizacion: Number(q.DocTotal || 0),
-          fecha: fechaISO,
-          estado,
-          cancelStatus,
-          usuario,
-          warehouse: wh,
-          comments: q.Comments || "",
-          // campos entregado (por defecto 0 si no se pide)
-          montoEntregado: 0,
-          pendiente: Number(q.DocTotal || 0),
-        };
-      });
+      const monto = Number(q.DocTotal || 0);
 
-    // ✅ ENTREGADO (solo si se pide)
+      return {
+        docEntry: q.DocEntry,
+        docNum: q.DocNum,
+        cardCode: String(q.CardCode || "").trim(),
+        cardName: String(q.CardName || "").trim(),
+        montoCotizacion: monto,
+        fecha: fechaISO,
+        estado,
+        cancelStatus,
+        isCancelled,
+        usuario,
+        warehouse: wh,
+        comments: q.Comments || "",
+        montoEntregado: 0,
+        pendiente: monto,
+      };
+    });
+
+    // ✅ ENTREGADO (solo NO canceladas)
     let deliveredPending = false;
 
     if (withDelivered && quotes.length) {
-      const CONC = 2;                 // baja concurrencia
-      const HARD_BUDGET_MS = 25000;   // budget total para no colgar
+      const targets = quotes.filter((q) => !q.isCancelled);
+
+      const CONC = 2;
+      const HARD_BUDGET_MS = 25000;
       const start = Date.now();
       let idx = 0;
 
       async function worker() {
-        while (idx < quotes.length) {
+        while (idx < targets.length) {
           if (Date.now() - start > HARD_BUDGET_MS) {
             deliveredPending = true;
             return;
           }
-
           const i = idx++;
-          const q = quotes[i];
+          const qq = targets[i];
 
           try {
-            const r = await traceDeliveredForQuote(q.docNum, from, to);
+            const r = await traceDeliveredForQuote(qq.docNum, from, to);
             if (r?.ok) {
-              q.montoEntregado = Number(r.totalEntregado || 0);
-              q.pendiente = Number(r.pendiente || 0);
+              qq.montoEntregado = Number(r.totalEntregado || 0);
+              qq.pendiente = Number(r.pendiente || 0);
             }
           } catch {
-            // si falla uno, no rompe todo
+            // no rompe
           }
         }
       }
@@ -662,7 +662,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       skip,
       count: quotes.length,
       withDelivered,
-      deliveredPending, // 👈 si true, el front puede mostrar "Entregado parcial"
+      deliveredPending,
       quotes,
     });
   } catch (err) {
@@ -672,8 +672,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN: DASHBOARD endpoint (compat)
-   Tu front lo llama pero no lo usa realmente.
+   ✅ ADMIN: DASHBOARD (compat)
 ========================================================= */
 app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   return res.json({ ok: true, message: "ok" });
