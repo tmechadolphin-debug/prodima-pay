@@ -33,7 +33,7 @@ const {
 } = process.env;
 
 /* =========================================================
-   ✅ CORS
+   ✅ CORS (importante: Authorization)
 ========================================================= */
 app.use(
   cors({
@@ -122,14 +122,12 @@ function sleep(ms) {
 
 /* =========================================================
    ✅ Time helpers (Panamá UTC-5)
-   (Si ya no lo necesitas exacto, igual sirve)
 ========================================================= */
 const TZ_OFFSET_MIN = -300;
 
 function getDateISOInOffset(offsetMin = 0) {
   const now = new Date();
-  const ms =
-    now.getTime() + now.getTimezoneOffset() * 60_000 + Number(offsetMin) * 60_000;
+  const ms = now.getTime() + now.getTimezoneOffset() * 60_000 + Number(offsetMin) * 60_000;
   const d = new Date(ms);
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
@@ -221,18 +219,14 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP Service Layer (Session cookie)
+   ✅ SAP Service Layer (cookie)
 ========================================================= */
 let SL_COOKIE = "";
 let SL_COOKIE_AT = 0;
 
 async function slLogin() {
   const url = `${SAP_BASE_URL.replace(/\/$/, "")}/Login`;
-  const body = {
-    CompanyDB: SAP_COMPANYDB,
-    UserName: SAP_USER,
-    Password: SAP_PASS,
-  };
+  const body = { CompanyDB: SAP_COMPANYDB, UserName: SAP_USER, Password: SAP_PASS };
 
   const r = await fetch(url, {
     method: "POST",
@@ -242,9 +236,7 @@ async function slLogin() {
 
   const txt = await r.text();
   let data = {};
-  try {
-    data = JSON.parse(txt);
-  } catch {}
+  try { data = JSON.parse(txt); } catch {}
 
   if (!r.ok) {
     throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
@@ -285,11 +277,7 @@ async function slFetch(path, options = {}) {
 
   const txt = await r.text();
   let data = {};
-  try {
-    data = JSON.parse(txt);
-  } catch {
-    data = { raw: txt };
-  }
+  try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
 
   if (!r.ok) {
     if (r.status === 401 || r.status === 403) {
@@ -304,34 +292,18 @@ async function slFetch(path, options = {}) {
 }
 
 /* =========================================================
-   ✅ SAP helpers para trace
+   ✅ Scope: users creados
 ========================================================= */
-async function sapGetFirstByDocNum(entity, docNum, select) {
-  const n = Number(docNum);
-  if (!Number.isFinite(n) || n <= 0) throw new Error("DocNum inválido");
-
-  const parts = [];
-  if (select) parts.push(`$select=${encodeURIComponent(select)}`);
-  parts.push(`$filter=${encodeURIComponent(`DocNum eq ${n}`)}`);
-  parts.push(`$top=1`);
-
-  const path = `/${entity}?${parts.join("&")}`;
-  const r = await slFetch(path);
-  const arr = Array.isArray(r?.value) ? r.value : [];
-  return arr[0] || null;
-}
-
-async function sapGetByDocEntry(entity, docEntry, select) {
-  const n = Number(docEntry);
-  if (!Number.isFinite(n) || n <= 0) throw new Error("DocEntry inválido");
-
-  let path = `/${entity}(${n})`;
-  if (select) path += `?$select=${encodeURIComponent(select)}`;
-  return slFetch(path);
+async function getCreatedUsersSet() {
+  if (!hasDb()) return new Set();
+  const r = await dbQuery(`SELECT username FROM app_users WHERE is_active=TRUE`);
+  return new Set(
+    (r.rows || []).map((x) => String(x.username || "").trim().toLowerCase()).filter(Boolean)
+  );
 }
 
 /* =========================================================
-   ✅ TRACE logic + cache (ENTREGADO)
+   ✅ TRACE OPTIMIZADO (2 llamadas grandes con $expand)
 ========================================================= */
 const TRACE_CACHE = new Map();
 const TRACE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -350,7 +322,20 @@ function cacheSet(key, data) {
   TRACE_CACHE.set(key, { at: Date.now(), data });
 }
 
-async function traceQuote(quoteDocNum, fromOverride, toOverride) {
+async function sapGetFirstByDocNum(entity, docNum, select) {
+  const n = Number(docNum);
+  if (!Number.isFinite(n) || n <= 0) throw new Error("DocNum inválido");
+  const parts = [];
+  if (select) parts.push(`$select=${encodeURIComponent(select)}`);
+  parts.push(`$filter=${encodeURIComponent(`DocNum eq ${n}`)}`);
+  parts.push(`$top=1`);
+  const path = `/${entity}?${parts.join("&")}`;
+  const r = await slFetch(path);
+  const arr = Array.isArray(r?.value) ? r.value : [];
+  return arr[0] || null;
+}
+
+async function traceQuoteFast(quoteDocNum, fromOverride, toOverride) {
   const cacheKey = `QDOCNUM:${quoteDocNum}`;
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
@@ -360,117 +345,91 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
     quoteDocNum,
     "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments"
   );
-
   if (!quoteHead) {
     const out = { ok: false, message: "Cotización no encontrada" };
     cacheSet(cacheKey, out);
     return out;
   }
 
-  const quote = await sapGetByDocEntry("Quotations", quoteHead.DocEntry);
-  const quoteDocEntry = Number(quote.DocEntry);
-  const cardCode = String(quote.CardCode || "").trim();
-  const quoteDate = String(quote.DocDate || "").slice(0, 10);
+  const quoteDocEntry = Number(quoteHead.DocEntry);
+  const cardCode = String(quoteHead.CardCode || "").trim();
+  const quoteDate = String(quoteHead.DocDate || "").slice(0, 10);
 
-  const from = /^\d{4}-\d{2}-\d{2}$/.test(String(fromOverride || ""))
-    ? String(fromOverride)
-    : addDaysISO(quoteDate, -7);
+  // 🔥 rango para trace (más ancho pero no infinito)
+  const from =
+    /^\d{4}-\d{2}-\d{2}$/.test(String(fromOverride || ""))
+      ? String(fromOverride)
+      : addDaysISO(quoteDate, -90);
 
-  const to = /^\d{4}-\d{2}-\d{2}$/.test(String(toOverride || ""))
-    ? String(toOverride)
-    : addDaysISO(quoteDate, 30);
+  const to =
+    /^\d{4}-\d{2}-\d{2}$/.test(String(toOverride || ""))
+      ? String(toOverride)
+      : addDaysISO(quoteDate, 120);
 
   const toPlus1 = addDaysISO(to, 1);
 
-  // 1) Buscar Orders del CardCode en rango
-  const ordersList = await slFetch(
-    `/Orders?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
+  // 1) Orders con DocumentLines expandidas (1 llamada)
+  const ordersResp = await slFetch(
+    `/Orders?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode` +
+      `&$expand=DocumentLines($select=BaseType,BaseEntry)` +
       `&$filter=${encodeURIComponent(
         `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
       )}` +
       `&$orderby=DocDate desc,DocEntry desc&$top=200`
   );
-  const orderCandidates = Array.isArray(ordersList?.value) ? ordersList.value : [];
+  const orders = Array.isArray(ordersResp?.value) ? ordersResp.value : [];
 
-  // 2) Confirmar cuáles Orders están linkeadas a la Quote (BaseType=23)
-  const orders = [];
-  for (const o of orderCandidates) {
-    const od = await sapGetByDocEntry("Orders", o.DocEntry);
-    const lines = Array.isArray(od?.DocumentLines) ? od.DocumentLines : [];
+  const linkedOrderDocEntries = new Set();
+  for (const o of orders) {
+    const lines = Array.isArray(o?.DocumentLines) ? o.DocumentLines : [];
     const linked = lines.some(
       (l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry
     );
-    if (linked) orders.push(od);
-    await sleep(25);
+    if (linked) linkedOrderDocEntries.add(Number(o.DocEntry));
   }
 
-  // 3) Buscar DeliveryNotes linkeadas a esos Orders (BaseType=17)
-  const deliveries = [];
-  const orderDocEntrySet = new Set(orders.map((x) => Number(x.DocEntry)));
+  // Si no hay orders linkeadas, no hay entregas
+  const totalCotizado = Number(quoteHead.DocTotal || 0);
+  if (linkedOrderDocEntries.size === 0) {
+    const out = {
+      ok: true,
+      totals: { totalCotizado, totalEntregado: 0, pendiente: Number(totalCotizado.toFixed(2)) },
+    };
+    cacheSet(cacheKey, out);
+    return out;
+  }
 
-  if (orders.length) {
-    const delList = await slFetch(
-      `/DeliveryNotes?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
-        `&$filter=${encodeURIComponent(
-          `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
-        )}` +
-        `&$orderby=DocDate desc,DocEntry desc&$top=300`
+  // 2) DeliveryNotes con DocumentLines expandidas (1 llamada)
+  const delResp = await slFetch(
+    `/DeliveryNotes?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode` +
+      `&$expand=DocumentLines($select=BaseType,BaseEntry)` +
+      `&$filter=${encodeURIComponent(
+        `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
+      )}` +
+      `&$orderby=DocDate desc,DocEntry desc&$top=300`
+  );
+  const dels = Array.isArray(delResp?.value) ? delResp.value : [];
+
+  let totalEntregado = 0;
+  for (const d of dels) {
+    const lines = Array.isArray(d?.DocumentLines) ? d.DocumentLines : [];
+    const linked = lines.some(
+      (l) => Number(l?.BaseType) === 17 && linkedOrderDocEntries.has(Number(l?.BaseEntry))
     );
-    const delCandidates = Array.isArray(delList?.value) ? delList.value : [];
-
-    const seen = new Set();
-    for (const d of delCandidates) {
-      const dd = await sapGetByDocEntry("DeliveryNotes", d.DocEntry);
-      const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
-      const linked = lines.some(
-        (l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry))
-      );
-      if (linked) {
-        const de = Number(dd.DocEntry);
-        if (!seen.has(de)) {
-          seen.add(de);
-          deliveries.push(dd);
-        }
-      }
-      await sleep(25);
-    }
+    if (linked) totalEntregado += Number(d?.DocTotal || 0);
   }
 
-  // Totales
-  const totalCotizado = Number(quote.DocTotal || 0);
-  const totalEntregado = deliveries.reduce((a, d) => a + Number(d?.DocTotal || 0), 0);
   const pendiente = Number((totalCotizado - totalEntregado).toFixed(2));
-
-  const out = {
-    ok: true,
-    quote,
-    orders,
-    deliveries,
-    totals: { totalCotizado, totalEntregado, pendiente },
-  };
-
+  const out = { ok: true, totals: { totalCotizado, totalEntregado, pendiente } };
   cacheSet(cacheKey, out);
-  cacheSet(`QDOCENTRY:${quoteDocEntry}`, out);
   return out;
 }
 
 /* =========================================================
-   ✅ Scope: users creados
+   ✅ CRAWLER OPTIMIZADO:
+   - deja de leer SAP cuando ya tiene lo necesario
 ========================================================= */
-async function getCreatedUsersSet() {
-  if (!hasDb()) return new Set();
-  const r = await dbQuery(`SELECT username FROM app_users WHERE is_active=TRUE`);
-  return new Set(
-    (r.rows || [])
-      .map((x) => String(x.username || "").trim().toLowerCase())
-      .filter(Boolean)
-  );
-}
-
-/* =========================================================
-   ✅ Crawler quotes (solo listado)
-========================================================= */
-async function crawlQuotes({
+async function crawlQuotesOptimized({
   from,
   to,
   maxPages = 100,
@@ -478,6 +437,8 @@ async function crawlQuotes({
   scope = "all", // all | created
   userFilter = "",
   clientFilter = "",
+  needCount = 200, // ✅ cuántas filas necesitamos juntar para responder
+  hardCap = 5000,  // ✅ por seguridad, no acumular infinito
 }) {
   const toPlus1 = addDaysISO(to, 1);
 
@@ -489,6 +450,7 @@ async function crawlQuotes({
   let skipSap = 0;
   const seenDocEntry = new Set();
   const out = [];
+  let excluded = 0;
 
   for (let page = 0; page < maxPages; page++) {
     const raw = await slFetch(
@@ -509,22 +471,34 @@ async function crawlQuotes({
         seenDocEntry.add(de);
       }
 
-      if (isCancelledLike(q)) continue;
+      if (isCancelledLike(q)) {
+        excluded++;
+        continue;
+      }
 
       const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
       const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
 
       if (createdSet) {
         const u = String(usuario || "").trim().toLowerCase();
-        if (!u || u === "sin_user" || !createdSet.has(u)) continue;
+        if (!u || u === "sin_user" || !createdSet.has(u)) {
+          excluded++;
+          continue;
+        }
       }
 
-      if (uFilter && !String(usuario).toLowerCase().includes(uFilter)) continue;
+      if (uFilter && !String(usuario).toLowerCase().includes(uFilter)) {
+        excluded++;
+        continue;
+      }
 
       if (cFilter) {
         const cc = String(q.CardCode || "").toLowerCase();
         const cn = String(q.CardName || "").toLowerCase();
-        if (!cc.includes(cFilter) && !cn.includes(cFilter)) continue;
+        if (!cc.includes(cFilter) && !cn.includes(cFilter)) {
+          excluded++;
+          continue;
+        }
       }
 
       out.push({
@@ -542,20 +516,24 @@ async function crawlQuotes({
         montoEntregado: 0,
         pendiente: Number(q.DocTotal || 0),
       });
+
+      if (out.length >= needCount) break;
+      if (out.length >= hardCap) break;
     }
+
+    if (out.length >= needCount) break;
+    if (out.length >= hardCap) break;
 
     await sleep(10);
   }
 
-  return { quotes: out, createdUsersCount: createdSet ? createdSet.size : null };
+  return { quotes: out, excluded, createdUsersCount: createdSet ? createdSet.size : null };
 }
 
 /* =========================================================
-   ✅ ADMIN QUOTES
-   Params:
-     scope=created|all
-     maxPages=100
-     withDelivered=1  -> calcula entregado para la PAGINA actual
+   ✅ /api/admin/quotes (Histórico)
+   - rápido: solo junta lo necesario para la página solicitada
+   - entregado: solo para la página visible
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -563,6 +541,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
 
+    // Nota: no obligo rango, pero pongo defaults razonables.
+    // Si tu UI manda vacío, igual trae bastante.
     const from =
       /^\d{4}-\d{2}-\d{2}$/.test(String(req.query?.from || ""))
         ? String(req.query.from)
@@ -581,7 +561,10 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const userFilter = String(req.query?.user || "").trim();
     const clientFilter = String(req.query?.client || "").trim();
 
-    const { quotes, createdUsersCount } = await crawlQuotes({
+    // ✅ SOLO juntamos lo que necesitamos para esa página + buffer
+    const needCount = page * limit + 50;
+
+    const { quotes, excluded, createdUsersCount } = await crawlQuotesOptimized({
       from,
       to,
       maxPages,
@@ -589,17 +572,17 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       scope,
       userFilter,
       clientFilter,
+      needCount,
+      hardCap: 8000,
     });
 
-    const total = quotes.length;
-    const pageCount = Math.max(1, Math.ceil(total / limit));
-
+    const totalKnown = quotes.length; // total “conocido” (hasta donde leímos)
     const start = (page - 1) * limit;
     const slice = quotes.slice(start, start + limit);
 
-    // ✅ Entregado: solo para la página (rápido)
+    // ✅ Entregado solo para la página (rápido)
     if (withDelivered && slice.length) {
-      const CONC = 2;
+      const CONC = 3;
       let idx = 0;
 
       async function worker() {
@@ -607,13 +590,13 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
           const i = idx++;
           const q = slice[i];
           try {
-            const tr = await traceQuote(q.docNum, from, to);
+            const tr = await traceQuoteFast(q.docNum, from, to);
             if (tr.ok) {
               q.montoEntregado = Number(tr.totals?.totalEntregado || 0);
               q.pendiente = Number(tr.totals?.pendiente || 0);
             }
           } catch {}
-          await sleep(25);
+          await sleep(10);
         }
       }
 
@@ -622,7 +605,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
     return safeJson(res, 200, {
       ok: true,
-      mode: "crawler",
+      mode: "crawler_pro",
       scope,
       from,
       to,
@@ -630,8 +613,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       withDelivered,
       page,
       limit,
-      total,
-      pageCount,
+      totalKnown,
+      excluded,
       createdUsersCount,
       quotes: slice,
     });
@@ -641,9 +624,9 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ DASHBOARD (alias para que tu HTML no tire 404)
-   Params:
-     withDelivered=1  -> calcula totalEntregado (puede tardar)
+   ✅ /api/admin/dashboard
+   - rápido: usa una muestra suficientemente grande
+   - entregado: por defecto solo calcula para N cotizaciones
 ========================================================= */
 app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   try {
@@ -664,35 +647,52 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
     const maxPages = Math.min(Math.max(Number(req.query?.maxPages || 100), 1), 250);
     const scope = String(req.query?.scope || "all").toLowerCase() === "created" ? "created" : "all";
 
-    const { quotes, createdUsersCount } = await crawlQuotes({
+    const userFilter = String(req.query?.user || "").trim();
+    const clientFilter = String(req.query?.client || "").trim();
+
+    // ✅ Dashboard no necesita 10,000 filas para renderizar: tomamos una muestra grande
+    // Puedes subir needCount si quieres (ej: 2000) pero 800 es buen balance
+    const needCount = Math.min(Math.max(Number(req.query?.needCount || 800), 200), 3000);
+
+    const { quotes, excluded, createdUsersCount } = await crawlQuotesOptimized({
       from,
       to,
       maxPages,
       sapPageSize: 200,
       scope,
-      userFilter: String(req.query?.user || "").trim(),
-      clientFilter: String(req.query?.client || "").trim(),
+      userFilter,
+      clientFilter,
+      needCount,
+      hardCap: 12000,
     });
 
     const totalCotizado = quotes.reduce((a, q) => a + Number(q.montoCotizacion || 0), 0);
 
     let totalEntregado = 0;
 
-    if (withDelivered && quotes.length) {
-      const CONC = 2;
+    // ✅ PRO: limitar entregado para que no se muera
+    const deliveredCap = Math.min(Math.max(Number(req.query?.deliveredCap || 150), 0), 1000);
+
+    let deliveredComputed = 0;
+    let deliveredPartial = false;
+
+    if (withDelivered && quotes.length && deliveredCap > 0) {
+      const work = quotes.slice(0, Math.min(deliveredCap, quotes.length));
+      deliveredPartial = work.length < quotes.length;
+
+      const CONC = 3;
       let idx = 0;
 
       async function worker() {
-        while (idx < quotes.length) {
+        while (idx < work.length) {
           const i = idx++;
-          const q = quotes[i];
+          const q = work[i];
           try {
-            const tr = await traceQuote(q.docNum, from, to);
-            if (tr.ok) {
-              totalEntregado += Number(tr.totals?.totalEntregado || 0);
-            }
+            const tr = await traceQuoteFast(q.docNum, from, to);
+            if (tr.ok) totalEntregado += Number(tr.totals?.totalEntregado || 0);
           } catch {}
-          await sleep(25);
+          deliveredComputed++;
+          await sleep(10);
         }
       }
 
@@ -704,11 +704,17 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
 
     return safeJson(res, 200, {
       ok: true,
+      mode: "dashboard_pro",
       scope,
       from,
       to,
       maxPages,
+      needCount,
       withDelivered,
+      deliveredCap,
+      deliveredComputed,
+      deliveredPartial,
+      excluded,
       createdUsersCount,
       kpis: {
         totalCotizaciones: quotes.length,
