@@ -752,41 +752,91 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
 -------------------------- */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
-    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+    if (missingSapEnv())
+      return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
-    const from = String(req.query?.from || "").slice(0, 10);
-    const to = String(req.query?.to || "").slice(0, 10);
+    const limit = Math.min(Math.max(Number(req.query?.limit || 100), 1), 1000);
+    const page = Math.max(1, Number(req.query?.page || 1));
+    const skip = (page - 1) * limit;
 
-    const page = pickInt(req.query?.page, 1, 1, 5000);
-    const limit = pickInt(req.query?.limit, 50, 1, 200); // SAP-friendly
-    const maxPages = pickInt(req.query?.maxPages, 100, 1, 500);
+    const maxPages = Math.min(Number(req.query?.maxPages || 100), 200);
+    const batchTop = 200;
 
-    const withDelivered = String(req.query?.withDelivered || "0") === "1";
+    const userFilter = String(req.query?.user || "").trim().toLowerCase();
+    const clientFilter = String(req.query?.client || "").trim().toLowerCase();
 
-    const scopeRaw = String(req.query?.scope || "all").toLowerCase();
-    const scope = scopeRaw === "created" ? "created" : "all";
+    let skipSap = 0;
+    let totalFiltered = 0;
+    const allRows = [];
+    const seenDocEntry = new Set();
 
-    const user = String(req.query?.user || "");
-    const client = String(req.query?.client || "");
+    for (let i = 0; i < maxPages; i++) {
 
-    const out = await scanQuotesPaged({
-      from: from || "",
-      to: to || "",
-      page,
-      limit,
+      const raw = await slFetch(
+        `/Quotations?$select=DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments` +
+        `&$orderby=DocDate desc,DocEntry desc` +
+        `&$top=${batchTop}&$skip=${skipSap}`
+      );
+
+      const rows = Array.isArray(raw?.value) ? raw.value : [];
+      if (!rows.length) break;
+
+      skipSap += rows.length;
+
+      for (const q of rows) {
+
+        const de = Number(q.DocEntry);
+        if (seenDocEntry.has(de)) continue;
+        seenDocEntry.add(de);
+
+        if (isCancelledLike(q)) continue;
+
+        const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
+        const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
+
+        if (userFilter && !usuario.toLowerCase().includes(userFilter)) continue;
+
+        if (clientFilter) {
+          const cc = String(q.CardCode || "").toLowerCase();
+          const cn = String(q.CardName || "").toLowerCase();
+          if (!cc.includes(clientFilter) && !cn.includes(clientFilter)) continue;
+        }
+
+        totalFiltered++;
+
+        allRows.push({
+          docEntry: q.DocEntry,
+          docNum: q.DocNum,
+          cardCode: q.CardCode,
+          cardName: q.CardName,
+          montoCotizacion: Number(q.DocTotal || 0),
+          fecha: String(q.DocDate || "").slice(0, 10),
+          estado: q.DocumentStatus || "",
+          comments: q.Comments || "",
+          usuario,
+          warehouse: wh,
+        });
+      }
+
+      if (rows.length < batchTop) break;
+    }
+
+    const paginated = allRows.slice(skip, skip + limit);
+
+    return safeJson(res, 200, {
+      ok: true,
+      mode: "crawler",
       maxPages,
-      userFilter: user,
-      clientFilter: client,
-      scope,
-      withDelivered,
+      total: totalFiltered,
+      page,
+      pageCount: Math.ceil(totalFiltered / limit),
+      quotes: paginated,
     });
 
-    return res.json(out);
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+    return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
-
 /* --------------------------
    DASHBOARD
    GET /api/admin/dashboard?needCount=800&maxPages=100&scope=created|all&withDelivered=1&deliveredCap=200
