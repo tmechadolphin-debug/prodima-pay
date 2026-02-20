@@ -508,7 +508,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const page = Math.max(1, Number(req.query?.page || 1));
     const wantSkip = (page - 1) * limit;
 
-    // ✅ “Sin rango” práctico: por defecto desde 2016-01-01 hasta hoy
+    // ✅ “Sin rango” práctico
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const fromIn = String(req.query?.from || "").trim();
     const toIn = String(req.query?.to || "").trim();
@@ -516,15 +516,17 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const f = /^\d{4}-\d{2}-\d{2}$/.test(fromIn) ? fromIn : "2016-01-01";
     const t = /^\d{4}-\d{2}-\d{2}$/.test(toIn) ? toIn : today;
 
-    // ✅ Control de “cuántas páginas de SAP leer”
-    // Ej: maxPages=100 => hasta 100*200=20,000 registros
+    // ✅ cuántas páginas de SAP leer
     const maxPages = Math.min(Math.max(Number(req.query?.maxPages || 100), 1), 300);
     const batchTop = 200;
 
     const userFilter = String(req.query?.user || "").trim().toLowerCase();
     const clientFilter = String(req.query?.client || "").trim().toLowerCase();
 
-    // 1) Crawl grande
+    // ✅ scope: all | created
+    const scope = String(req.query?.scope || "all").trim().toLowerCase();
+
+    // 1) Crawl grande (ya filtra user/client si vienen)
     const all = await crawlQuotesFromSap({
       from: f,
       to: t,
@@ -534,10 +536,38 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       clientFilter,
     });
 
-    // 2) Pagina aquí (ya filtrado)
-    const total = all.length;
+    const debug = {
+      totalSap: all.length,
+      totalAfterScope: null,
+      scope,
+      usersInDb: null,
+    };
+
+    // 2) Scope "created" => SOLO usuarios que existan en app_users
+    let scoped = all;
+
+    if (scope === "created") {
+      if (!hasDb()) {
+        return safeJson(res, 500, {
+          ok: false,
+          message: "DB no configurada para scope=created",
+        });
+      }
+
+      const r = await dbQuery(`SELECT username FROM app_users WHERE is_active=TRUE`);
+      const set = new Set((r.rows || []).map(x => String(x.username || "").trim().toLowerCase()));
+      debug.usersInDb = set.size;
+
+      scoped = all.filter(q => set.has(String(q.usuario || "").trim().toLowerCase()));
+      debug.totalAfterScope = scoped.length;
+    } else {
+      debug.totalAfterScope = all.length;
+    }
+
+    // 3) Paginar
+    const total = scoped.length;
     const pageCount = Math.max(1, Math.ceil(total / limit));
-    const quotes = all.slice(wantSkip, wantSkip + limit);
+    const quotes = scoped.slice(wantSkip, wantSkip + limit);
 
     return safeJson(res, 200, {
       ok: true,
@@ -550,11 +580,13 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       total,
       pageCount,
       quotes,
+      debug,
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
+
 
 /* =========================================================
    ✅ START
