@@ -26,7 +26,7 @@ const {
   SAP_WAREHOUSE = "300",
   SAP_PRICE_LIST = "Lista 02 Res. Com. Ind. Analitic",
 
-  // ⚠️ pon esto en Render:
+  // Render:
   // CORS_ORIGIN=https://prodima.com.pa,https://www.prodima.com.pa
   CORS_ORIGIN = "",
 } = process.env;
@@ -197,8 +197,7 @@ async function httpFetch(url, options) {
 }
 
 /* =========================================================
-   ✅ SAP Service Layer
-   - timeout corto (12s) para listados
+   ✅ SAP Service Layer (12s default)
 ========================================================= */
 let SL_COOKIE = "";
 let SL_COOKIE_AT = 0;
@@ -215,9 +214,7 @@ async function slLogin() {
 
   const txt = await r.text();
   let data = {};
-  try {
-    data = JSON.parse(txt);
-  } catch {}
+  try { data = JSON.parse(txt); } catch {}
 
   if (!r.ok) throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
 
@@ -240,7 +237,7 @@ async function slFetch(path, options = {}) {
   const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
 
   const controller = new AbortController();
-  const timeoutMs = Number(options.timeoutMs || 12000); // ✅ 12s por defecto
+  const timeoutMs = Number(options.timeoutMs || 12000);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
@@ -257,11 +254,7 @@ async function slFetch(path, options = {}) {
 
     const txt = await r.text();
     let data = {};
-    try {
-      data = JSON.parse(txt);
-    } catch {
-      data = { raw: txt };
-    }
+    try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
 
     if (!r.ok) {
       if (r.status === 401 || r.status === 403) {
@@ -294,10 +287,10 @@ async function sapGetFirstByDocNum(entity, docNum, select) {
   const arr = Array.isArray(r?.value) ? r.value : [];
   return arr[0] || null;
 }
-async function sapGetByDocEntry(entity, docEntry) {
+async function sapGetByDocEntry(entity, docEntry, timeoutMs = 12000) {
   const n = Number(docEntry);
   if (!Number.isFinite(n) || n <= 0) throw new Error("DocEntry inválido");
-  return slFetch(`/${entity}(${n})`, { timeoutMs: 12000 });
+  return slFetch(`/${entity}(${n})`, { timeoutMs });
 }
 
 /* =========================================================
@@ -313,9 +306,7 @@ async function getCreatedUsersSetCached() {
     return CREATED_USERS_CACHE.set;
   }
   const r = await dbQuery(`SELECT username FROM app_users WHERE is_active=TRUE`);
-  const set = new Set(
-    (r.rows || []).map((x) => String(x.username || "").trim().toLowerCase()).filter(Boolean)
-  );
+  const set = new Set((r.rows || []).map((x) => String(x.username || "").trim().toLowerCase()).filter(Boolean));
   CREATED_USERS_CACHE = { ts: now, set };
   return set;
 }
@@ -339,12 +330,20 @@ function cacheSet(key, data) {
   TRACE_CACHE.set(key, { at: Date.now(), data });
 }
 
+/* ✅ timeout por traza para NO tumbar /quotes */
+function withTimeout(promise, ms, label = "timeout") {
+  let t;
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(label)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+
 async function traceQuoteTotals(quoteDocNum, fromOverride, toOverride) {
   const cacheKey = `Q:${quoteDocNum}:${fromOverride || ""}:${toOverride || ""}`;
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
 
-  // ⚠️ trazado es pesado => timeout mayor SOLO aquí
   const quoteHead = await sapGetFirstByDocNum(
     "Quotations",
     quoteDocNum,
@@ -356,33 +355,40 @@ async function traceQuoteTotals(quoteDocNum, fromOverride, toOverride) {
     return out;
   }
 
-  const quote = await sapGetByDocEntry("Quotations", quoteHead.DocEntry);
+  // ✅ aquí damos más timeout al header/quote (pero lo manejamos arriba con withTimeout)
+  const quote = await sapGetByDocEntry("Quotations", quoteHead.DocEntry, 18000);
+
   const quoteDocEntry = Number(quote.DocEntry);
   const cardCode = String(quote.CardCode || "").trim();
   const quoteDate = String(quote.DocDate || "").slice(0, 10);
 
-  const from = /^\d{4}-\d{2}-\d{2}$/.test(String(fromOverride || "")) ? String(fromOverride) : addDaysISO(quoteDate, -7);
-  const to = /^\d{4}-\d{2}-\d{2}$/.test(String(toOverride || "")) ? String(toOverride) : addDaysISO(quoteDate, 30);
+  const from = /^\d{4}-\d{2}-\d{2}$/.test(String(fromOverride || ""))
+    ? String(fromOverride)
+    : addDaysISO(quoteDate, -7);
+
+  const to = /^\d{4}-\d{2}-\d{2}$/.test(String(toOverride || ""))
+    ? String(toOverride)
+    : addDaysISO(quoteDate, 30);
+
   const toPlus1 = addDaysISO(to, 1);
 
-  // ✅ listados con timeout un poco mayor
   const ordersList = await slFetch(
     `/Orders?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
       `&$filter=${encodeURIComponent(
         `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
       )}` +
-      `&$orderby=DocDate desc,DocEntry desc&$top=200`,
+      `&$orderby=DocDate desc,DocEntry desc&$top=120`,
     { timeoutMs: 18000 }
   );
   const orderCandidates = Array.isArray(ordersList?.value) ? ordersList.value : [];
 
   const orders = [];
   for (const o of orderCandidates) {
-    const od = await sapGetByDocEntry("Orders", o.DocEntry);
+    const od = await sapGetByDocEntry("Orders", o.DocEntry, 18000);
     const lines = Array.isArray(od?.DocumentLines) ? od.DocumentLines : [];
     const linked = lines.some((l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry);
     if (linked) orders.push(od);
-    await sleep(15);
+    await sleep(10);
   }
 
   let totalEntregado = 0;
@@ -395,14 +401,14 @@ async function traceQuoteTotals(quoteDocNum, fromOverride, toOverride) {
         `&$filter=${encodeURIComponent(
           `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
         )}` +
-        `&$orderby=DocDate desc,DocEntry desc&$top=300`,
+        `&$orderby=DocDate desc,DocEntry desc&$top=200`,
       { timeoutMs: 18000 }
     );
     const delCandidates = Array.isArray(delList?.value) ? delList.value : [];
 
     const seen = new Set();
     for (const d of delCandidates) {
-      const dd = await sapGetByDocEntry("DeliveryNotes", d.DocEntry);
+      const dd = await sapGetByDocEntry("DeliveryNotes", d.DocEntry, 18000);
       const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
       const linked = lines.some((l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry)));
       if (linked) {
@@ -412,7 +418,7 @@ async function traceQuoteTotals(quoteDocNum, fromOverride, toOverride) {
           totalEntregado += Number(dd?.DocTotal || 0);
         }
       }
-      await sleep(15);
+      await sleep(10);
     }
   }
 
@@ -439,7 +445,7 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN USERS (igual)
+   ✅ ADMIN USERS
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
@@ -456,8 +462,8 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN QUOTES (rápido)
-   - NO calcula entregado aquí
+   ✅ ADMIN QUOTES
+   ✅ con withDelivered=1 (seguro)
 ========================================================= */
 async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter, onlyCreated }) {
   const toPlus1 = addDaysISO(t, 1);
@@ -527,7 +533,6 @@ async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter,
           usuario,
           warehouse: wh,
           montoCotizacion: Number(q.DocTotal || 0),
-          // entregado se llena luego por endpoint batch:
           montoEntregado: 0,
           pendiente: Number(q.DocTotal || 0),
         });
@@ -548,6 +553,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const to = String(req.query?.to || "");
 
     const onlyCreated = String(req.query?.onlyCreated || "0") === "1";
+    const withDelivered = String(req.query?.withDelivered || "0") === "1";
 
     const limitRaw =
       req.query?.limit != null
@@ -556,7 +562,10 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         ? Number(req.query.top)
         : 20;
 
-    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
+    let limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
+
+    // ✅ cap duro cuando piden entregado (para que sea rápido y no muera)
+    if (withDelivered) limit = Math.min(limit, 60);
 
     const skip = req.query?.skip != null ? Math.max(0, Number(req.query.skip) || 0) : 0;
 
@@ -567,11 +576,11 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const defaultFrom = addDaysISO(today, -30);
 
     const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
-    const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
+    const tt = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
 
     const { pageRows, totalFiltered } = await scanQuotes({
       f,
-      t,
+      t: tt,
       wantSkip: skip,
       wantLimit: limit,
       userFilter,
@@ -579,15 +588,49 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       onlyCreated,
     });
 
+    // ✅ ENTREGADO “best effort”: NO tumba el endpoint si SAP se demora
+    if (withDelivered && pageRows.length) {
+      const CONC = 1; // ✅ en Render: 1 es lo más estable
+      let idx = 0;
+
+      async function worker() {
+        while (idx < pageRows.length) {
+          const i = idx++;
+          const q = pageRows[i];
+
+          try {
+            // ✅ timeout por quote: si no responde, seguimos
+            const r = await withTimeout(
+              traceQuoteTotals(q.docNum, f, tt),
+              20000,
+              "trace timeout (20s)"
+            );
+
+            if (r && r.ok) {
+              q.montoEntregado = Number(r.totalEntregado || 0);
+              q.pendiente = Number(r.pendiente || 0);
+            }
+          } catch {
+            // dejamos 0 y seguimos
+          }
+
+          await sleep(60);
+        }
+      }
+
+      await Promise.all(Array.from({ length: CONC }, () => worker()));
+    }
+
     return safeJson(res, 200, {
       ok: true,
       quotes: pageRows,
       from: f,
-      to: t,
+      to: tt,
       limit,
       skip,
       total: totalFiltered,
       scope: { onlyCreated },
+      withDelivered,
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -595,8 +638,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ENTREGADO BATCH (nuevo)
-   GET /api/admin/quotes/delivered?docNums=123,456&from=YYYY-MM-DD&to=YYYY-MM-DD
+   ✅ ENTREGADO BATCH (lo dejamos, opcional para mejorar después)
 ========================================================= */
 app.get("/api/admin/quotes/delivered", verifyAdmin, async (req, res) => {
   try {
@@ -606,7 +648,7 @@ app.get("/api/admin/quotes/delivered", verifyAdmin, async (req, res) => {
       .split(",")
       .map((x) => Number(String(x).trim()))
       .filter((n) => Number.isFinite(n) && n > 0)
-      .slice(0, 20); // ✅ máximo 20 por batch
+      .slice(0, 20);
 
     if (!docNums.length) return safeJson(res, 400, { ok: false, message: "docNums vacío" });
 
@@ -620,7 +662,6 @@ app.get("/api/admin/quotes/delivered", verifyAdmin, async (req, res) => {
     const tt = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
 
     const out = {};
-    // ✅ 1 por 1 para no morir por timeout
     for (const dn of docNums) {
       try {
         const r = await traceQuoteTotals(dn, f, tt);
