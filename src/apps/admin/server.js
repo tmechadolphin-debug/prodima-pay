@@ -1,4 +1,4 @@
-// server.js (optimizado para ADMIN: Dashboard + Histórico + Usuarios + Entregado)
+// server.js (ADMIN: Dashboard + Histórico + Usuarios + Entregado + Grupos)
 
 import express from "express";
 import cors from "cors";
@@ -30,8 +30,8 @@ const {
   SAP_USER = "",
   SAP_PASS = "",
 
-  SAP_WAREHOUSE = "300", // default fallback
-  SAP_PRICE_LIST = "Lista 02 Res. Com. Ind. Analitic", // se deja por compatibilidad / health
+  SAP_WAREHOUSE = "300",
+  SAP_PRICE_LIST = "Lista 02 Res. Com. Ind. Analitic",
   YAPPY_ALIAS = "@prodimasansae",
 } = process.env;
 
@@ -62,7 +62,6 @@ function hasDb() {
 async function dbQuery(text, params = []) {
   return pool.query(text, params);
 }
-
 async function ensureDb() {
   if (!hasDb()) return;
 
@@ -95,7 +94,6 @@ function getDateISOInOffset(offsetMin = 0) {
   const dd = String(d.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${dd}`;
 }
-
 function addDaysISO(iso, days) {
   const d = new Date(String(iso || "").slice(0, 10));
   if (Number.isNaN(d.getTime())) return "";
@@ -128,16 +126,14 @@ function provinceToWarehouse(province) {
 }
 
 /* =========================================================
-   ✅ Helpers (auth + safe json)
+   ✅ Helpers
 ========================================================= */
 function safeJson(res, status, obj) {
   res.status(status).json(obj);
 }
-
 function signToken(payload, ttl = "12h") {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: ttl });
 }
-
 function signUserToken(u, ttl = "30d") {
   return signToken(
     {
@@ -151,13 +147,11 @@ function signUserToken(u, ttl = "30d") {
     ttl
   );
 }
-
 function readBearer(req) {
   const auth = String(req.headers.authorization || "");
   const m = auth.match(/^Bearer\s+(.+)$/i);
   return m ? m[1] : "";
 }
-
 function verifyAdmin(req, res, next) {
   const token = readBearer(req);
   if (!token) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
@@ -171,7 +165,6 @@ function verifyAdmin(req, res, next) {
     return safeJson(res, 401, { ok: false, message: "Invalid token" });
   }
 }
-
 function verifyUser(req, res, next) {
   const token = readBearer(req);
   if (!token) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
@@ -185,15 +178,12 @@ function verifyUser(req, res, next) {
     return safeJson(res, 401, { ok: false, message: "Invalid token" });
   }
 }
-
 function missingSapEnv() {
   return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
 }
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-
 function parseUserFromComments(comments) {
   const m = String(comments || "").match(/\[user:([^\]]+)\]/i);
   return m ? String(m[1]).trim() : "";
@@ -232,7 +222,19 @@ app.get("/api/health", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP Service Layer (Session cookie)
+   ✅ Fetch wrapper (Node 16/18 compatible)
+========================================================= */
+let _fetch = globalThis.fetch || null;
+async function httpFetch(url, options) {
+  if (_fetch) return _fetch(url, options);
+  // Node < 18 fallback
+  const mod = await import("node-fetch");
+  _fetch = mod.default;
+  return _fetch(url, options);
+}
+
+/* =========================================================
+   ✅ SAP Service Layer (Session cookie) + timeout
 ========================================================= */
 let SL_COOKIE = "";
 let SL_COOKIE_AT = 0;
@@ -245,7 +247,7 @@ async function slLogin() {
     Password: SAP_PASS,
   };
 
-  const r = await fetch(url, {
+  const r = await httpFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -281,37 +283,49 @@ async function slFetch(path, options = {}) {
 
   const base = SAP_BASE_URL.replace(/\/$/, "");
   const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
-
   const method = String(options.method || "GET").toUpperCase();
 
-  const r = await fetch(url, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      Cookie: SL_COOKIE,
-      ...(options.headers || {}),
-    },
-    body: options.body,
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
 
-  const txt = await r.text();
-  let data = {};
   try {
-    data = JSON.parse(txt);
-  } catch {
-    data = { raw: txt };
-  }
+    const r = await httpFetch(url, {
+      method,
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: SL_COOKIE,
+        ...(options.headers || {}),
+      },
+      body: options.body,
+    });
 
-  if (!r.ok) {
-    if (r.status === 401 || r.status === 403) {
-      SL_COOKIE = "";
-      await slLogin();
-      return slFetch(path, options);
+    const txt = await r.text();
+    let data = {};
+    try {
+      data = JSON.parse(txt);
+    } catch {
+      data = { raw: txt };
     }
-    throw new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
-  }
 
-  return data;
+    if (!r.ok) {
+      if (r.status === 401 || r.status === 403) {
+        SL_COOKIE = "";
+        await slLogin();
+        return slFetch(path, options);
+      }
+      throw new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
+    }
+
+    return data;
+  } catch (e) {
+    if (String(e?.name) === "AbortError") {
+      throw new Error("SAP timeout (30s) en slFetch");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /* =========================================================
@@ -342,7 +356,7 @@ async function sapGetByDocEntry(entity, docEntry, select) {
 }
 
 /* =========================================================
-   ✅ TRACE logic + cache (ENTREGADO)
+   ✅ TRACE (ENTREGADO) + cache
 ========================================================= */
 const TRACE_CACHE = new Map();
 const TRACE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -391,7 +405,6 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
 
   const toPlus1 = addDaysISO(to, 1);
 
-  // ✅ Buscar Orders candidatos por CardCode y fecha
   const ordersList = await slFetch(
     `/Orders?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
       `&$filter=${encodeURIComponent(
@@ -399,6 +412,7 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
       )}` +
       `&$orderby=DocDate desc,DocEntry desc&$top=200`
   );
+
   const orderCandidates = Array.isArray(ordersList?.value) ? ordersList.value : [];
 
   const orders = [];
@@ -409,10 +423,9 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
       (l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry
     );
     if (linked) orders.push(od);
-    await sleep(25);
+    await sleep(20);
   }
 
-  // ✅ Deliveries linkeadas a esos Orders
   const deliveries = [];
   const orderDocEntrySet = new Set(orders.map((x) => Number(x.DocEntry)));
 
@@ -424,9 +437,10 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
         )}` +
         `&$orderby=DocDate desc,DocEntry desc&$top=300`
     );
-    const delCandidates = Array.isArray(delList?.value) ? delList.value : [];
 
+    const delCandidates = Array.isArray(delList?.value) ? delList.value : [];
     const seen = new Set();
+
     for (const d of delCandidates) {
       const dd = await sapGetByDocEntry("DeliveryNotes", d.DocEntry);
       const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
@@ -440,7 +454,7 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
           deliveries.push(dd);
         }
       }
-      await sleep(25);
+      await sleep(20);
     }
   }
 
@@ -462,12 +476,12 @@ async function traceQuote(quoteDocNum, fromOverride, toOverride) {
 }
 
 /* =========================================================
-   ✅ Item Group cache + helpers (withGroups=1)
+   ✅ Grupos SAP (withGroups=1) + cache
 ========================================================= */
-const ITEM_GROUP_CODE_TO_NAME = new Map(); // groupCode -> groupName
-const ITEM_CODE_TO_GROUP_NAME = new Map(); // itemCode -> groupName
+const ITEM_GROUP_CODE_TO_NAME = new Map();
+const ITEM_CODE_TO_GROUP_NAME = new Map();
 const GROUP_TTL_MS = 24 * 60 * 60 * 1000;
-const GROUP_CACHE_AT = new Map(); // key -> ts
+const GROUP_CACHE_AT = new Map();
 
 function cacheFresh(key, ttl) {
   const ts = GROUP_CACHE_AT.get(key);
@@ -508,7 +522,6 @@ async function getGroupNameByItemCode(itemCode) {
 
   const it = await slFetch(`/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemsGroupCode`);
   const gcode = it?.ItemsGroupCode;
-
   const gname = await getGroupNameByGroupCode(gcode);
 
   ITEM_CODE_TO_GROUP_NAME.set(code, gname);
@@ -555,7 +568,7 @@ async function resolveGroupsForItemCodes(itemCodes) {
 }
 
 /* =========================================================
-   ✅ USER LOGIN (se mantiene por si lo usas)
+   ✅ USER LOGIN (se mantiene)
 ========================================================= */
 async function handleUserLogin(req, res) {
   try {
@@ -610,7 +623,6 @@ async function handleUserLogin(req, res) {
 
 app.post("/api/login", handleUserLogin);
 app.post("/api/auth/login", handleUserLogin);
-
 app.get("/api/me", verifyUser, async (req, res) => safeJson(res, 200, { ok: true, user: req.user }));
 app.get("/api/auth/me", verifyUser, async (req, res) =>
   safeJson(res, 200, { ok: true, user: req.user })
@@ -705,9 +717,7 @@ app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
     if (!id) return safeJson(res, 400, { ok: false, message: "ID inválido" });
 
     const pin = String(req.body?.pin || "").trim();
-    if (!pin || pin.length < 4) {
-      return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
-    }
+    if (!pin || pin.length < 4) return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
 
     const pin_hash = await bcrypt.hash(pin, 10);
 
@@ -753,12 +763,7 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
     const id = toIntId(req.params.id);
     if (!id) return safeJson(res, 400, { ok: false, message: "ID inválido" });
 
-    const r = await dbQuery(
-      `DELETE FROM app_users WHERE id=$1
-       RETURNING id`,
-      [id]
-    );
-
+    const r = await dbQuery(`DELETE FROM app_users WHERE id=$1 RETURNING id`, [id]);
     if (!r.rows?.length) return safeJson(res, 404, { ok: false, message: "Usuario no existe" });
     return safeJson(res, 200, { ok: true });
   } catch (e) {
@@ -767,22 +772,13 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN QUOTES (HISTÓRICO + DASHBOARD feed)
-   - soporta page/limit (tu admin lo usa)
-   - soporta top/skip (tu admin lo usa para "fetchMoreQuotesBatch")
-   - withDelivered=1 (ENTREGADO)
-   - withGroups=1 (grupos por ItemCode)
+   ✅ ADMIN QUOTES (Histórico + Dashboard feed)
+   FIX: anti-freeze (caps)
 ========================================================= */
+const HARD_CAP_DELIVERED = 60; // 🔒 no más de 60 con entregado
+const HARD_CAP_GROUPS = 120;   // 🔒 no más de 120 con grupos
 
-async function scanQuotes({
-  f,
-  t,
-  wantSkip,
-  wantLimit,
-  userFilter,
-  clientFilter,
-  includeTotal,
-}) {
+async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter, includeTotal }) {
   const toPlus1 = addDaysISO(t, 1);
   const batchTop = 200;
 
@@ -794,7 +790,6 @@ async function scanQuotes({
   const cFilter = String(clientFilter || "").trim().toLowerCase();
 
   const maxSapPages = includeTotal ? 200 : 50;
-
   const seenDocEntry = new Set();
 
   for (let page = 0; page < maxSapPages; page++) {
@@ -867,7 +862,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const withDelivered = String(req.query?.withDelivered || "0") === "1";
     const withGroups = wantsGroups(req);
 
-    // ✅ soporta limit/top/page/skip
     const limitRaw =
       req.query?.limit != null
         ? Number(req.query.limit)
@@ -875,7 +869,11 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         ? Number(req.query.top)
         : 20;
 
-    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
+    let limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
+
+    // ✅ caps anti-freeze
+    if (withDelivered) limit = Math.min(limit, HARD_CAP_DELIVERED);
+    if (withGroups) limit = Math.min(limit, HARD_CAP_GROUPS);
 
     const pageRaw = req.query?.page != null ? Number(req.query.page) : null;
     const page = pageRaw != null ? Math.max(1, Number.isFinite(pageRaw) ? pageRaw : 1) : null;
@@ -890,7 +888,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         : 0;
 
     const includeTotal = String(req.query?.includeTotal || "0") === "1";
-
     const userFilter = String(req.query?.user || "");
     const clientFilter = String(req.query?.client || "");
 
@@ -910,7 +907,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       includeTotal,
     });
 
-    // ✅ ENTREGADO (importante)
+    // ✅ ENTREGADO
     if (withDelivered && pageRows.length) {
       const CONC = 2;
       let idx = 0;
@@ -933,7 +930,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       await Promise.all(Array.from({ length: CONC }, () => worker()));
     }
 
-    // ✅ Grupos por artículo (si se pide)
+    // ✅ GROUPS
     if (withGroups && pageRows.length) {
       const CONC = 4;
       let idx = 0;
@@ -945,9 +942,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
           try {
             const full = await slFetch(
-              `/Quotations(${Number(q.docEntry)})` +
-                `?$select=DocEntry` +
-                `&$expand=DocumentLines($select=ItemCode,LineTotal)`
+              `/Quotations(${Number(q.docEntry)})?$select=DocEntry&$expand=DocumentLines($select=ItemCode,LineTotal)`
             );
 
             const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
@@ -959,13 +954,10 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
             for (const ln of lines) {
               const code = String(ln?.ItemCode || "").trim();
               if (!code) continue;
-
-              const grp = mapGroups.get(code) || "";
-
               outLines.push({
                 ItemCode: code,
                 LineTotal: Number(ln?.LineTotal || 0),
-                ItmsGrpNam: grp,
+                ItmsGrpNam: mapGroups.get(code) || "",
               });
             }
 
@@ -991,6 +983,11 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       skip,
       total: includeTotal ? totalFiltered : null,
       pageCount: includeTotal ? Math.max(1, Math.ceil(totalFiltered / limit)) : null,
+      capped: {
+        deliveredCap: HARD_CAP_DELIVERED,
+        groupsCap: HARD_CAP_GROUPS,
+        applied: withDelivered || withGroups ? true : false,
+      },
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -998,20 +995,21 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN DASHBOARD (opcional)
-   Tu front lo llama pero hace catch si falla. Aquí lo dejamos
-   para que SIEMPRE responda OK (no duplica lógica).
+   ✅ ADMIN DASHBOARD (tu front lo llama)
 ========================================================= */
 app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   return safeJson(res, 200, {
     ok: true,
-    message: "Dashboard se construye desde /api/admin/quotes (withDelivered/withGroups).",
+    message: "Dashboard se arma en el frontend usando /api/admin/quotes (withDelivered/withGroups).",
   });
 });
 
 /* =========================================================
    ✅ START
 ========================================================= */
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+
 (async () => {
   try {
     await ensureDb();
