@@ -34,14 +34,36 @@ const {
 } = process.env;
 
 /* =========================================================
-   ✅ CORS
+   ✅ CORS (ROBUSTO)
 ========================================================= */
-app.use(
-  cors({
-    origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
-    credentials: false,
-  })
+const ALLOWED_ORIGINS = new Set(
+  String(process.env.CORS_ORIGIN || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
 );
+
+// Si no defines nada, permite todo (refleja el Origin)
+const allowAll = ALLOWED_ORIGINS.size === 0;
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (allowAll && origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  } else if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
 /* =========================================================
    ✅ DB (Postgres)
