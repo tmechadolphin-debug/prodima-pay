@@ -56,7 +56,7 @@ app.use((req, res, next) => {
 });
 
 /* =========================================================
-   ✅ DB (optional)
+   ✅ DB (optional, solo para app_users)
 ========================================================= */
 const pool = new Pool({
   connectionString: DATABASE_URL || undefined,
@@ -164,6 +164,7 @@ function isCancelledLike(q) {
     commLower.includes("cancelad")
   );
 }
+
 function wantsGroups(req) {
   const q = req.query || {};
   const v = (x) => String(x ?? "").trim().toLowerCase();
@@ -200,7 +201,7 @@ async function httpFetch(url, options) {
 }
 
 /* =========================================================
-   ✅ SAP Service Layer
+   ✅ SAP Service Layer (cookie + timeout)
 ========================================================= */
 let SL_COOKIE = "";
 let SL_COOKIE_AT = 0;
@@ -297,14 +298,12 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ ADMIN USERS (FIX: si no hay DB -> devuelve [] en vez de error)
+   ✅ ADMIN USERS (NO rompe si no hay DB)
 ========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
-    if (!hasDb()) {
-      // ✅ no rompas el frontend si no hay DB configurada
-      return safeJson(res, 200, { ok: true, users: [] });
-    }
+    if (!hasDb()) return safeJson(res, 200, { ok: true, users: [] });
+
     const r = await dbQuery(
       `SELECT id, username, full_name, province, warehouse_code, is_active, created_at
        FROM app_users
@@ -317,7 +316,7 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ Scope cache users created (si DB on)
+   ✅ Scope cache (si DB on)
 ========================================================= */
 let CREATED_USERS_CACHE = { ts: 0, set: new Set() };
 const CREATED_USERS_TTL_MS = 5 * 60 * 1000;
@@ -334,88 +333,102 @@ async function getCreatedUsersSetCached() {
 }
 
 /* =========================================================
-   ✅ ItemGroup cache
+   ✅ GROUP RESOLUTION (BATCH) - OPTIMIZADO
 ========================================================= */
-const ITEM_GROUP_CODE_TO_NAME = new Map();
-const ITEM_CODE_TO_GROUP_NAME = new Map();
-const GROUP_TTL_MS = 24 * 60 * 60 * 1000;
-const GROUP_CACHE_AT = new Map();
+const GROUP_NAME_BY_CODE = new Map(); // groupCode -> groupName
+const GROUP_CACHE_TS = new Map();
+const GROUP_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
-function cacheFresh(key, ttl) {
-  const ts = GROUP_CACHE_AT.get(key);
-  return ts && Date.now() - ts < ttl;
+function groupCacheFresh(key) {
+  const ts = GROUP_CACHE_TS.get(key);
+  return ts && Date.now() - ts < GROUP_CACHE_TTL_MS;
 }
-function cacheStamp(key) {
-  GROUP_CACHE_AT.set(key, Date.now());
+function groupCacheStamp(key) {
+  GROUP_CACHE_TS.set(key, Date.now());
 }
 
-async function getGroupNameByGroupCode(groupCode) {
-  const code = Number(groupCode);
-  if (!Number.isFinite(code)) return "";
-  const key = `G:${code}`;
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
 
-  if (ITEM_GROUP_CODE_TO_NAME.has(code) && cacheFresh(key, GROUP_TTL_MS)) {
-    return ITEM_GROUP_CODE_TO_NAME.get(code) || "";
+// batch: items -> itemsGroupCode
+async function fetchItemsGroupCodes(itemCodes) {
+  const codes = Array.from(new Set(itemCodes.map((x) => String(x || "").trim()).filter(Boolean)));
+  const itemToGroupCode = new Map();
+
+  for (const part of chunk(codes, 20)) {
+    // ItemCode eq 'A' or ItemCode eq 'B' ...
+    const ors = part.map((c) => `ItemCode eq '${c.replace(/'/g, "''")}'`).join(" or ");
+    const path =
+      `/Items?$select=ItemCode,ItemsGroupCode&$filter=${encodeURIComponent(ors)}&$top=${part.length}`;
+
+    const r = await slFetch(path, { timeoutMs: 15000 });
+    const rows = Array.isArray(r?.value) ? r.value : [];
+
+    for (const it of rows) {
+      const ic = String(it?.ItemCode || "").trim();
+      const gc = Number(it?.ItemsGroupCode);
+      if (ic) itemToGroupCode.set(ic, Number.isFinite(gc) ? gc : null);
+    }
+
+    await sleep(10);
   }
 
-  const r = await slFetch(
-    `/ItemGroups?$select=GroupCode,GroupName&$filter=${encodeURIComponent(`GroupCode eq ${code}`)}&$top=1`,
-    { timeoutMs: 12000 }
-  );
-
-  const arr = Array.isArray(r?.value) ? r.value : [];
-  const name = String(arr?.[0]?.GroupName || "").trim();
-
-  ITEM_GROUP_CODE_TO_NAME.set(code, name);
-  cacheStamp(key);
-  return name;
+  return itemToGroupCode;
 }
 
-async function getGroupNameByItemCode(itemCode) {
-  const code = String(itemCode || "").trim();
-  if (!code) return "";
-
-  const key = `I:${code}`;
-  if (ITEM_CODE_TO_GROUP_NAME.has(code) && cacheFresh(key, GROUP_TTL_MS)) {
-    return ITEM_CODE_TO_GROUP_NAME.get(code) || "";
-  }
-
-  const it = await slFetch(`/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemsGroupCode`, {
-    timeoutMs: 12000,
-  });
-
-  const gcode = it?.ItemsGroupCode;
-  const gname = await getGroupNameByGroupCode(gcode);
-
-  ITEM_CODE_TO_GROUP_NAME.set(code, gname);
-  cacheStamp(key);
-  return gname;
-}
-
-async function resolveGroupsForItemCodes(itemCodes) {
-  const unique = Array.from(new Set(itemCodes.map((x) => String(x || "").trim()).filter(Boolean)));
-  if (!unique.length) return new Map();
-
+// batch: groupCode -> groupName
+async function fetchGroupNames(groupCodes) {
+  const codes = Array.from(new Set(groupCodes.map((x) => Number(x)).filter((n) => Number.isFinite(n))));
   const out = new Map();
-  const CONC = 8;
-  let idx = 0;
 
-  async function worker() {
-    while (idx < unique.length) {
-      const i = idx++;
-      const code = unique[i];
-      try {
-        const g = await getGroupNameByItemCode(code);
-        out.set(code, g || "");
-      } catch {
-        out.set(code, "");
-      }
-      await sleep(5);
+  // primero usa cache
+  const need = [];
+  for (const gc of codes) {
+    const key = `G:${gc}`;
+    if (GROUP_NAME_BY_CODE.has(gc) && groupCacheFresh(key)) {
+      out.set(gc, GROUP_NAME_BY_CODE.get(gc) || "");
+    } else {
+      need.push(gc);
     }
   }
 
-  await Promise.all(Array.from({ length: CONC }, worker));
+  for (const part of chunk(need, 20)) {
+    const ors = part.map((gc) => `GroupCode eq ${gc}`).join(" or ");
+    const path = `/ItemGroups?$select=GroupCode,GroupName&$filter=${encodeURIComponent(ors)}&$top=${part.length}`;
+
+    const r = await slFetch(path, { timeoutMs: 15000 });
+    const rows = Array.isArray(r?.value) ? r.value : [];
+
+    for (const g of rows) {
+      const gc = Number(g?.GroupCode);
+      const gn = String(g?.GroupName || "").trim();
+      if (Number.isFinite(gc)) {
+        GROUP_NAME_BY_CODE.set(gc, gn);
+        groupCacheStamp(`G:${gc}`);
+        out.set(gc, gn);
+      }
+    }
+
+    await sleep(10);
+  }
+
   return out;
+}
+
+async function resolveGroupsForItemCodesBatch(itemCodes) {
+  const itemToGroupCode = await fetchItemsGroupCodes(itemCodes);
+  const groupCodes = Array.from(itemToGroupCode.values()).filter((x) => Number.isFinite(x));
+  const groupNames = await fetchGroupNames(groupCodes);
+
+  const itemToGroupName = new Map();
+  for (const [item, gc] of itemToGroupCode.entries()) {
+    const name = Number.isFinite(gc) ? (groupNames.get(gc) || "") : "";
+    itemToGroupName.set(item, name);
+  }
+  return itemToGroupName;
 }
 
 /* =========================================================
@@ -493,7 +506,7 @@ async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter,
 }
 
 /* =========================================================
-   ✅ /api/admin/quotes (GRUPOS)
+   ✅ /api/admin/quotes (WITH GROUPS BATCH)
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -503,7 +516,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const to = String(req.query?.to || "");
 
     const withGroups = wantsGroups(req);
-    const withDelivered = String(req.query?.withDelivered || "0") === "1";
     const onlyCreated = String(req.query?.onlyCreated || "0") === "1";
 
     const limitRaw =
@@ -516,7 +528,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     let limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
     const skip = req.query?.skip != null ? Math.max(0, Number(req.query.skip) || 0) : 0;
 
-    if (withDelivered) limit = Math.min(limit, 60);
+    // seguridad (tu request estaba pidiendo 300)
     if (withGroups) limit = Math.min(limit, 80);
 
     const userFilter = String(req.query?.user || "");
@@ -538,17 +550,19 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       onlyCreated,
     });
 
-    // ✅ llena grupos/lineas
+    const meta = { groups: { requested: withGroups, quotes: pageRows.length, ok: 0, err: 0, lastError: "" } };
+
     if (withGroups && pageRows.length) {
       const CONC = 3;
       let idx = 0;
 
-      async function workerGroups() {
+      async function worker() {
         while (idx < pageRows.length) {
           const i = idx++;
           const q = pageRows[i];
 
           try {
+            // Traer líneas de la cotización
             const full = await slFetch(
               `/Quotations(${Number(q.docEntry)})?$select=DocEntry&$expand=DocumentLines($select=ItemCode,LineTotal)`,
               { timeoutMs: 15000 }
@@ -557,7 +571,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
             const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
             const codes = lines.map((ln) => String(ln?.ItemCode || "").trim()).filter(Boolean);
 
-            const mapGroups = await resolveGroupsForItemCodes(codes);
+            // Resolver grupos en batch
+            const itemToGroup = await resolveGroupsForItemCodesBatch(codes);
 
             const outLines = [];
             for (const ln of lines) {
@@ -567,7 +582,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
               outLines.push({
                 ItemCode: code,
                 LineTotal: Number(ln?.LineTotal || 0),
-                ItmsGrpNam: mapGroups.get(code) || "",
+                ItmsGrpNam: itemToGroup.get(code) || "",
               });
             }
 
@@ -575,15 +590,18 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 
             const uniq = new Set(outLines.map((x) => x.ItmsGrpNam).filter(Boolean));
             if (uniq.size === 1) q.itemGroup = Array.from(uniq)[0];
-          } catch {
-            // best effort
+
+            meta.groups.ok += 1;
+          } catch (e) {
+            meta.groups.err += 1;
+            meta.groups.lastError = String(e?.message || e);
           }
 
-          await sleep(15);
+          await sleep(20);
         }
       }
 
-      await Promise.all(Array.from({ length: CONC }, () => workerGroups()));
+      await Promise.all(Array.from({ length: CONC }, () => worker()));
     }
 
     return safeJson(res, 200, {
@@ -594,9 +612,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       limit,
       skip,
       total: totalFiltered,
-      withGroups,
-      withDelivered,
       scope: { onlyCreated },
+      meta,
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
