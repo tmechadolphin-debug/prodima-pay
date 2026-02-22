@@ -728,17 +728,19 @@ async function sapGetGroupNames(groupCodes) {
   const chunkSize = 20;
   for (let i = 0; i < pending.length; i += chunkSize) {
     const chunk = pending.slice(i, i + chunkSize);
-    const ors = chunk.map((gc) => `ItmsGrpCod eq ${Number(gc)}`).join(" or ");
+
+    // ✅ en tu SAP: ItemGroups(Number, GroupName)
+    const ors = chunk.map((gc) => `Number eq ${Number(gc)}`).join(" or ");
 
     const r = await slFetch(
-      `/ItemGroups?$select=ItmsGrpCod,ItmsGrpNam&$filter=${encodeURIComponent(ors)}&$top=${chunkSize}`,
+      `/ItemGroups?$select=Number,GroupName&$filter=${encodeURIComponent(ors)}&$top=${chunkSize}`,
       { timeoutMs: 18000 }
     );
 
     const rows = Array.isArray(r?.value) ? r.value : [];
     for (const g of rows) {
-      const code = Number(g?.ItmsGrpCod);
-      const name = String(g?.ItmsGrpNam || "").trim();
+      const code = Number(g?.Number);
+      const name = String(g?.GroupName || "").trim();
       if (Number.isFinite(code) && name) {
         out.set(code, name);
         igCacheSet(GROUP_NAME_CACHE, String(code), { name });
