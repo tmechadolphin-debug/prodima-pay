@@ -198,7 +198,6 @@ async function httpFetch(url, options) {
 
 /* =========================================================
    ✅ SAP Service Layer
-   - timeout corto (12s) para listados
 ========================================================= */
 let SL_COOKIE = "";
 let SL_COOKIE_AT = 0;
@@ -240,7 +239,7 @@ async function slFetch(path, options = {}) {
   const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
 
   const controller = new AbortController();
-  const timeoutMs = Number(options.timeoutMs || 12000); // ✅ 12s por defecto
+  const timeoutMs = Number(options.timeoutMs || 12000);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
@@ -297,7 +296,7 @@ async function sapGetFirstByDocNum(entity, docNum, select) {
 async function sapGetByDocEntry(entity, docEntry) {
   const n = Number(docEntry);
   if (!Number.isFinite(n) || n <= 0) throw new Error("DocEntry inválido");
-  return slFetch(`/${entity}(${n})`, { timeoutMs: 12000 });
+  return slFetch(`/${entity}(${n})`, { timeoutMs: 18000 });
 }
 
 /* =========================================================
@@ -344,7 +343,6 @@ async function traceQuoteTotals(quoteDocNum, fromOverride, toOverride) {
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
 
-  // ⚠️ trazado es pesado => timeout mayor SOLO aquí
   const quoteHead = await sapGetFirstByDocNum(
     "Quotations",
     quoteDocNum,
@@ -361,11 +359,16 @@ async function traceQuoteTotals(quoteDocNum, fromOverride, toOverride) {
   const cardCode = String(quote.CardCode || "").trim();
   const quoteDate = String(quote.DocDate || "").slice(0, 10);
 
-  const from = /^\d{4}-\d{2}-\d{2}$/.test(String(fromOverride || "")) ? String(fromOverride) : addDaysISO(quoteDate, -7);
-  const to = /^\d{4}-\d{2}-\d{2}$/.test(String(toOverride || "")) ? String(toOverride) : addDaysISO(quoteDate, 30);
+  const from = /^\d{4}-\d{2}-\d{2}$/.test(String(fromOverride || ""))
+    ? String(fromOverride)
+    : addDaysISO(quoteDate, -7);
+
+  const to = /^\d{4}-\d{2}-\d{2}$/.test(String(toOverride || ""))
+    ? String(toOverride)
+    : addDaysISO(quoteDate, 30);
+
   const toPlus1 = addDaysISO(to, 1);
 
-  // ✅ listados con timeout un poco mayor
   const ordersList = await slFetch(
     `/Orders?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
       `&$filter=${encodeURIComponent(
@@ -457,7 +460,6 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN QUOTES (rápido)
-   - NO calcula entregado aquí
 ========================================================= */
 async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter, onlyCreated }) {
   const toPlus1 = addDaysISO(t, 1);
@@ -527,7 +529,6 @@ async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter,
           usuario,
           warehouse: wh,
           montoCotizacion: Number(q.DocTotal || 0),
-          // entregado se llena luego por endpoint batch:
           montoEntregado: 0,
           pendiente: Number(q.DocTotal || 0),
         });
@@ -557,7 +558,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
         : 20;
 
     const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
-
     const skip = req.query?.skip != null ? Math.max(0, Number(req.query.skip) || 0) : 0;
 
     const userFilter = String(req.query?.user || "");
@@ -595,10 +595,53 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ CACHE Items -> Group y GroupCode -> GroupName
+   ✅ ENTREGADO BATCH
+========================================================= */
+app.get("/api/admin/quotes/delivered", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    const docNums = String(req.query?.docNums || "")
+      .split(",")
+      .map((x) => Number(String(x).trim()))
+      .filter((n) => Number.isFinite(n) && n > 0)
+      .slice(0, 20);
+
+    if (!docNums.length) return safeJson(res, 400, { ok: false, message: "docNums vacío" });
+
+    const from = String(req.query?.from || "");
+    const to = String(req.query?.to || "");
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const defaultFrom = addDaysISO(today, -30);
+
+    const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
+    const tt = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
+
+    const out = {};
+    for (const dn of docNums) {
+      try {
+        const r = await traceQuoteTotals(dn, f, tt);
+        if (r.ok) out[String(dn)] = { ok: true, totalEntregado: r.totalEntregado, pendiente: r.pendiente };
+        else out[String(dn)] = { ok: false, message: r.message || "no ok" };
+      } catch (e) {
+        out[String(dn)] = { ok: false, message: e.message || String(e) };
+      }
+      await sleep(80);
+    }
+
+    return safeJson(res, 200, { ok: true, from: f, to: tt, delivered: out });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
+   ✅ DASHBOARD: grupos + consumibles/no consumibles
+   - FIX: SIN $expand(DocumentLines)
 ========================================================= */
 const ITEM_GROUP_CACHE = new Map(); // itemCode -> { groupCode, at }
-const GROUP_NAME_CACHE = new Map(); // groupCode -> { name, at }
+const GROUP_NAME_CACHE = new Map(); // groupCode(string) -> { name, at }
 const IG_TTL = 12 * 60 * 60 * 1000;
 
 function igCacheGet(map, key) {
@@ -614,30 +657,27 @@ function igCacheSet(map, key, value) {
   map.set(key, { ...value, at: Date.now() });
 }
 
+// ✅ FIX PRINCIPAL AQUÍ
 async function sapGetQuotationLines(docEntry) {
   const n = Number(docEntry);
   if (!Number.isFinite(n) || n <= 0) return [];
 
-  // Trae SOLO líneas (ItemCode y LineTotal) para no cargar pesado
-  const q = await slFetch(
-    `/Quotations(${n})?$select=DocEntry,DocNum&$expand=` +
-      `DocumentLines($select=ItemCode,LineTotal,Quantity)`,
-    { timeoutMs: 18000 }
-  );
+  // SIN $expand: tu SAP no soporta expand DocumentLines aquí
+  const q = await slFetch(`/Quotations(${n})`, { timeoutMs: 18000 });
 
   const lines = Array.isArray(q?.DocumentLines) ? q.DocumentLines : [];
-  return lines.map((l) => ({
-    itemCode: String(l?.ItemCode || "").trim(),
-    lineTotal: Number(l?.LineTotal || 0),
-    qty: Number(l?.Quantity || 0),
-  })).filter(x => x.itemCode);
+  return lines
+    .map((l) => ({
+      itemCode: String(l?.ItemCode || "").trim(),
+      lineTotal: Number(l?.LineTotal || 0),
+      qty: Number(l?.Quantity || 0),
+    }))
+    .filter((x) => x.itemCode);
 }
 
 async function sapGetItemsGroupCodes(itemCodes) {
-  // Devuelve map itemCode -> groupCode
   const out = new Map();
 
-  // Primero, intenta desde cache
   const pending = [];
   for (const code of itemCodes) {
     const hit = igCacheGet(ITEM_GROUP_CACHE, code);
@@ -646,14 +686,11 @@ async function sapGetItemsGroupCodes(itemCodes) {
   }
   if (!pending.length) return out;
 
-  // SAP SL no siempre soporta "in (...)" fácil, así que usamos OR por chunks
   const chunkSize = 15;
   for (let i = 0; i < pending.length; i += chunkSize) {
     const chunk = pending.slice(i, i + chunkSize);
 
-    const ors = chunk
-      .map((c) => `ItemCode eq '${c.replace(/'/g, "''")}'`)
-      .join(" or ");
+    const ors = chunk.map((c) => `ItemCode eq '${c.replace(/'/g, "''")}'`).join(" or ");
 
     const r = await slFetch(
       `/Items?$select=ItemCode,ItemsGroupCode&$filter=${encodeURIComponent(ors)}&$top=${chunkSize}`,
@@ -688,7 +725,6 @@ async function sapGetGroupNames(groupCodes) {
   }
   if (!pending.length) return out;
 
-  // ItemGroups: ItmsGrpCod, ItmsGrpNam
   const chunkSize = 20;
   for (let i = 0; i < pending.length; i += chunkSize) {
     const chunk = pending.slice(i, i + chunkSize);
@@ -715,10 +751,6 @@ async function sapGetGroupNames(groupCodes) {
   return out;
 }
 
-/* =========================================================
-   ✅ DASHBOARD (agregados por grupo + consumibles)
-   GET /api/admin/dashboard?from=YYYY-MM-DD&to=YYYY-MM-DD&limit=200&skip=0
-========================================================= */
 app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
   try {
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
@@ -726,8 +758,8 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
     const from = String(req.query?.from || "");
     const to = String(req.query?.to || "");
 
-    const limitRaw = req.query?.limit != null ? Number(req.query.limit) : 200;
-    const limit = Math.max(1, Math.min(400, Number.isFinite(limitRaw) ? limitRaw : 200));
+    const limitRaw = req.query?.limit != null ? Number(req.query.limit) : 60;
+    const limit = Math.max(1, Math.min(120, Number.isFinite(limitRaw) ? limitRaw : 60));
     const skip = req.query?.skip != null ? Math.max(0, Number(req.query.skip) || 0) : 0;
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
@@ -736,9 +768,10 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
     const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
     const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
 
-    // 1) Trae quotes “rápido” (encabezado)
+    // 1) Quotes base
     const { pageRows, totalFiltered } = await scanQuotes({
-      f, t,
+      f,
+      t,
       wantSkip: skip,
       wantLimit: limit,
       userFilter: "",
@@ -746,17 +779,23 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       onlyCreated: false,
     });
 
-    // 2) Para esas quotes, trae líneas y resuelve grupos
+    // 2) Líneas por quote (sin tumbar todo si una falla)
     const allItemCodes = new Set();
     const quotesWithLines = [];
 
     for (const q of pageRows) {
-      const lines = await sapGetQuotationLines(q.docEntry);
-      for (const l of lines) allItemCodes.add(l.itemCode);
-      quotesWithLines.push({ ...q, lines });
-      await sleep(30);
+      try {
+        const lines = await sapGetQuotationLines(q.docEntry);
+        for (const l of lines) allItemCodes.add(l.itemCode);
+        quotesWithLines.push({ ...q, lines });
+      } catch (e) {
+        console.error("Lines error docEntry", q.docEntry, e.message);
+        quotesWithLines.push({ ...q, lines: [] });
+      }
+      await sleep(25);
     }
 
+    // 3) Resolver groups
     const itemCodesArr = Array.from(allItemCodes);
     const itemToGroup = await sapGetItemsGroupCodes(itemCodesArr);
 
@@ -764,21 +803,20 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
     for (const gc of itemToGroup.values()) if (Number.isFinite(gc)) groupCodes.add(gc);
     const groupNameMap = await sapGetGroupNames(Array.from(groupCodes));
 
-    // 3) Clasificación consumible vs no consumible (por nombre de grupo)
-    const NO_CONSUMIBLES = new Set([
-      "Cuidado de la Ropa",
-      "Art. De Limpieza",
-      "Prod. De Limpieza",
-      "M.P. Cuid. de la Rop",
-    ].map(s => s.toLowerCase()));
+    // 4) Consumibles vs No consumibles (por nombre de grupo)
+    const NO_CONSUMIBLES = new Set(
+      ["Cuidado de la Ropa", "Art. De Limpieza", "Prod. De Limpieza", "M.P. Cuid. de la Rop"].map((s) =>
+        s.toLowerCase()
+      )
+    );
 
-    // 4) Agregados
+    // 5) Agregados por grupo
     const byGroup = new Map(); // groupName -> { cotizado, countLines }
     let totalConsumibles = 0;
     let totalNoConsumibles = 0;
 
     for (const q of quotesWithLines) {
-      for (const l of q.lines) {
+      for (const l of q.lines || []) {
         const gc = itemToGroup.get(l.itemCode);
         const gname = groupNameMap.get(gc) || "Sin grupo";
         const key = String(gname);
@@ -795,7 +833,12 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
     }
 
     const groupsArr = Array.from(byGroup.entries())
-      .map(([group, v]) => ({ group, cotizado: Number(v.cotizado.toFixed(2)), countLines: v.countLines }))
+      .map(([group, v]) => ({
+        group,
+        cotizado: Number(v.cotizado.toFixed(2)),
+        countLines: v.countLines,
+        entregado: 0, // (si luego quieres: se calcula con /quotes/delivered)
+      }))
       .sort((a, b) => b.cotizado - a.cotizado);
 
     return safeJson(res, 200, {
@@ -803,57 +846,13 @@ app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
       from: f,
       to: t,
       total: totalFiltered,
-      quotes: quotesWithLines, // si tu UI no lo necesita, puedes quitarlo
+      quotes: quotesWithLines, // tu UI lo puede usar si necesita
       meta: {
         groups: groupsArr,
         consumibles: Number(totalConsumibles.toFixed(2)),
         noConsumibles: Number(totalNoConsumibles.toFixed(2)),
       },
     });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   ✅ ENTREGADO BATCH (nuevo)
-   GET /api/admin/quotes/delivered?docNums=123,456&from=YYYY-MM-DD&to=YYYY-MM-DD
-========================================================= */
-app.get("/api/admin/quotes/delivered", verifyAdmin, async (req, res) => {
-  try {
-    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
-
-    const docNums = String(req.query?.docNums || "")
-      .split(",")
-      .map((x) => Number(String(x).trim()))
-      .filter((n) => Number.isFinite(n) && n > 0)
-      .slice(0, 20); // ✅ máximo 20 por batch
-
-    if (!docNums.length) return safeJson(res, 400, { ok: false, message: "docNums vacío" });
-
-    const from = String(req.query?.from || "");
-    const to = String(req.query?.to || "");
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
-
-    const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
-    const tt = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
-
-    const out = {};
-    // ✅ 1 por 1 para no morir por timeout
-    for (const dn of docNums) {
-      try {
-        const r = await traceQuoteTotals(dn, f, tt);
-        if (r.ok) out[String(dn)] = { ok: true, totalEntregado: r.totalEntregado, pendiente: r.pendiente };
-        else out[String(dn)] = { ok: false, message: r.message || "no ok" };
-      } catch (e) {
-        out[String(dn)] = { ok: false, message: e.message || String(e) };
-      }
-      await sleep(80);
-    }
-
-    return safeJson(res, 200, { ok: true, from: f, to: tt, delivered: out });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
