@@ -595,6 +595,227 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
+   ✅ CACHE Items -> Group y GroupCode -> GroupName
+========================================================= */
+const ITEM_GROUP_CACHE = new Map(); // itemCode -> { groupCode, at }
+const GROUP_NAME_CACHE = new Map(); // groupCode -> { name, at }
+const IG_TTL = 12 * 60 * 60 * 1000;
+
+function igCacheGet(map, key) {
+  const it = map.get(key);
+  if (!it) return null;
+  if (Date.now() - it.at > IG_TTL) {
+    map.delete(key);
+    return null;
+  }
+  return it;
+}
+function igCacheSet(map, key, value) {
+  map.set(key, { ...value, at: Date.now() });
+}
+
+async function sapGetQuotationLines(docEntry) {
+  const n = Number(docEntry);
+  if (!Number.isFinite(n) || n <= 0) return [];
+
+  // Trae SOLO líneas (ItemCode y LineTotal) para no cargar pesado
+  const q = await slFetch(
+    `/Quotations(${n})?$select=DocEntry,DocNum&$expand=` +
+      `DocumentLines($select=ItemCode,LineTotal,Quantity)`,
+    { timeoutMs: 18000 }
+  );
+
+  const lines = Array.isArray(q?.DocumentLines) ? q.DocumentLines : [];
+  return lines.map((l) => ({
+    itemCode: String(l?.ItemCode || "").trim(),
+    lineTotal: Number(l?.LineTotal || 0),
+    qty: Number(l?.Quantity || 0),
+  })).filter(x => x.itemCode);
+}
+
+async function sapGetItemsGroupCodes(itemCodes) {
+  // Devuelve map itemCode -> groupCode
+  const out = new Map();
+
+  // Primero, intenta desde cache
+  const pending = [];
+  for (const code of itemCodes) {
+    const hit = igCacheGet(ITEM_GROUP_CACHE, code);
+    if (hit?.groupCode != null) out.set(code, hit.groupCode);
+    else pending.push(code);
+  }
+  if (!pending.length) return out;
+
+  // SAP SL no siempre soporta "in (...)" fácil, así que usamos OR por chunks
+  const chunkSize = 15;
+  for (let i = 0; i < pending.length; i += chunkSize) {
+    const chunk = pending.slice(i, i + chunkSize);
+
+    const ors = chunk
+      .map((c) => `ItemCode eq '${c.replace(/'/g, "''")}'`)
+      .join(" or ");
+
+    const r = await slFetch(
+      `/Items?$select=ItemCode,ItemsGroupCode&$filter=${encodeURIComponent(ors)}&$top=${chunkSize}`,
+      { timeoutMs: 18000 }
+    );
+
+    const rows = Array.isArray(r?.value) ? r.value : [];
+    for (const it of rows) {
+      const ic = String(it?.ItemCode || "").trim();
+      const gc = Number(it?.ItemsGroupCode);
+      if (ic) {
+        out.set(ic, gc);
+        igCacheSet(ITEM_GROUP_CACHE, ic, { groupCode: gc });
+      }
+    }
+
+    await sleep(40);
+  }
+
+  return out;
+}
+
+async function sapGetGroupNames(groupCodes) {
+  const out = new Map();
+
+  const pending = [];
+  for (const gc of groupCodes) {
+    const k = String(gc);
+    const hit = igCacheGet(GROUP_NAME_CACHE, k);
+    if (hit?.name) out.set(gc, hit.name);
+    else pending.push(gc);
+  }
+  if (!pending.length) return out;
+
+  // ItemGroups: ItmsGrpCod, ItmsGrpNam
+  const chunkSize = 20;
+  for (let i = 0; i < pending.length; i += chunkSize) {
+    const chunk = pending.slice(i, i + chunkSize);
+    const ors = chunk.map((gc) => `ItmsGrpCod eq ${Number(gc)}`).join(" or ");
+
+    const r = await slFetch(
+      `/ItemGroups?$select=ItmsGrpCod,ItmsGrpNam&$filter=${encodeURIComponent(ors)}&$top=${chunkSize}`,
+      { timeoutMs: 18000 }
+    );
+
+    const rows = Array.isArray(r?.value) ? r.value : [];
+    for (const g of rows) {
+      const code = Number(g?.ItmsGrpCod);
+      const name = String(g?.ItmsGrpNam || "").trim();
+      if (Number.isFinite(code) && name) {
+        out.set(code, name);
+        igCacheSet(GROUP_NAME_CACHE, String(code), { name });
+      }
+    }
+
+    await sleep(40);
+  }
+
+  return out;
+}
+
+/* =========================================================
+   ✅ DASHBOARD (agregados por grupo + consumibles)
+   GET /api/admin/dashboard?from=YYYY-MM-DD&to=YYYY-MM-DD&limit=200&skip=0
+========================================================= */
+app.get("/api/admin/dashboard", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    const from = String(req.query?.from || "");
+    const to = String(req.query?.to || "");
+
+    const limitRaw = req.query?.limit != null ? Number(req.query.limit) : 200;
+    const limit = Math.max(1, Math.min(400, Number.isFinite(limitRaw) ? limitRaw : 200));
+    const skip = req.query?.skip != null ? Math.max(0, Number(req.query.skip) || 0) : 0;
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const defaultFrom = addDaysISO(today, -30);
+
+    const f = /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : defaultFrom;
+    const t = /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : today;
+
+    // 1) Trae quotes “rápido” (encabezado)
+    const { pageRows, totalFiltered } = await scanQuotes({
+      f, t,
+      wantSkip: skip,
+      wantLimit: limit,
+      userFilter: "",
+      clientFilter: "",
+      onlyCreated: false,
+    });
+
+    // 2) Para esas quotes, trae líneas y resuelve grupos
+    const allItemCodes = new Set();
+    const quotesWithLines = [];
+
+    for (const q of pageRows) {
+      const lines = await sapGetQuotationLines(q.docEntry);
+      for (const l of lines) allItemCodes.add(l.itemCode);
+      quotesWithLines.push({ ...q, lines });
+      await sleep(30);
+    }
+
+    const itemCodesArr = Array.from(allItemCodes);
+    const itemToGroup = await sapGetItemsGroupCodes(itemCodesArr);
+
+    const groupCodes = new Set();
+    for (const gc of itemToGroup.values()) if (Number.isFinite(gc)) groupCodes.add(gc);
+    const groupNameMap = await sapGetGroupNames(Array.from(groupCodes));
+
+    // 3) Clasificación consumible vs no consumible (por nombre de grupo)
+    const NO_CONSUMIBLES = new Set([
+      "Cuidado de la Ropa",
+      "Art. De Limpieza",
+      "Prod. De Limpieza",
+      "M.P. Cuid. de la Rop",
+    ].map(s => s.toLowerCase()));
+
+    // 4) Agregados
+    const byGroup = new Map(); // groupName -> { cotizado, countLines }
+    let totalConsumibles = 0;
+    let totalNoConsumibles = 0;
+
+    for (const q of quotesWithLines) {
+      for (const l of q.lines) {
+        const gc = itemToGroup.get(l.itemCode);
+        const gname = groupNameMap.get(gc) || "Sin grupo";
+        const key = String(gname);
+
+        const cur = byGroup.get(key) || { cotizado: 0, countLines: 0 };
+        cur.cotizado += Number(l.lineTotal || 0);
+        cur.countLines += 1;
+        byGroup.set(key, cur);
+
+        const isNo = NO_CONSUMIBLES.has(String(gname).toLowerCase());
+        if (isNo) totalNoConsumibles += Number(l.lineTotal || 0);
+        else totalConsumibles += Number(l.lineTotal || 0);
+      }
+    }
+
+    const groupsArr = Array.from(byGroup.entries())
+      .map(([group, v]) => ({ group, cotizado: Number(v.cotizado.toFixed(2)), countLines: v.countLines }))
+      .sort((a, b) => b.cotizado - a.cotizado);
+
+    return safeJson(res, 200, {
+      ok: true,
+      from: f,
+      to: t,
+      total: totalFiltered,
+      quotes: quotesWithLines, // si tu UI no lo necesita, puedes quitarlo
+      meta: {
+        groups: groupsArr,
+        consumibles: Number(totalConsumibles.toFixed(2)),
+        noConsumibles: Number(totalNoConsumibles.toFixed(2)),
+      },
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
    ✅ ENTREGADO BATCH (nuevo)
    GET /api/admin/quotes/delivered?docNums=123,456&from=YYYY-MM-DD&to=YYYY-MM-DD
 ========================================================= */
