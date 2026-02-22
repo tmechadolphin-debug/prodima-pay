@@ -56,7 +56,7 @@ app.use((req, res, next) => {
 });
 
 /* =========================================================
-   ✅ DB (solo para app_users scope)
+   ✅ DB (optional)
 ========================================================= */
 const pool = new Pool({
   connectionString: DATABASE_URL || undefined,
@@ -164,7 +164,6 @@ function isCancelledLike(q) {
     commLower.includes("cancelad")
   );
 }
-
 function wantsGroups(req) {
   const q = req.query || {};
   const v = (x) => String(x ?? "").trim().toLowerCase();
@@ -201,7 +200,7 @@ async function httpFetch(url, options) {
 }
 
 /* =========================================================
-   ✅ SAP Service Layer (cookie + timeout)
+   ✅ SAP Service Layer
 ========================================================= */
 let SL_COOKIE = "";
 let SL_COOKIE_AT = 0;
@@ -298,7 +297,27 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ Created users scope (si lo usas)
+   ✅ ADMIN USERS (FIX: si no hay DB -> devuelve [] en vez de error)
+========================================================= */
+app.get("/api/admin/users", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) {
+      // ✅ no rompas el frontend si no hay DB configurada
+      return safeJson(res, 200, { ok: true, users: [] });
+    }
+    const r = await dbQuery(
+      `SELECT id, username, full_name, province, warehouse_code, is_active, created_at
+       FROM app_users
+       ORDER BY id DESC`
+    );
+    return safeJson(res, 200, { ok: true, users: r.rows || [] });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
+   ✅ Scope cache users created (si DB on)
 ========================================================= */
 let CREATED_USERS_CACHE = { ts: 0, set: new Set() };
 const CREATED_USERS_TTL_MS = 5 * 60 * 1000;
@@ -315,10 +334,10 @@ async function getCreatedUsersSetCached() {
 }
 
 /* =========================================================
-   ✅ Item Group cache + helpers (ESTO ES LO QUE TE FALTA)
+   ✅ ItemGroup cache
 ========================================================= */
-const ITEM_GROUP_CODE_TO_NAME = new Map(); // groupCode -> groupName
-const ITEM_CODE_TO_GROUP_NAME = new Map(); // itemCode -> groupName
+const ITEM_GROUP_CODE_TO_NAME = new Map();
+const ITEM_CODE_TO_GROUP_NAME = new Map();
 const GROUP_TTL_MS = 24 * 60 * 60 * 1000;
 const GROUP_CACHE_AT = new Map();
 
@@ -333,8 +352,8 @@ function cacheStamp(key) {
 async function getGroupNameByGroupCode(groupCode) {
   const code = Number(groupCode);
   if (!Number.isFinite(code)) return "";
-
   const key = `G:${code}`;
+
   if (ITEM_GROUP_CODE_TO_NAME.has(code) && cacheFresh(key, GROUP_TTL_MS)) {
     return ITEM_GROUP_CODE_TO_NAME.get(code) || "";
   }
@@ -343,6 +362,7 @@ async function getGroupNameByGroupCode(groupCode) {
     `/ItemGroups?$select=GroupCode,GroupName&$filter=${encodeURIComponent(`GroupCode eq ${code}`)}&$top=1`,
     { timeoutMs: 12000 }
   );
+
   const arr = Array.isArray(r?.value) ? r.value : [];
   const name = String(arr?.[0]?.GroupName || "").trim();
 
@@ -399,7 +419,7 @@ async function resolveGroupsForItemCodes(itemCodes) {
 }
 
 /* =========================================================
-   ✅ QUOTES scan (rápido)
+   ✅ QUOTES scan
 ========================================================= */
 async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter, onlyCreated }) {
   const toPlus1 = addDaysISO(t, 1);
@@ -411,9 +431,7 @@ async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter,
 
   const uFilter = String(userFilter || "").trim().toLowerCase();
   const cFilter = String(clientFilter || "").trim().toLowerCase();
-
   const maxSapPages = 60;
-  const seenDocEntry = new Set();
 
   const createdSet = onlyCreated ? await getCreatedUsersSetCached() : null;
 
@@ -430,12 +448,6 @@ async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter,
     skipSap += rows.length;
 
     for (const q of rows) {
-      const de = Number(q?.DocEntry);
-      if (Number.isFinite(de)) {
-        if (seenDocEntry.has(de)) continue;
-        seenDocEntry.add(de);
-      }
-
       if (isCancelledLike(q)) continue;
 
       const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
@@ -468,9 +480,7 @@ async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter,
           usuario,
           warehouse: wh,
           montoCotizacion: Number(q.DocTotal || 0),
-
-          // delivered lo maneja tu lógica aparte (no afecta grupos)
-          montoEntregado: Number(q.montoEntregado || 0) || 0,
+          montoEntregado: 0,
           pendiente: Number(q.DocTotal || 0),
         });
       }
@@ -483,7 +493,7 @@ async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter,
 }
 
 /* =========================================================
-   ✅ /api/admin/quotes (con withGroups)
+   ✅ /api/admin/quotes (GRUPOS)
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -492,9 +502,8 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const from = String(req.query?.from || "");
     const to = String(req.query?.to || "");
 
-    const withDelivered = String(req.query?.withDelivered || "0") === "1";
     const withGroups = wantsGroups(req);
-
+    const withDelivered = String(req.query?.withDelivered || "0") === "1";
     const onlyCreated = String(req.query?.onlyCreated || "0") === "1";
 
     const limitRaw =
@@ -507,7 +516,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     let limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
     const skip = req.query?.skip != null ? Math.max(0, Number(req.query.skip) || 0) : 0;
 
-    // caps para estabilidad
     if (withDelivered) limit = Math.min(limit, 60);
     if (withGroups) limit = Math.min(limit, 80);
 
@@ -530,7 +538,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       onlyCreated,
     });
 
-    // ✅ GRUPOS (esto es lo que necesitas para tus 2 tablas)
+    // ✅ llena grupos/lineas
     if (withGroups && pageRows.length) {
       const CONC = 3;
       let idx = 0;
@@ -568,7 +576,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
             const uniq = new Set(outLines.map((x) => x.ItmsGrpNam).filter(Boolean));
             if (uniq.size === 1) q.itemGroup = Array.from(uniq)[0];
           } catch {
-            // best-effort
+            // best effort
           }
 
           await sleep(15);
@@ -578,7 +586,6 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
       await Promise.all(Array.from({ length: CONC }, () => workerGroups()));
     }
 
-    // ✅ (si no usas withDelivered aquí, no pasa nada; tu HTML ya lo maneja)
     return safeJson(res, 200, {
       ok: true,
       quotes: pageRows,
