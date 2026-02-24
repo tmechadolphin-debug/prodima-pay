@@ -251,7 +251,7 @@ async function scanInvoices({ f, t, wantSkip, wantLimit, clientFilter }) {
       `/Invoices?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName` +
         `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
         `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`,
-      { timeoutMs: 24000 }
+      { timeoutMs: 8000 }
     );
 
     const rows = Array.isArray(raw?.value) ? raw.value : [];
