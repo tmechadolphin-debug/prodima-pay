@@ -346,8 +346,21 @@ app.get("/api/admin/invoices", verifyAdmin, async (req, res) => {
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const defaultFrom = addDaysISO(today, -30);
 
-    const f = isISO(from) ? from : defaultFrom;
-    const t = isISO(to) ? to : today;
+    const hasAnyDate = !!String(from || "").trim() || !!String(to || "").trim();
+
+let f = defaultFrom;
+let t = today;
+
+if (hasAnyDate) {
+  if (!isISO(from) || !isISO(to)) {
+    return safeJson(res, 400, {
+      ok: false,
+      message: "Debes seleccionar DESDE y HASTA (YYYY-MM-DD) antes de cargar el dashboard.",
+    });
+  }
+  f = from;
+  t = to;
+}
 
     const { pageRows, totalFiltered } = await scanInvoices({
       f,
@@ -388,8 +401,22 @@ app.get("/api/admin/invoices/dashboard", verifyAdmin, async (req, res) => {
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const defaultFrom = addDaysISO(today, -30);
 
-    const f = isISO(from) ? from : defaultFrom;
-    const t = isISO(to) ? to : today;
+    // ✅ Regla: si el user está filtrando (mandó from o to), deben venir ambos y ser ISO.
+   const hasAnyDate = !!String(from || "").trim() || !!String(to || "").trim();
+
+   let f = defaultFrom;
+   let t = today;
+
+if (hasAnyDate) {
+  if (!isISO(from) || !isISO(to)) {
+    return safeJson(res, 400, {
+      ok: false,
+      message: "Debes seleccionar DESDE y HASTA (YYYY-MM-DD) antes de cargar.",
+    });
+  }
+  f = from;
+  t = to;
+};
 
     // 1) headers rápido
     const { pageRows } = await scanInvoices({
