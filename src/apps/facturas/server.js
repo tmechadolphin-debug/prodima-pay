@@ -248,7 +248,7 @@ async function scanInvoices({ f, t, wantSkip, wantLimit, clientFilter }) {
 
   for (let page = 0; page < maxSapPages; page++) {
     const raw = await slFetch(
-      `/Invoices?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,Canceled` +
+      `/Invoices?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName` +
         `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
         `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`,
       { timeoutMs: 12000 }
@@ -264,16 +264,6 @@ async function scanInvoices({ f, t, wantSkip, wantLimit, clientFilter }) {
       if (Number.isFinite(de)) {
         if (seenDocEntry.has(de)) continue;
         seenDocEntry.add(de);
-      }
-
-      // cancelar
-      const canceled = String(inv?.Canceled ?? "").toLowerCase();
-      if (canceled === "y" || canceled === "yes" || canceled === "true") continue;
-
-      if (cFilter) {
-        const cc = String(inv.CardCode || "").toLowerCase();
-        const cn = String(inv.CardName || "").toLowerCase();
-        if (!cc.includes(cFilter) && !cn.includes(cFilter)) continue;
       }
 
       const idx = totalFiltered++;
