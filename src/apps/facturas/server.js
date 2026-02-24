@@ -382,8 +382,8 @@ app.get("/api/admin/invoices/dashboard", verifyAdmin, async (req, res) => {
     const from = String(req.query?.from || "");
     const to = String(req.query?.to || "");
 
-    const maxDocsRaw = Number(req.query?.maxDocs || 600);
-    const maxDocs = Math.max(100, Math.min(2000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 600));
+    const maxDocsRaw = Number(req.query?.maxDocs || 1500);
+    const maxDocs = Math.max(100, Math.min(2000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 1500));
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const defaultFrom = addDaysISO(today, -30);
