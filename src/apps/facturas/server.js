@@ -1,868 +1,500 @@
-<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="robots" content="noindex,nofollow,noarchive" />
-  <title>PRODIMA · Facturación (Dashboard)</title>
+import express from "express";
+import jwt from "jsonwebtoken";
 
-  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800;900&display=swap" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.19.3/dist/xlsx.full.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+const {
+  PORT = 3000,
+  JWT_SECRET = "change_me",
+  ADMIN_USER = "PRODIMA",
+  ADMIN_PASS = "ADMINISTRADOR",
 
-  <style>
-    :root{
-      --brand:#c31b1c;
-      --accent:#ffbf24;
-      --ink:#1f1f1f;
-      --muted:#6b6b6b;
-      --card:#ffffff;
-      --bd:#f1d39f;
-      --shadow: 0 18px 50px rgba(0,0,0,.10);
-      --ok:#0c8c6a;
-      --warn:#e67e22;
-      --bad:#c31b1c;
-    }
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{
-      font-family:'Montserrat',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
-      color:var(--ink);
-      background:
-        radial-gradient(1200px 520px at 10% -10%, rgba(255,191,36,.40), transparent 60%),
-        radial-gradient(900px 420px at 95% 0%, rgba(195,21,28,.20), transparent 62%),
-        linear-gradient(120deg,#fff3db 0%, #ffffff 55%, #fff3db 100%);
-      min-height:100vh;
-    }
+  SAP_BASE_URL = "",
+  SAP_COMPANYDB = "",
+  SAP_USER = "",
+  SAP_PASS = "",
 
-    .topbar{
-      background:linear-gradient(90deg,var(--brand) 0%, #e0341d 45%, var(--accent) 100%);
-      color:#fff;
-      padding:12px 16px;
-      font-weight:900;
-      letter-spacing:.3px;
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:12px;
-      flex-wrap:wrap;
-      position:sticky; top:0; z-index:50;
-    }
-    .topbar .left{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  CORS_ORIGIN = "",
+} = process.env;
 
-    .pill{
-      background:#fff;
-      color:#7b1a01;
-      border:1px solid #ffd27f;
-      border-radius:999px;
-      padding:6px 10px;
-      font-size:12px;
-      font-weight:900;
-      box-shadow:0 10px 18px rgba(0,0,0,.06);
-      white-space:nowrap;
-    }
-    .pill.ok{ color:var(--ok); border-color:#b7f0db; }
-    .pill.bad{ color:#b30000; border-color:#ffd27f; }
-    .pill.warn{ color:#8a4b00; border-color:#ffe3a8; }
-
-    .btn{
-      height:40px;border-radius:14px;font-weight:900;border:0;cursor:pointer;
-      padding:0 14px;display:inline-flex;align-items:center;justify-content:center;gap:8px;
-      letter-spacing:.2px;user-select:none;
-    }
-    .btn-primary{
-      background:linear-gradient(90deg,var(--brand) 0%, var(--accent) 100%);
-      color:#fff;box-shadow:0 12px 22px rgba(195,21,28,.25);
-    }
-    .btn-outline{
-      background:#fff;color:var(--brand);border:1px solid #ffd27f;
-    }
-    .btn:disabled{opacity:.6;cursor:not-allowed}
-
-    .wrap{max-width:1400px;margin:18px auto 70px;padding:0 16px}
-    .hero{
-      background:
-        radial-gradient(1000px 420px at 20% -10%, rgba(255,191,36,.55), transparent 60%),
-        radial-gradient(900px 420px at 95% 0%, rgba(195,21,28,.22), transparent 62%),
-        #fff;
-      border:1px solid var(--bd);
-      border-radius:22px;
-      box-shadow: var(--shadow);
-      padding:16px 16px 14px;
-    }
-    .hero h1{font-size:22px;font-weight:900;color:var(--brand);margin-bottom:4px}
-    .hero p{color:#6a3b1b;font-weight:700;font-size:13px;line-height:1.35;max-width:1180px}
-
-    .section{
-      margin-top:14px;background:var(--card);border:1px solid var(--bd);
-      border-radius:18px;box-shadow: var(--shadow);overflow:hidden;
-    }
-    .section-h{
-      background:linear-gradient(90deg, rgba(195,21,28,.08), rgba(255,191,36,.25));
-      border-bottom:1px solid var(--bd);
-      padding:12px 14px;
-      display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
-    }
-    .section-h strong{color:var(--brand);font-weight:900;letter-spacing:.2px}
-    .section-b{padding:14px}
-
-    .row{
-      display:grid;
-      grid-template-columns: 1fr 1fr 1fr 1fr;
-      gap:10px;
-    }
-    @media (max-width:1100px){ .row{grid-template-columns:1fr 1fr} }
-    @media (max-width:560px){ .row{grid-template-columns:1fr} }
-
-    label{display:block;font-weight:900;color:#6a3b1b;font-size:12px;margin-bottom:6px;letter-spacing:.2px}
-    .input{
-      width:100%;height:42px;border-radius:14px;border:1px solid #ffd27f;
-      padding:0 12px;outline:none;background:#fffdf6;font-weight:800;color:#2b1c16;
-    }
-    .input::placeholder{color:#c08a40;font-weight:700}
-
-    .cards{
-      display:grid;grid-template-columns: repeat(4, 1fr);gap:12px;margin-top:10px;
-    }
-    @media (max-width:1100px){ .cards{grid-template-columns: repeat(2, 1fr);} }
-    @media (max-width:560px){ .cards{grid-template-columns: 1fr;} }
-
-    .stat{
-      background:linear-gradient(180deg,#fffef8 0%, #fff7e8 100%);
-      border:1px solid var(--bd);
-      border-radius:16px;
-      padding:12px;
-    }
-    .stat .k{color:#7a4a1a;font-weight:900;font-size:12px}
-    .stat .v{margin-top:6px;font-weight:900;font-size:22px;color:#111}
-    .stat .s{margin-top:6px;font-weight:800;font-size:12px;color:#6b6b6b}
-
-    .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    @media (max-width:1000px){.grid2{grid-template-columns:1fr}}
-
-    .chartCard{
-      background:linear-gradient(180deg,#fffef8 0%, #fff7e8 100%);
-      border:1px solid var(--bd);
-      border-radius:16px;
-      padding:12px;
-    }
-    .chartWrap{position:relative;width:100%;height:260px;margin-top:10px}
-
-    table{
-      width:100%;
-      border-collapse:separate;border-spacing:0;
-      border:1px solid var(--bd);
-      border-radius:16px;
-      overflow:hidden;
-    }
-    thead th{
-      text-align:left;padding:10px 10px;font-size:12px;color:#6a3b1b;font-weight:900;
-      background:linear-gradient(90deg, rgba(195,21,28,.06), rgba(255,191,36,.20));
-      border-bottom:1px solid var(--bd);
-      white-space:nowrap;
-    }
-    tbody td{
-      padding:10px 10px;border-bottom:1px dashed var(--bd);vertical-align:top;
-      background:#fff;font-size:12px;font-weight:800;color:#2b1c16;
-    }
-    tbody tr:last-child td{border-bottom:0}
-    .tableWrap{overflow:auto;border-radius:16px}
-
-    .barRow{display:flex;gap:10px;align-items:center}
-    .bar{
-      flex:1;height:12px;border-radius:999px;background:#ffe7b7;
-      border:1px solid #ffd27f;overflow:hidden;
-    }
-    .bar > i{
-      display:block;height:100%;
-      width:0%;
-      background:linear-gradient(90deg,var(--brand) 0%, var(--accent) 100%);
-    }
-    .muted{color:#777;font-weight:800;font-size:12px}
-
-    .seg{
-      display:flex;gap:8px;flex-wrap:wrap;align-items:center;
-      background:#fff;border:1px solid #ffd27f;border-radius:999px;padding:6px;
-      box-shadow:0 10px 18px rgba(0,0,0,.06);
-    }
-    .seg button{
-      height:34px;border-radius:999px;border:0;cursor:pointer;
-      padding:0 12px;font-weight:900;
-      background:transparent;color:#7b1a01;
-    }
-    .seg button.active{
-      background:linear-gradient(90deg, rgba(195,21,28,.10), rgba(255,191,36,.35));
-      border:1px solid var(--bd);
-      color:var(--brand);
-    }
-
-    .toast{
-      position:fixed;right:18px;bottom:18px;background:#111;color:#fff;
-      padding:12px 14px;border-radius:14px;box-shadow:0 20px 50px rgba(0,0,0,.25);
-      display:none;max-width:560px;z-index:999;font-weight:800;line-height:1.35;
-    }
-    .toast.ok{background:linear-gradient(90deg,#0c8c6a,#1bb88a)}
-    .toast.bad{background:linear-gradient(90deg,#a40b0d,#ff7a00)}
-    .toast.warn{background:linear-gradient(90deg,#8a4b00,#ffbf24)}
-
-    /* Modal Login */
-    .overlay{
-      position:fixed;inset:0;background:rgba(0,0,0,.55);
-      display:none;align-items:center;justify-content:center;padding:18px;z-index:1000;
-    }
-    .modal{
-      width:min(560px, 96vw);background:#fff;border:1px solid var(--bd);
-      border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,.28);overflow:hidden;
-    }
-    .modal-h{
-      padding:12px 14px;background:linear-gradient(90deg,var(--brand) 0%, var(--accent) 100%);
-      color:#fff;font-weight:900;display:flex;justify-content:space-between;align-items:center;gap:10px;
-    }
-    .modal-b{padding:14px}
-    .modal-b .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-    @media (max-width:560px){ .modal-b .row2{grid-template-columns:1fr} }
-    .modal-f{
-      padding:14px;display:flex;justify-content:flex-end;gap:10px;
-      border-top:1px solid var(--bd);background:#fffef8;
-    }
-  </style>
-</head>
-
-<body>
-  <div class="topbar">
-    <div class="left">
-      <div>📊 PRODIMA · Facturación</div>
-      <span class="pill bad" id="apiPill">API: —</span>
-      <span class="pill bad" id="authPill">Admin: no</span>
-      <span class="pill warn" id="rangePill">—</span>
-    </div>
-
-    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <button class="btn btn-outline" id="btnExportAll" type="button" disabled>📄 Export Excel</button>
-      <button class="btn btn-outline" id="btnRefresh" type="button" disabled>🔄 Refrescar</button>
-      <button class="btn btn-outline" id="btnLogout" type="button" style="display:none">🚪 Salir</button>
-    </div>
-  </div>
-
-  <div class="wrap" id="appContent" style="display:none">
-    <section class="hero">
-      <h1>Dashboard de Facturación</h1>
-      <p>
-        Totales de facturas por <b>Cliente</b> y por <b>Bodega</b>.<br>
-        ✅ Top por <b>$</b> y por <b># Facturas</b> · ✅ Visual = % del total.
-      </p>
-    </section>
-
-    <section class="section">
-      <div class="section-h">
-        <strong>📅 Filtros</strong>
-        <span class="pill" id="hint">Listo</span>
-      </div>
-      <div class="section-b">
-        <div class="row">
-          <div>
-            <label>Desde</label>
-            <input id="from" class="input" type="date">
-          </div>
-          <div>
-            <label>Hasta</label>
-            <input id="to" class="input" type="date">
-          </div>
-          <div>
-            <label>Atajos</label>
-            <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <button class="btn btn-outline" id="btnToday" type="button" style="height:42px">Hoy</button>
-              <button class="btn btn-outline" id="btnThisMonth" type="button" style="height:42px">Este mes</button>
-              <button class="btn btn-outline" id="btnThisYear" type="button" style="height:42px">Este año</button>
-            </div>
-          </div>
-          <div>
-            <label>&nbsp;</label>
-            <button class="btn btn-primary" id="btnLoad" type="button" style="width:100%">✅ Cargar</button>
-          </div>
-        </div>
-
-        <div class="muted" style="margin-top:10px">
-          Tip: rangos grandes = más lento. Usa mes o trimestre para velocidad.
-        </div>
-      </div>
-    </section>
-
-    <section class="section">
-      <div class="section-h">
-        <strong>⭐ KPIs</strong>
-        <span class="pill" id="kpiHint">—</span>
-      </div>
-      <div class="section-b">
-        <div class="cards">
-          <div class="stat">
-            <div class="k">Facturas</div>
-            <div class="v" id="kpiInvoices">0</div>
-            <div class="s">Cantidad de documentos</div>
-          </div>
-          <div class="stat">
-            <div class="k">Facturación total</div>
-            <div class="v" id="kpiDollars">$ 0.00</div>
-            <div class="s">Suma DocTotal</div>
-          </div>
-          <div class="stat">
-            <div class="k">Top bodega</div>
-            <div class="v" id="kpiTopWh">—</div>
-            <div class="s" id="kpiTopWhVal">—</div>
-          </div>
-          <div class="stat">
-            <div class="k">Top cliente</div>
-            <div class="v" id="kpiTopCust">—</div>
-            <div class="s" id="kpiTopCustVal">—</div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <section class="section">
-      <div class="section-h">
-        <strong>🏆 Top (con visual %)</strong>
-        <div class="seg">
-          <button id="segMoney" class="active" type="button">Por $</button>
-          <button id="segInvoices" type="button">Por # Facturas</button>
-        </div>
-      </div>
-
-      <div class="section-b">
-        <div class="grid2">
-          <div class="chartCard">
-            <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
-              <div style="font-weight:900;color:#6a3b1b">Top clientes</div>
-              <span class="pill" id="topClientsHint">—</span>
-            </div>
-            <div class="chartWrap"><canvas id="chClients"></canvas></div>
-            <div class="tableWrap">
-              <table>
-                <thead>
-                  <tr><th>Cliente</th><th id="thClientMetric">$</th><th style="width:220px">Visual</th></tr>
-                </thead>
-                <tbody id="topClientsBody"></tbody>
-              </table>
-            </div>
-          </div>
-
-          <div class="chartCard">
-            <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
-              <div style="font-weight:900;color:#6a3b1b">Top bodegas</div>
-              <span class="pill" id="topWhHint">—</span>
-            </div>
-            <div class="chartWrap"><canvas id="chWh"></canvas></div>
-            <div class="tableWrap">
-              <table>
-                <thead>
-                  <tr><th>Bodega</th><th id="thWhMetric">$</th><th style="width:220px">Visual</th></tr>
-                </thead>
-                <tbody id="topWhBody"></tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <section class="section">
-      <div class="section-h">
-        <strong>🧾 Cliente × Bodega</strong>
-        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-          <input id="search" class="input" style="height:38px;border-radius:12px;width:280px" placeholder="Buscar cliente / bodega...">
-          <span class="pill" id="rowsPill">0 filas</span>
-        </div>
-      </div>
-      <div class="section-b">
-        <div class="tableWrap">
-          <table>
-            <thead>
-              <tr><th>Cliente</th><th>Bodega</th><th>$</th><th># Facturas</th><th style="width:220px">Visual</th></tr>
-            </thead>
-            <tbody id="mainBody"></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-  </div>
-
-  <div id="toast" class="toast"></div>
-
-  <div class="overlay" id="loginOverlay">
-    <div class="modal">
-      <div class="modal-h">
-        <div>🔐 Login Administrador</div>
-        <span class="pill" id="loginState">—</span>
-      </div>
-      <div class="modal-b">
-        <div class="row2">
-          <div>
-            <label>Usuario</label>
-            <input id="aUser" class="input" placeholder="PRODIMA" autocomplete="username">
-          </div>
-          <div>
-            <label>Contraseña</label>
-            <input id="aPass" class="input" type="password" placeholder="********" autocomplete="current-password">
-          </div>
-        </div>
-        <div class="muted" style="margin-top:10px">
-          Se valida contra <b>/api/admin/login</b>. Si falla, verás el error exacto.
-        </div>
-      </div>
-      <div class="modal-f">
-        <button class="btn btn-primary" id="btnLogin" type="button">Entrar</button>
-      </div>
-    </div>
-  </div>
-
-<script>
-/* =========================
-   ✅ CONFIG
-========================= */
-const API_BASE = "https://prodima-sales-admin.onrender.com";
-const TOKEN_KEY = "prodima_sales_admin_token";
-
-/* ✅ Ajusta aquí si quieres más/menos carga (recomendado 300–800) */
-const DASH_MAX_DOCS = 600;
+const app = express();
+app.use(express.json({ limit: "2mb" }));
 
 /* =========================
-   STATE
+   CORS robusto
 ========================= */
-let LAST = null;
-let MODE = "money";
-let chClients = null, chWh = null;
+const ALLOWED_ORIGINS = new Set(
+  String(CORS_ORIGIN || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+const allowAll = ALLOWED_ORIGINS.size === 0;
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (allowAll && origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  } else if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
 /* =========================
-   UI Helpers
+   Helpers
 ========================= */
-function showToast(msg, type="ok"){
-  const t = document.getElementById("toast");
-  t.className = "toast " + (type==="ok" ? "ok" : type==="warn" ? "warn" : "bad");
-  t.textContent = msg;
-  t.style.display = "block";
-  setTimeout(()=> t.style.display = "none", 5200);
+function safeJson(res, status, obj) {
+  res.status(status).json(obj);
 }
-function money(n){
-  const x = Number(n || 0);
-  return "$ " + (Number.isFinite(x) ? x.toFixed(2) : "0.00");
+function signToken(payload, ttl = "12h") {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: ttl });
 }
-function ymd(d){
-  const dt = d instanceof Date ? d : new Date(d);
-  const y = dt.getFullYear();
-  const m = String(dt.getMonth()+1).padStart(2,'0');
-  const dd = String(dt.getDate()).padStart(2,'0');
+function readBearer(req) {
+  const auth = String(req.headers.authorization || "");
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1] : "";
+}
+function verifyAdmin(req, res, next) {
+  const token = readBearer(req);
+  if (!token) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded?.role !== "admin") return safeJson(res, 403, { ok: false, message: "Forbidden" });
+    req.admin = decoded;
+    next();
+  } catch {
+    return safeJson(res, 401, { ok: false, message: "Invalid token" });
+  }
+}
+function missingSapEnv() {
+  return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
+}
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+function addDaysISO(iso, days) {
+  const d = new Date(String(iso || "").slice(0, 10));
+  if (Number.isNaN(d.getTime())) return "";
+  d.setDate(d.getDate() + Number(days || 0));
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${dd}`;
 }
-function token(){ return localStorage.getItem(TOKEN_KEY) || ""; }
-function setToken(t){ localStorage.setItem(TOKEN_KEY, t); }
-function clearToken(){ localStorage.removeItem(TOKEN_KEY); }
-function headers(){
-  const t = token();
-  return { "Content-Type":"application/json", ...(t ? {"Authorization":"Bearer "+t} : {}) };
+const TZ_OFFSET_MIN = -300;
+function getDateISOInOffset(offsetMin = 0) {
+  const now = new Date();
+  const ms = now.getTime() + now.getTimezoneOffset() * 60000 + Number(offsetMin) * 60000;
+  const d = new Date(ms);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
 }
-
-function openLogin(){ document.getElementById("loginOverlay").style.display = "flex"; }
-function closeLogin(){ document.getElementById("loginOverlay").style.display = "none"; }
-
-function setAuthUI(ok){
-  const ap = document.getElementById("authPill");
-  ap.className = "pill " + (ok ? "ok" : "bad");
-  ap.textContent = ok ? "Admin: sí ✅" : "Admin: no";
-
-  document.getElementById("btnLogout").style.display = ok ? "inline-flex" : "none";
-  document.getElementById("appContent").style.display = ok ? "" : "none";
-  document.getElementById("btnRefresh").disabled = !ok;
-}
-
-function setRange(from, to){
-  document.getElementById("from").value = from;
-  document.getElementById("to").value = to;
-  document.getElementById("rangePill").textContent = `${from} → ${to}`;
+function isISO(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 }
 
 /* =========================
-   API
+   Health
 ========================= */
-async function apiHealth(){
-  const r = await fetch(`${API_BASE}/api/health`);
-  const j = await r.json().catch(()=>({}));
-  return { ok: r.ok && j.ok, data: j };
-}
-async function apiLogin(user, pass){
-  const r = await fetch(`${API_BASE}/api/admin/login`,{
-    method:"POST",
-    headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify({ user, pass })
+app.get("/api/health", async (req, res) => {
+  safeJson(res, 200, {
+    ok: true,
+    message: "✅ PRODIMA INVOICES API activa",
+    sap: missingSapEnv() ? "missing" : "ok",
   });
-  const j = await r.json().catch(()=>({}));
-  if(!r.ok || !j.ok) throw new Error(j?.message || `HTTP ${r.status}`);
-  return j.token;
-}
-async function apiLoadDashboard(from, to){
-  const qs = new URLSearchParams();
-  if(from) qs.set("from", from);
-  if(to) qs.set("to", to);
-  qs.set("maxDocs", String(DASH_MAX_DOCS));
+});
 
-  const r = await fetch(`${API_BASE}/api/admin/invoices/dashboard?${qs.toString()}`, { headers: headers() });
-  const j = await r.json().catch(()=>({}));
-  if(!r.ok || !j.ok) throw new Error(j?.message || `HTTP ${r.status} ${r.statusText}`);
-  return j;
+/* =========================
+   fetch wrapper (Node16/18)
+========================= */
+let _fetch = globalThis.fetch || null;
+async function httpFetch(url, options) {
+  if (_fetch) return _fetch(url, options);
+  const mod = await import("node-fetch");
+  _fetch = mod.default;
+  return _fetch(url, options);
 }
 
 /* =========================
-   Aggregations extra (top por # facturas)
+   SAP Service Layer (cookie + timeout)
 ========================= */
-function buildAgg(table){
-  const byCustomerDol = new Map();
-  const byCustomerInv = new Map();
-  const byWhDol = new Map();
-  const byWhInv = new Map();
+let SL_COOKIE = "";
+let SL_COOKIE_AT = 0;
 
-  let totalDol = 0;
-  let totalInv = 0;
+async function slLogin() {
+  const url = `${SAP_BASE_URL.replace(/\/$/, "")}/Login`;
+  const body = { CompanyDB: SAP_COMPANYDB, UserName: SAP_USER, Password: SAP_PASS };
 
-  for(const r of (table||[])){
-    const cust = String(r.customer||"SIN_CLIENTE");
-    const wh = String(r.warehouse||"SIN_WH");
-    const dol = Number(r.dollars||0);
-    const inv = Number(r.invoices||0);
+  const r = await httpFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 
-    totalDol += dol;
-    totalInv += inv;
+  const txt = await r.text();
+  let data = {};
+  try { data = JSON.parse(txt); } catch {}
 
-    byCustomerDol.set(cust, (byCustomerDol.get(cust)||0) + dol);
-    byCustomerInv.set(cust, (byCustomerInv.get(cust)||0) + inv);
+  if (!r.ok) throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
 
-    byWhDol.set(wh, (byWhDol.get(wh)||0) + dol);
-    byWhInv.set(wh, (byWhInv.get(wh)||0) + inv);
+  const setCookie = r.headers.get("set-cookie") || "";
+  const cookies = [];
+  for (const part of setCookie.split(",")) {
+    const s = part.trim();
+    if (s.startsWith("B1SESSION=") || s.startsWith("ROUTEID=")) cookies.push(s.split(";")[0]);
+  }
+  SL_COOKIE = cookies.join("; ");
+  SL_COOKIE_AT = Date.now();
+}
+
+async function slFetch(path, options = {}) {
+  if (missingSapEnv()) throw new Error("Missing SAP env");
+
+  if (!SL_COOKIE || Date.now() - SL_COOKIE_AT > 25 * 60 * 1000) await slLogin();
+
+  const base = SAP_BASE_URL.replace(/\/$/, "");
+  const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
+
+  const controller = new AbortController();
+  const timeoutMs = Number(options.timeoutMs || 30000); // ✅ default 30s
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const r = await httpFetch(url, {
+      method: String(options.method || "GET").toUpperCase(),
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: SL_COOKIE,
+        ...(options.headers || {}),
+      },
+      body: options.body,
+    });
+
+    const txt = await r.text();
+    let data = {};
+    try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+
+    if (!r.ok) {
+      if (r.status === 401 || r.status === 403) {
+        SL_COOKIE = "";
+        await slLogin();
+        return slFetch(path, options);
+      }
+      throw new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
+    }
+
+    return data;
+  } catch (e) {
+    if (String(e?.name) === "AbortError") throw new Error(`SAP timeout (${timeoutMs}ms) en slFetch`);
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/* =========================
+   Admin login
+========================= */
+app.post("/api/admin/login", async (req, res) => {
+  const user = String(req.body?.user || "").trim();
+  const pass = String(req.body?.pass || "").trim();
+
+  if (user !== ADMIN_USER || pass !== ADMIN_PASS) {
+    return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
+  }
+  const token = signToken({ role: "admin", user }, "12h");
+  return safeJson(res, 200, { ok: true, token });
+});
+
+/* =========================
+   Invoices scan (headers rápido)
+========================= */
+async function scanInvoices({ f, t, wantSkip, wantLimit, clientFilter }) {
+  const toPlus1 = addDaysISO(t, 1);
+  const batchTop = 200;
+
+  let skipSap = 0;
+  let totalFiltered = 0;
+  const pageRows = [];
+
+  const cFilter = String(clientFilter || "").trim().toLowerCase();
+  const maxSapPages = 80;
+
+  const seenDocEntry = new Set();
+
+  for (let page = 0; page < maxSapPages; page++) {
+    const raw = await slFetch(
+      `/Invoices?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName` +
+        `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
+        `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`,
+      { timeoutMs: 30000 } // ✅ 30s en listados
+    );
+
+    const rows = Array.isArray(raw?.value) ? raw.value : [];
+    if (!rows.length) break;
+
+    skipSap += rows.length;
+
+    for (const inv of rows) {
+      const de = Number(inv?.DocEntry);
+      if (Number.isFinite(de)) {
+        if (seenDocEntry.has(de)) continue;
+        seenDocEntry.add(de);
+      }
+
+      if (cFilter) {
+        const cc = String(inv.CardCode || "").toLowerCase();
+        const cn = String(inv.CardName || "").toLowerCase();
+        if (!cc.includes(cFilter) && !cn.includes(cFilter)) continue;
+      }
+
+      const idx = totalFiltered++;
+      if (idx >= wantSkip && pageRows.length < wantLimit) {
+        pageRows.push({
+          docEntry: inv.DocEntry,
+          docNum: inv.DocNum,
+          fecha: String(inv.DocDate || "").slice(0, 10),
+          cardCode: inv.CardCode,
+          cardName: inv.CardName,
+          docTotal: Number(inv.DocTotal || 0),
+        });
+      }
+    }
+
+    if (pageRows.length >= wantLimit) break;
   }
 
-  const toSorted = (m) => Array.from(m.entries())
-    .map(([k,v])=>({key:k, value:Number(v||0)}))
-    .sort((a,b)=> b.value - a.value);
-
-  return {
-    totals: { dollars: totalDol, invoices: totalInv },
-    topCustomersByMoney: toSorted(byCustomerDol),
-    topCustomersByInv: toSorted(byCustomerInv),
-    topWhByMoney: toSorted(byWhDol),
-    topWhByInv: toSorted(byWhInv),
-  };
-}
-
-function pct(value,total){
-  const v = Math.max(0, Number(value||0));
-  const t = Math.max(0, Number(total||0));
-  return t>0 ? Math.max(0, Math.min(100, (v/t)*100)) : 0;
-}
-function barCell(p){
-  return `
-    <div class="barRow">
-      <div class="bar"><i style="width:${p.toFixed(0)}%"></i></div>
-      <span class="muted" style="min-width:54px;text-align:right">${p.toFixed(1)}%</span>
-    </div>
-  `;
-}
-function renderBarChart(existing, canvasId, labels, values){
-  const ctx = document.getElementById(canvasId);
-  if(!ctx) return existing;
-  if(existing){ existing.destroy(); existing = null; }
-  return new Chart(ctx, {
-    type:"bar",
-    data:{ labels, datasets:[{ data: values }] },
-    options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{display:false} } }
-  });
+  return { pageRows, totalFiltered };
 }
 
 /* =========================
-   Render
+   Cache líneas por DocEntry (6h)
 ========================= */
-function renderKPIs(data, agg){
-  const inv = Number(data?.totals?.invoices ?? agg?.totals?.invoices ?? 0);
-  const dol = Number(data?.totals?.dollars ?? agg?.totals?.dollars ?? 0);
+const INV_LINES_CACHE = new Map();
+const INV_LINES_TTL_MS = 6 * 60 * 60 * 1000;
 
-  document.getElementById("kpiInvoices").textContent = String(inv||0);
-  document.getElementById("kpiDollars").textContent = money(dol);
-
-  const topWh = (MODE==="money" ? agg.topWhByMoney : agg.topWhByInv)[0];
-  const topCu = (MODE==="money" ? agg.topCustomersByMoney : agg.topCustomersByInv)[0];
-
-  document.getElementById("kpiTopWh").textContent = topWh ? topWh.key : "—";
-  document.getElementById("kpiTopWhVal").textContent = topWh ? (MODE==="money" ? money(topWh.value) : `${topWh.value} facturas`) : "—";
-
-  document.getElementById("kpiTopCust").textContent = topCu ? (topCu.key.length>22 ? topCu.key.slice(0,22)+"…" : topCu.key) : "—";
-  document.getElementById("kpiTopCustVal").textContent = topCu ? (MODE==="money" ? money(topCu.value) : `${topCu.value} facturas`) : "—";
+function invCacheGet(key) {
+  const it = INV_LINES_CACHE.get(key);
+  if (!it) return null;
+  if (Date.now() - it.at > INV_LINES_TTL_MS) {
+    INV_LINES_CACHE.delete(key);
+    return null;
+  }
+  return it.data;
+}
+function invCacheSet(key, data) {
+  INV_LINES_CACHE.set(key, { at: Date.now(), data });
 }
 
-function renderTops(agg){
-  const isMoney = MODE==="money";
-  document.getElementById("thClientMetric").textContent = isMoney ? "$" : "#";
-  document.getElementById("thWhMetric").textContent = isMoney ? "$" : "#";
+async function getInvoiceLinesCached(docEntry) {
+  const de = Number(docEntry);
+  if (!Number.isFinite(de) || de <= 0) return { ok: false, lines: [] };
 
-  const topClients = (isMoney ? agg.topCustomersByMoney : agg.topCustomersByInv).slice(0, 12);
-  const topWh = (isMoney ? agg.topWhByMoney : agg.topWhByInv).slice(0, 12);
+  const key = `INV:${de}`;
+  const cached = invCacheGet(key);
+  if (cached) return cached;
 
-  const denomClients = isMoney ? agg.totals.dollars : agg.totals.invoices;
-  const denomWh = isMoney ? agg.totals.dollars : agg.totals.invoices;
+  // ✅ aquí sí viene DocumentLines (sin $expand)
+  const full = await slFetch(`/Invoices(${de})`, { timeoutMs: 45000 }); // ✅ 45s
+  const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
 
-  document.getElementById("topClientsHint").textContent = `${topClients.length} clientes`;
-  document.getElementById("topWhHint").textContent = `${topWh.length} bodegas`;
-
-  document.getElementById("topClientsBody").innerHTML = topClients.map(x=>{
-    const p = pct(x.value, denomClients);
-    return `<tr><td>${x.key}</td><td>${isMoney ? money(x.value) : x.value}</td><td>${barCell(p)}</td></tr>`;
-  }).join("") || `<tr><td colspan="3" class="muted">Sin datos</td></tr>`;
-
-  document.getElementById("topWhBody").innerHTML = topWh.map(x=>{
-    const p = pct(x.value, denomWh);
-    return `<tr><td>${x.key}</td><td>${isMoney ? money(x.value) : x.value}</td><td>${barCell(p)}</td></tr>`;
-  }).join("") || `<tr><td colspan="3" class="muted">Sin datos</td></tr>`;
-
-  const cLabels = topClients.map(x=> x.key.length>18 ? x.key.slice(0,18)+"…" : x.key);
-  const cVals = topClients.map(x=> Number(x.value||0));
-  const wLabels = topWh.map(x=> x.key);
-  const wVals = topWh.map(x=> Number(x.value||0));
-
-  chClients = renderBarChart(chClients, "chClients", cLabels, cVals);
-  chWh = renderBarChart(chWh, "chWh", wLabels, wVals);
-}
-
-function renderMainTable(data){
-  const q = String(document.getElementById("search").value||"").trim().toLowerCase();
-  const rows = (data?.table || []).filter(r=>{
-    if(!q) return true;
-    return String(r.customer||"").toLowerCase().includes(q) || String(r.warehouse||"").toLowerCase().includes(q);
-  });
-
-  document.getElementById("rowsPill").textContent = `${rows.length} filas`;
-
-  const totalDol = Number(data?.totals?.dollars || 0);
-
-  document.getElementById("mainBody").innerHTML = rows.slice(0, 1600).map(r=>{
-    const p = pct(r.dollars, totalDol);
-    return `
-      <tr>
-        <td>${r.customer}</td>
-        <td>${r.warehouse}</td>
-        <td>${money(r.dollars)}</td>
-        <td>${r.invoices}</td>
-        <td>${barCell(p)}</td>
-      </tr>
-    `;
-  }).join("") || `<tr><td colspan="5" class="muted">Sin datos</td></tr>`;
-}
-
-/* =========================
-   Export
-========================= */
-function exportAll(){
-  if(!LAST || !LAST.ok) return showToast("No hay data para exportar", "bad");
-  if(typeof XLSX === "undefined") return showToast("No cargó XLSX (CDN).", "bad");
-
-  const wb = XLSX.utils.book_new();
-
-  const main = (LAST.table||[]).map(r=>({
-    Cliente: r.customer,
-    Bodega: r.warehouse,
-    Dolares: Number(r.dollars||0),
-    Facturas: Number(r.invoices||0),
+  const outLines = lines.map((ln) => ({
+    WarehouseCode: String(ln?.WarehouseCode || "SIN_WH"),
+    LineTotal: Number(ln?.LineTotal || 0),
   }));
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(main), "Cliente_x_Bodega");
 
-  const agg = buildAgg(LAST.table||[]);
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(agg.topCustomersByMoney.slice(0,200).map(x=>({Cliente:x.key, Dolares:x.value}))), "TopClientes_$");
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(agg.topCustomersByInv.slice(0,200).map(x=>({Cliente:x.key, Facturas:x.value}))), "TopClientes_#");
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(agg.topWhByMoney.slice(0,200).map(x=>({Bodega:x.key, Dolares:x.value}))), "TopBodegas_$");
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(agg.topWhByInv.slice(0,200).map(x=>({Bodega:x.key, Facturas:x.value}))), "TopBodegas_#");
-
-  XLSX.writeFile(wb, `facturacion_dashboard_${Date.now()}.xlsx`);
+  const out = { ok: true, lines: outLines };
+  invCacheSet(key, out);
+  return out;
 }
 
 /* =========================
-   Load Dashboard
+   LIST invoices headers (por si export)
 ========================= */
-async function loadDashboard(){
-  const from = document.getElementById("from").value || "";
-  const to = document.getElementById("to").value || "";
+app.get("/api/admin/invoices", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
-  if(from && to && from > to){
-    showToast("La fecha 'Desde' no puede ser mayor que 'Hasta'.", "bad");
-    return;
+    const from = String(req.query?.from || "");
+    const to = String(req.query?.to || "");
+
+    const limitRaw = req.query?.limit != null ? Number(req.query.limit) : 50;
+    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 50));
+    const skip = req.query?.skip != null ? Math.max(0, Number(req.query.skip) || 0) : 0;
+
+    const clientFilter = String(req.query?.client || "");
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const defaultFrom = addDaysISO(today, -30);
+
+    const f = isISO(from) ? from : defaultFrom;
+    const t = isISO(to) ? to : today;
+
+    const { pageRows, totalFiltered } = await scanInvoices({
+      f, t, wantSkip: skip, wantLimit: limit, clientFilter,
+    });
+
+    return safeJson(res, 200, {
+      ok: true,
+      invoices: pageRows,
+      from: f, to: t,
+      limit, skip, total: totalFiltered,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
   }
+});
 
-  document.getElementById("hint").textContent = "Cargando...";
-  document.getElementById("kpiHint").textContent = "Cargando...";
-  document.getElementById("rangePill").textContent = (from||to) ? `${from||"—"} → ${to||"—"}` : "Sin filtro";
+/* =========================
+   Dashboard cache (5 min)
+========================= */
+const DASH_CACHE = new Map();
+const DASH_TTL_MS = 5 * 60 * 1000;
 
-  try{
-    const data = await apiLoadDashboard(from,to);
-    LAST = data;
-
-    const agg = buildAgg(data.table||[]);
-    renderKPIs(data, agg);
-    renderTops(agg);
-    renderMainTable(data);
-
-    document.getElementById("btnExportAll").disabled = !(data.table||[]).length;
-    document.getElementById("hint").textContent = "Listo ✅";
-    document.getElementById("kpiHint").textContent = "Listo ✅";
-    showToast("Dashboard cargado ✅","ok");
-  }catch(e){
-    document.getElementById("hint").textContent = "Error";
-    document.getElementById("kpiHint").textContent = "Error";
-    showToast(e.message || e, "bad");
+function dashCacheGet(key){
+  const it = DASH_CACHE.get(key);
+  if(!it) return null;
+  if(Date.now() - it.at > DASH_TTL_MS){
+    DASH_CACHE.delete(key);
+    return null;
   }
+  return it.data;
+}
+function dashCacheSet(key, data){
+  DASH_CACHE.set(key, { at: Date.now(), data });
 }
 
 /* =========================
-   Auth
+   DASHBOARD: Cliente x Bodega
 ========================= */
-async function doLogin(){
-  const user = String(document.getElementById("aUser").value||"").trim();
-  const pass = String(document.getElementById("aPass").value||"").trim();
-  if(!user || !pass) return showToast("Completa usuario y contraseña.", "bad");
+app.get("/api/admin/invoices/dashboard", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
-  const st = document.getElementById("loginState");
-  st.className = "pill warn";
-  st.textContent = "Validando...";
+    const from = String(req.query?.from || "");
+    const to = String(req.query?.to || "");
 
-  const btn = document.getElementById("btnLogin");
-  btn.disabled = true;
-  btn.textContent = "⏳ Entrando...";
+    const maxDocsRaw = Number(req.query?.maxDocs || 600);
+    const maxDocs = Math.max(50, Math.min(2000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 600));
 
-  try{
-    const t = await apiLogin(user, pass);
-    setToken(t);
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const defaultFrom = addDaysISO(today, -30);
 
-    st.className = "pill ok";
-    st.textContent = "OK ✅";
+    const f = isISO(from) ? from : defaultFrom;
+    const t = isISO(to) ? to : today;
 
-    closeLogin();
-    setAuthUI(true);
-    document.getElementById("btnRefresh").disabled = false;
+    const cacheKey = `DASH:${f}:${t}:${maxDocs}`;
+    const cached = dashCacheGet(cacheKey);
+    if(cached) return safeJson(res, 200, cached);
 
-    await loadDashboard();
-  }catch(e){
-    st.className = "pill bad";
-    st.textContent = "Falló ⛔";
-    showToast(e.message || e, "bad");
-  }finally{
-    btn.disabled = false;
-    btn.textContent = "Entrar";
+    // 1) headers rápido
+    const { pageRows } = await scanInvoices({
+      f, t, wantSkip: 0, wantLimit: maxDocs, clientFilter: "",
+    });
+
+    const invoiceSet = new Set();
+    let totalDocTotal = 0;
+
+    const byWh = new Map();     // wh -> $ (por líneas)
+    const byCust = new Map();   // customer -> $ (DocTotal)
+    const byCustWh = new Map(); // key -> { dollars, invoices:Set }
+
+    const CONC = 2; // ✅ menos presión a SL
+    let idx = 0;
+
+    async function worker() {
+      while (idx < pageRows.length) {
+        const i = idx++;
+        const inv = pageRows[i];
+
+        const cust = `${inv.cardCode} · ${inv.cardName}`.trim() || "SIN_CLIENTE";
+
+        byCust.set(cust, (byCust.get(cust) || 0) + Number(inv.docTotal || 0));
+        totalDocTotal += Number(inv.docTotal || 0);
+        invoiceSet.add(String(inv.docNum || inv.docEntry));
+
+        try {
+          const r = await getInvoiceLinesCached(inv.docEntry);
+          if (!r.ok) continue;
+
+          const whSeen = new Set();
+          for (const ln of r.lines) {
+            const wh = String(ln.WarehouseCode || "SIN_WH").trim() || "SIN_WH";
+            const lt = Number(ln.LineTotal || 0);
+
+            byWh.set(wh, (byWh.get(wh) || 0) + lt);
+
+            const key = `${cust}||${wh}`;
+            if (!byCustWh.has(key)) byCustWh.set(key, { dollars: 0, invoices: new Set() });
+            const cur = byCustWh.get(key);
+            cur.dollars += lt;
+
+            if (!whSeen.has(wh)) {
+              whSeen.add(wh);
+              cur.invoices.add(String(inv.docNum || inv.docEntry));
+            }
+          }
+        } catch {}
+
+        await sleep(8);
+      }
+    }
+
+    await Promise.all(Array.from({ length: CONC }, () => worker()));
+
+    const topSort = (m) =>
+      Array.from(m.entries())
+        .map(([k, v]) => ({ key: k, dollars: Number(Number(v || 0).toFixed(2)) }))
+        .sort((a, b) => b.dollars - a.dollars);
+
+    const table = Array.from(byCustWh.entries())
+      .map(([k, v]) => {
+        const [customer, warehouse] = k.split("||");
+        return {
+          customer,
+          warehouse,
+          dollars: Number(Number(v.dollars || 0).toFixed(2)),
+          invoices: v.invoices.size,
+        };
+      })
+      .sort((a, b) => b.dollars - a.dollars);
+
+    const out = {
+      ok: true,
+      from: f,
+      to: t,
+      totals: {
+        invoices: invoiceSet.size,
+        dollars: Number(totalDocTotal.toFixed(2)), // suma DocTotal
+      },
+      topWarehouses: topSort(byWh).slice(0, 20),
+      topCustomers: topSort(byCust).slice(0, 20),
+      table,
+      meta: { maxDocsUsed: pageRows.length, cached: false },
+    };
+
+    dashCacheSet(cacheKey, { ...out, meta: { ...out.meta, cached: true } });
+    return safeJson(res, 200, out);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
   }
-}
-
-function doLogout(){
-  clearToken();
-  setAuthUI(false);
-  openLogin();
-}
+});
 
 /* =========================
-   Segmented control
+   START
 ========================= */
-function setMode(m){
-  MODE = m;
-  document.getElementById("segMoney").classList.toggle("active", MODE==="money");
-  document.getElementById("segInvoices").classList.toggle("active", MODE==="invoices");
-  if(LAST && LAST.ok){
-    const agg = buildAgg(LAST.table||[]);
-    renderKPIs(LAST, agg);
-    renderTops(agg);
-  }
-}
-
-/* =========================
-   Events
-========================= */
-document.getElementById("btnLogin").addEventListener("click", doLogin);
-document.getElementById("aPass").addEventListener("keydown",(e)=>{ if(e.key==="Enter") doLogin(); });
-
-document.getElementById("btnLoad").addEventListener("click", loadDashboard);
-document.getElementById("btnRefresh").addEventListener("click", loadDashboard);
-document.getElementById("btnExportAll").addEventListener("click", exportAll);
-document.getElementById("btnLogout").addEventListener("click", doLogout);
-
-document.getElementById("search").addEventListener("input", ()=>{
-  if(LAST && LAST.ok) renderMainTable(LAST);
-});
-
-document.getElementById("segMoney").addEventListener("click", ()=> setMode("money"));
-document.getElementById("segInvoices").addEventListener("click", ()=> setMode("invoices"));
-
-/* ✅ FIX: Atajos ahora SÍ cargan */
-document.getElementById("btnToday").addEventListener("click", async ()=>{
-  const t = ymd(new Date());
-  setRange(t, t);
-  await loadDashboard();
-});
-
-document.getElementById("btnThisMonth").addEventListener("click", async ()=>{
-  const now = new Date();
-  const f = ymd(new Date(now.getFullYear(), now.getMonth(), 1));
-  const t = ymd(now);
-  setRange(f, t);
-  await loadDashboard();
-});
-
-document.getElementById("btnThisYear").addEventListener("click", async ()=>{
-  const now = new Date();
-  const f = ymd(new Date(now.getFullYear(), 0, 1));
-  const t = ymd(now);
-  setRange(f, t);
-  await loadDashboard();
-});
-
-/* ✅ FIX: cambiar fecha manual dispara carga (debounce) */
-const debouncedLoad = (() => {
-  let timer = null;
-  return () => {
-    clearTimeout(timer);
-    timer = setTimeout(() => loadDashboard(), 350);
-  };
-})();
-function maybeAutoLoad(){
-  const from = document.getElementById("from").value || "";
-  const to = document.getElementById("to").value || "";
-
-  // ✅ Solo auto-cargar si ya están ambas fechas
-  if(from && to){
-    document.getElementById("rangePill").textContent = `${from} → ${to}`;
-    debouncedLoad();
-  } else {
-    // solo actualiza pill para que el usuario vea el progreso
-    document.getElementById("rangePill").textContent = from ? `${from} → —` : "—";
-  }
-}
-
-document.getElementById("from").addEventListener("change", maybeAutoLoad);
-document.getElementById("to").addEventListener("change", maybeAutoLoad);
-
-/* =========================
-   INIT (a prueba de balas)
-   - SIEMPRE muestra login al inicio
-========================= */
-window.addEventListener("load", async ()=>{
-  // 1) API health
-  try{
-    const r = await apiHealth();
-    const p = document.getElementById("apiPill");
-    p.className = "pill " + (r.ok ? "ok" : "bad");
-    p.textContent = r.ok ? "API: OK ✅" : "API: ERROR";
-  }catch{
-    const p = document.getElementById("apiPill");
-    p.className = "pill bad";
-    p.textContent = "API: ERROR";
-  }
-
-  // 2) fechas default: este mes (solo set, no carga)
-  const now = new Date();
-  setRange(ymd(new Date(now.getFullYear(), now.getMonth(), 1)), ymd(now));
-
-  // 3) SIEMPRE pedir login
-  setAuthUI(false);
-  openLogin();
-});
-</script>
-</body>
-</html>
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+app.listen(Number(PORT), () => console.log(`Invoices server listening on :${PORT}`));
