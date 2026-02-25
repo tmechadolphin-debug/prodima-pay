@@ -925,8 +925,11 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
 
-       const baseComments = [
+    // ✅ FIX: cerrar array y convertir a string
+    const baseComments = [
       `[user:${creator}]`,
+      `[wh:${warehouseCode}]`,
+    ].join(" ");
 
     const payload = {
       CardCode: cardCode,
