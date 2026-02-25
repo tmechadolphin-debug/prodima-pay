@@ -209,18 +209,20 @@ function parseWhFromComments(comments) {
   const m = String(comments || "").match(/\[wh:([^\]]+)\]/i);
   return m ? String(m[1]).trim() : "";
 }
+
+/**
+ * ✅ Ajuste mínimo:
+ * Antes estabas descartando por "cancel" en comments y eso puede tumbar docs.
+ * Aquí dejamos solo CancelStatus real.
+ */
 function isCancelledLike(q) {
   const cancelVal = q?.CancelStatus ?? q?.cancelStatus ?? q?.Cancelled ?? q?.cancelled ?? "";
   const cancelRaw = String(cancelVal).trim().toLowerCase();
-  const commLower = String(q?.Comments || q?.comments || "").toLowerCase();
   return (
     cancelRaw === "csyes" ||
     cancelRaw === "yes" ||
     cancelRaw === "true" ||
-    cancelRaw.includes("csyes") ||
-    cancelRaw.includes("cancel") ||
-    commLower.includes("[cancel") ||
-    commLower.includes("cancelad")
+    cancelRaw.includes("csyes")
   );
 }
 
@@ -342,6 +344,149 @@ async function sapGetByDocEntry(entity, docEntry) {
   const n = Number(docEntry);
   if (!Number.isFinite(n) || n <= 0) throw new Error("DocEntry inválido");
   return slFetch(`/${entity}(${n})`, { timeoutMs: 12000 });
+}
+
+/* =========================
+   ✅ CATEGORÍAS / GROUP_NAME
+   - Cachea ItemCode -> group
+========================= */
+const ITEM_GROUP_CACHE = new Map(); // key: itemCode => {at, group}
+const ITEM_GROUP_TTL_MS = 6 * 60 * 60 * 1000;
+
+function norm(s) {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ");
+}
+
+function mapToSixCats(raw) {
+  const t = norm(raw);
+  if (!t) return "";
+
+  // Orden importa: lo más específico primero
+  if (t.includes("sazon")) return "Sazonadores";
+  if (t.includes("vinagr")) return "Vinagres";
+  if (t.includes("cuidado de la ropa") || (t.includes("cuidado") && t.includes("ropa"))) return "Cuidado de la Ropa";
+  if (t.includes("prod") && t.includes("limp")) return "Prod. De limpieza";
+  if (t.includes("art") && t.includes("limp")) return "Art. De limpieza";
+  if (t.includes("especial") || t.includes("gmt")) return "Especialidades y GMT";
+
+  // variantes comunes
+  if (t.includes("limpieza") && t.includes("producto")) return "Prod. De limpieza";
+  if (t.includes("limpieza") && t.includes("articulo")) return "Art. De limpieza";
+
+  return "";
+}
+
+function cacheItemGet(itemCode) {
+  const it = ITEM_GROUP_CACHE.get(itemCode);
+  if (!it) return null;
+  if (Date.now() - it.at > ITEM_GROUP_TTL_MS) {
+    ITEM_GROUP_CACHE.delete(itemCode);
+    return null;
+  }
+  return it.group || null;
+}
+function cacheItemSet(itemCode, group) {
+  ITEM_GROUP_CACHE.set(itemCode, { at: Date.now(), group: group || null });
+}
+
+/**
+ * Intenta leer un "group/categoría" desde Items.
+ * Busca varios UDF posibles + fallback a ItemsGroupCode.
+ */
+async function sapGetItemGroupName(itemCode) {
+  const code = String(itemCode || "").trim();
+  if (!code) return "";
+
+  const cached = cacheItemGet(code);
+  if (cached !== null) return cached || "";
+
+  // OData para Items normalmente: /Items('CODE')
+  // OJO: code con comillas simples
+  const safe = code.replace(/'/g, "''");
+
+  let item = null;
+  try {
+    item = await slFetch(`/Items('${safe}')`, { timeoutMs: 12000 });
+  } catch {
+    cacheItemSet(code, "");
+    return "";
+  }
+
+  // UDFs típicos que la gente usa para categoría/grupo
+  const candidates = [
+    item?.U_group_name,
+    item?.U_GroupName,
+    item?.U_GROUP_NAME,
+    item?.U_Categoria,
+    item?.U_CATEGORIA,
+    item?.U_CATEGORY,
+    item?.U_Cat,
+    item?.U_LINEA,
+    item?.U_Grupo,
+    item?.U_GRUPO,
+  ].map((x) => String(x || "").trim()).filter(Boolean);
+
+  for (const c of candidates) {
+    const mapped = mapToSixCats(c);
+    if (mapped) {
+      cacheItemSet(code, mapped);
+      return mapped;
+    }
+  }
+
+  // fallback: ItemsGroupCode -> ItemGroups
+  const igc = item?.ItemsGroupCode;
+  const igcNum = Number(igc);
+  if (Number.isFinite(igcNum) && igcNum > 0) {
+    try {
+      const g = await slFetch(`/ItemGroups(${igcNum})`, { timeoutMs: 12000 });
+      const gname = String(g?.GroupName || g?.groupName || "").trim();
+      const mapped = mapToSixCats(gname);
+      if (mapped) {
+        cacheItemSet(code, mapped);
+        return mapped;
+      }
+    } catch {}
+  }
+
+  cacheItemSet(code, "");
+  return "";
+}
+
+/**
+ * Obtiene group_name de una cotización mirando sus líneas.
+ * - Revisa primeros N items (para que no sea lento)
+ * - Vota por la categoría más frecuente
+ */
+async function inferQuoteGroupNameByDocEntry(docEntry) {
+  try {
+    const q = await sapGetByDocEntry("Quotations", docEntry);
+    const lines = Array.isArray(q?.DocumentLines) ? q.DocumentLines : [];
+    if (!lines.length) return "";
+
+    const maxLines = Math.min(12, lines.length);
+    const counts = new Map();
+
+    for (let i = 0; i < maxLines; i++) {
+      const itemCode = lines[i]?.ItemCode;
+      const g = await sapGetItemGroupName(itemCode);
+      if (g) counts.set(g, (counts.get(g) || 0) + 1);
+      await sleep(10);
+    }
+
+    let best = "";
+    let bestN = 0;
+    for (const [k, v] of counts.entries()) {
+      if (v > bestN) { best = k; bestN = v; }
+    }
+    return best || "";
+  } catch {
+    return "";
+  }
 }
 
 /* =========================
@@ -502,13 +647,10 @@ function docDateTimeToMs(docDate, docTime) {
   const t = Number(docTime || 0);
   const hh = Math.floor(t / 100);
   const mm = t % 100;
-  // Construimos en "local Panamá" (UTC-5) y lo llevamos a ms
   const iso = `${d}T${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00`;
-  // iso está en hora local Panamá; convertimos a UTC sumando 5h
-  const dt = new Date(iso + "Z"); // treat as UTC to avoid server tz
+  const dt = new Date(iso + "Z");
   const msLocalAsUtc = dt.getTime();
-  // Corrige: ese "Z" lo hizo UTC; queremos Panamá => UTC+5
-  return msLocalAsUtc - (TZ_OFFSET_MIN * 60000); // TZ_OFFSET_MIN = -300 => -(-300)=+300min
+  return msLocalAsUtc - (TZ_OFFSET_MIN * 60000);
 }
 
 async function upsertQuoteCache(row) {
@@ -564,7 +706,18 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
 
     const mode = String(req.query?.mode || "days").toLowerCase(); // days|hours|minutes
     const nRaw = Number(req.query?.n || 5);
-    const n = Math.max(1, Math.min(mode === "days" ? 10 : mode === "hours" ? 48 : 720, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5));
+
+    /**
+     * ✅ FIX 1 (CRÍTICO):
+     * Antes: days máximo 10 => Ene→Hoy jamás funcionaba.
+     * Ahora: days permite hasta 400 días.
+     */
+    const nMax =
+      mode === "days" ? 400 :
+      mode === "hours" ? 48 :
+      720;
+
+    const n = Math.max(1, Math.min(nMax, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5));
 
     const maxDocsRaw = Number(req.query?.maxDocs || 500);
     const maxDocs = Math.max(20, Math.min(2000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 500));
@@ -578,11 +731,11 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
 
     const fromMs = nowMs - winMs;
 
-    // para SL usamos DocDate por rango de días (buffer 1 día)
+    // para SL usamos DocDate por rango de días (buffer 1-2 días)
     const today = isoDateInOffset(TZ_OFFSET_MIN);
     const fromDate = mode === "days"
       ? addDaysISO(today, -n)
-      : addDaysISO(today, -2); // horas/minutos: miramos hoy y ayer (buffer)
+      : addDaysISO(today, -2);
 
     const toDate = today;
     const { from, toPlus1 } = toDocDateFilterRange(fromDate, toDate);
@@ -595,7 +748,10 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
     // trazado entregado: limitar para que sync sea rápido
     const maxTrace = Math.min(200, maxDocs);
 
-    for (let page = 0; page < 30; page++) {
+    // ✅ calcular categorías solo para un número razonable por sync (evita lentitud)
+    const maxGroupCalc = Math.min(800, maxDocs);
+
+    for (let page = 0; page < 60; page++) {
       if (saved >= maxDocs) break;
 
       const raw = await slFetch(
@@ -624,7 +780,6 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
         if (mode !== "days") {
           const ms = docDateTimeToMs(docDate, docTime);
           if (ms && ms < fromMs) continue;
-          // si no tenemos ms (DocTime faltante), aceptamos por día (hoy/ayer) para no perder data
         }
 
         const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
@@ -636,10 +791,19 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
           try {
             const tr = await traceQuoteTotals(docNum, addDaysISO(today, -30), today);
             if (tr?.ok) deliveredTotal = Number(tr.totalEntregado || 0);
-          } catch {
-            // no rompemos el sync
-          }
-          await sleep(30);
+          } catch {}
+          await sleep(20);
+        }
+
+        /**
+         * ✅ FIX 2: group_name real
+         * Solo calculamos para los primeros maxGroupCalc docs del sync para que no se vuelva pesado.
+         */
+        let groupName = null;
+        if (saved < maxGroupCalc) {
+          const g = await inferQuoteGroupNameByDocEntry(q.DocEntry);
+          groupName = g ? g : null;
+          await sleep(15);
         }
 
         await upsertQuoteCache({
@@ -656,7 +820,7 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
           status: q.DocumentStatus || "",
           cancelStatus: q.CancelStatus ?? "",
           comments: q.Comments || "",
-          groupName: null, // si más adelante guardas grupo, se llena aquí
+          groupName,
         });
 
         saved++;
@@ -677,7 +841,7 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
       saved,
       lastSyncAt: stamp,
       window: { fromDate, toDate },
-      note: "Sync corto guardado en Supabase. Lectura (dashboard/histórico) ya es DB.",
+      note: "Sync guardado en Supabase. Ahora incluye group_name (categorías) cuando sea posible.",
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -750,7 +914,7 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
       [from, to]
     );
 
-    // byClient (CNT FIX AQUÍ ✅)
+    // byClient
     const byClientR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.card_name,''), q.card_code, 'sin_cliente') AS customer,
@@ -765,7 +929,7 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
       [from, to]
     );
 
-    // byGroup (CNT FIX AQUÍ ✅) — si no hay group_name, cae en "Sin grupo"
+    // byGroup
     const byGroupR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.group_name,''), 'Sin grupo') AS "group",
