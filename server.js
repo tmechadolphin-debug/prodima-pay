@@ -39,55 +39,17 @@ const JWT_SECRET = process.env.JWT_SECRET || "prodima_change_this_secret";
 // ---- Timezone Fix (para fecha SAP) ----
 const TZ_OFFSET_MIN = Number(process.env.TZ_OFFSET_MIN || -300);
 
-// ---- PORT (Render) ----
-const PORT = Number(process.env.PORT || 10000);
-
 /* =========================================================
-   ✅ CORS (FIX x-warehouse + preflight)
+   ✅ CORS
 ========================================================= */
-function parseOrigins(val) {
-  const s = String(val || "").trim();
-  if (!s || s === "*") return "*";
-  const arr = s
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
-  return arr.length ? arr : "*";
-}
-
-const ORIGINS = parseOrigins(CORS_ORIGIN);
-
-const corsOptions = {
-  origin: (origin, cb) => {
-    // same-origin / curl / server-to-server
-    if (!origin) return cb(null, true);
-
-    // allow all
-    if (ORIGINS === "*") return cb(null, true);
-
-    // allow list
-    if (Array.isArray(ORIGINS) && ORIGINS.includes(origin)) return cb(null, true);
-
-    return cb(new Error(`CORS blocked origin: ${origin}`), false);
-  },
-  credentials: false,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "x-warehouse",
-    "X-Warehouse",
-    "x-warehouse-code",
-    "X-Warehouse-Code",
-  ],
-  exposedHeaders: ["Content-Length"],
-  maxAge: 86400,
-  optionsSuccessStatus: 204,
-};
-
-app.use(cors(corsOptions));
-// Preflight para todas las rutas
-app.options("*", cors(corsOptions));
+app.use(
+  cors({
+    origin: CORS_ORIGIN === "*" ? "*" : [CORS_ORIGIN],
+    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+app.options("*", cors());
 
 /* =========================================================
    ✅ Provincias + Bodegas (Auto)
@@ -253,7 +215,9 @@ function verifyAdmin(req, res, next) {
 }
 
 /**
- * ✅ verifyUser rehidrata desde DB
+ * ✅ FIX #1: verifyUser rehidrata desde DB
+ * - No dependes del warehouse_code viejo del JWT
+ * - Valida is_active real
  */
 async function verifyUser(req, res, next) {
   try {
@@ -267,6 +231,7 @@ async function verifyUser(req, res, next) {
     if (!decoded || decoded.typ !== "user")
       return res.status(403).json({ ok: false, message: "Token inválido" });
 
+    // ✅ rehidratar desde DB (si existe)
     if (hasDb()) {
       const uid = Number(decoded.uid || 0);
       let r = null;
@@ -299,6 +264,7 @@ async function verifyUser(req, res, next) {
         return res.status(401).json({ ok: false, message: "Usuario desactivado" });
       }
 
+      // ✅ usa datos reales de DB
       req.user = {
         typ: "user",
         uid: u.id,
@@ -308,6 +274,7 @@ async function verifyUser(req, res, next) {
         warehouse_code: String(u.warehouse_code || "").trim(),
       };
     } else {
+      // fallback sin DB
       req.user = decoded;
     }
 
@@ -413,13 +380,9 @@ function getDateISOInOffset(offsetMinutes = -300) {
 }
 
 /* =========================================================
-   ✅ Helper: warehouse por usuario (y override via header)
-   - Si el front manda x-warehouse, úsalo (solo si existe)
+   ✅ Helper: warehouse por usuario
 ========================================================= */
 function getWarehouseFromReq(req) {
-  const headerWh = String(req.headers["x-warehouse"] || req.headers["x-warehouse-code"] || "").trim();
-  if (headerWh) return headerWh;
-
   const wh = String(req.user?.warehouse_code || "").trim();
   return wh || SAP_WAREHOUSE || "01";
 }
@@ -572,6 +535,8 @@ app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
 
 /* =========================================================
    ✅ ADMIN: HISTÓRICO DE COTIZACIONES (SAP)
+   - Paginación real (500 por página)
+   - Soporta skip/limit para el front
 ========================================================= */
 app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
   try {
@@ -596,6 +561,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const SELECT =
       `DocEntry,DocNum,CardCode,CardName,DocTotal,DocDate,DocumentStatus,CancelStatus,Comments`;
 
+    // ✅ Esto devuelve exactamente "la página" que el front pide
     const sap = await slFetch(
       `/Quotations?$select=${SELECT}` +
         `&$orderby=DocDate desc&$top=${limit}&$skip=${skip}${sapFilter}`
@@ -611,7 +577,7 @@ app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
     const quotes = values.map((q) => {
       const fechaISO = String(q.DocDate || "").slice(0, 10);
 
-      const cancelStatus = String(q.CancelStatus || "").trim();
+      const cancelStatus = String(q.CancelStatus || "").trim(); // csYes/csNo
       const isCancelled = cancelStatus.toLowerCase() === "csyes";
 
       const estado = isCancelled
@@ -836,7 +802,9 @@ function getSalesUomFactor(itemFull) {
 }
 
 /* =========================================================
-   ✅ Stock
+   ✅ FIX #2: Stock usando el patrón que A TI te funciona
+   - ItemWarehouseInfoCollection en $select (NO $expand)
+   - fallback si no viene colección
 ========================================================= */
 function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
   const item = {
@@ -889,6 +857,7 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 
   let itemFull;
 
+  // ✅ IMPORTANTE: NO expandimos ItemWarehouseInfoCollection (como tu viejo)
   try {
     itemFull = await slFetch(
       `/Items('${encodeURIComponent(code)}')` +
@@ -906,6 +875,7 @@ async function getOneItem(code, priceListNo, warehouseCode) {
     }
   }
 
+  // ✅ fallback: si SAP no trajo la colección, la pedimos por endpoint alterno
   if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
     try {
       const whInfo = await slFetch(
@@ -923,7 +893,7 @@ async function getOneItem(code, priceListNo, warehouseCode) {
 }
 
 /* =========================================================
-   ✅ SAP: ITEM
+   ✅ SAP: ITEM (warehouse dinámico) + ✅ disponible top-level
 ========================================================= */
 app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
@@ -949,6 +919,8 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
       factorCaja: r.factorCaja,
       uom: r.item?.SalesUnit || "Caja",
       stock: r.stock,
+
+      // ✅ para tu columna “Disponible”
       disponible: r?.stock?.available ?? null,
       enStock: r?.stock?.hasStock ?? null,
     });
@@ -959,7 +931,7 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ SAP: MULTI ITEMS
+   ✅ SAP: MULTI ITEMS (warehouse dinámico) + disponible
 ========================================================= */
 app.get("/api/sap/items", verifyUser, async (req, res) => {
   try {
@@ -993,6 +965,8 @@ app.get("/api/sap/items", verifyUser, async (req, res) => {
             priceUnit: r.priceUnit,
             factorCaja: r.factorCaja,
             stock: r.stock,
+
+            // ✅ para tu columna “Disponible”
             disponible: r?.stock?.available ?? null,
             enStock: r?.stock?.hasStock ?? null,
           };
@@ -1169,10 +1143,8 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 /* =========================================================
    ✅ START
 ========================================================= */
+const PORT = process.env.PORT || 10000;
+
 ensureSchema()
-  .then(() =>
-    app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT))
-  )
-  .catch(() =>
-    app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT, "(sin DB)"))
-  );
+  .then(() => app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT)))
+  .catch(() => app.listen(PORT, () => console.log("✅ Server listo en puerto", PORT, "(sin DB)")));
