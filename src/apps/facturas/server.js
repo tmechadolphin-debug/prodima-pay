@@ -739,11 +739,11 @@ app.post("/api/admin/invoices/sync/recent", verifyAdmin, async (req, res) => {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
-    const daysRaw = Number(req.query?.days || 10);
-    const days = Math.max(1, Math.min(120, Number.isFinite(daysRaw) ? Math.trunc(daysRaw) : 10));
+    const daysRaw = Number(req.query?.days || 365);
+const days = Math.max(1, Math.min(400, Number.isFinite(daysRaw) ? Math.trunc(daysRaw) : 365));
 
-    const maxDocsRaw = Number(req.query?.maxDocs || 2500);
-    const maxDocs = Math.max(50, Math.min(5000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 2500));
+const maxDocsRaw = Number(req.query?.maxDocs || 50000);
+const maxDocs = Math.max(50, Math.min(80000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 50000));
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const from = addDaysISO(today, -days);
