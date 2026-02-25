@@ -5,7 +5,7 @@ import pg from "pg";
 const { Pool } = pg;
 
 const app = express();
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "6mb" }));
 
 /* =========================================================
    ✅ ENV
@@ -131,7 +131,6 @@ async function dbQuery(text, params = []) {
 async function ensureDb() {
   if (!hasDb()) return;
 
-  // Base table
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS fact_invoice_lines (
       doc_entry      INTEGER NOT NULL,
@@ -144,16 +143,18 @@ async function ensureDb() {
       item_code      TEXT    NOT NULL DEFAULT '',
       item_desc      TEXT    NOT NULL DEFAULT '',
       quantity       NUMERIC(18,4) NOT NULL DEFAULT 0,
-      line_total     NUMERIC(18,2) NOT NULL,
+      line_total     NUMERIC(18,2) NOT NULL DEFAULT 0,
+      gross_profit   NUMERIC(18,2) NOT NULL DEFAULT 0,
       updated_at     TIMESTAMP DEFAULT NOW(),
       PRIMARY KEY (doc_entry, line_num)
     );
   `);
 
-  // Migrations (safe if table existed)
+  // migrations safe
   await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS item_code TEXT NOT NULL DEFAULT '';`);
   await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS item_desc TEXT NOT NULL DEFAULT '';`);
   await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS quantity NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0;`);
 
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_doc_date ON fact_invoice_lines(doc_date);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_wh ON fact_invoice_lines(warehouse_code);`);
@@ -231,7 +232,7 @@ async function slFetch(path, options = {}) {
   const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
 
   const controller = new AbortController();
-  const timeoutMs = Number(options.timeoutMs || 60000); // 60s
+  const timeoutMs = Number(options.timeoutMs || 60000);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
@@ -270,17 +271,17 @@ async function slFetch(path, options = {}) {
 /* =========================================================
    ✅ SAP: scan invoice headers
 ========================================================= */
-async function scanInvoicesHeaders({ f, t, maxDocs = 1200 }) {
+async function scanInvoicesHeaders({ f, t, maxDocs = 3000 }) {
   const toPlus1 = addDaysISO(t, 1);
   const batchTop = 200;
   let skipSap = 0;
   const out = [];
 
-  for (let page = 0; page < 250; page++) {
+  for (let page = 0; page < 300; page++) {
     const raw = await slFetch(
       `/Invoices?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName` +
         `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
-        `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`,
+        `&$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skipSap}`,
       { timeoutMs: 60000 }
     );
 
@@ -306,12 +307,26 @@ async function scanInvoicesHeaders({ f, t, maxDocs = 1200 }) {
 async function getInvoiceDoc(docEntry) {
   const de = Number(docEntry);
   if (!Number.isFinite(de) || de <= 0) return null;
-  return slFetch(`/Invoices(${de})`, { timeoutMs: 90000 }); // 90s solo aquí
+  return slFetch(`/Invoices(${de})`, { timeoutMs: 90000 });
 }
 
 /* =========================================================
-   ✅ Sync: upsert invoice lines into Postgres
+   ✅ Sync: upsert invoice lines
 ========================================================= */
+function pickGrossProfit(ln) {
+  const candidates = [
+    ln?.GrossProfit,
+    ln?.GrossProfitTotal,
+    ln?.GrossProfitFC,
+    ln?.GrossProfitSC,
+  ];
+  for (const c of candidates) {
+    const n = Number(c);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
+
 async function upsertLinesToDb(invHeader, docFull) {
   const lines = Array.isArray(docFull?.DocumentLines) ? docFull.DocumentLines : [];
   if (!lines.length) return 0;
@@ -335,9 +350,10 @@ async function upsertLinesToDb(invHeader, docFull) {
     const qty = Number(ln.Quantity || 0);
     const itemCode = String(ln.ItemCode || "").trim();
     const itemDesc = String(ln.ItemDescription || ln.ItemName || "").trim();
+    const gp = pickGrossProfit(ln);
 
-    params.push(docEntry, lineNum, docNum, docDate, cardCode, cardName, wh, itemCode, itemDesc, qty, lt);
-    values.push(`($${p++},$${p++},$${p++},$${p++}::date,$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`);
+    params.push(docEntry, lineNum, docNum, docDate, cardCode, cardName, wh, itemCode, itemDesc, qty, lt, gp);
+    values.push(`($${p++},$${p++},$${p++},$${p++}::date,$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`);
   }
 
   if (!values.length) return 0;
@@ -345,7 +361,7 @@ async function upsertLinesToDb(invHeader, docFull) {
   await dbQuery(
     `
     INSERT INTO fact_invoice_lines
-      (doc_entry,line_num,doc_num,doc_date,card_code,card_name,warehouse_code,item_code,item_desc,quantity,line_total)
+      (doc_entry,line_num,doc_num,doc_date,card_code,card_name,warehouse_code,item_code,item_desc,quantity,line_total,gross_profit)
     VALUES ${values.join(",")}
     ON CONFLICT (doc_entry,line_num)
     DO UPDATE SET
@@ -358,6 +374,7 @@ async function upsertLinesToDb(invHeader, docFull) {
       item_desc=EXCLUDED.item_desc,
       quantity=EXCLUDED.quantity,
       line_total=EXCLUDED.line_total,
+      gross_profit=EXCLUDED.gross_profit,
       updated_at=NOW()
     `,
     params
@@ -366,14 +383,16 @@ async function upsertLinesToDb(invHeader, docFull) {
   return values.length;
 }
 
-async function syncRangeToDb({ from, to, maxDocs = 1200 }) {
+async function syncRangeToDb({ from, to, maxDocs = 6000 }) {
   if (!hasDb()) throw new Error("DB no configurada (DATABASE_URL)");
-
   const headers = await scanInvoicesHeaders({ f: from, t: to, maxDocs });
-  if (!headers.length) return { headers: 0, lines: 0 };
 
-  // Concurrencia baja (estable)
-  const CONC = 1;
+  if (!headers.length) {
+    await setState("last_sync_at", new Date().toISOString());
+    return { headers: 0, lines: 0 };
+  }
+
+  const CONC = 1; // estable
   let idx = 0;
   let totalLines = 0;
 
@@ -386,7 +405,7 @@ async function syncRangeToDb({ from, to, maxDocs = 1200 }) {
         const inserted = await upsertLinesToDb(h, full);
         totalLines += inserted;
       } catch {}
-      await sleep(25);
+      await sleep(20);
     }
   }
 
@@ -407,7 +426,8 @@ async function dashboardFromDb(from, to) {
     `
     SELECT
       COUNT(DISTINCT doc_entry) AS invoices,
-      COALESCE(SUM(line_total),0)::numeric(18,2) AS dollars
+      COALESCE(SUM(line_total),0)::numeric(18,2) AS dollars,
+      COALESCE(SUM(gross_profit),0)::numeric(18,2) AS gross_profit
     FROM fact_invoice_lines
     WHERE doc_date >= $1::date AND doc_date <= $2::date
     `,
@@ -421,6 +441,7 @@ async function dashboardFromDb(from, to) {
       card_name AS card_name,
       warehouse_code AS warehouse,
       SUM(line_total)::numeric(18,2) AS dollars,
+      SUM(gross_profit)::numeric(18,2) AS gross_profit,
       COUNT(DISTINCT doc_entry) AS invoices
     FROM fact_invoice_lines
     WHERE doc_date >= $1::date AND doc_date <= $2::date
@@ -435,7 +456,8 @@ async function dashboardFromDb(from, to) {
     SELECT
       to_char(date_trunc('month', doc_date), 'YYYY-MM') AS month,
       COUNT(DISTINCT doc_entry) AS invoices,
-      COALESCE(SUM(line_total),0)::numeric(18,2) AS dollars
+      COALESCE(SUM(line_total),0)::numeric(18,2) AS dollars,
+      COALESCE(SUM(gross_profit),0)::numeric(18,2) AS gross_profit
     FROM fact_invoice_lines
     WHERE doc_date >= $1::date AND doc_date <= $2::date
     GROUP BY 1
@@ -452,7 +474,7 @@ async function dashboardFromDb(from, to) {
     WHERE doc_date >= $1::date AND doc_date <= $2::date
     GROUP BY 1
     ORDER BY dollars DESC
-    LIMIT 20
+    LIMIT 50
     `,
     [from, to]
   );
@@ -465,12 +487,14 @@ async function dashboardFromDb(from, to) {
     WHERE doc_date >= $1::date AND doc_date <= $2::date
     GROUP BY 1,2
     ORDER BY dollars DESC
-    LIMIT 20
+    LIMIT 50
     `,
     [from, to]
   );
 
   const toNum = (x) => Number(x || 0);
+  const totalDol = toNum(totalsQ.rows?.[0]?.dollars);
+  const totalGP = toNum(totalsQ.rows?.[0]?.gross_profit);
 
   return {
     ok: true,
@@ -478,13 +502,21 @@ async function dashboardFromDb(from, to) {
     to,
     totals: {
       invoices: toNum(totalsQ.rows?.[0]?.invoices),
-      dollars: toNum(totalsQ.rows?.[0]?.dollars),
+      dollars: totalDol,
+      grossProfit: totalGP,
+      grossPct: totalDol > 0 ? Number(((totalGP / totalDol) * 100).toFixed(2)) : 0,
     },
-    byMonth: (byMonthQ.rows || []).map((r) => ({
-      month: r.month,
-      invoices: toNum(r.invoices),
-      dollars: toNum(r.dollars),
-    })),
+    byMonth: (byMonthQ.rows || []).map((r) => {
+      const dol = toNum(r.dollars);
+      const gp = toNum(r.gross_profit);
+      return {
+        month: r.month,
+        invoices: toNum(r.invoices),
+        dollars: dol,
+        grossProfit: gp,
+        grossPct: dol > 0 ? Number(((gp / dol) * 100).toFixed(2)) : 0,
+      };
+    }),
     topWarehouses: (topWhQ.rows || []).map((r) => ({
       warehouse: r.warehouse,
       dollars: toNum(r.dollars),
@@ -495,26 +527,32 @@ async function dashboardFromDb(from, to) {
       customer: `${r.card_code} · ${r.card_name}`,
       dollars: toNum(r.dollars),
     })),
-    table: (tableQ.rows || []).map((r) => ({
-      cardCode: r.card_code,
-      cardName: r.card_name,
-      customer: `${r.card_code} · ${r.card_name}`,
-      warehouse: r.warehouse,
-      dollars: toNum(r.dollars),
-      invoices: toNum(r.invoices),
-    })),
+    table: (tableQ.rows || []).map((r) => {
+      const dol = toNum(r.dollars);
+      const gp = toNum(r.gross_profit);
+      return {
+        cardCode: r.card_code,
+        cardName: r.card_name,
+        customer: `${r.card_code} · ${r.card_name}`,
+        warehouse: r.warehouse,
+        dollars: dol,
+        grossProfit: gp,
+        grossPct: dol > 0 ? Number(((gp / dol) * 100).toFixed(2)) : 0,
+        invoices: toNum(r.invoices),
+      };
+    }),
   };
 }
 
 /* =========================================================
-   ✅ Details: invoices + lines for customer+warehouse
+   ✅ Details: invoices + lines
 ========================================================= */
 async function detailsFromDb({ from, to, cardCode, warehouse }) {
   const q = await dbQuery(
     `
     SELECT
       doc_entry, doc_num, doc_date,
-      item_code, item_desc, quantity, line_total
+      item_code, item_desc, quantity, line_total, gross_profit
     FROM fact_invoice_lines
     WHERE doc_date >= $1::date AND doc_date <= $2::date
       AND card_code = $3
@@ -524,8 +562,7 @@ async function detailsFromDb({ from, to, cardCode, warehouse }) {
     [from, to, cardCode, warehouse]
   );
 
-  // group
-  const map = new Map(); // doc_num -> {docNum, docDate, docEntry, lines[]}
+  const map = new Map(); // doc_num -> invoice
   for (const r of q.rows || []) {
     const dn = Number(r.doc_num);
     if (!map.has(dn)) {
@@ -534,41 +571,55 @@ async function detailsFromDb({ from, to, cardCode, warehouse }) {
         docDate: String(r.doc_date).slice(0, 10),
         docEntry: Number(r.doc_entry),
         lines: [],
-        totals: { qty: 0, dollars: 0 },
+        totals: { qty: 0, dollars: 0, grossProfit: 0 },
       });
     }
     const it = map.get(dn);
     const qty = Number(r.quantity || 0);
     const dol = Number(r.line_total || 0);
+    const gp = Number(r.gross_profit || 0);
     it.lines.push({
       itemCode: String(r.item_code || ""),
       itemDesc: String(r.item_desc || ""),
       quantity: qty,
       dollars: dol,
+      grossProfit: gp,
+      grossPct: dol > 0 ? Number(((gp / dol) * 100).toFixed(2)) : 0,
     });
     it.totals.qty += qty;
     it.totals.dollars += dol;
+    it.totals.grossProfit += gp;
   }
 
-  const invoices = Array.from(map.values());
+  const invoices = Array.from(map.values()).map((inv) => {
+    inv.totals.qty = Number(inv.totals.qty.toFixed(4));
+    inv.totals.dollars = Number(inv.totals.dollars.toFixed(2));
+    inv.totals.grossProfit = Number(inv.totals.grossProfit.toFixed(2));
+    inv.totals.grossPct = inv.totals.dollars > 0 ? Number(((inv.totals.grossProfit / inv.totals.dollars) * 100).toFixed(2)) : 0;
+    return inv;
+  });
+
   const totals = invoices.reduce(
     (a, x) => {
       a.invoices += 1;
       a.qty += Number(x.totals.qty || 0);
       a.dollars += Number(x.totals.dollars || 0);
+      a.grossProfit += Number(x.totals.grossProfit || 0);
       return a;
     },
-    { invoices: 0, qty: 0, dollars: 0 }
+    { invoices: 0, qty: 0, dollars: 0, grossProfit: 0 }
   );
 
   totals.qty = Number(totals.qty.toFixed(4));
   totals.dollars = Number(totals.dollars.toFixed(2));
+  totals.grossProfit = Number(totals.grossProfit.toFixed(2));
+  totals.grossPct = totals.dollars > 0 ? Number(((totals.grossProfit / totals.dollars) * 100).toFixed(2)) : 0;
 
   return { ok: true, from, to, cardCode, warehouse, totals, invoices };
 }
 
 /* =========================================================
-   ✅ Top products (by warehouse / by customer)
+   ✅ Top products
 ========================================================= */
 async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", limit = 10 }) {
   const params = [from, to];
@@ -590,13 +641,14 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", limi
       item_desc,
       COALESCE(SUM(quantity),0)::numeric(18,4) AS qty,
       COALESCE(SUM(line_total),0)::numeric(18,2) AS dollars,
+      COALESCE(SUM(gross_profit),0)::numeric(18,2) AS gross_profit,
       COUNT(DISTINCT doc_entry) AS invoices
     FROM fact_invoice_lines
     WHERE ${where}
       AND item_code <> ''
     GROUP BY 1,2
     ORDER BY dollars DESC
-    LIMIT ${Math.max(1, Math.min(100, limit))}
+    LIMIT ${Math.max(1, Math.min(200, limit))}
     `,
     params
   );
@@ -607,13 +659,19 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", limi
     to,
     warehouse: warehouse || null,
     cardCode: cardCode || null,
-    top: (q.rows || []).map((r) => ({
-      itemCode: r.item_code,
-      itemDesc: r.item_desc,
-      qty: Number(r.qty || 0),
-      dollars: Number(r.dollars || 0),
-      invoices: Number(r.invoices || 0),
-    })),
+    top: (q.rows || []).map((r) => {
+      const dol = Number(r.dollars || 0);
+      const gp = Number(r.gross_profit || 0);
+      return {
+        itemCode: r.item_code,
+        itemDesc: r.item_desc,
+        qty: Number(r.qty || 0),
+        dollars: dol,
+        grossProfit: gp,
+        grossPct: dol > 0 ? Number(((gp / dol) * 100).toFixed(2)) : 0,
+        invoices: Number(r.invoices || 0),
+      };
+    }),
   };
 }
 
@@ -697,7 +755,7 @@ app.get("/api/admin/invoices/top-products", verifyAdmin, async (req, res) => {
     const warehouse = String(req.query?.warehouse || "").trim();
     const cardCode = String(req.query?.cardCode || "").trim();
     const limitRaw = Number(req.query?.limit || 10);
-    const limit = Math.max(1, Math.min(100, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 10));
+    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 10));
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const defaultFrom = addDaysISO(today, -30);
@@ -724,8 +782,8 @@ app.post("/api/admin/invoices/sync", verifyAdmin, async (req, res) => {
     const toQ = String(req.query?.to || "");
     if (!isISO(fromQ) || !isISO(toQ)) return safeJson(res, 400, { ok: false, message: "Requiere from y to (YYYY-MM-DD)" });
 
-    const maxDocsRaw = Number(req.query?.maxDocs || 1200);
-    const maxDocs = Math.max(50, Math.min(4000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 1200));
+    const maxDocsRaw = Number(req.query?.maxDocs || 6000);
+    const maxDocs = Math.max(50, Math.min(20000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 6000));
 
     const out = await syncRangeToDb({ from: fromQ, to: toQ, maxDocs });
     return safeJson(res, 200, { ok: true, ...out, from: fromQ, to: toQ, maxDocs });
@@ -739,11 +797,11 @@ app.post("/api/admin/invoices/sync/recent", verifyAdmin, async (req, res) => {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
-    const daysRaw = Number(req.query?.days || 365);
-const days = Math.max(1, Math.min(400, Number.isFinite(daysRaw) ? Math.trunc(daysRaw) : 365));
+    const daysRaw = Number(req.query?.days || 10);
+    const days = Math.max(1, Math.min(120, Number.isFinite(daysRaw) ? Math.trunc(daysRaw) : 10));
 
-const maxDocsRaw = Number(req.query?.maxDocs || 50000);
-const maxDocs = Math.max(50, Math.min(80000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 50000));
+    const maxDocsRaw = Number(req.query?.maxDocs || 2500);
+    const maxDocs = Math.max(50, Math.min(20000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 2500));
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const from = addDaysISO(today, -days);
