@@ -1,1270 +1,1110 @@
-import express from "express";
-import pg from "pg";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex,nofollow,noarchive" />
+  <title>PRODIMA · Admin (Usuarios · Histórico · Dashboard)</title>
 
-const { Pool } = pg;
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.19.3/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
-const app = express();
-app.use(express.json({ limit: "6mb" }));
+  <style>
+    :root{
+      --brand:#c31b1c; --accent:#ffbf24; --ink:#1f1f1f; --muted:#6b6b6b;
+      --card:#ffffff; --bd:#f1d39f; --shadow: 0 18px 50px rgba(0,0,0,.10);
+      --ok:#0c8c6a; --warn:#e67e22; --bad:#c31b1c;
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{
+      font-family:'Montserrat',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      color:var(--ink);
+      background:
+        radial-gradient(1200px 520px at 10% -10%, rgba(255,191,36,.40), transparent 60%),
+        radial-gradient(900px 420px at 95% 0%, rgba(195,21,28,.20), transparent 62%),
+        linear-gradient(120deg,#fff3db 0%, #ffffff 55%, #fff3db 100%);
+      min-height:100vh;
+    }
 
-/* =========================================================
-   ✅ ENV
-========================================================= */
-const {
-  PORT = 3000,
-  DATABASE_URL = "",
-  JWT_SECRET = "change_me",
-  ADMIN_USER = "PRODIMA",
-  ADMIN_PASS = "ADMINISTRADOR",
+    .topbar{
+      background:linear-gradient(90deg,var(--brand) 0%, #e0341d 45%, var(--accent) 100%);
+      color:#fff; padding:12px 16px;
+      font-weight:900; letter-spacing:.3px;
+      display:flex; align-items:center; justify-content:space-between;
+      gap:12px; flex-wrap:wrap;
+      position:sticky; top:0; z-index:50;
+      box-shadow:0 12px 28px rgba(0,0,0,.18);
+    }
+    .topbar .left{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 
-  SAP_BASE_URL = "",
-  SAP_COMPANYDB = "",
-  SAP_USER = "",
-  SAP_PASS = "",
+    .pill{
+      background:#fff; color:#7b1a01;
+      border:1px solid #ffd27f; border-radius:999px;
+      padding:6px 10px; font-size:12px; font-weight:900;
+      box-shadow:0 10px 18px rgba(0,0,0,.06);
+      white-space:nowrap;
+    }
+    .pill.ok{ color:var(--ok); border-color:#b7f0db; }
+    .pill.bad{ color:#b30000; border-color:#ffd27f; }
+    .pill.warn{ color:#8a4b00; border-color:#ffe3a8; }
 
-  SAP_WAREHOUSE = "300",
-  SAP_PRICE_LIST = "Lista 02 Res. Com. Ind. Analitic",
+    .btn{
+      height:40px;border-radius:14px;font-weight:900;border:0;cursor:pointer;
+      padding:0 14px;display:inline-flex;align-items:center;justify-content:center;gap:8px;
+      letter-spacing:.2px;user-select:none;
+    }
+    .btn-primary{
+      background:linear-gradient(90deg,var(--brand) 0%, var(--accent) 100%);
+      color:#fff;box-shadow:0 12px 22px rgba(195,21,28,.25);
+    }
+    .btn-outline{ background:#fff;color:var(--brand);border:1px solid #ffd27f; }
+    .btn-danger{ background:linear-gradient(90deg,#a40b0d 0%, #ff7a00 100%); color:#fff; }
+    .btn:disabled{opacity:.6;cursor:not-allowed}
 
-  // Render:
-  // CORS_ORIGIN=https://prodima.com.pa,https://www.prodima.com.pa
-  CORS_ORIGIN = "",
-} = process.env;
+    .wrap{max-width:1400px;margin:18px auto 60px;padding:0 16px}
+    .hero{
+      background:
+        radial-gradient(1000px 420px at 20% -10%, rgba(255,191,36,.55), transparent 60%),
+        radial-gradient(900px 420px at 95% 0%, rgba(195,21,28,.22), transparent 62%),
+        #fff;
+      border:1px solid var(--bd);
+      border-radius:22px;
+      box-shadow: var(--shadow);
+      padding:16px 16px 14px;
+    }
+    .hero h1{font-size:22px;font-weight:900;color:var(--brand);margin-bottom:4px}
+    .hero p{color:#6a3b1b;font-weight:700;font-size:13px;line-height:1.35;max-width:1200px}
 
-/* =========================================================
-   ✅ CORS ROBUSTO
-========================================================= */
-const ALLOWED_ORIGINS = new Set(
-  String(CORS_ORIGIN || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-);
-const allowAll = ALLOWED_ORIGINS.size === 0;
+    .tabs{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
+    .tab{
+      background:#fff;border:1px solid #ffd27f;border-radius:999px;
+      padding:10px 14px;font-weight:900;color:#7b1a01;cursor:pointer;
+      box-shadow:0 10px 18px rgba(0,0,0,.06);
+      user-select:none;
+    }
+    .tab.active{
+      background:linear-gradient(90deg, rgba(195,21,28,.10), rgba(255,191,36,.35));
+      border-color:var(--bd);
+      color:var(--brand);
+    }
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
+    .section{
+      margin-top:16px;background:var(--card);border:1px solid var(--bd);
+      border-radius:18px;box-shadow: var(--shadow);overflow:hidden;
+    }
+    .section-h{
+      background:linear-gradient(90deg, rgba(195,21,28,.08), rgba(255,191,36,.25));
+      border-bottom:1px solid var(--bd);
+      padding:12px 14px;
+      display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
+    }
+    .section-h strong{color:var(--brand);font-weight:900;letter-spacing:.2px}
+    .section-b{padding:14px}
 
-  if (allowAll && origin) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-  } else if (origin && ALLOWED_ORIGINS.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-  }
+    .row{display:grid;grid-template-columns: 1fr 1fr 1fr 1fr;gap:10px}
+    @media (max-width:1100px){ .row{grid-template-columns:1fr 1fr} }
+    @media (max-width:560px){ .row{grid-template-columns:1fr} }
 
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Max-Age", "86400");
+    label{display:block;font-weight:900;color:#6a3b1b;font-size:12px;margin-bottom:6px;letter-spacing:.2px}
+    .input{
+      width:100%;height:42px;border-radius:14px;border:1px solid #ffd27f;
+      padding:0 12px;outline:none;background:#fffdf6;font-weight:800;color:#2b1c16;
+    }
+    select.input{ cursor:pointer; }
+    .muted{color:#777;font-weight:800;font-size:12px}
 
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
+    .cards{display:grid;grid-template-columns: repeat(4, 1fr);gap:12px;margin-top:10px}
+    @media (max-width:1100px){ .cards{grid-template-columns: repeat(2, 1fr);} }
+    @media (max-width:560px){ .cards{grid-template-columns: 1fr;} }
 
-/* =========================================================
-   ✅ DB (Postgres)
-========================================================= */
-const pool = new Pool({
-  connectionString: DATABASE_URL || undefined,
-  ssl: DATABASE_URL ? { rejectUnauthorized: false } : undefined,
-});
+    .stat{
+      background:linear-gradient(180deg,#fffef8 0%, #fff7e8 100%);
+      border:1px solid var(--bd);
+      border-radius:16px;
+      padding:12px;
+    }
+    .stat .k{color:#7a4a1a;font-weight:900;font-size:12px}
+    .stat .v{margin-top:6px;font-weight:900;font-size:20px;color:#111}
+    .stat .s{margin-top:6px;font-weight:800;font-size:12px;color:#6a6a6a}
 
-function hasDb() {
-  return Boolean(DATABASE_URL);
+    .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    @media (max-width:1000px){.grid2{grid-template-columns:1fr}}
+
+    .chartCard{
+      background:linear-gradient(180deg,#fffef8 0%, #fff7e8 100%);
+      border:1px solid var(--bd);
+      border-radius:16px;
+      padding:12px;
+    }
+    .chartWrap{position:relative;width:100%;height:260px;margin-top:10px}
+
+    table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--bd);border-radius:16px;overflow:hidden}
+    thead th{
+      text-align:left;padding:10px 10px;font-size:12px;color:#6a3b1b;font-weight:900;
+      background:linear-gradient(90deg, rgba(195,21,28,.06), rgba(255,191,36,.20));
+      border-bottom:1px solid var(--bd); white-space:nowrap;
+    }
+    tbody td{
+      padding:10px 10px;border-bottom:1px dashed var(--bd);vertical-align:top;
+      background:#fff;font-size:12px;font-weight:800;color:#2b1c16;
+    }
+    tbody tr:last-child td{border-bottom:0}
+    .tableWrap{overflow:auto;border-radius:16px}
+
+    .barRow{display:flex;gap:10px;align-items:center}
+    .bar{flex:1;height:12px;border-radius:999px;background:#ffe7b7;border:1px solid #ffd27f;overflow:hidden}
+    .bar>i{display:block;height:100%;width:0%;background:linear-gradient(90deg,var(--brand) 0%, var(--accent) 100%)}
+
+    .tag{display:inline-flex;align-items:center;justify-content:center;border-radius:999px;padding:4px 8px;border:1px solid #ffd27f;font-weight:900;font-size:11px;background:#fff;white-space:nowrap;}
+    .tag.ok{border-color:#b7f0db;color:var(--ok)}
+    .tag.bad{border-color:#ffd27f;color:#b30000}
+    .tag.warn{border-color:#ffe3a8;color:#8a4b00}
+
+    .toast{
+      position:fixed;right:18px;bottom:18px;background:#111;color:#fff;
+      padding:12px 14px;border-radius:14px;box-shadow:0 20px 50px rgba(0,0,0,.25);
+      display:none;max-width:560px;z-index:999;font-weight:800;line-height:1.35;
+    }
+    .toast.ok{background:linear-gradient(90deg,#0c8c6a,#1bb88a)}
+    .toast.bad{background:linear-gradient(90deg,#a40b0d,#ff7a00)}
+    .toast.warn{background:linear-gradient(90deg,#8a4b00,#ffbf24)}
+
+    .overlay{
+      position:fixed;inset:0;background:rgba(0,0,0,.55);
+      display:none;align-items:center;justify-content:center;padding:18px;z-index:1000;
+    }
+    .modal{
+      width:min(560px, 96vw);background:#fff;border:1px solid var(--bd);
+      border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,.28);overflow:hidden;
+    }
+    .modal-h{
+      padding:12px 14px;background:linear-gradient(90deg,var(--brand) 0%, var(--accent) 100%);
+      color:#fff;font-weight:900;display:flex;justify-content:space-between;align-items:center;gap:10px;
+    }
+    .modal-b{padding:14px}
+    .modal-b .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    @media (max-width:560px){ .modal-b .row2{grid-template-columns:1fr} }
+    .modal-f{padding:14px;display:flex;justify-content:flex-end;gap:10px;border-top:1px solid var(--bd);background:#fffef8}
+  </style>
+</head>
+
+<body>
+  <div class="topbar">
+    <div class="left">
+      <div>🛠️ PRODIMA · Admin</div>
+      <span class="pill bad" id="apiStatus">API: verificando...</span>
+      <span class="pill bad" id="authStatus">Admin: no</span>
+      <span class="pill warn" id="syncPill">Sync DB: —</span>
+      <span class="pill bad" id="whoami">Usuario: --</span>
+      <span class="pill warn" id="scopePill">Scope: Todos</span>
+    </div>
+
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-outline" id="btnRefresh" type="button" style="height:34px;border-radius:12px;padding:0 10px;font-size:12px">
+        🔄 Refrescar
+      </button>
+      <button class="btn btn-outline" id="btnLogout" type="button" style="display:none;height:34px;border-radius:12px;padding:0 10px;font-size:12px">
+        🚪 Salir
+      </button>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <section class="hero">
+      <h1>Panel Administrador</h1>
+      <p>
+        ✅ Dashboard (DB cache) con Sync · ✅ Histórico (SL) con entregado batch y paginación real · ✅ Categorías.
+      </p>
+
+      <div class="tabs">
+        <div class="tab active" data-tab="dash">📊 Dashboard</div>
+        <div class="tab" data-tab="quotes">🧾 Histórico</div>
+        <div class="tab" data-tab="users">👥 Usuarios</div>
+      </div>
+    </section>
+
+    <!-- Scope -->
+    <section class="section">
+      <div class="section-h">
+        <strong>🎯 Scope de datos</strong>
+        <span class="pill" id="scopeHint">—</span>
+      </div>
+      <div class="section-b">
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px;border:1px solid #ffd27f;border-radius:16px;background:#fff;box-shadow:0 10px 18px rgba(0,0,0,.06)">
+          <label style="display:flex;gap:10px;align-items:center;font-weight:900;color:#6a3b1b">
+            <input id="scopeOnlyCreated" type="checkbox" checked style="transform:scale(1.2)">
+            Solo usuarios creados (app_users)
+          </label>
+          <span class="pill ok" id="createdUsersChip">Usuarios creados: 0</span>
+          <span class="pill warn" id="excludedChip">Excluidos: 0</span>
+          <span class="muted" style="margin-left:auto">Afecta Dashboard DB + Histórico</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- DASHBOARD -->
+    <section class="section" id="tab_dash">
+      <div class="section-h">
+        <strong>📊 Dashboard (DB)</strong>
+        <span class="pill" id="dashHint">Listo</span>
+      </div>
+      <div class="section-b">
+
+        <div class="row">
+          <div><label>Desde</label><input id="dashFrom" class="input" type="date"></div>
+          <div><label>Hasta</label><input id="dashTo" class="input" type="date"></div>
+          <div>
+            <label>Categoría</label>
+            <select id="dashCat" class="input">
+              <option value="__ALL__">Todas (sin filtro)</option>
+              <option value="Prod. De limpieza">Prod. De limpieza</option>
+              <option value="Art. De limpieza">Art. De limpieza</option>
+              <option value="Cuidado de la Ropa">Cuidado de la Ropa</option>
+              <option value="Sazonadores">Sazonadores</option>
+              <option value="Vinagres">Vinagres</option>
+              <option value="Especialidades y GMT">Especialidades y GMT</option>
+            </select>
+          </div>
+          <div><label>&nbsp;</label><button class="btn btn-primary" id="btnLoadDash" type="button" style="width:100%">✅ Cargar</button></div>
+        </div>
+
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:10px">
+          <button class="btn btn-outline" id="btnToday" type="button">Hoy</button>
+          <button class="btn btn-outline" id="btnThisMonth" type="button">Este mes</button>
+          <button class="btn btn-outline" id="btnThisYear" type="button">Este año</button>
+          <span class="pill" id="dashRangePill">—</span>
+        </div>
+
+        <div class="cards">
+          <div class="stat"><div class="k">Cotizaciones</div><div class="v" id="kpiQuotes">0</div><div class="s" id="kpiNote">DB cache</div></div>
+          <div class="stat"><div class="k">Monto cotizado</div><div class="v" id="kpiCot">$ 0.00</div><div class="s">Σ DocTotal</div></div>
+          <div class="stat"><div class="k">Monto entregado</div><div class="v" id="kpiEnt">$ 0.00</div><div class="s">Σ Delivery</div></div>
+          <div class="stat"><div class="k">Fill rate</div><div class="v" id="kpiFill">0%</div><div class="s">Entregado / Cotizado</div></div>
+        </div>
+
+        <div class="grid2" style="margin-top:12px">
+          <div class="chartCard">
+            <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+              <div style="font-weight:900;color:#6a3b1b">👤 Top usuarios</div>
+              <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+                <span class="pill" id="topUsersHint">—</span>
+                <button class="btn btn-outline" id="btnUsersExpand" type="button" style="height:34px;border-radius:12px;padding:0 10px;font-size:12px">Ver todos</button>
+              </div>
+            </div>
+            <div class="tableWrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Usuario</th><th>Cant.</th><th>Cotizado</th><th>Entregado</th><th>%</th><th style="width:220px">Visual</th>
+                  </tr>
+                </thead>
+                <tbody id="topUsersBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="chartCard">
+            <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+              <div style="font-weight:900;color:#6a3b1b">🏬 Top bodegas</div>
+              <span class="pill" id="topWhHint">—</span>
+            </div>
+            <div class="tableWrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Bodega</th><th>Cant.</th><th>Cotizado</th><th>Entregado</th><th>%</th><th style="width:220px">Visual</th>
+                  </tr>
+                </thead>
+                <tbody id="topWhBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid2" style="margin-top:12px">
+          <div class="chartCard">
+            <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+              <div style="font-weight:900;color:#6a3b1b">🏷️ Top clientes</div>
+              <span class="pill" id="topClientsHint">—</span>
+            </div>
+            <div class="tableWrap">
+              <table>
+                <thead><tr><th>Cliente</th><th>Cant.</th><th>$</th><th style="width:220px">Visual</th></tr></thead>
+                <tbody id="topClientsBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="chartCard">
+            <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+              <div style="font-weight:900;color:#6a3b1b">🧩 Categorías</div>
+              <span class="pill" id="groupsHint">—</span>
+            </div>
+            <div class="tableWrap">
+              <table>
+                <thead><tr><th>Grupo</th><th>Cant.</th><th>$</th><th style="width:220px">Visual</th></tr></thead>
+                <tbody id="groupsBody"></tbody>
+              </table>
+            </div>
+            <div class="muted" style="margin-top:10px">
+              Si una categoría te sale 0, casi siempre es porque el nombre viene diferente. Este HTML hace match tolerante (minúsculas + espacios).
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- HISTÓRICO -->
+    <section class="section" id="tab_quotes" style="display:none">
+      <div class="section-h">
+        <strong>🧾 Histórico (SL)</strong>
+        <span class="pill" id="quotesHint">—</span>
+      </div>
+      <div class="section-b">
+        <div class="row">
+          <div><label>Desde</label><input id="qFrom" class="input" type="date"></div>
+          <div><label>Hasta</label><input id="qTo" class="input" type="date"></div>
+          <div><label>Usuario</label><input id="qUser" class="input" placeholder="Ej: luis01"></div>
+          <div><label>Cliente</label><input id="qClient" class="input" placeholder="Ej: Ricamar"></div>
+        </div>
+
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;align-items:center">
+          <button class="btn btn-primary" id="btnLoadQuotes" type="button">✅ Buscar</button>
+          <button class="btn btn-outline" id="btnExportQuotesXlsx" type="button">📄 Exportar Excel</button>
+          <button class="btn btn-outline" id="btnQuotesDay" type="button">📅 Día</button>
+          <button class="btn btn-outline" id="btnQuotesOpen" type="button">🟠 Abiertas</button>
+
+          <span class="pill" id="quotesCount">0 registros</span>
+          <span class="pill warn" id="quotesScopeInfo">Scope</span>
+          <span class="pill" id="quotesFillPill">Fill rate: —</span>
+
+          <div style="margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button class="btn btn-outline" id="btnPrevPage" type="button" style="height:36px;border-radius:12px;padding:0 10px;font-size:12px">⬅️</button>
+            <span class="pill" id="pageInfo">Página 1</span>
+            <button class="btn btn-outline" id="btnNextPage" type="button" style="height:36px;border-radius:12px;padding:0 10px;font-size:12px">➡️</button>
+            <span class="pill" id="pageMeta">20 por página</span>
+          </div>
+        </div>
+
+        <div class="tableWrap" style="margin-top:10px">
+          <table>
+            <thead>
+              <tr>
+                <th>Fecha</th><th>DocNum</th><th>Cliente</th><th>Usuario</th><th>Bodega</th>
+                <th>Estado</th><th>Cotizado</th><th>Entregado</th><th>Comentarios</th>
+              </tr>
+            </thead>
+            <tbody id="quotesBody"></tbody>
+          </table>
+        </div>
+        <div class="muted" style="margin-top:10px">
+          Tip: “Entregado” se calcula por batch (20 docNums) vía /quotes/delivered al cambiar de página también.
+        </div>
+      </div>
+    </section>
+
+    <!-- USUARIOS -->
+    <section class="section" id="tab_users" style="display:none">
+      <div class="section-h">
+        <strong>👥 Usuarios</strong>
+        <span class="pill" id="usersHint">—</span>
+      </div>
+      <div class="section-b">
+
+        <div class="row">
+          <div><label>Username</label><input id="uUsername" class="input" placeholder="Ej: vane15"></div>
+          <div><label>Nombre</label><input id="uFullName" class="input" placeholder="Ej: Vanessa Pérez"></div>
+          <div><label>PIN</label><input id="uPin" class="input" type="password" placeholder="Mínimo 4"></div>
+          <div>
+            <label>Provincia</label>
+            <input id="uProvince" class="input" placeholder="Ej: Panamá / Chiriquí / Veraguas">
+            <div class="muted" style="margin-top:6px">Bodega sugerida: <b id="uWhPreview">--</b></div>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
+          <button class="btn btn-primary" id="btnCreateUser" type="button">➕ Crear usuario</button>
+          <span class="pill" id="usersCount">0 usuarios</span>
+        </div>
+
+        <div class="tableWrap" style="margin-top:10px">
+          <table>
+            <thead>
+              <tr><th>ID</th><th>Username</th><th>Nombre</th><th>Activo</th><th>Provincia</th><th>Bodega</th><th>Creado</th><th>Acción</th></tr>
+            </thead>
+            <tbody id="usersBody"></tbody>
+          </table>
+        </div>
+
+      </div>
+    </section>
+
+    <div class="muted" style="text-align:center;margin-top:16px">©️ 2026 PRODIMA · Admin interno</div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <!-- LOGIN -->
+  <div class="overlay" id="overlayLogin">
+    <div class="modal">
+      <div class="modal-h">
+        <div>🔐 Login Administrador</div>
+        <span class="pill" id="loginState">—</span>
+      </div>
+      <div class="modal-b">
+        <div class="row2">
+          <div><label>Usuario</label><input id="aUser" class="input" placeholder="ADMIN" autocomplete="username"></div>
+          <div><label>Contraseña</label><input id="aPass" class="input" type="password" placeholder="********" autocomplete="current-password"></div>
+        </div>
+        <div class="muted" style="margin-top:10px">Debes iniciar sesión como admin.</div>
+      </div>
+      <div class="modal-f">
+        <button class="btn btn-primary" id="btnLogin" type="button">Entrar</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* =========================
+   CONFIG
+========================= */
+const API_BASE = "https://prodima-admin.onrender.com";
+const ADMIN_TOKEN_KEY = "prodima_admin_token";
+const PAGE_SIZE = 20;
+
+/* =========================
+   STATE
+========================= */
+let USERS_LIST = [];
+let CREATED_USER_SET = new Set();
+
+let DASH_RAW = null;
+let USERS_EXPANDED = false;
+
+let LAST_QUOTES = [];
+let QUOTES_PAGE = 1;
+let QUOTES_TOTAL = null;     // si backend lo devuelve
+let QUOTES_HAS_MORE = true;
+let QUOTES_SKIP = 0;         // skip real
+
+/* =========================
+   UI Helpers
+========================= */
+function showToast(msg, type="ok"){
+  const t = document.getElementById("toast");
+  t.className = "toast " + (type==="ok" ? "ok" : type==="warn" ? "warn" : "bad");
+  t.textContent = msg;
+  t.style.display = "block";
+  setTimeout(()=> t.style.display = "none", 5200);
 }
-async function dbQuery(text, params = []) {
-  return pool.query(text, params);
+function money(n){
+  const x = Number(n || 0);
+  return "$ " + (Number.isFinite(x) ? x.toFixed(2) : "0.00");
 }
-
-async function ensureDb() {
-  if (!hasDb()) return;
-
-  // users
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS app_users (
-      id SERIAL PRIMARY KEY,
-      username TEXT UNIQUE NOT NULL,
-      full_name TEXT DEFAULT '',
-      pin_hash TEXT NOT NULL,
-      province TEXT DEFAULT '',
-      warehouse_code TEXT DEFAULT '',
-      is_active BOOLEAN DEFAULT TRUE,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // sync state
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS sync_state (
-      k TEXT PRIMARY KEY,
-      v TEXT NOT NULL,
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // quote header cache (DB dashboard)
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS quote_head_cache (
-      doc_entry INTEGER PRIMARY KEY,
-      doc_num   INTEGER NOT NULL,
-      doc_date  DATE NOT NULL,
-      card_code TEXT NOT NULL,
-      card_name TEXT NOT NULL,
-      usuario   TEXT NOT NULL DEFAULT 'sin_user',
-      warehouse TEXT NOT NULL DEFAULT 'sin_wh',
-      doc_total NUMERIC(18,2) NOT NULL DEFAULT 0,
-      delivered_total NUMERIC(18,2) NOT NULL DEFAULT 0,
-      pending_total   NUMERIC(18,2) NOT NULL DEFAULT 0,
-      document_status TEXT NOT NULL DEFAULT '',
-      cancel_status   TEXT NOT NULL DEFAULT '',
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // quote lines cache (para categorías)
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS quote_line_cache (
-      doc_entry INTEGER NOT NULL,
-      line_num  INTEGER NOT NULL,
-      doc_num   INTEGER NOT NULL,
-      doc_date  DATE NOT NULL,
-      card_code TEXT NOT NULL,
-      warehouse TEXT NOT NULL DEFAULT 'sin_wh',
-      item_code TEXT NOT NULL DEFAULT '',
-      item_desc TEXT NOT NULL DEFAULT '',
-      item_group TEXT NOT NULL DEFAULT '',
-      quantity NUMERIC(18,4) NOT NULL DEFAULT 0,
-      line_total NUMERIC(18,2) NOT NULL DEFAULT 0,
-      updated_at TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY (doc_entry, line_num)
-    );
-  `);
-
-  // item group cache (ItemCode -> GroupName)
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS item_group_cache (
-      item_code TEXT PRIMARY KEY,
-      group_name TEXT NOT NULL DEFAULT '',
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_qhc_date ON quote_head_cache(doc_date);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_qhc_user ON quote_head_cache(usuario);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_qhc_wh ON quote_head_cache(warehouse);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_qhc_card ON quote_head_cache(card_code);`);
-
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_qlc_date ON quote_line_cache(doc_date);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_qlc_group ON quote_line_cache(item_group);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_qlc_item ON quote_line_cache(item_code);`);
+function pct(n){
+  const x = Number(n||0);
+  return (Number.isFinite(x) ? x.toFixed(2) : "0.00") + "%";
 }
-
-async function setState(k, v) {
-  if (!hasDb()) return;
-  await dbQuery(
-    `INSERT INTO sync_state(k,v,updated_at) VALUES($1,$2,NOW())
-     ON CONFLICT(k) DO UPDATE SET v=EXCLUDED.v, updated_at=NOW()`,
-    [String(k), String(v)]
-  );
-}
-async function getState(k) {
-  if (!hasDb()) return "";
-  const r = await dbQuery(`SELECT v FROM sync_state WHERE k=$1 LIMIT 1`, [String(k)]);
-  return r.rows?.[0]?.v || "";
-}
-
-/* =========================================================
-   ✅ Helpers
-========================================================= */
-function safeJson(res, status, obj) {
-  res.status(status).json(obj);
-}
-function signToken(payload, ttl = "12h") {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: ttl });
-}
-function readBearer(req) {
-  const auth = String(req.headers.authorization || "");
-  const m = auth.match(/^Bearer\s+(.+)$/i);
-  return m ? m[1] : "";
-}
-function verifyAdmin(req, res, next) {
-  const token = readBearer(req);
-  if (!token) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
-
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded?.role !== "admin") return safeJson(res, 403, { ok: false, message: "Forbidden" });
-    req.admin = decoded;
-    next();
-  } catch {
-    return safeJson(res, 401, { ok: false, message: "Invalid token" });
-  }
-}
-function missingSapEnv() {
-  return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
-}
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-function addDaysISO(iso, days) {
-  const d = new Date(String(iso || "").slice(0, 10));
-  if (Number.isNaN(d.getTime())) return "";
-  d.setDate(d.getDate() + Number(days || 0));
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
+function ymd(d){
+  const dt = (d instanceof Date) ? d : new Date(d);
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth()+1).padStart(2,'0');
+  const dd = String(dt.getDate()).padStart(2,'0');
   return `${y}-${m}-${dd}`;
 }
-const TZ_OFFSET_MIN = -300;
-function getDateISOInOffset(offsetMin = 0) {
-  const now = new Date();
-  const ms = now.getTime() + now.getTimezoneOffset() * 60000 + Number(offsetMin) * 60000;
-  const d = new Date(ms);
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
+function fmtDateES(iso){
+  const s = String(iso || "").slice(0,10);
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(s)) return s || "--";
+  const [Y,M,D] = s.split("-");
+  return `${D}/${M}/${Y}`;
 }
-function isISO(s) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
+function getAdminToken(){ return localStorage.getItem(ADMIN_TOKEN_KEY) || ""; }
+function setAdminToken(t){ localStorage.setItem(ADMIN_TOKEN_KEY, t); }
+function clearAdminToken(){ localStorage.removeItem(ADMIN_TOKEN_KEY); }
+function authHeaders(){
+  const t = getAdminToken();
+  return { "Content-Type":"application/json", ...(t ? {"Authorization":"Bearer "+t} : {}) };
 }
+function setApiStatus(ok){
+  const el = document.getElementById("apiStatus");
+  el.className = "pill " + (ok ? "ok" : "bad");
+  el.textContent = ok ? "API: OK ✅" : "API: ERROR";
+}
+function setAuthStatus(ok){
+  const el = document.getElementById("authStatus");
+  el.className = "pill " + (ok ? "ok" : "bad");
+  el.textContent = ok ? "Admin: sí ✅" : "Admin: no";
+}
+function openLogin(){ document.getElementById("overlayLogin").style.display = "flex"; }
+function closeLogin(){ document.getElementById("overlayLogin").style.display = "none"; }
 
-function parseUserFromComments(comments) {
-  const m = String(comments || "").match(/\[user:([^\]]+)\]/i);
-  return m ? String(m[1]).trim() : "";
+function isScopeOnlyCreated(){ return !!document.getElementById("scopeOnlyCreated")?.checked; }
+function setScopePill(){
+  const el = document.getElementById("scopePill");
+  const only = isScopeOnlyCreated();
+  el.className = "pill " + (only ? "ok" : "warn");
+  el.textContent = only ? "Scope: Usuarios creados" : "Scope: Todos";
 }
-function parseWhFromComments(comments) {
-  const m = String(comments || "").match(/\[wh:([^\]]+)\]/i);
-  return m ? String(m[1]).trim() : "";
+function buildCreatedUserSet(){
+  const set = new Set();
+  for(const u of (USERS_LIST||[])){
+    const un = String(u.username||"").trim().toLowerCase();
+    if(un) set.add(un);
+  }
+  CREATED_USER_SET = set;
+  document.getElementById("createdUsersChip").textContent = `Usuarios creados: ${set.size}`;
 }
-function isCancelledLike(q) {
-  const cancelVal = q?.CancelStatus ?? q?.cancelStatus ?? q?.Cancelled ?? q?.cancelled ?? "";
-  const cancelRaw = String(cancelVal).trim().toLowerCase();
-  const commLower = String(q?.Comments || q?.comments || "").toLowerCase();
-  const stLower = String(q?.DocumentStatus || q?.documentStatus || "").toLowerCase();
-  return (
-    cancelRaw === "csyes" ||
-    cancelRaw === "yes" ||
-    cancelRaw === "true" ||
-    cancelRaw.includes("csyes") ||
-    cancelRaw.includes("cancel") ||
-    stLower.includes("cancel") ||
-    commLower.includes("[cancel") ||
-    commLower.includes("cancelad")
-  );
-}
-
-/* =========================================================
-   ✅ HEALTH
-========================================================= */
-app.get("/api/health", async (req, res) => {
-  safeJson(res, 200, {
-    ok: true,
-    message: "✅ PRODIMA API activa",
-    db: hasDb() ? "on" : "off",
-    sap: missingSapEnv() ? "missing" : "ok",
-    priceList: SAP_PRICE_LIST,
-    whDefault: SAP_WAREHOUSE,
-    quotes_last_sync_at: await getState("quotes_last_sync_at"),
+function applyScopeToQuotes(quotes){
+  if(!isScopeOnlyCreated()) return quotes;
+  return (quotes||[]).filter(q=>{
+    const u = String(q.usuario||"").trim().toLowerCase();
+    return u && CREATED_USER_SET.has(u);
   });
-});
-
-/* =========================================================
-   ✅ fetch wrapper (Node16/18)
-========================================================= */
-let _fetch = globalThis.fetch || null;
-async function httpFetch(url, options) {
-  if (_fetch) return _fetch(url, options);
-  const mod = await import("node-fetch");
-  _fetch = mod.default;
-  return _fetch(url, options);
+}
+function normalizeText(s){
+  return String(s||"")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g,"")
+    .replace(/\s+/g," ");
+}
+function barCell(value,total){
+  const v = Math.max(0, Number(value||0));
+  const t = Math.max(0, Number(total||0));
+  const p = t>0 ? Math.max(0, Math.min(100, (v/t)*100)) : 0;
+  return `
+    <div class="barRow">
+      <div class="bar"><i style="width:${p.toFixed(0)}%"></i></div>
+      <span class="muted" style="min-width:54px;text-align:right">${p.toFixed(1)}%</span>
+    </div>
+  `;
 }
 
-/* =========================================================
-   ✅ SAP Service Layer
-========================================================= */
-let SL_COOKIE = "";
-let SL_COOKIE_AT = 0;
-
-async function slLogin() {
-  const url = `${SAP_BASE_URL.replace(/\/$/, "")}/Login`;
-  const body = { CompanyDB: SAP_COMPANYDB, UserName: SAP_USER, Password: SAP_PASS };
-
-  const r = await httpFetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+/* =========================
+   API
+========================= */
+async function apiHealth(){
+  const r = await fetch(`${API_BASE}/api/health`);
+  const j = await r.json().catch(()=>({}));
+  return { ok: r.ok && j.ok, data: j };
+}
+async function apiAdminLogin(user, pass){
+  const res = await fetch(`${API_BASE}/api/admin/login`,{
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ user, pass })
   });
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok || !data.ok) throw new Error(data?.message || "Login inválido");
+  return data;
+}
+async function apiGetUsers(){
+  const res = await fetch(`${API_BASE}/api/admin/users`, { headers: authHeaders() });
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok || !data.ok) throw new Error(data?.message || "No se pudo cargar usuarios");
+  return data.users || [];
+}
+async function apiDashDb(from,to){
+  const qs = new URLSearchParams();
+  if(from) qs.set("from", from);
+  if(to) qs.set("to", to);
+  if(isScopeOnlyCreated()) qs.set("onlyCreated","1");
+  const res = await fetch(`${API_BASE}/api/admin/quotes/dashboard-db?${qs.toString()}`, { headers: authHeaders() });
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok || !data.ok) throw new Error(data?.message || "No se pudo cargar dashboard DB");
+  return data;
+}
+async function apiGetQuotes({from,to,user,client,limit=PAGE_SIZE,skip=0}){
+  const qs = new URLSearchParams();
+  if(from) qs.set("from", from);
+  if(to) qs.set("to", to);
+  if(user) qs.set("user", user);
+  if(client) qs.set("client", client);
+  qs.set("limit", String(limit));
+  qs.set("skip", String(skip));
+  if(isScopeOnlyCreated()) qs.set("onlyCreated","1");
 
-  const txt = await r.text();
-  let data = {};
-  try { data = JSON.parse(txt); } catch {}
-
-  if (!r.ok) throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
-
-  const setCookie = r.headers.get("set-cookie") || "";
-  const cookies = [];
-  for (const part of setCookie.split(",")) {
-    const s = part.trim();
-    if (s.startsWith("B1SESSION=") || s.startsWith("ROUTEID=")) cookies.push(s.split(";")[0]);
-  }
-  SL_COOKIE = cookies.join("; ");
-  SL_COOKIE_AT = Date.now();
+  const res = await fetch(`${API_BASE}/api/admin/quotes?${qs.toString()}`, { headers: authHeaders() });
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok || !data.ok) throw new Error(data?.message || "No se pudo cargar histórico");
+  return data;
+}
+async function apiDeliveredBatch(docNums, from, to){
+  const qs = new URLSearchParams();
+  qs.set("docNums", docNums.join(","));
+  if(from) qs.set("from", from);
+  if(to) qs.set("to", to);
+  const res = await fetch(`${API_BASE}/api/admin/quotes/delivered?${qs.toString()}`, { headers: authHeaders() });
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok || !data.ok) throw new Error(data?.message || "No se pudo calcular entregado");
+  return data.delivered || {};
 }
 
-async function slFetch(path, options = {}) {
-  if (missingSapEnv()) throw new Error("Missing SAP env");
-  if (!SL_COOKIE || Date.now() - SL_COOKIE_AT > 25 * 60 * 1000) await slLogin();
+/* =========================
+   DASHBOARD: categoría (tolerante)
+========================= */
+function getSelectedCat(){ return String(document.getElementById("dashCat").value || "__ALL__"); }
 
-  const base = SAP_BASE_URL.replace(/\/$/, "");
-  const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
+function applyCategoryView(d0, cat){
+  if(!d0 || !d0.ok) return d0;
+  if(!cat || cat==="__ALL__") return d0;
 
-  const controller = new AbortController();
-  const timeoutMs = Number(options.timeoutMs || 20000);
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const target = normalizeText(cat);
+  const byGroup = Array.isArray(d0.byGroup) ? d0.byGroup : [];
+  const gTotal = byGroup.reduce((a,x)=> a + Number(x.cotizado||0), 0);
 
-  try {
-    const r = await httpFetch(url, {
-      method: String(options.method || "GET").toUpperCase(),
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Cookie: SL_COOKIE,
-        ...(options.headers || {}),
-      },
-      body: options.body,
-    });
+  // match tolerante
+  const gCat = byGroup
+    .filter(x => normalizeText(x.group) === target)
+    .reduce((a,x)=> a + Number(x.cotizado||0), 0);
 
-    const txt = await r.text();
-    let data = {};
-    try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+  const share = (gTotal > 0) ? (gCat / gTotal) : 0;
 
-    if (!r.ok) {
-      if (r.status === 401 || r.status === 403) {
-        SL_COOKIE = "";
-        await slLogin();
-        return slFetch(path, options);
+  const clone = JSON.parse(JSON.stringify(d0));
+
+  // si no hay data de grupo para esa categoria, no escondemos todo: avisamos
+  clone.__cat = cat;
+  clone.__share = share;
+
+  clone.totals.cotizado = Number((Number(d0.totals.cotizado||0) * share).toFixed(2));
+  clone.totals.entregado = Number((Number(d0.totals.entregado||0) * share).toFixed(2));
+  clone.totals.fillRatePct = clone.totals.cotizado > 0 ? Number(((clone.totals.entregado/clone.totals.cotizado)*100).toFixed(2)) : 0;
+  clone.totals.quotes = Math.round(Number(d0.totals.quotes||0) * share);
+
+  const scaleArr = (arr)=> (arr||[]).map(r=>({
+    ...r,
+    cnt: Math.round(Number(r.cnt||0) * share),
+    cotizado: Number((Number(r.cotizado||0) * share).toFixed(2)),
+    entregado: Number((Number(r.entregado||0) * share).toFixed(2)),
+    fillRatePct: (Number(r.cotizado||0) * share) > 0 ? Number(((Number(r.entregado||0)*share)/(Number(r.cotizado||0)*share)*100).toFixed(2)) : 0
+  }));
+
+  clone.byUser = scaleArr(d0.byUser);
+  clone.byWh = scaleArr(d0.byWh);
+  clone.byClient = (d0.byClient||[]).map(r=>({
+    ...r,
+    cnt: Math.round(Number(r.cnt||0) * share),
+    cotizado: Number((Number(r.cotizado||0)*share).toFixed(2))
+  }));
+  clone.byGroup = (d0.byGroup||[]).filter(x=> normalizeText(x.group) === target).map(x=>({
+    ...x,
+    cnt: Number(x.cnt||0),
+    cotizado: Number(x.cotizado||0)
+  }));
+
+  return clone;
+}
+
+/* =========================
+   DASHBOARD render
+========================= */
+function renderDashDb(d0){
+  const cat = getSelectedCat();
+  const d = applyCategoryView(d0, cat);
+
+  document.getElementById("dashRangePill").textContent =
+    `${d.from} → ${d.to}` + (cat!=="__ALL__" ? ` · Cat: ${cat}` : "");
+
+  document.getElementById("syncPill").className = "pill " + (d.lastSyncAt ? "ok":"warn");
+  document.getElementById("syncPill").textContent = d.lastSyncAt ? ("Sync DB: " + d.lastSyncAt.replace("T"," ").slice(0,19)) : "Sync DB: —";
+
+  document.getElementById("kpiQuotes").textContent = String(d.totals.quotes||0);
+  document.getElementById("kpiCot").textContent = money(d.totals.cotizado||0);
+  document.getElementById("kpiEnt").textContent = money(d.totals.entregado||0);
+  document.getElementById("kpiFill").textContent = pct(d.totals.fillRatePct||0);
+
+  if(cat !== "__ALL__" && d.__share === 0){
+    document.getElementById("kpiNote").textContent = `⚠️ Cat no encontrada en byGroup (revise nombres)`;
+  }else if(cat !== "__ALL__"){
+    document.getElementById("kpiNote").textContent = `Filtro cat (aprox) · share ${(d.__share*100).toFixed(1)}%`;
+  }else{
+    document.getElementById("kpiNote").textContent = "DB cache";
+  }
+
+  // Top usuarios (expandible)
+  const users = d.byUser || [];
+  document.getElementById("topUsersHint").textContent = `${users.length} usuarios`;
+  const denomU = Math.max(1, Number(d.totals.cotizado||0));
+  const sliceN = USERS_EXPANDED ? users.length : 12;
+
+  document.getElementById("topUsersBody").innerHTML = users.slice(0,sliceN).map(r=>`
+    <tr>
+      <td>${r.usuario}</td>
+      <td>${Number(r.cnt||0)}</td>
+      <td>${money(r.cotizado)}</td>
+      <td>${money(r.entregado)}</td>
+      <td>${pct(r.fillRatePct)}</td>
+      <td>${barCell(r.cotizado, denomU)}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="6" class="muted">Sin datos</td></tr>`;
+
+  // Top bodegas
+  const wh = d.byWh || [];
+  document.getElementById("topWhHint").textContent = `${wh.length} bodegas`;
+  document.getElementById("topWhBody").innerHTML = wh.slice(0,12).map(r=>`
+    <tr>
+      <td>${r.warehouse}</td>
+      <td>${Number(r.cnt||0)}</td>
+      <td>${money(r.cotizado)}</td>
+      <td>${money(r.entregado)}</td>
+      <td>${pct(r.fillRatePct)}</td>
+      <td>${barCell(r.cotizado, denomU)}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="6" class="muted">Sin datos</td></tr>`;
+
+  // Top clientes
+  const cl = d.byClient || [];
+  document.getElementById("topClientsHint").textContent = `${cl.length} clientes`;
+  document.getElementById("topClientsBody").innerHTML = cl.slice(0,12).map(r=>`
+    <tr>
+      <td>${r.customer}</td>
+      <td>${Number(r.cnt||0)}</td>
+      <td>${money(r.cotizado)}</td>
+      <td>${barCell(r.cotizado, denomU)}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="4" class="muted">Sin datos</td></tr>`;
+
+  // Categorías
+  const gr = d0.byGroup || []; // acá usamos el total real para que el visual tenga sentido
+  const denomG = Math.max(1, gr.reduce((a,x)=>a+Number(x.cotizado||0),0));
+  document.getElementById("groupsHint").textContent = `${gr.length} grupos`;
+  document.getElementById("groupsBody").innerHTML = gr.slice(0,25).map(r=>`
+    <tr>
+      <td>${r.group}</td>
+      <td>${Number(r.cnt||0)}</td>
+      <td>${money(r.cotizado)}</td>
+      <td>${barCell(r.cotizado, denomG)}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="4" class="muted">Sin datos</td></tr>`;
+}
+
+async function loadDashboardDb(){
+  const from = document.getElementById("dashFrom").value || "";
+  const to = document.getElementById("dashTo").value || "";
+  document.getElementById("dashHint").textContent = "Cargando...";
+  try{
+    const d = await apiDashDb(from,to);
+    DASH_RAW = d;
+    renderDashDb(DASH_RAW);
+    document.getElementById("dashHint").textContent = "Listo ✅";
+  }catch(e){
+    document.getElementById("dashHint").textContent = "Error";
+    showToast(e.message || e, "bad");
+  }
+}
+
+/* =========================
+   HISTÓRICO: paginación real (FIX)
+========================= */
+function inferStatus(q){
+  const cs = (q.cancelStatus ?? q.CancelStatus ?? q.Cancelled ?? q.cancelled);
+  const csStr = String(cs ?? "").toLowerCase().trim();
+  const comm = String(q.comments||"").toLowerCase();
+  if(cs === true || csStr.includes("csyes") || csStr.includes("cancel") || comm.includes("cancel")){
+    return { text:"Cancelled", cls:"tag warn" };
+  }
+  const st = String(q.estado||q.DocumentStatus||"").toLowerCase();
+  if(st.includes("open")) return { text:"Open", cls:"tag bad" };
+  if(st.includes("close")) return { text:"Close", cls:"tag ok" };
+  return { text: String(q.estado||"--"), cls:"tag" };
+}
+function computeQuotesFill(quotes){
+  let cot=0, ent=0;
+  for(const q of (quotes||[])){
+    cot += Number(q.montoCotizacion||0);
+    ent += Number(q.montoEntregado||0);
+  }
+  const p = cot>0 ? (ent/cot)*100 : 0;
+  return { cot, ent, pct: p };
+}
+function renderQuotesTable(){
+  const body = document.getElementById("quotesBody");
+  body.innerHTML = (LAST_QUOTES||[]).map(q=>{
+    const cliente = `${q.cardCode||""} · ${q.cardName||""}`.trim();
+    const st = inferStatus(q);
+    return `
+      <tr>
+        <td>${fmtDateES(q.fecha)}</td>
+        <td>${q.docNum||""}</td>
+        <td>${cliente||"--"}</td>
+        <td>${q.usuario||"--"}</td>
+        <td>${q.warehouse||"--"}</td>
+        <td><span class="${st.cls}">${st.text}</span></td>
+        <td>${money(q.montoCotizacion||0)}</td>
+        <td>${money(q.montoEntregado||0)}</td>
+        <td>${String(q.comments||"").slice(0,200)}</td>
+      </tr>
+    `;
+  }).join("") || `<tr><td colspan="9" class="muted">Sin resultados</td></tr>`;
+
+  document.getElementById("quotesCount").textContent = `${LAST_QUOTES.length} registros`;
+  document.getElementById("quotesScopeInfo").textContent = isScopeOnlyCreated() ? "Scope: Usuarios creados" : "Scope: Todos";
+
+  const f = computeQuotesFill(LAST_QUOTES);
+  document.getElementById("quotesFillPill").textContent = `Fill rate: ${pct(f.pct)} (Ent ${money(f.ent)} / Cot ${money(f.cot)})`;
+
+  const pages = QUOTES_TOTAL != null ? Math.max(1, Math.ceil(QUOTES_TOTAL / PAGE_SIZE)) : (QUOTES_HAS_MORE ? "…" : QUOTES_PAGE);
+  document.getElementById("pageInfo").textContent = `Página ${QUOTES_PAGE} / ${pages}`;
+  document.getElementById("pageMeta").textContent = `${PAGE_SIZE} por página` + (QUOTES_TOTAL!=null ? ` · total ${QUOTES_TOTAL}` : "");
+
+  document.getElementById("btnPrevPage").disabled = QUOTES_PAGE <= 1;
+  // si no sabemos total, usamos hasMore
+  document.getElementById("btnNextPage").disabled = (QUOTES_TOTAL!=null) ? (QUOTES_PAGE >= Math.ceil(QUOTES_TOTAL/PAGE_SIZE)) : (!QUOTES_HAS_MORE);
+}
+
+async function hydrateDelivered(from,to){
+  const docNums = (LAST_QUOTES||[]).map(x=>Number(x.docNum)).filter(n=>Number.isFinite(n)&&n>0).slice(0,20);
+  if(!docNums.length) return;
+
+  try{
+    const delivered = await apiDeliveredBatch(docNums, from, to);
+    const map = new Map(Object.entries(delivered||{}));
+    for(const q of LAST_QUOTES){
+      const it = map.get(String(q.docNum||""));
+      if(it?.ok){
+        q.montoEntregado = Number(it.totalEntregado||0);
+        q.pendiente = Number(it.pendiente||0);
       }
-      throw new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
     }
-    return data;
-  } catch (e) {
-    if (String(e?.name) === "AbortError") throw new Error(`SAP timeout (${timeoutMs}ms) en slFetch`);
-    throw e;
-  } finally {
-    clearTimeout(timeout);
+  }catch(e){
+    showToast("Entregado batch falló: " + (e.message||e), "warn");
   }
 }
 
-async function sapGetFirstByDocNum(entity, docNum, select) {
-  const n = Number(docNum);
-  if (!Number.isFinite(n) || n <= 0) throw new Error("DocNum inválido");
+async function loadQuotesPage({page=1, openOnly=false}={}){
+  const from = document.getElementById("qFrom").value || "";
+  const to = document.getElementById("qTo").value || "";
+  const user = String(document.getElementById("qUser").value||"").trim();
+  const client = String(document.getElementById("qClient").value||"").trim();
 
-  const parts = [];
-  if (select) parts.push(`$select=${encodeURIComponent(select)}`);
-  parts.push(`$filter=${encodeURIComponent(`DocNum eq ${n}`)}`);
-  parts.push(`$top=1`);
+  const skip = (page - 1) * PAGE_SIZE;
+  document.getElementById("quotesHint").textContent = "Cargando...";
 
-  const r = await slFetch(`/${entity}?${parts.join("&")}`, { timeoutMs: 20000 });
-  const arr = Array.isArray(r?.value) ? r.value : [];
-  return arr[0] || null;
-}
-async function sapGetByDocEntry(entity, docEntry, timeoutMs = 20000) {
-  const n = Number(docEntry);
-  if (!Number.isFinite(n) || n <= 0) throw new Error("DocEntry inválido");
-  return slFetch(`/${entity}(${n})`, { timeoutMs });
-}
+  try{
+    const data = await apiGetQuotes({from,to,user,client,limit:PAGE_SIZE,skip});
+    let rows = data.quotes || [];
+    rows = applyScopeToQuotes(rows);
 
-/* =========================================================
-   ✅ Cache usuarios creados (scope)
-========================================================= */
-let CREATED_USERS_CACHE = { ts: 0, set: new Set() };
-const CREATED_USERS_TTL_MS = 5 * 60 * 1000;
-
-async function getCreatedUsersSetCached() {
-  if (!hasDb()) return new Set();
-  const now = Date.now();
-  if (CREATED_USERS_CACHE.ts && now - CREATED_USERS_CACHE.ts < CREATED_USERS_TTL_MS) {
-    return CREATED_USERS_CACHE.set;
-  }
-  const r = await dbQuery(`SELECT username FROM app_users WHERE is_active=TRUE`);
-  const set = new Set(
-    (r.rows || []).map((x) => String(x.username || "").trim().toLowerCase()).filter(Boolean)
-  );
-  CREATED_USERS_CACHE = { ts: now, set };
-  return set;
-}
-
-/* =========================================================
-   ✅ TRACE entregado (cotización -> pedido -> entrega)
-========================================================= */
-const TRACE_CACHE = new Map();
-const TRACE_TTL_MS = 6 * 60 * 60 * 1000;
-function cacheGet(key) {
-  const it = TRACE_CACHE.get(key);
-  if (!it) return null;
-  if (Date.now() - it.at > TRACE_TTL_MS) {
-    TRACE_CACHE.delete(key);
-    return null;
-  }
-  return it.data;
-}
-function cacheSet(key, data) {
-  TRACE_CACHE.set(key, { at: Date.now(), data });
-}
-
-async function traceQuoteTotals(quoteDocNum, fromOverride, toOverride) {
-  const cacheKey = `Q:${quoteDocNum}:${fromOverride || ""}:${toOverride || ""}`;
-  const cached = cacheGet(cacheKey);
-  if (cached) return cached;
-
-  const quoteHead = await sapGetFirstByDocNum(
-    "Quotations",
-    quoteDocNum,
-    "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments"
-  );
-  if (!quoteHead) {
-    const out = { ok: false, message: "Cotización no encontrada" };
-    cacheSet(cacheKey, out);
-    return out;
-  }
-
-  const quote = await sapGetByDocEntry("Quotations", quoteHead.DocEntry, 25000);
-  const quoteDocEntry = Number(quote.DocEntry);
-  const cardCode = String(quote.CardCode || "").trim();
-  const quoteDate = String(quote.DocDate || "").slice(0, 10);
-
-  const from = isISO(fromOverride) ? String(fromOverride) : addDaysISO(quoteDate, -7);
-  const to = isISO(toOverride) ? String(toOverride) : addDaysISO(quoteDate, 30);
-  const toPlus1 = addDaysISO(to, 1);
-
-  const ordersList = await slFetch(
-    `/Orders?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
-      `&$filter=${encodeURIComponent(
-        `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
-      )}` +
-      `&$orderby=DocDate desc,DocEntry desc&$top=200`,
-    { timeoutMs: 30000 }
-  );
-  const orderCandidates = Array.isArray(ordersList?.value) ? ordersList.value : [];
-
-  const orders = [];
-  for (const o of orderCandidates) {
-    const od = await sapGetByDocEntry("Orders", o.DocEntry, 30000);
-    const lines = Array.isArray(od?.DocumentLines) ? od.DocumentLines : [];
-    const linked = lines.some((l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry);
-    if (linked) orders.push(od);
-    await sleep(12);
-  }
-
-  let totalEntregado = 0;
-
-  if (orders.length) {
-    const orderDocEntrySet = new Set(orders.map((x) => Number(x.DocEntry)));
-
-    const delList = await slFetch(
-      `/DeliveryNotes?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
-        `&$filter=${encodeURIComponent(
-          `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
-        )}` +
-        `&$orderby=DocDate desc,DocEntry desc&$top=300`,
-      { timeoutMs: 30000 }
-    );
-    const delCandidates = Array.isArray(delList?.value) ? delList.value : [];
-
-    const seen = new Set();
-    for (const d of delCandidates) {
-      const dd = await sapGetByDocEntry("DeliveryNotes", d.DocEntry, 30000);
-      const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
-      const linked = lines.some((l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry)));
-      if (linked) {
-        const de = Number(dd.DocEntry);
-        if (!seen.has(de)) {
-          seen.add(de);
-          totalEntregado += Number(dd?.DocTotal || 0);
-        }
-      }
-      await sleep(12);
+    if(openOnly){
+      rows = rows.filter(q => inferStatus(q).text === "Open");
+      // ojo: esto afecta el count del page, pero se deja porque tu objetivo es ver Open rápido
     }
+
+    LAST_QUOTES = rows;
+    QUOTES_PAGE = page;
+    QUOTES_SKIP = skip;
+
+    QUOTES_TOTAL = (data.total != null && Number.isFinite(Number(data.total))) ? Number(data.total) : null;
+    QUOTES_HAS_MORE = (rows.length >= PAGE_SIZE) && (QUOTES_TOTAL==null);
+
+    renderQuotesTable();
+    await hydrateDelivered(from,to);
+    renderQuotesTable();
+
+    document.getElementById("quotesHint").textContent = openOnly ? "Listo ✅ (Open)" : "Listo ✅";
+  }catch(e){
+    document.getElementById("quotesHint").textContent = "Error";
+    showToast(e.message || e, "bad");
   }
-
-  const totalCotizado = Number(quote.DocTotal || 0);
-  const pendiente = Number((totalCotizado - totalEntregado).toFixed(2));
-
-  const out = { ok: true, totalCotizado, totalEntregado, pendiente };
-  cacheSet(cacheKey, out);
-  return out;
 }
 
-/* =========================================================
-   ✅ ADMIN LOGIN
-========================================================= */
-app.post("/api/admin/login", async (req, res) => {
-  const user = String(req.body?.user || "").trim();
-  const pass = String(req.body?.pass || "").trim();
+function exportQuotesXLSX(){
+  const rows = LAST_QUOTES || [];
+  if(!rows.length){ showToast("No hay datos para exportar.","bad"); return; }
+  if(typeof XLSX === "undefined"){ showToast("No cargó XLSX (CDN).","bad"); return; }
 
-  if (user !== ADMIN_USER || pass !== ADMIN_PASS) {
-    return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
-  }
-  const token = signToken({ role: "admin", user }, "12h");
-  return safeJson(res, 200, { ok: true, token });
-});
+  const data = rows.map(q=>({
+    Fecha: String(q.fecha||"").slice(0,10),
+    DocNum: q.docNum,
+    CardCode: q.cardCode,
+    CardName: q.cardName,
+    Usuario: q.usuario,
+    Bodega: q.warehouse,
+    Estado: inferStatus(q).text,
+    MontoCotizacion: Number(q.montoCotizacion||0),
+    MontoEntregado: Number(q.montoEntregado||0),
+    Comentarios: q.comments || ""
+  }));
 
-/* =========================================================
-   ✅ ADMIN USERS (CRUD completo)
-========================================================= */
-app.get("/api/admin/users", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+  const ws = XLSX.utils.json_to_sheet(data);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Historico");
+  XLSX.writeFile(wb, `prodima_historico_${Date.now()}.xlsx`);
+}
 
-    const r = await dbQuery(
-      `SELECT id, username, full_name, province, warehouse_code, is_active, created_at
-       FROM app_users
-       ORDER BY id DESC`
-    );
-    return safeJson(res, 200, { ok: true, users: r.rows });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
-});
-
-function provinceToWarehouse(province) {
+/* =========================
+   USERS UI (mínimo)
+========================= */
+function provinceToWarehouseUI(province){
   const p = String(province || "").trim().toLowerCase();
   if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
   if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera") return "500";
   if (p === "panamá" || p === "panama" || p === "panamá oeste" || p === "panama oeste" || p === "colón" || p === "colon") return "300";
-  return "";
+  return "--";
+}
+async function loadUsers(){
+  document.getElementById("usersHint").textContent = "Cargando...";
+  try{
+    USERS_LIST = await apiGetUsers();
+    buildCreatedUserSet();
+    document.getElementById("usersCount").textContent = `${USERS_LIST.length} usuarios`;
+    document.getElementById("usersHint").textContent = "Listo ✅";
+  }catch(e){
+    document.getElementById("usersHint").textContent = "Error";
+    showToast(e.message||e,"bad");
+  }
 }
 
-app.post("/api/admin/users", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+/* =========================
+   AUTH
+========================= */
+async function doLogin(){
+  const user = String(document.getElementById("aUser").value||"").trim();
+  const pass = String(document.getElementById("aPass").value||"").trim();
+  if(!user || !pass) return showToast("Completa usuario y contraseña","bad");
 
-    const username = String(req.body?.username || "").trim().toLowerCase();
-    const fullName = String(req.body?.fullName || req.body?.full_name || "").trim();
-    const pin = String(req.body?.pin || "").trim();
-    const province = String(req.body?.province || "").trim();
+  const btn = document.getElementById("btnLogin");
+  btn.disabled=true; btn.textContent="⏳ Entrando...";
 
-    if (!username) return safeJson(res, 400, { ok: false, message: "username requerido" });
-    if (!pin || pin.length < 4) return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
+  try{
+    const r = await apiAdminLogin(user, pass);
+    setAdminToken(r.token);
+    setAuthStatus(true);
+    document.getElementById("whoami").textContent = "Usuario: " + user;
+    document.getElementById("btnLogout").style.display = "inline-flex";
+    closeLogin();
 
-    const wh = provinceToWarehouse(province) || String(req.body?.warehouse_code || "").trim() || "";
-
-    const pin_hash = await bcrypt.hash(pin, 10);
-
-    const r = await dbQuery(
-      `INSERT INTO app_users (username, full_name, pin_hash, province, warehouse_code, is_active)
-       VALUES ($1,$2,$3,$4,$5,TRUE)
-       RETURNING id, username, full_name, province, warehouse_code, is_active, created_at`,
-      [username, fullName, pin_hash, province, wh]
-    );
-
-    CREATED_USERS_CACHE.ts = 0; // invalidate cache
-    return safeJson(res, 200, { ok: true, user: r.rows[0] });
-  } catch (e) {
-    const msg = String(e?.message || e);
-    if (msg.toLowerCase().includes("duplicate") || msg.toLowerCase().includes("unique")) {
-      return safeJson(res, 400, { ok: false, message: "username ya existe" });
-    }
-    return safeJson(res, 500, { ok: false, message: msg });
+    await refreshAll();
+    showToast("Sesión admin iniciada ✅","ok");
+  }catch(e){
+    showToast(e.message||e,"bad");
+  }finally{
+    btn.disabled=false; btn.textContent="Entrar";
   }
+}
+function doLogout(){
+  clearAdminToken();
+  setAuthStatus(false);
+  document.getElementById("btnLogout").style.display="none";
+  document.getElementById("whoami").textContent="Usuario: --";
+  openLogin();
+}
+
+/* =========================
+   Refresh
+========================= */
+async function refreshAll(){
+  await loadUsers();
+  await loadDashboardDb();
+  await loadQuotesPage({page:1, openOnly:false});
+}
+
+/* =========================
+   EVENTS
+========================= */
+document.querySelectorAll(".tab").forEach(el=> el.addEventListener("click", ()=> {
+  document.querySelectorAll(".tab").forEach(t=>t.classList.toggle("active", t===el));
+  document.getElementById("tab_dash").style.display = el.dataset.tab==="dash" ? "" : "none";
+  document.getElementById("tab_quotes").style.display = el.dataset.tab==="quotes" ? "" : "none";
+  document.getElementById("tab_users").style.display = el.dataset.tab==="users" ? "" : "none";
+}));
+
+document.getElementById("btnLogin").addEventListener("click", doLogin);
+document.getElementById("aPass").addEventListener("keydown",(e)=>{ if(e.key==="Enter") doLogin(); });
+document.getElementById("btnLogout").addEventListener("click", doLogout);
+
+document.getElementById("btnRefresh").addEventListener("click", async ()=>{
+  if(!getAdminToken()) return openLogin();
+  await refreshAll();
 });
 
-app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) return safeJson(res, 400, { ok: false, message: "id inválido" });
+document.getElementById("btnLoadDash").addEventListener("click", loadDashboardDb);
+document.getElementById("dashCat").addEventListener("change", ()=>{ if(DASH_RAW) renderDashDb(DASH_RAW); });
 
-    const r = await dbQuery(
-      `UPDATE app_users
-       SET is_active = NOT is_active
-       WHERE id=$1
-       RETURNING id, username, full_name, province, warehouse_code, is_active, created_at`,
-      [id]
-    );
-    CREATED_USERS_CACHE.ts = 0;
-    return safeJson(res, 200, { ok: true, user: r.rows[0] });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
+document.getElementById("btnUsersExpand").addEventListener("click", ()=>{
+  USERS_EXPANDED = !USERS_EXPANDED;
+  document.getElementById("btnUsersExpand").textContent = USERS_EXPANDED ? "Ver top 12" : "Ver todos";
+  if(DASH_RAW) renderDashDb(DASH_RAW);
 });
 
-app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) return safeJson(res, 400, { ok: false, message: "id inválido" });
-
-    await dbQuery(`DELETE FROM app_users WHERE id=$1`, [id]);
-    CREATED_USERS_CACHE.ts = 0;
-    return safeJson(res, 200, { ok: true });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
+document.getElementById("btnThisMonth").addEventListener("click", ()=>{
+  const now = new Date();
+  document.getElementById("dashFrom").value = ymd(new Date(now.getFullYear(), now.getMonth(), 1));
+  document.getElementById("dashTo").value = ymd(now);
+  loadDashboardDb();
+});
+document.getElementById("btnThisYear").addEventListener("click", ()=>{
+  const now = new Date();
+  document.getElementById("dashFrom").value = ymd(new Date(now.getFullYear(), 0, 1));
+  document.getElementById("dashTo").value = ymd(now);
+  loadDashboardDb();
+});
+document.getElementById("btnToday").addEventListener("click", ()=>{
+  const t = ymd(new Date());
+  document.getElementById("dashFrom").value = t;
+  document.getElementById("dashTo").value = t;
+  loadDashboardDb();
 });
 
-app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
-    const id = Number(req.params.id);
-    const pin = String(req.body?.pin || "").trim();
-    if (!Number.isFinite(id)) return safeJson(res, 400, { ok: false, message: "id inválido" });
-    if (!pin || pin.length < 4) return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
+document.getElementById("btnLoadQuotes").addEventListener("click", ()=> loadQuotesPage({page:1, openOnly:false}));
+document.getElementById("btnQuotesOpen").addEventListener("click", ()=> loadQuotesPage({page:1, openOnly:true}));
+document.getElementById("btnQuotesDay").addEventListener("click", ()=>{
+  const t = ymd(new Date());
+  document.getElementById("qFrom").value = t;
+  document.getElementById("qTo").value = t;
+  loadQuotesPage({page:1, openOnly:false});
+});
+document.getElementById("btnExportQuotesXlsx").addEventListener("click", exportQuotesXLSX);
 
-    const pin_hash = await bcrypt.hash(pin, 10);
-    await dbQuery(`UPDATE app_users SET pin_hash=$1 WHERE id=$2`, [pin_hash, id]);
-    return safeJson(res, 200, { ok: true });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
+document.getElementById("btnPrevPage").addEventListener("click", ()=>{
+  const next = Math.max(1, QUOTES_PAGE - 1);
+  loadQuotesPage({page:next, openOnly:false});
+});
+document.getElementById("btnNextPage").addEventListener("click", ()=>{
+  // si tenemos total, validamos
+  if(QUOTES_TOTAL != null){
+    const maxPage = Math.max(1, Math.ceil(QUOTES_TOTAL / PAGE_SIZE));
+    if(QUOTES_PAGE >= maxPage) return;
+  }else{
+    // si no tenemos total, dependemos de hasMore
+    if(!QUOTES_HAS_MORE) return;
   }
+  loadQuotesPage({page:QUOTES_PAGE + 1, openOnly:false});
 });
 
-/* =========================================================
-   ✅ HISTÓRICO (Service Layer) - rápido
-========================================================= */
-async function scanQuotes({ f, t, wantSkip, wantLimit, userFilter, clientFilter, onlyCreated }) {
-  const toPlus1 = addDaysISO(t, 1);
-  const batchTop = 200;
-
-  let skipSap = 0;
-  let totalFiltered = 0;
-  const pageRows = [];
-
-  const uFilter = String(userFilter || "").trim().toLowerCase();
-  const cFilter = String(clientFilter || "").trim().toLowerCase();
-
-  const maxSapPages = 40;
-  const seenDocEntry = new Set();
-
-  const createdSet = onlyCreated ? await getCreatedUsersSetCached() : null;
-
-  for (let page = 0; page < maxSapPages; page++) {
-    const raw = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
-        `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
-        `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`,
-      { timeoutMs: 20000 }
-    );
-
-    const rows = Array.isArray(raw?.value) ? raw.value : [];
-    if (!rows.length) break;
-
-    skipSap += rows.length;
-
-    for (const q of rows) {
-      const de = Number(q?.DocEntry);
-      if (Number.isFinite(de)) {
-        if (seenDocEntry.has(de)) continue;
-        seenDocEntry.add(de);
-      }
-
-      // para histórico dejamos canceladas visibles (tú las quieres ver). No filtramos aquí.
-
-      const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
-      const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
-
-      if (createdSet) {
-        const u = String(usuario || "").trim().toLowerCase();
-        if (!u || !createdSet.has(u)) continue;
-      }
-
-      if (uFilter && !String(usuario).toLowerCase().includes(uFilter)) continue;
-
-      if (cFilter) {
-        const cc = String(q.CardCode || "").toLowerCase();
-        const cn = String(q.CardName || "").toLowerCase();
-        if (!cc.includes(cFilter) && !cn.includes(cFilter)) continue;
-      }
-
-      const idx = totalFiltered++;
-      if (idx >= wantSkip && pageRows.length < wantLimit) {
-        pageRows.push({
-          docEntry: q.DocEntry,
-          docNum: q.DocNum,
-          cardCode: q.CardCode,
-          cardName: q.CardName,
-          fecha: String(q.DocDate || "").slice(0, 10),
-          estado: q.DocumentStatus || "",
-          cancelStatus: q.CancelStatus ?? "",
-          comments: q.Comments || "",
-          usuario,
-          warehouse: wh,
-          montoCotizacion: Number(q.DocTotal || 0),
-
-          // entregado: se llena por endpoint batch (quotes/delivered)
-          montoEntregado: 0,
-          pendiente: Number(q.DocTotal || 0),
-        });
-      }
-    }
-
-    if (pageRows.length >= wantLimit) break;
-  }
-
-  return { pageRows, totalFiltered };
-}
-
-app.get("/api/admin/quotes", verifyAdmin, async (req, res) => {
-  try {
-    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
-
-    const from = String(req.query?.from || "");
-    const to = String(req.query?.to || "");
-
-    const onlyCreated = String(req.query?.onlyCreated || "0") === "1";
-
-    const limitRaw =
-      req.query?.limit != null
-        ? Number(req.query.limit)
-        : req.query?.top != null
-        ? Number(req.query.top)
-        : 20;
-
-    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
-    const skip = req.query?.skip != null ? Math.max(0, Number(req.query.skip) || 0) : 0;
-
-    const userFilter = String(req.query?.user || "");
-    const clientFilter = String(req.query?.client || "");
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
-
-    const f = isISO(from) ? from : defaultFrom;
-    const t = isISO(to) ? to : today;
-
-    const { pageRows, totalFiltered } = await scanQuotes({
-      f,
-      t,
-      wantSkip: skip,
-      wantLimit: limit,
-      userFilter,
-      clientFilter,
-      onlyCreated,
-    });
-
-    return safeJson(res, 200, {
-      ok: true,
-      quotes: pageRows,
-      from: f,
-      to: t,
-      limit,
-      skip,
-      total: totalFiltered,
-      scope: { onlyCreated },
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
+document.getElementById("scopeOnlyCreated").addEventListener("change", async ()=>{
+  setScopePill();
+  await loadDashboardDb();
+  await loadQuotesPage({page:1, openOnly:false});
 });
 
-app.get("/api/admin/quotes/delivered", verifyAdmin, async (req, res) => {
-  try {
-    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+/* =========================
+   INIT
+========================= */
+(async function init(){
+  try{
+    const r = await apiHealth();
+    setApiStatus(r.ok);
+  }catch{ setApiStatus(false); }
 
-    const docNums = String(req.query?.docNums || "")
-      .split(",")
-      .map((x) => Number(String(x).trim()))
-      .filter((n) => Number.isFinite(n) && n > 0)
-      .slice(0, 20);
+  setScopePill();
 
-    if (!docNums.length) return safeJson(res, 400, { ok: false, message: "docNums vacío" });
+  const now = new Date();
+  document.getElementById("dashFrom").value = ymd(new Date(now.getFullYear(), now.getMonth(), 1));
+  document.getElementById("dashTo").value = ymd(now);
 
-    const from = String(req.query?.from || "");
-    const to = String(req.query?.to || "");
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
-
-    const f = isISO(from) ? from : defaultFrom;
-    const tt = isISO(to) ? to : today;
-
-    const out = {};
-    for (const dn of docNums) {
-      try {
-        const r = await traceQuoteTotals(dn, f, tt);
-        if (r.ok) out[String(dn)] = { ok: true, totalEntregado: r.totalEntregado, pendiente: r.pendiente };
-        else out[String(dn)] = { ok: false, message: r.message || "no ok" };
-      } catch (e) {
-        out[String(dn)] = { ok: false, message: e.message || String(e) };
-      }
-      await sleep(60);
-    }
-
-    return safeJson(res, 200, { ok: true, from: f, to: tt, delivered: out });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
+  if(getAdminToken()){
+    setAuthStatus(true);
+    document.getElementById("btnLogout").style.display="inline-flex";
+    document.getElementById("whoami").textContent="Usuario: Admin";
+    try{ await refreshAll(); }catch{ doLogout(); }
+  }else{
+    setAuthStatus(false);
+    openLogin();
   }
-});
-
-/* =========================================================
-   ✅ DASHBOARD DB: Sync (SAP -> Supabase)
-========================================================= */
-
-/** Item group resolver (cache DB + memory) */
-const ITEM_GROUP_MEM = new Map(); // itemCode -> {name, at}
-const ITEM_GROUP_TTL = 7 * 24 * 60 * 60 * 1000;
-
-async function getGroupFromDb(itemCode) {
-  if (!hasDb()) return "";
-  const r = await dbQuery(`SELECT group_name FROM item_group_cache WHERE item_code=$1 LIMIT 1`, [itemCode]);
-  return r.rows?.[0]?.group_name || "";
-}
-async function setGroupToDb(itemCode, groupName) {
-  if (!hasDb()) return;
-  await dbQuery(
-    `INSERT INTO item_group_cache(item_code, group_name, updated_at)
-     VALUES($1,$2,NOW())
-     ON CONFLICT(item_code) DO UPDATE SET group_name=EXCLUDED.group_name, updated_at=NOW()`,
-    [itemCode, groupName]
-  );
-}
-
-async function resolveItemGroup(itemCode) {
-  const code = String(itemCode || "").trim();
-  if (!code) return "";
-
-  const mem = ITEM_GROUP_MEM.get(code);
-  if (mem && Date.now() - mem.at < ITEM_GROUP_TTL) return mem.name;
-
-  const dbVal = await getGroupFromDb(code);
-  if (dbVal) {
-    ITEM_GROUP_MEM.set(code, { name: dbVal, at: Date.now() });
-    return dbVal;
-  }
-
-  // SAP: Items('CODE') -> ItemsGroupCode -> ItemGroups(id) -> GroupName
-  try {
-    const it = await slFetch(`/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemsGroupCode`, { timeoutMs: 20000 });
-    const grpCode = Number(it?.ItemsGroupCode);
-    if (!Number.isFinite(grpCode)) {
-      ITEM_GROUP_MEM.set(code, { name: "", at: Date.now() });
-      return "";
-    }
-    const grp = await slFetch(`/ItemGroups(${grpCode})?$select=GroupName`, { timeoutMs: 20000 });
-    const name = String(grp?.GroupName || "").trim();
-
-    await setGroupToDb(code, name);
-    ITEM_GROUP_MEM.set(code, { name, at: Date.now() });
-    return name;
-  } catch {
-    ITEM_GROUP_MEM.set(code, { name: "", at: Date.now() });
-    return "";
-  }
-}
-
-async function scanQuotationsHeaders({ from, to, maxDocs = 5000, onlyCreated = false }) {
-  const toPlus1 = addDaysISO(to, 1);
-  const batchTop = 200;
-  let skip = 0;
-  const out = [];
-
-  const createdSet = onlyCreated ? await getCreatedUsersSetCached() : null;
-
-  for (let page = 0; page < 250; page++) {
-    const raw = await slFetch(
-      `/Quotations?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
-        `&$filter=${encodeURIComponent(`DocDate ge '${from}' and DocDate lt '${toPlus1}'`)}` +
-        `&$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skip}`,
-      { timeoutMs: 25000 }
-    );
-
-    const rows = Array.isArray(raw?.value) ? raw.value : [];
-    if (!rows.length) break;
-    skip += rows.length;
-
-    for (const q of rows) {
-      // Dashboard DB NO quiere canceladas
-      if (isCancelledLike(q)) continue;
-
-      const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
-      if (createdSet) {
-        const u = String(usuario || "").trim().toLowerCase();
-        if (!u || !createdSet.has(u)) continue;
-      }
-
-      const wh = parseWhFromComments(q.Comments || "") || "sin_wh";
-
-      out.push({
-        DocEntry: Number(q.DocEntry),
-        DocNum: Number(q.DocNum),
-        DocDate: String(q.DocDate || "").slice(0, 10),
-        DocTotal: Number(q.DocTotal || 0),
-        CardCode: String(q.CardCode || ""),
-        CardName: String(q.CardName || ""),
-        DocumentStatus: String(q.DocumentStatus || ""),
-        CancelStatus: String(q.CancelStatus ?? ""),
-        Comments: String(q.Comments || ""),
-        usuario,
-        warehouse: wh,
-      });
-
-      if (out.length >= maxDocs) return out;
-    }
-  }
-  return out;
-}
-
-async function upsertQuoteHead(h, delivered) {
-  const docEntry = Number(h.DocEntry);
-  const docNum = Number(h.DocNum);
-  const docDate = String(h.DocDate || "").slice(0, 10);
-  const cardCode = String(h.CardCode || "");
-  const cardName = String(h.CardName || "");
-  const usuario = String(h.usuario || "sin_user");
-  const wh = String(h.warehouse || "sin_wh");
-  const docTotal = Number(h.DocTotal || 0);
-  const deliveredTotal = Number(delivered?.totalEntregado || 0);
-  const pendingTotal = Number((docTotal - deliveredTotal).toFixed(2));
-
-  await dbQuery(
-    `
-    INSERT INTO quote_head_cache
-      (doc_entry, doc_num, doc_date, card_code, card_name, usuario, warehouse, doc_total, delivered_total, pending_total, document_status, cancel_status)
-    VALUES
-      ($1,$2,$3::date,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-    ON CONFLICT(doc_entry) DO UPDATE SET
-      doc_num=EXCLUDED.doc_num,
-      doc_date=EXCLUDED.doc_date,
-      card_code=EXCLUDED.card_code,
-      card_name=EXCLUDED.card_name,
-      usuario=EXCLUDED.usuario,
-      warehouse=EXCLUDED.warehouse,
-      doc_total=EXCLUDED.doc_total,
-      delivered_total=EXCLUDED.delivered_total,
-      pending_total=EXCLUDED.pending_total,
-      document_status=EXCLUDED.document_status,
-      cancel_status=EXCLUDED.cancel_status,
-      updated_at=NOW()
-    `,
-    [
-      docEntry,
-      docNum,
-      docDate,
-      cardCode,
-      cardName,
-      usuario,
-      wh,
-      docTotal,
-      deliveredTotal,
-      pendingTotal,
-      String(h.DocumentStatus || ""),
-      String(h.CancelStatus || ""),
-    ]
-  );
-}
-
-async function upsertQuoteLines(h, doc) {
-  const docEntry = Number(h.DocEntry);
-  const docNum = Number(h.DocNum);
-  const docDate = String(h.DocDate || "").slice(0, 10);
-  const cardCode = String(h.CardCode || "");
-  const whDefault = String(h.warehouse || "sin_wh");
-
-  const lines = Array.isArray(doc?.DocumentLines) ? doc.DocumentLines : [];
-  if (!lines.length) return 0;
-
-  const values = [];
-  const params = [];
-  let p = 1;
-
-  for (const ln of lines) {
-    const lineNum = Number(ln.LineNum);
-    if (!Number.isFinite(lineNum)) continue;
-
-    const itemCode = String(ln.ItemCode || "").trim();
-    const itemDesc = String(ln.ItemDescription || ln.ItemName || "").trim();
-    const qty = Number(ln.Quantity || 0);
-    const lt = Number(ln.LineTotal || 0);
-    const wh = String(ln.WarehouseCode || whDefault || "sin_wh").trim() || "sin_wh";
-
-    // resolve group (cached)
-    const groupName = itemCode ? await resolveItemGroup(itemCode) : "";
-
-    params.push(docEntry, lineNum, docNum, docDate, cardCode, wh, itemCode, itemDesc, groupName, qty, lt);
-    values.push(`($${p++},$${p++},$${p++},$${p++}::date,$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`);
-  }
-
-  if (!values.length) return 0;
-
-  await dbQuery(
-    `
-    INSERT INTO quote_line_cache
-      (doc_entry,line_num,doc_num,doc_date,card_code,warehouse,item_code,item_desc,item_group,quantity,line_total)
-    VALUES ${values.join(",")}
-    ON CONFLICT(doc_entry,line_num) DO UPDATE SET
-      doc_num=EXCLUDED.doc_num,
-      doc_date=EXCLUDED.doc_date,
-      card_code=EXCLUDED.card_code,
-      warehouse=EXCLUDED.warehouse,
-      item_code=EXCLUDED.item_code,
-      item_desc=EXCLUDED.item_desc,
-      item_group=EXCLUDED.item_group,
-      quantity=EXCLUDED.quantity,
-      line_total=EXCLUDED.line_total,
-      updated_at=NOW()
-    `,
-    params
-  );
-
-  return values.length;
-}
-
-async function syncQuotesRange({ from, to, maxDocs = 5000, onlyCreated = true }) {
-  if (!hasDb()) throw new Error("DB no configurada (DATABASE_URL)");
-  if (missingSapEnv()) throw new Error("Faltan variables SAP");
-
-  const headers = await scanQuotationsHeaders({ from, to, maxDocs, onlyCreated });
-  let linesCount = 0;
-
-  // estable: 1-by-1 (evita timeouts)
-  for (let i = 0; i < headers.length; i++) {
-    const h = headers[i];
-    try {
-      const delivered = await traceQuoteTotals(h.DocNum, from, to); // fill-rate real
-      await upsertQuoteHead(h, delivered.ok ? delivered : { totalEntregado: 0 });
-
-      const doc = await sapGetByDocEntry("Quotations", h.DocEntry, 30000);
-      linesCount += await upsertQuoteLines(h, doc);
-
-    } catch {
-      // sigue con el próximo
-    }
-    await sleep(35);
-  }
-
-  await setState("quotes_last_sync_from", from);
-  await setState("quotes_last_sync_to", to);
-  await setState("quotes_last_sync_at", new Date().toISOString());
-
-  return { headers: headers.length, lines: linesCount };
-}
-
-/* Sync endpoints */
-app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
-  try {
-    const from = String(req.query?.from || "");
-    const to = String(req.query?.to || "");
-    if (!isISO(from) || !isISO(to)) return safeJson(res, 400, { ok: false, message: "Requiere from y to (YYYY-MM-DD)" });
-
-    const maxDocsRaw = Number(req.query?.maxDocs || 5000);
-    const maxDocs = Math.max(50, Math.min(20000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 5000));
-
-    const onlyCreated = String(req.query?.onlyCreated || "1") === "1";
-
-    const out = await syncQuotesRange({ from, to, maxDocs, onlyCreated });
-    return safeJson(res, 200, { ok: true, ...out, from, to, maxDocs, onlyCreated });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
-});
-
-app.post("/api/admin/quotes/sync/recent", verifyAdmin, async (req, res) => {
-  try {
-    const daysRaw = Number(req.query?.days || 5);
-    const days = Math.max(1, Math.min(60, Number.isFinite(daysRaw) ? Math.trunc(daysRaw) : 5));
-
-    const maxDocsRaw = Number(req.query?.maxDocs || 2500);
-    const maxDocs = Math.max(50, Math.min(20000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 2500));
-
-    const onlyCreated = String(req.query?.onlyCreated || "1") === "1";
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = addDaysISO(today, -days);
-
-    const out = await syncQuotesRange({ from, to: today, maxDocs, onlyCreated });
-    return safeJson(res, 200, { ok: true, ...out, from, to: today, days, maxDocs, onlyCreated });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   ✅ DASHBOARD (desde DB) - rápido
-========================================================= */
-const NON_CONSUMABLE = new Set([
-  "Cuidado de la Ropa",
-  "Art. De limpieza",
-  "M.P. Cuid. de la Rop",
-  "Prod. De limpieza",
-]);
-
-function grossPct(num, den) {
-  const n = Number(num || 0);
-  const d = Number(den || 0);
-  return d > 0 ? Number(((n / d) * 100).toFixed(2)) : 0;
-}
-
-app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
-
-    const fromQ = String(req.query?.from || "");
-    const toQ = String(req.query?.to || "");
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
-
-    const from = isISO(fromQ) ? fromQ : defaultFrom;
-    const to = isISO(toQ) ? toQ : today;
-
-    const totals = await dbQuery(
-      `
-      SELECT
-        COUNT(*)::int AS quotes,
-        COALESCE(SUM(doc_total),0)::numeric(18,2) AS cotizado,
-        COALESCE(SUM(delivered_total),0)::numeric(18,2) AS entregado
-      FROM quote_head_cache
-      WHERE doc_date >= $1::date AND doc_date <= $2::date
-      `,
-      [from, to]
-    );
-
-    const cot = Number(totals.rows?.[0]?.cotizado || 0);
-    const ent = Number(totals.rows?.[0]?.entregado || 0);
-
-    const byUser = await dbQuery(
-      `
-      SELECT usuario, COUNT(*)::int AS cnt,
-             COALESCE(SUM(doc_total),0)::numeric(18,2) AS cotizado,
-             COALESCE(SUM(delivered_total),0)::numeric(18,2) AS entregado
-      FROM quote_head_cache
-      WHERE doc_date >= $1::date AND doc_date <= $2::date
-      GROUP BY 1
-      ORDER BY cotizado DESC
-      LIMIT 25
-      `,
-      [from, to]
-    );
-
-    const byWh = await dbQuery(
-      `
-      SELECT warehouse, COUNT(*)::int AS cnt,
-             COALESCE(SUM(doc_total),0)::numeric(18,2) AS cotizado,
-             COALESCE(SUM(delivered_total),0)::numeric(18,2) AS entregado
-      FROM quote_head_cache
-      WHERE doc_date >= $1::date AND doc_date <= $2::date
-      GROUP BY 1
-      ORDER BY cotizado DESC
-      LIMIT 25
-      `,
-      [from, to]
-    );
-
-    const byClient = await dbQuery(
-      `
-      SELECT card_code, card_name,
-             COALESCE(SUM(doc_total),0)::numeric(18,2) AS cotizado
-      FROM quote_head_cache
-      WHERE doc_date >= $1::date AND doc_date <= $2::date
-      GROUP BY 1,2
-      ORDER BY cotizado DESC
-      LIMIT 25
-      `,
-      [from, to]
-    );
-
-    const byMonth = await dbQuery(
-      `
-      SELECT to_char(date_trunc('month', doc_date),'YYYY-MM') AS month,
-             COUNT(*)::int AS cnt,
-             COALESCE(SUM(doc_total),0)::numeric(18,2) AS cotizado,
-             COALESCE(SUM(delivered_total),0)::numeric(18,2) AS entregado
-      FROM quote_head_cache
-      WHERE doc_date >= $1::date AND doc_date <= $2::date
-      GROUP BY 1
-      ORDER BY 1
-      `,
-      [from, to]
-    );
-
-    // categorías por grupo desde líneas
-    const byGroup = await dbQuery(
-      `
-      SELECT item_group,
-             COALESCE(SUM(line_total),0)::numeric(18,2) AS cotizado
-      FROM quote_line_cache
-      WHERE doc_date >= $1::date AND doc_date <= $2::date
-        AND item_group <> ''
-      GROUP BY 1
-      ORDER BY cotizado DESC
-      LIMIT 50
-      `,
-      [from, to]
-    );
-
-    let consumibles = 0;
-    let noConsumibles = 0;
-    for (const r of byGroup.rows || []) {
-      const g = String(r.item_group || "").trim();
-      const v = Number(r.cotizado || 0);
-      if (NON_CONSUMABLE.has(g)) noConsumibles += v;
-      else consumibles += v;
-    }
-
-    return safeJson(res, 200, {
-      ok: true,
-      from,
-      to,
-      lastSyncAt: await getState("quotes_last_sync_at"),
-      totals: {
-        quotes: Number(totals.rows?.[0]?.quotes || 0),
-        cotizado: cot,
-        entregado: ent,
-        fillRatePct: grossPct(ent, cot),
-      },
-      byUser: (byUser.rows || []).map((r) => ({
-        usuario: r.usuario,
-        cnt: Number(r.cnt || 0),
-        cotizado: Number(r.cotizado || 0),
-        entregado: Number(r.entregado || 0),
-        fillRatePct: grossPct(Number(r.entregado || 0), Number(r.cotizado || 0)),
-      })),
-      byWh: (byWh.rows || []).map((r) => ({
-        warehouse: r.warehouse,
-        cnt: Number(r.cnt || 0),
-        cotizado: Number(r.cotizado || 0),
-        entregado: Number(r.entregado || 0),
-        fillRatePct: grossPct(Number(r.entregado || 0), Number(r.cotizado || 0)),
-      })),
-      byClient: (byClient.rows || []).map((r) => ({
-        customer: `${r.card_code} · ${r.card_name}`,
-        cotizado: Number(r.cotizado || 0),
-      })),
-      byMonth: (byMonth.rows || []).map((r) => ({
-        month: r.month,
-        cnt: Number(r.cnt || 0),
-        cotizado: Number(r.cotizado || 0),
-        entregado: Number(r.entregado || 0),
-        fillRatePct: grossPct(Number(r.entregado || 0), Number(r.cotizado || 0)),
-      })),
-      byGroup: (byGroup.rows || []).map((r) => ({
-        group: r.item_group,
-        cotizado: Number(r.cotizado || 0),
-      })),
-      pie: {
-        consumibles,
-        noConsumibles,
-      },
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
-});
-
-/* =========================================================
-   ✅ START
-========================================================= */
-process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
-process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
-
-(async () => {
-  try {
-    await ensureDb();
-    console.log(hasDb() ? "DB ready ✅" : "DB not configured ⚠️");
-  } catch (e) {
-    console.error("DB init error:", e.message);
-  }
-
-  app.listen(Number(PORT), () => console.log(`Server listening on :${PORT}`));
 })();
+</script>
+
+</body>
+</html>
