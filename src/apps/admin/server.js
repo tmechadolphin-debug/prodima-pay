@@ -1079,6 +1079,171 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
 });
 
 /* =========================
+   ✅ QUOTE LINES (DETALLE POR DOCNUM)
+   GET /api/admin/quotes/lines?docNum=123
+   Devuelve líneas de cotización + entregado por ItemCode
+========================= */
+app.get("/api/admin/quotes/lines", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    const docNum = Number(req.query?.docNum || 0);
+    if (!Number.isFinite(docNum) || docNum <= 0) {
+      return safeJson(res, 400, { ok: false, message: "docNum inválido" });
+    }
+
+    // 1) buscar la cotización por DocNum -> DocEntry
+    const qHead = await sapGetFirstByDocNum(
+      "Quotations",
+      docNum,
+      "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus"
+    );
+    if (!qHead?.DocEntry) {
+      return safeJson(res, 404, { ok: false, message: "Cotización no encontrada" });
+    }
+
+    // 2) traer cotización completa para leer DocumentLines
+    const quote = await sapGetByDocEntry("Quotations", qHead.DocEntry);
+    const quoteDocEntry = Number(quote.DocEntry);
+    const docDate = String(quote.DocDate || "").slice(0, 10);
+
+    const qLines = Array.isArray(quote?.DocumentLines) ? quote.DocumentLines : [];
+    if (!qLines.length) {
+      return safeJson(res, 200, { ok: true, docNum, docDate, lines: [] });
+    }
+
+    // 3) Map de solicitado por item (y $ cotizado por item)
+    //    Nota: si el mismo ItemCode aparece en varias líneas, lo agregamos por ItemCode.
+    const quotedByItem = new Map(); // itemCode -> { qty, dollars, desc }
+    for (const ln of qLines) {
+      const itemCode = String(ln?.ItemCode || "").trim();
+      if (!itemCode) continue;
+
+      const qty = Number(ln?.Quantity || 0);
+      const dollars = Number(ln?.LineTotal ?? ln?.RowTotal ?? 0); // depende de SL
+      const desc = String(ln?.ItemDescription || ln?.ItemName || "").trim();
+
+      const prev = quotedByItem.get(itemCode) || { qty: 0, dollars: 0, desc };
+      prev.qty += Number.isFinite(qty) ? qty : 0;
+      prev.dollars += Number.isFinite(dollars) ? dollars : 0;
+      if (!prev.desc && desc) prev.desc = desc;
+      quotedByItem.set(itemCode, prev);
+    }
+
+    // 4) encontrar órdenes que referencian la cotización (BaseType 23 / BaseEntry quoteDocEntry)
+    //    Para limitar carga, buscamos por CardCode y rango de fechas alrededor de la cotización.
+    const cardCode = String(quote.CardCode || "").trim().replace(/'/g, "''");
+    const from = addDaysISO(docDate, -30);
+    const toPlus1 = addDaysISO(addDaysISO(docDate, 60), 1);
+
+    const ordersList = await slFetch(
+      `/Orders?$select=DocEntry,DocNum,DocDate,CardCode&` +
+        `$filter=${encodeURIComponent(`CardCode eq '${cardCode}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`)}&` +
+        `$orderby=DocDate desc,DocEntry desc&$top=200`,
+      { timeoutMs: 20000 }
+    );
+
+    const orderCandidates = Array.isArray(ordersList?.value) ? ordersList.value : [];
+
+    const orderDocEntries = [];
+    for (const o of orderCandidates) {
+      // leer orden completa y verificar vínculo real por BaseEntry/Type
+      const od = await sapGetByDocEntry("Orders", o.DocEntry);
+      const lines = Array.isArray(od?.DocumentLines) ? od.DocumentLines : [];
+      const linked = lines.some(
+        (l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry
+      );
+      if (linked) orderDocEntries.push(Number(od.DocEntry));
+      await sleep(10);
+    }
+
+    // si no hay órdenes, entregado = 0
+    if (!orderDocEntries.length) {
+      const linesOut = Array.from(quotedByItem.entries()).map(([itemCode, v]) => ({
+        itemCode,
+        itemDesc: v.desc || "",
+        qtyQuoted: Number(v.qty || 0),
+        qtyDelivered: 0,
+        dollarsQuoted: Number(v.dollars || 0),
+        dollarsDelivered: 0,
+      }));
+      return safeJson(res, 200, { ok: true, docNum, docDate, lines: linesOut });
+    }
+
+    const orderDocEntrySet = new Set(orderDocEntries);
+
+    // 5) buscar delivery notes del mismo CardCode en el mismo rango, y quedarnos con las que referencian esas órdenes
+    const delList = await slFetch(
+      `/DeliveryNotes?$select=DocEntry,DocNum,DocDate,CardCode&` +
+        `$filter=${encodeURIComponent(`CardCode eq '${cardCode}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`)}&` +
+        `$orderby=DocDate desc,DocEntry desc&$top=300`,
+      { timeoutMs: 20000 }
+    );
+
+    const delCandidates = Array.isArray(delList?.value) ? delList.value : [];
+
+    // 6) sumar entregado por itemCode (qty + $)
+    const deliveredByItem = new Map(); // itemCode -> { qty, dollars }
+    const seenDel = new Set();
+
+    for (const d of delCandidates) {
+      const dd = await sapGetByDocEntry("DeliveryNotes", d.DocEntry);
+      const dEntry = Number(dd?.DocEntry);
+      if (!dEntry || seenDel.has(dEntry)) continue;
+      seenDel.add(dEntry);
+
+      const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
+
+      // ¿esta entrega referencia alguna de nuestras órdenes?
+      const linked = lines.some(
+        (l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry))
+      );
+      if (!linked) { await sleep(10); continue; }
+
+      for (const ln of lines) {
+        if (Number(ln?.BaseType) !== 17) continue;
+        if (!orderDocEntrySet.has(Number(ln?.BaseEntry))) continue;
+
+        const itemCode = String(ln?.ItemCode || "").trim();
+        if (!itemCode) continue;
+
+        const qty = Number(ln?.Quantity || 0);
+        const dollars = Number(ln?.LineTotal ?? ln?.RowTotal ?? 0);
+
+        const prev = deliveredByItem.get(itemCode) || { qty: 0, dollars: 0 };
+        prev.qty += Number.isFinite(qty) ? qty : 0;
+        prev.dollars += Number.isFinite(dollars) ? dollars : 0;
+        deliveredByItem.set(itemCode, prev);
+      }
+
+      await sleep(10);
+    }
+
+    // 7) armar respuesta final: todas las líneas cotizadas + entregado por item
+    const linesOut = Array.from(quotedByItem.entries()).map(([itemCode, v]) => {
+      const d = deliveredByItem.get(itemCode) || { qty: 0, dollars: 0 };
+      return {
+        itemCode,
+        itemDesc: v.desc || "",
+        qtyQuoted: Number(v.qty || 0),
+        qtyDelivered: Number(d.qty || 0),
+        dollarsQuoted: Number(v.dollars || 0),
+        dollarsDelivered: Number(d.dollars || 0),
+      };
+    });
+
+    return safeJson(res, 200, {
+      ok: true,
+      docNum,
+      docDate,
+      lines: linesOut,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+/* =========================
    START
 ========================= */
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
