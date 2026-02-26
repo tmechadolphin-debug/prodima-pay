@@ -51,7 +51,6 @@ app.use((req, res, next) => {
   }
 
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
-  // ✅ si luego agregas headers custom, ponlos aquí también
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
 
@@ -114,7 +113,6 @@ function getDateISOInOffset(offsetMin = 0) {
   const dd = String(d.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${dd}`;
 }
-
 function normText(s) {
   return String(s || "")
     .trim()
@@ -124,7 +122,7 @@ function normText(s) {
 }
 
 /* =========================================================
-   ✅ Grupos por área (fallback si area viene vacío)
+   ✅ Grupos por área (fallback)
 ========================================================= */
 const GROUPS_CONS = new Set([
   "Prod. De Limpieza",
@@ -167,17 +165,10 @@ async function dbQuery(text, params = []) {
   return pool.query(text, params);
 }
 
-/**
- * Tablas usadas por este app:
- * - item_group_cache (ya la tienes) -> base para área/grupo por item
- * - inv_item_cache (inventario actual) -> la llenamos por sync
- * - sales_item_lines (ventas netas INV/CRN) -> la llenamos por sync
- * - sync_state
- */
 async function ensureDb() {
   if (!hasDb()) return;
 
-  // ✅ si ya existe, no la rompe. (Tu tabla ya existe en Supabase)
+  // tabla base (ya la tienes)
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS item_group_cache (
       item_code TEXT PRIMARY KEY,
@@ -189,7 +180,7 @@ async function ensureDb() {
     );
   `);
 
-  // ✅ inventario (SUMA TODAS las bodegas)
+  // inventario agregado
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS inv_item_cache (
       item_code TEXT PRIMARY KEY,
@@ -204,12 +195,12 @@ async function ensureDb() {
     );
   `);
 
-  // ✅ ventas netas por línea (INV positivo, CRN negativo)
+  // ventas netas por línea
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS sales_item_lines (
       doc_entry INTEGER NOT NULL,
       line_num  INTEGER NOT NULL,
-      doc_type  TEXT NOT NULL, -- 'INV' o 'CRN'
+      doc_type  TEXT NOT NULL, -- INV o CRN
       doc_date  DATE NOT NULL,
       card_code TEXT NOT NULL DEFAULT '',
       item_code TEXT NOT NULL DEFAULT '',
@@ -431,7 +422,6 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
 async function syncSales({ from, to, maxDocs = 2500 }) {
   let saved = 0;
 
-  // Invoices
   const invHeaders = await scanDocHeaders("Invoices", { from, to, maxDocs });
   for (const h of invHeaders) {
     try {
@@ -441,7 +431,6 @@ async function syncSales({ from, to, maxDocs = 2500 }) {
     await sleep(10);
   }
 
-  // CreditNotes
   const crnHeaders = await scanDocHeaders("CreditNotes", { from, to, maxDocs });
   for (const h of crnHeaders) {
     try {
@@ -455,24 +444,34 @@ async function syncSales({ from, to, maxDocs = 2500 }) {
 }
 
 /* =========================================================
-   ✅ Sync Inventario REAL (solo items relevantes)
-   - Toma items desde item_group_cache (lo que usa tu dashboard)
-   - Para cada item: suma InStock/Min/Max/Committed/Ordered en TODAS las bodegas
+   ✅ Sync Inventario REAL (corrigiendo encoding + nombres)
+   - Solo items relevantes: item_group_cache
 ========================================================= */
-function escapeODataKey(s) {
-  // OData key string dentro de ('...')
-  return String(s || "").replace(/'/g, "''");
+function odataKey(code) {
+  // muy importante: esto evita que ItemCode con puntos, espacios, etc rompa el endpoint
+  return encodeURIComponent(String(code || "").trim());
 }
 
-async function getRelevantItemCodesForInventory(limit = 5000) {
-  // base: item_group_cache (tus categorías reales)
+function n0(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function pickField(obj, keys) {
+  for (const k of keys) {
+    if (obj && obj[k] != null) return obj[k];
+  }
+  return null;
+}
+
+async function getRelevantItemCodesForInventory(limit = 8000) {
   const r = await dbQuery(
     `SELECT item_code
      FROM item_group_cache
      WHERE COALESCE(NULLIF(item_code,''),'') <> ''
      ORDER BY updated_at DESC
      LIMIT $1`,
-    [Math.max(10, Math.min(20000, Number(limit) || 5000))]
+    [Math.max(10, Math.min(20000, Number(limit) || 8000))]
   );
   return (r.rows || []).map((x) => String(x.item_code || "").trim()).filter(Boolean);
 }
@@ -481,99 +480,57 @@ async function fetchItemInventoryTotals(itemCode) {
   const code = String(itemCode || "").trim();
   if (!code) return null;
 
-  // Intento #1 (rápido): traer item + expand de warehouseinfo
-  // Nota: en algunos SL, ItemWarehouseInfoCollection NO se expande; por eso hay fallback.
+  // 1) name (ItemName)
+  let itemName = "";
   try {
-    const safe = escapeODataKey(code);
-    const item = await slFetch(
-      `/Items('${safe}')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection&` +
-        `$expand=ItemWarehouseInfoCollection($select=WarehouseCode,InStock,MinStock,MaxStock,Committed,Ordered)`,
-      { timeoutMs: 90000 }
-    );
-
-    const wh = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : null;
-    if (wh && wh.length) {
-      let stock = 0,
-        mn = 0,
-        mx = 0,
-        committed = 0,
-        ordered = 0;
-
-      for (const w of wh) {
-        stock += Number(w?.InStock || 0);
-        mn += Number(w?.MinStock || 0);
-        mx += Number(w?.MaxStock || 0);
-        committed += Number(w?.Committed || 0);
-        ordered += Number(w?.Ordered || 0);
-      }
-
-      const available = stock - committed;
-      return {
-        itemCode: code,
-        itemDesc: String(item?.ItemName || "").trim(),
-        stock,
-        stockMin: mn,
-        stockMax: mx,
-        committed,
-        ordered,
-        available,
-      };
-    }
+    const head = await slFetch(`/Items('${odataKey(code)}')?$select=ItemCode,ItemName`, { timeoutMs: 60000 });
+    itemName = String(head?.ItemName || "").trim();
   } catch {
-    // fallback abajo
-  }
-
-  // Intento #2 (fallback): endpoint de la colección
-  try {
-    const safe = escapeODataKey(code);
-    const col = await slFetch(
-      `/Items('${safe}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,MinStock,MaxStock,Committed,Ordered`,
-      { timeoutMs: 90000 }
-    );
-
-    const whRows = Array.isArray(col?.value) ? col.value : [];
-    if (!whRows.length) {
-      // si no hay nada, devolvemos igualmente (stock 0) con desc vacía
-      return {
-        itemCode: code,
-        itemDesc: "",
-        stock: 0,
-        stockMin: 0,
-        stockMax: 0,
-        committed: 0,
-        ordered: 0,
-        available: 0,
-      };
-    }
-
-    let stock = 0,
-      mn = 0,
-      mx = 0,
-      committed = 0,
-      ordered = 0;
-
-    for (const w of whRows) {
-      stock += Number(w?.InStock || 0);
-      mn += Number(w?.MinStock || 0);
-      mx += Number(w?.MaxStock || 0);
-      committed += Number(w?.Committed || 0);
-      ordered += Number(w?.Ordered || 0);
-    }
-
-    const available = stock - committed;
-    return {
-      itemCode: code,
-      itemDesc: "",
-      stock,
-      stockMin: mn,
-      stockMax: mx,
-      committed,
-      ordered,
-      available,
-    };
-  } catch {
+    // si ni siquiera se puede leer el item, no insistimos
     return null;
   }
+
+  // 2) colección por warehouse
+  let whRows = [];
+  try {
+    const col = await slFetch(
+      `/Items('${odataKey(code)}')/ItemWarehouseInfoCollection` +
+        `?$select=WarehouseCode,InStock,OnHand,Committed,IsCommited,Ordered,OnOrder,MinStock,MaxStock,MinimumStock,MaximumStock`,
+      { timeoutMs: 90000 }
+    );
+    whRows = Array.isArray(col?.value) ? col.value : [];
+  } catch {
+    // fallback: algunos SL exponen otro nombre de entidad
+    whRows = [];
+  }
+
+  // si no hay filas, devolvemos stock 0 pero guardamos desc
+  let stock = 0,
+    committed = 0,
+    ordered = 0,
+    stockMin = 0,
+    stockMax = 0;
+
+  for (const w of whRows) {
+    stock += n0(pickField(w, ["InStock", "OnHand"]));
+    committed += n0(pickField(w, ["Committed", "IsCommited"]));
+    ordered += n0(pickField(w, ["Ordered", "OnOrder"]));
+    stockMin += n0(pickField(w, ["MinStock", "MinimumStock"]));
+    stockMax += n0(pickField(w, ["MaxStock", "MaximumStock"]));
+  }
+
+  const available = stock - committed + ordered;
+
+  return {
+    itemCode: code,
+    itemDesc: itemName,
+    stock,
+    stockMin,
+    stockMax,
+    committed,
+    ordered,
+    available,
+  };
 }
 
 async function upsertInventoryRow(row) {
@@ -604,14 +561,13 @@ async function upsertInventoryRow(row) {
   );
 }
 
-async function syncInventoryForRelevantItems({ maxItems = 5000 }) {
+async function syncInventoryForRelevantItems({ maxItems = 8000 }) {
   const codes = await getRelevantItemCodesForInventory(maxItems);
   if (!codes.length) return { scanned: 0, saved: 0, note: "No hay item_group_cache para tomar items." };
 
   let saved = 0;
   let scanned = 0;
 
-  // Concurrencia moderada para no tumbar SL
   const CONC = 3;
   let i = 0;
 
@@ -624,20 +580,12 @@ async function syncInventoryForRelevantItems({ maxItems = 5000 }) {
       try {
         const row = await fetchItemInventoryTotals(code);
         if (row) {
-          // si item_desc vacío, intentamos rellenar desde item_group_cache
-          if (!row.itemDesc) {
-            try {
-              const rr = await dbQuery(`SELECT item_desc FROM item_group_cache WHERE item_code=$1 LIMIT 1`, [code]);
-              row.itemDesc = String(rr.rows?.[0]?.item_desc || "").trim();
-            } catch {}
-          }
-
           await upsertInventoryRow(row);
           saved++;
         }
       } catch {}
 
-      if (scanned % 40 === 0) await sleep(20);
+      if (scanned % 40 === 0) await sleep(30);
     }
   }
 
@@ -646,7 +594,7 @@ async function syncInventoryForRelevantItems({ maxItems = 5000 }) {
 }
 
 /* =========================================================
-   ✅ ABC helpers (A/B/C por contribución acumulada)
+   ✅ ABC helpers
 ========================================================= */
 function abcByMetric(rows, metricKey) {
   const arr = rows
@@ -675,11 +623,9 @@ function totalLabelFromABC(a1, a2, a3) {
 }
 
 /* =========================================================
-   ✅ Dashboard (DB) - YA NO USA item_master
-   Base = item_group_cache (tus categorías)
+   ✅ Dashboard (DB) usando item_group_cache + inv_item_cache
 ========================================================= */
 async function dashboardFromDb({ from, to, area, grupo, q }) {
-  // filtros sobre item_group_cache
   const params = [from, to];
   let p = 3;
 
@@ -699,7 +645,6 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     whereG += ` AND (LOWER(g.item_code) LIKE $${p++} OR LOWER(g.item_desc) LIKE $${p++})`;
   }
 
-  // ✅ sales agregadas por item en rango
   const salesAgg = await dbQuery(
     `
     SELECT
@@ -720,7 +665,6 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     params
   );
 
-  // inventario map
   const inv = await dbQuery(
     `
     SELECT item_code,
@@ -736,17 +680,14 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
   );
   const invMap = new Map(inv.rows.map((r) => [String(r.item_code), r]));
 
-  // construir items
   const items = (salesAgg.rows || []).map((r) => {
     const rev = Number(r.revenue || 0);
     const gp = Number(r.gp || 0);
     const pct = rev > 0 ? (gp / rev) * 100 : 0;
 
     const rawGrupo = String(r.grupo || "Sin grupo").trim() || "Sin grupo";
-
-    // ✅ area fallback si viene vacío
     let a = String(r.area || "").trim();
-    if (!a) a = inferAreaFromGroup(rawGrupo) || "CONS"; // fallback final
+    if (!a) a = inferAreaFromGroup(rawGrupo) || "CONS";
 
     const invRow = invMap.get(String(r.item_code)) || {
       stock: 0,
@@ -770,15 +711,13 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
       stockMax: Number(invRow.stock_max || 0),
       committed: Number(invRow.committed || 0),
       ordered: Number(invRow.ordered || 0),
-      available: Number(invRow.available || (Number(invRow.stock || 0) - Number(invRow.committed || 0))),
+      available: Number(invRow.available || 0),
     };
   });
 
-  // availableGroups (para selector)
   const groupSet = new Set(items.map((x) => x.grupo).filter(Boolean));
   const availableGroups = Array.from(groupSet).sort((a, b) => a.localeCompare(b));
 
-  // groupAgg + rankArea
   const groupAggMap = new Map();
   for (const it of items) {
     const g = it.grupo || "Sin grupo";
@@ -797,7 +736,6 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
   const groupRank = new Map();
   groupAgg.forEach((g, idx) => groupRank.set(g.grupo, idx + 1));
 
-  // ABC por métricas
   const abcRev = abcByMetric(items, "revenue");
   const abcGP = abcByMetric(items, "gp");
   const abcPct = abcByMetric(items, "gpPct");
@@ -911,10 +849,7 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const from = addDaysISO(today, -n);
 
-    // 1) sales recent (INV + CRN)
     const salesSaved = await syncSales({ from, to: today, maxDocs });
-
-    // 2) inventory actual (solo items relevantes del dashboard)
     const invRes = await syncInventoryForRelevantItems({ maxItems: 8000 });
 
     await setState("last_sync_at", new Date().toISOString());
@@ -940,9 +875,7 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ Debug rápido (opcional):
-   GET /api/admin/estratificacion/debug-counts
-   (te ayuda a confirmar si ya hay data en las tablas)
+   ✅ Debug counts
 ========================================================= */
 app.get("/api/admin/estratificacion/debug-counts", verifyAdmin, async (req, res) => {
   try {
