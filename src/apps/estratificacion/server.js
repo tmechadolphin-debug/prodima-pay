@@ -894,6 +894,43 @@ app.get("/api/admin/estratificacion/debug-counts", verifyAdmin, async (req, res)
   }
 });
 
+app.get("/api/admin/estratificacion/debug-sap-inv", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    const code = String(req.query?.code || "").trim();
+    if (!code) return safeJson(res, 400, { ok: false, message: "code requerido" });
+
+    const safe = code.replace(/'/g, "''");
+
+    // 1) intenta por sub-recurso
+    let raw1 = null;
+    try {
+      raw1 = await slFetch(
+        `/Items('${safe}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,Committed,Ordered,MinStock,MaxStock,OnHand,IsCommited,OnOrder`,
+        { timeoutMs: 90000 }
+      );
+    } catch (e) {
+      raw1 = { error: String(e.message || e) };
+    }
+
+    // 2) intenta por expand (a veces funciona cuando el sub-recurso no)
+    let raw2 = null;
+    try {
+      raw2 = await slFetch(
+        `/Items('${safe}')?$select=ItemCode,ItemName&$expand=ItemWarehouseInfoCollection($select=WarehouseCode,InStock,Committed,Ordered,MinStock,MaxStock,OnHand,IsCommited,OnOrder)`,
+        { timeoutMs: 90000 }
+      );
+    } catch (e) {
+      raw2 = { error: String(e.message || e) };
+    }
+
+    return safeJson(res, 200, { ok: true, code, raw1, raw2 });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 /* =========================================================
    ✅ START
 ========================================================= */
