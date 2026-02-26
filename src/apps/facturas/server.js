@@ -1,6 +1,7 @@
 import express from "express";
 import jwt from "jsonwebtoken";
 import pg from "pg";
+import XLSX from "xlsx";
 
 const { Pool } = pg;
 
@@ -210,7 +211,9 @@ async function slLogin() {
 
   const txt = await r.text();
   let data = {};
-  try { data = JSON.parse(txt); } catch {}
+  try {
+    data = JSON.parse(txt);
+  } catch {}
 
   if (!r.ok) throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
 
@@ -249,7 +252,11 @@ async function slFetch(path, options = {}) {
 
     const txt = await r.text();
     let data = {};
-    try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+    try {
+      data = JSON.parse(txt);
+    } catch {
+      data = { raw: txt };
+    }
 
     if (!r.ok) {
       if (r.status === 401 || r.status === 403) {
@@ -314,12 +321,7 @@ async function getInvoiceDoc(docEntry) {
    ✅ Sync: upsert invoice lines
 ========================================================= */
 function pickGrossProfit(ln) {
-  const candidates = [
-    ln?.GrossProfit,
-    ln?.GrossProfitTotal,
-    ln?.GrossProfitFC,
-    ln?.GrossProfitSC,
-  ];
+  const candidates = [ln?.GrossProfit, ln?.GrossProfitTotal, ln?.GrossProfitFC, ln?.GrossProfitSC];
   for (const c of candidates) {
     const n = Number(c);
     if (Number.isFinite(n)) return n;
@@ -353,7 +355,9 @@ async function upsertLinesToDb(invHeader, docFull) {
     const gp = pickGrossProfit(ln);
 
     params.push(docEntry, lineNum, docNum, docDate, cardCode, cardName, wh, itemCode, itemDesc, qty, lt, gp);
-    values.push(`($${p++},$${p++},$${p++},$${p++}::date,$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`);
+    values.push(
+      `($${p++},$${p++},$${p++},$${p++}::date,$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`
+    );
   }
 
   if (!values.length) return 0;
@@ -595,7 +599,8 @@ async function detailsFromDb({ from, to, cardCode, warehouse }) {
     inv.totals.qty = Number(inv.totals.qty.toFixed(4));
     inv.totals.dollars = Number(inv.totals.dollars.toFixed(2));
     inv.totals.grossProfit = Number(inv.totals.grossProfit.toFixed(2));
-    inv.totals.grossPct = inv.totals.dollars > 0 ? Number(((inv.totals.grossProfit / inv.totals.dollars) * 100).toFixed(2)) : 0;
+    inv.totals.grossPct =
+      inv.totals.dollars > 0 ? Number(((inv.totals.grossProfit / inv.totals.dollars) * 100).toFixed(2)) : 0;
     return inv;
   });
 
@@ -767,6 +772,101 @@ app.get("/api/admin/invoices/top-products", verifyAdmin, async (req, res) => {
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+/* =========================================================
+   ✅ EXPORT EXCEL (SERVER-SIDE) — SOLO SE AGREGA ESTO
+========================================================= */
+app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
+    const fromQ = String(req.query?.from || "");
+    const toQ = String(req.query?.to || "");
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const defaultFrom = addDaysISO(today, -30);
+
+    const from = isISO(fromQ) ? fromQ : defaultFrom;
+    const to = isISO(toQ) ? toQ : today;
+
+    const data = await dashboardFromDb(from, to);
+
+    const wb = XLSX.utils.book_new();
+
+    const main = (data.table || []).map((r) => ({
+      CardCode: r.cardCode,
+      CardName: r.cardName,
+      Cliente: r.customer,
+      Bodega: r.warehouse,
+      Dolares: Number(r.dollars || 0),
+      GananciaBruta: Number(r.grossProfit || 0),
+      PorcentajeGP: Number(r.grossPct || 0),
+      Facturas: Number(r.invoices || 0),
+    }));
+
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(main), "Cliente_x_Bodega");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(data.byMonth || []), "PorMes");
+
+    const buf = XLSX.write(wb, { bookType: "xlsx", type: "buffer" });
+
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="facturacion_${Date.now()}.xlsx"`);
+    return res.status(200).send(buf);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get("/api/admin/invoices/details/export", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
+    const fromQ = String(req.query?.from || "");
+    const toQ = String(req.query?.to || "");
+    const cardCode = String(req.query?.cardCode || "").trim();
+    const warehouse = String(req.query?.warehouse || "").trim();
+
+    if (!cardCode || !warehouse) return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const defaultFrom = addDaysISO(today, -30);
+
+    const from = isISO(fromQ) ? fromQ : defaultFrom;
+    const to = isISO(toQ) ? toQ : today;
+
+    const detail = await detailsFromDb({ from, to, cardCode, warehouse });
+
+    const rows = [];
+    for (const inv of detail.invoices || []) {
+      for (const ln of inv.lines || []) {
+        rows.push({
+          DocNum: inv.docNum,
+          Fecha: inv.docDate,
+          ItemCode: ln.itemCode,
+          Descripcion: ln.itemDesc,
+          Cantidad: Number(ln.quantity || 0),
+          Total: Number(ln.dollars || 0),
+          GananciaBruta: Number(ln.grossProfit || 0),
+          PorcentajeGP: Number(ln.grossPct || 0),
+        });
+      }
+    }
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), "Detalle");
+
+    const buf = XLSX.write(wb, { bookType: "xlsx", type: "buffer" });
+
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="detalle_${cardCode}_${warehouse}_${Date.now()}.xlsx"`
+    );
+    return res.status(200).send(buf);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
 });
 
