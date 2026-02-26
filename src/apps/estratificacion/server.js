@@ -931,6 +931,36 @@ app.get("/api/admin/estratificacion/debug-sap-inv", verifyAdmin, async (req, res
   }
 });
 
+app.get("/api/admin/estratificacion/debug-sap-inv2", verifyAdmin, async (req, res) => {
+  try {
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    const code = String(req.query?.code || "").trim();
+    if (!code) return safeJson(res, 400, { ok: false, message: "code requerido" });
+
+    const safe = code.replace(/'/g, "''");
+
+    let a = null;
+    try {
+      // ✅ patrón que suele funcionar: coleccion embebida sin expand
+      a = await slFetch(`/Items('${safe}')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection`, { timeoutMs: 90000 });
+    } catch (e) {
+      a = { error: String(e.message || e) };
+    }
+
+    let b = null;
+    try {
+      // ✅ subrecurso SIN query options
+      b = await slFetch(`/Items('${safe}')/ItemWarehouseInfoCollection`, { timeoutMs: 90000 });
+    } catch (e) {
+      b = { error: String(e.message || e) };
+    }
+
+    return safeJson(res, 200, { ok: true, code, a, b });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
 /* =========================================================
    ✅ START
 ========================================================= */
