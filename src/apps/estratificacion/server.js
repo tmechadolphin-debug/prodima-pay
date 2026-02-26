@@ -130,19 +130,22 @@ async function dbQuery(text, params = []) {
 }
 
 /**
- * Tablas:
- * 1) item_master (manual) -> la cargas desde tu CSV curado:
- *    item_code (PK), item_desc, area ('CONS'|'RCI'), grupo
+ * ✅ Tablas:
+ * 1) item_group_cache (manual CSV curado):
+ *    item_code (PK), item_desc opcional, area ('CONS'|'RCI'), grupo
  *
- * 2) inv_item_cache (sync SAP): stock min/max/actual por item (sumado en bodegas)
+ * 2) inv_item_cache (sync SAP): stock min/max/actual + committed/ordered/available (sumado en bodegas)
  * 3) sales_item_lines (sync SAP): líneas netas (INV positivo, CRN negativo)
  * 4) sync_state
+ *
+ * ⚠️ Nota: NO dependemos de item_master para dashboard.
  */
 async function ensureDb() {
   if (!hasDb()) return;
 
+  // ✅ Estratificación / agrupación (cargas CSV aquí)
   await dbQuery(`
-    CREATE TABLE IF NOT EXISTS item_master (
+    CREATE TABLE IF NOT EXISTS item_group_cache (
       item_code TEXT PRIMARY KEY,
       item_desc TEXT NOT NULL DEFAULT '',
       area TEXT NOT NULL DEFAULT 'CONS',
@@ -150,17 +153,22 @@ async function ensureDb() {
     );
   `);
 
+  // ✅ Inventario (cache SAP)
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS inv_item_cache (
       item_code TEXT PRIMARY KEY,
       item_desc TEXT NOT NULL DEFAULT '',
       stock NUMERIC(18,4) NOT NULL DEFAULT 0,
+      committed NUMERIC(18,4) NOT NULL DEFAULT 0,
+      ordered NUMERIC(18,4) NOT NULL DEFAULT 0,
+      available NUMERIC(18,4) NOT NULL DEFAULT 0,
       stock_min NUMERIC(18,4) NOT NULL DEFAULT 0,
       stock_max NUMERIC(18,4) NOT NULL DEFAULT 0,
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
 
+  // ✅ Ventas netas por item (INV - CRN)
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS sales_item_lines (
       doc_entry INTEGER NOT NULL,
@@ -170,8 +178,8 @@ async function ensureDb() {
       item_code TEXT NOT NULL DEFAULT '',
       item_desc TEXT NOT NULL DEFAULT '',
       quantity  NUMERIC(18,4) NOT NULL DEFAULT 0,
-      revenue   NUMERIC(18,2) NOT NULL DEFAULT 0, -- LineTotal (neto, CRN negativo)
-      gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0, -- neto, CRN negativo
+      revenue   NUMERIC(18,2) NOT NULL DEFAULT 0, -- LineTotal neto (CRN negativo)
+      gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0, -- neto (CRN negativo)
       updated_at TIMESTAMP DEFAULT NOW(),
       PRIMARY KEY (doc_entry, line_num, doc_type)
     );
@@ -187,6 +195,22 @@ async function ensureDb() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  // ✅ Migraciones seguras (por si ya existían con esquema viejo)
+  await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS area TEXT NOT NULL DEFAULT 'CONS';`);
+  await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS grupo TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS item_desc TEXT NOT NULL DEFAULT '';`);
+
+  await dbQuery(`ALTER TABLE inv_item_cache ADD COLUMN IF NOT EXISTS committed NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE inv_item_cache ADD COLUMN IF NOT EXISTS ordered NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE inv_item_cache ADD COLUMN IF NOT EXISTS available NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE inv_item_cache ADD COLUMN IF NOT EXISTS stock_min NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE inv_item_cache ADD COLUMN IF NOT EXISTS stock_max NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE inv_item_cache ADD COLUMN IF NOT EXISTS item_desc TEXT NOT NULL DEFAULT '';`);
+
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS item_desc TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS revenue NUMERIC(18,2) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0;`);
 }
 
 async function setState(k, v) {
@@ -230,7 +254,9 @@ async function slLogin() {
 
   const txt = await r.text();
   let data = {};
-  try { data = JSON.parse(txt); } catch {}
+  try {
+    data = JSON.parse(txt);
+  } catch {}
 
   if (!r.ok) throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
 
@@ -269,7 +295,11 @@ async function slFetch(path, options = {}) {
 
     const txt = await r.text();
     let data = {};
-    try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+    try {
+      data = JSON.parse(txt);
+    } catch {
+      data = { raw: txt };
+    }
 
     if (!r.ok) {
       if (r.status === 401 || r.status === 403) {
@@ -290,11 +320,18 @@ async function slFetch(path, options = {}) {
 
 /* =========================================================
    ✅ Sync: Inventario (Items -> ItemWarehouseInfoCollection)
-   - Suma InStock en todas las bodegas
-   - Min/Max: sumamos MinStock/MaxStock (si existen)
+   - Suma InStock / Committed / Ordered en todas las bodegas
+   - Min/Max: suma MinStock/MaxStock (si existen)
 ========================================================= */
-async function syncInventoryItems({ fromDate, toDate }) {
-  // no dependemos de fechas para inventario: lo traemos “actual”
+function safeItemKey(code) {
+  // OData: Items('CODE') necesita encoding correcto dentro de comillas simples
+  // Estrategia: encodeURIComponent y luego reemplazar %27 para evitar romper comillas internas
+  // pero mantenemos el formato Items('...')
+  const raw = String(code || "").trim();
+  return encodeURIComponent(raw).replace(/'/g, "%27");
+}
+
+async function syncInventoryItems() {
   const batchTop = 200;
   let skipSap = 0;
   let saved = 0;
@@ -312,39 +349,51 @@ async function syncInventoryItems({ fromDate, toDate }) {
       const code = String(it.ItemCode || "").trim();
       if (!code) continue;
 
-      let full = null;
+      // ✅ traer warehouses info
+      let whInfo = null;
       try {
-        full = await slFetch(
-          `/Items('${code.replace(/'/g,"''")}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,MinStock,MaxStock,Committed,Ordered`,
+        const key = safeItemKey(code);
+        whInfo = await slFetch(
+          `/Items('${key}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,MinStock,MaxStock,Committed,Ordered`,
           { timeoutMs: 90000 }
         );
       } catch {
-        // si falla, saltamos
-        await sleep(10);
+        await sleep(5);
         continue;
       }
 
-      const whRows = Array.isArray(full?.value) ? full.value : [];
-      let stock = 0, mn = 0, mx = 0;
+      const whRows = Array.isArray(whInfo?.value) ? whInfo.value : [];
+      let stock = 0,
+        committed = 0,
+        ordered = 0,
+        mn = 0,
+        mx = 0;
 
       for (const w of whRows) {
         stock += Number(w?.InStock || 0);
+        committed += Number(w?.Committed || 0);
+        ordered += Number(w?.Ordered || 0);
         mn += Number(w?.MinStock || 0);
         mx += Number(w?.MaxStock || 0);
       }
 
+      const available = stock - committed;
+
       await dbQuery(
         `
-        INSERT INTO inv_item_cache(item_code,item_desc,stock,stock_min,stock_max,updated_at)
-        VALUES($1,$2,$3,$4,$5,NOW())
+        INSERT INTO inv_item_cache(item_code,item_desc,stock,committed,ordered,available,stock_min,stock_max,updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW())
         ON CONFLICT(item_code) DO UPDATE SET
           item_desc=EXCLUDED.item_desc,
           stock=EXCLUDED.stock,
+          committed=EXCLUDED.committed,
+          ordered=EXCLUDED.ordered,
+          available=EXCLUDED.available,
           stock_min=EXCLUDED.stock_min,
           stock_max=EXCLUDED.stock_max,
           updated_at=NOW()
         `,
-        [code, String(it.ItemName || ""), stock, mn, mx]
+        [code, String(it.ItemName || ""), stock, committed, ordered, available, mn, mx]
       );
 
       saved++;
@@ -357,8 +406,6 @@ async function syncInventoryItems({ fromDate, toDate }) {
 
 /* =========================================================
    ✅ Sync: Ventas netas por item (INV - CRN)
-   - Invoices (INV): revenue + gp
-   - CreditNotes (CRN): revenue negativo, gp negativo
 ========================================================= */
 function pickGrossProfit(ln) {
   const candidates = [ln?.GrossProfit, ln?.GrossProfitTotal, ln?.GrossProfitFC, ln?.GrossProfitSC];
@@ -378,8 +425,8 @@ async function scanDocHeaders(entity, { from, to, maxDocs = 2500 }) {
   for (let page = 0; page < 300; page++) {
     const raw = await slFetch(
       `/${entity}?$select=DocEntry,DocNum,DocDate&` +
-      `$filter=${encodeURIComponent(`DocDate ge '${from}' and DocDate lt '${toPlus1}'`)}&` +
-      `$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skipSap}`,
+        `$filter=${encodeURIComponent(`DocDate ge '${from}' and DocDate lt '${toPlus1}'`)}&` +
+        `$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skipSap}`,
       { timeoutMs: 90000 }
     );
 
@@ -388,7 +435,7 @@ async function scanDocHeaders(entity, { from, to, maxDocs = 2500 }) {
     skipSap += rows.length;
 
     for (const r of rows) {
-      out.push({ DocEntry: Number(r.DocEntry), DocDate: String(r.DocDate || "").slice(0,10) });
+      out.push({ DocEntry: Number(r.DocEntry), DocDate: String(r.DocDate || "").slice(0, 10) });
       if (out.length >= maxDocs) return out;
     }
   }
@@ -418,6 +465,8 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
     const rev = Number(ln?.LineTotal || 0) * sign;
     const gp = pickGrossProfit(ln) * sign;
 
+    if (!itemCode) continue;
+
     await dbQuery(
       `
       INSERT INTO sales_item_lines(doc_entry,line_num,doc_type,doc_date,item_code,item_desc,quantity,revenue,gross_profit,updated_at)
@@ -444,24 +493,22 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
 async function syncSales({ from, to, maxDocs = 2500 }) {
   let saved = 0;
 
-  // Invoices
   const invHeaders = await scanDocHeaders("Invoices", { from, to, maxDocs });
   for (const h of invHeaders) {
     try {
       const full = await getDoc("Invoices", h.DocEntry);
       saved += await upsertSalesLines("INV", h.DocDate, full, +1);
     } catch {}
-    await sleep(10);
+    await sleep(5);
   }
 
-  // CreditNotes
   const crnHeaders = await scanDocHeaders("CreditNotes", { from, to, maxDocs });
   for (const h of crnHeaders) {
     try {
       const full = await getDoc("CreditNotes", h.DocEntry);
       saved += await upsertSalesLines("CRN", h.DocDate, full, -1);
     } catch {}
-    await sleep(10);
+    await sleep(5);
   }
 
   return saved;
@@ -472,140 +519,160 @@ async function syncSales({ from, to, maxDocs = 2500 }) {
 ========================================================= */
 function abcByMetric(rows, metricKey) {
   const arr = rows
-    .map(r => ({ key: r.itemCode, v: Math.max(0, Number(r[metricKey] || 0)) }))
-    .sort((a,b)=> b.v - a.v);
+    .map((r) => ({ key: r.itemCode, v: Math.max(0, Number(r[metricKey] || 0)) }))
+    .sort((a, b) => b.v - a.v);
 
-  const total = arr.reduce((a,x)=>a+x.v,0) || 0;
+  const total = arr.reduce((a, x) => a + x.v, 0) || 0;
   let acc = 0;
 
   const out = new Map();
   for (const x of arr) {
     acc += x.v;
-    const share = total > 0 ? (acc / total) : 1;
-    // Regla típica ABC: A hasta 80%, B hasta 95%, C resto
-    const letter = share <= 0.80 ? "A" : share <= 0.95 ? "B" : "C";
+    const share = total > 0 ? acc / total : 1;
+    const letter = share <= 0.8 ? "A" : share <= 0.95 ? "B" : "C";
     out.set(x.key, letter);
   }
   return out;
 }
 
-function totalLabelFromABC(a1,a2,a3){
-  const score = (l)=> l==="A" ? 3 : l==="B" ? 2 : 1;
-  const avg = (score(a1)+score(a2)+score(a3))/3;
+function totalLabelFromABC(a1, a2, a3) {
+  const score = (l) => (l === "A" ? 3 : l === "B" ? 2 : 1);
+  const avg = (score(a1) + score(a2) + score(a3)) / 3;
 
-  // Etiquetas tipo negocio (simple y útil):
-  // - AB Crítico: promedio >= 2.5
-  // - C Importante: promedio >= 1.8
-  // - D: resto
   if (avg >= 2.5) return { label: "AB Crítico", cls: "bad" };
   if (avg >= 1.8) return { label: "C Importante", cls: "warn" };
   return { label: "D", cls: "ok" };
 }
 
 /* =========================================================
-   ✅ Dashboard (DB)
+   ✅ Dashboard (DB) - NO depende de item_master
 ========================================================= */
 async function dashboardFromDb({ from, to, area, grupo, q }) {
-  const params = [from, to];
-  let p = 3;
-
-  let whereMaster = "1=1";
-  if (area && area !== "__ALL__") {
-    params.push(area);
-    whereMaster += ` AND m.area = $${p++}`;
-  }
-  if (grupo && grupo !== "__ALL__") {
-    params.push(grupo);
-    whereMaster += ` AND m.grupo = $${p++}`;
-  }
-  if (q && String(q).trim()) {
-    const qq = `%${String(q).trim().toLowerCase()}%`;
-    params.push(qq);
-    params.push(qq);
-    whereMaster += ` AND (LOWER(m.item_code) LIKE $${p++} OR LOWER(m.item_desc) LIKE $${p++})`;
-  }
-
-  // aggregate sales by item for date range
+  // 1) ventas por item en rango
   const salesAgg = await dbQuery(
     `
     SELECT
-      COALESCE(m.item_code, s.item_code) AS item_code,
-      COALESCE(NULLIF(m.item_desc,''), NULLIF(s.item_desc,''), '') AS item_desc,
-      COALESCE(NULLIF(m.area,''),'CONS') AS area,
-      COALESCE(NULLIF(m.grupo,''),'Sin grupo') AS grupo,
+      s.item_code AS item_code,
+      MAX(NULLIF(s.item_desc,'')) AS item_desc,
       COALESCE(SUM(s.revenue),0)::numeric(18,2) AS revenue,
       COALESCE(SUM(s.gross_profit),0)::numeric(18,2) AS gp
-    FROM item_master m
-    LEFT JOIN sales_item_lines s
-      ON s.item_code = m.item_code
-      AND s.doc_date >= $1::date AND s.doc_date <= $2::date
-    WHERE ${whereMaster}
-    GROUP BY 1,2,3,4
+    FROM sales_item_lines s
+    WHERE s.doc_date >= $1::date AND s.doc_date <= $2::date
+      AND s.item_code <> ''
+    GROUP BY 1
     ORDER BY revenue DESC
     `,
-    params
+    [from, to]
   );
 
+  // 2) inventario actual
   const inv = await dbQuery(
     `
-    SELECT item_code, stock::float AS stock, stock_min::float AS stock_min, stock_max::float AS stock_max
+    SELECT
+      item_code,
+      item_desc,
+      stock::float AS stock,
+      committed::float AS committed,
+      ordered::float AS ordered,
+      available::float AS available,
+      stock_min::float AS stock_min,
+      stock_max::float AS stock_max
     FROM inv_item_cache
     `,
     []
   );
-  const invMap = new Map(inv.rows.map(r=>[String(r.item_code), r]));
+  const invMap = new Map(inv.rows.map((r) => [String(r.item_code), r]));
 
-  const items = (salesAgg.rows || []).map(r=>{
+  // 3) grupo/area manual (csv)
+  const groups = await dbQuery(
+    `
+    SELECT item_code, item_desc, area, grupo
+    FROM item_group_cache
+    `,
+    []
+  );
+  const gMap = new Map(groups.rows.map((r) => [String(r.item_code), r]));
+
+  // 4) combinar todo
+  let items = (salesAgg.rows || []).map((r) => {
+    const code = String(r.item_code);
     const rev = Number(r.revenue || 0);
     const gp = Number(r.gp || 0);
     const pct = rev > 0 ? (gp / rev) * 100 : 0;
 
-    const invRow = invMap.get(String(r.item_code)) || { stock:0, stock_min:0, stock_max:0 };
+    const invRow = invMap.get(code) || {
+      item_desc: "",
+      stock: 0,
+      committed: 0,
+      ordered: 0,
+      available: 0,
+      stock_min: 0,
+      stock_max: 0,
+    };
+
+    const gr = gMap.get(code) || { area: "CONS", grupo: "Sin grupo", item_desc: "" };
+
+    const desc = String(gr.item_desc || "").trim() || String(invRow.item_desc || "").trim() || String(r.item_desc || "").trim();
 
     return {
-      itemCode: r.item_code,
-      itemDesc: r.item_desc || "",
-      area: r.area || "CONS",
-      grupo: r.grupo || "Sin grupo",
+      itemCode: code,
+      itemDesc: desc,
+      area: String(gr.area || "CONS").trim() || "CONS",
+      grupo: String(gr.grupo || "Sin grupo").trim() || "Sin grupo",
       revenue: rev,
       gp: gp,
       gpPct: Number(pct.toFixed(2)),
       stock: Number(invRow.stock || 0),
+      committed: Number(invRow.committed || 0),
+      ordered: Number(invRow.ordered || 0),
+      available: Number(invRow.available ?? (Number(invRow.stock || 0) - Number(invRow.committed || 0))),
       stockMin: Number(invRow.stock_min || 0),
       stockMax: Number(invRow.stock_max || 0),
     };
   });
 
-  // grupos disponibles según área (para el selector)
-  const groupSet = new Set(items.map(x=>x.grupo).filter(Boolean));
-  const availableGroups = Array.from(groupSet).sort((a,b)=>a.localeCompare(b));
+  // 5) filtros (area / grupo / search)
+  if (area && area !== "__ALL__") {
+    items = items.filter((x) => String(x.area || "").toUpperCase() === String(area).toUpperCase());
+  }
+  if (grupo && grupo !== "__ALL__") {
+    items = items.filter((x) => String(x.grupo || "") === String(grupo));
+  }
+  if (q && String(q).trim()) {
+    const qq = String(q).trim().toLowerCase();
+    items = items.filter((x) => String(x.itemCode).toLowerCase().includes(qq) || String(x.itemDesc).toLowerCase().includes(qq));
+  }
 
-  // group ranking por revenue (rank área)
+  // 6) grupos disponibles
+  const groupSet = new Set(items.map((x) => x.grupo).filter(Boolean));
+  const availableGroups = Array.from(groupSet).sort((a, b) => a.localeCompare(b));
+
+  // 7) ranking de grupo por revenue
   const groupAggMap = new Map();
   for (const it of items) {
     const g = it.grupo || "Sin grupo";
-    const cur = groupAggMap.get(g) || { grupo:g, revenue:0, gp:0 };
+    const cur = groupAggMap.get(g) || { grupo: g, revenue: 0, gp: 0 };
     cur.revenue += it.revenue;
     cur.gp += it.gp;
     groupAggMap.set(g, cur);
   }
   const groupAgg = Array.from(groupAggMap.values())
-    .map(g=>({ ...g, gpPct: g.revenue>0 ? Number(((g.gp/g.revenue)*100).toFixed(2)) : 0 }))
-    .sort((a,b)=>b.revenue-a.revenue);
+    .map((g) => ({ ...g, gpPct: g.revenue > 0 ? Number(((g.gp / g.revenue) * 100).toFixed(2)) : 0 }))
+    .sort((a, b) => b.revenue - a.revenue);
 
   const groupRank = new Map();
-  groupAgg.forEach((g, idx)=> groupRank.set(g.grupo, idx+1));
+  groupAgg.forEach((g, idx) => groupRank.set(g.grupo, idx + 1));
 
-  // ABC por métricas
+  // 8) ABC
   const abcRev = abcByMetric(items, "revenue");
-  const abcGP  = abcByMetric(items, "gp");
-  const abcPct = abcByMetric(items, "gpPct"); // aquí pesa “alto %”, no “contribución”; igual sirve como ranking por contribución del % (simple)
+  const abcGP = abcByMetric(items, "gp");
+  const abcPct = abcByMetric(items, "gpPct");
 
-  const outItems = items.map(it=>{
+  const outItems = items.map((it) => {
     const a1 = abcRev.get(it.itemCode) || "C";
-    const a2 = abcGP.get(it.itemCode)  || "C";
+    const a2 = abcGP.get(it.itemCode) || "C";
     const a3 = abcPct.get(it.itemCode) || "C";
-    const total = totalLabelFromABC(a1,a2,a3);
+    const total = totalLabelFromABC(a1, a2, a3);
 
     return {
       ...it,
@@ -618,14 +685,16 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     };
   });
 
-  // Totales generales
-  const totals = outItems.reduce((a,x)=>{
-    a.revenue += Number(x.revenue||0);
-    a.gp += Number(x.gp||0);
-    return a;
-  }, { revenue:0, gp:0 });
-
-  const gpPctTotal = totals.revenue > 0 ? Number(((totals.gp/totals.revenue)*100).toFixed(2)) : 0;
+  // 9) totales
+  const totals = outItems.reduce(
+    (a, x) => {
+      a.revenue += Number(x.revenue || 0);
+      a.gp += Number(x.gp || 0);
+      return a;
+    },
+    { revenue: 0, gp: 0 }
+  );
+  const gpPctTotal = totals.revenue > 0 ? Number(((totals.gp / totals.revenue) * 100).toFixed(2)) : 0;
 
   return {
     ok: true,
@@ -638,7 +707,7 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     totals: { revenue: totals.revenue, gp: totals.gp, gpPct: gpPctTotal },
     availableGroups,
     groupAgg,
-    items: outItems.sort((a,b)=> (a.rankArea - b.rankArea) || (b.revenue - a.revenue)),
+    items: outItems.sort((a, b) => a.rankArea - b.rankArea || b.revenue - a.revenue),
   };
 }
 
@@ -710,7 +779,7 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
     const from = addDaysISO(today, -n);
 
     // 1) inventory (actual)
-    const invSaved = await syncInventoryItems({ fromDate: from, toDate: today });
+    const invSaved = await syncInventoryItems();
 
     // 2) sales recent (INV + CRN)
     const salesSaved = await syncSales({ from, to: today, maxDocs });
@@ -729,6 +798,8 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
       from,
       to: today,
       lastSyncAt: await getState("last_sync_at"),
+      note:
+        "Dashboard NO depende de item_master. Area/Grupo salen de item_group_cache (CSV) + ventas/inv como fallback.",
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
