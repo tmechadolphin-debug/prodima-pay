@@ -292,7 +292,9 @@ async function slLogin() {
 
   const txt = await r.text();
   let data = {};
-  try { data = JSON.parse(txt); } catch {}
+  try {
+    data = JSON.parse(txt);
+  } catch {}
 
   if (!r.ok) throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
 
@@ -331,7 +333,11 @@ async function slFetch(path, options = {}) {
 
     const txt = await r.text();
     let data = {};
-    try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+    try {
+      data = JSON.parse(txt);
+    } catch {
+      data = { raw: txt };
+    }
 
     if (!r.ok) {
       if (r.status === 401 || r.status === 403) {
@@ -352,7 +358,6 @@ async function slFetch(path, options = {}) {
 
 /* =========================================================
    ✅ Sync: Ventas netas por item (INV - CRN)
-   ✅ FIX NC: uso ABS() y luego signo para que SIEMPRE resten
 ========================================================= */
 function pickGrossProfit(ln) {
   const candidates = [ln?.GrossProfit, ln?.GrossProfitTotal, ln?.GrossProfitFC, ln?.GrossProfitSC];
@@ -416,7 +421,7 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
 
     const itemDesc = String(ln?.ItemDescription || ln?.ItemName || "").trim();
 
-    // ✅ FIX: algunos sistemas traen CRN ya negativo => usamos ABS y aplicamos signo
+    // ✅ FIX NC: ABS + signo para que CRN siempre reste
     const qtyRaw = Number(ln?.Quantity || 0);
     const revRaw = Number(ln?.LineTotal || 0);
     const gpRaw = Number(pickGrossProfit(ln) || 0);
@@ -476,8 +481,7 @@ async function syncSales({ from, to, maxDocs = 2500 }) {
 }
 
 /* =========================================================
-   ✅ Inventario por Item
-   ✅ FIX: SOLO bodegas 300, 200, 500 y 01
+   ✅ Inventario (solo bodegas 300,200,500,01)
 ========================================================= */
 const INV_WH_ALLOWED = new Set(["300", "200", "500", "01"]);
 
@@ -578,7 +582,6 @@ async function syncInventoryForSalesItems({ from, to, maxItems = 1200 }) {
 
 /* =========================================================
    ✅ Sync: Grupos por Item (ItemGroups)
-   ✅ FIX: guardo "grupo" canónico
 ========================================================= */
 async function getItemGroupNameFromSap(itemCode) {
   const code = String(itemCode || "").trim();
@@ -628,7 +631,6 @@ async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
       const sap = await getItemGroupNameFromSap(code);
       const groupNameRaw = String(sap.groupName || "").trim();
 
-      // ✅ guardamos el "grupo" con el nombre canónico de tu lista (si matchea)
       const grupo = canonicalGroupName(groupNameRaw || "");
       const area = inferAreaFromGroup(grupo) || inferAreaFromGroup(groupNameRaw) || "";
 
@@ -657,7 +659,11 @@ async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
 }
 
 /* =========================================================
-   ✅ ABC helpers
+   ✅ ABC helpers (AHORA A/B/C/D como Excel)
+   - A: <= 80% acumulado
+   - B: <= 95% acumulado
+   - C: <= 99% acumulado
+   - D: resto
 ========================================================= */
 function abcByMetric(rows, metricKey) {
   const arr = rows
@@ -671,23 +677,34 @@ function abcByMetric(rows, metricKey) {
   for (const x of arr) {
     acc += x.v;
     const share = total > 0 ? acc / total : 1;
-    const letter = share <= 0.8 ? "A" : share <= 0.95 ? "B" : "C";
+    const letter = share <= 0.8 ? "A" : share <= 0.95 ? "B" : share <= 0.99 ? "C" : "D";
     out.set(x.key, letter);
   }
   return out;
 }
 
-function totalLabelFromABC(a1, a2, a3) {
-  const score = (l) => (l === "A" ? 3 : l === "B" ? 2 : 1);
-  const avg = (score(a1) + score(a2) + score(a3)) / 3;
+function letterScore(l) {
+  const L = String(l || "").toUpperCase();
+  if (L === "A") return 4;
+  if (L === "B") return 3;
+  if (L === "C") return 2;
+  return 1; // D o vacío
+}
 
-  if (avg >= 2.5) return { label: "AB Crítico", cls: "bad" };
-  if (avg >= 1.8) return { label: "C Importante", cls: "warn" };
-  return { label: "D", cls: "ok" };
+function totalFromLetters(a1, a2, a3) {
+  const r = letterScore(a1);
+  const g = letterScore(a2);
+  const p = letterScore(a3);
+  const avg = (r + g + p) / 3;
+  const t = Math.round(avg * 10) / 10; // 1 decimal como Excel
+
+  if (t >= 3.5) return { label: "AB Crítico", cls: "bad", r, g, p, t };
+  if (t >= 2.0) return { label: "C Importante", cls: "warn", r, g, p, t };
+  return { label: "D", cls: "ok", r, g, p, t };
 }
 
 /* =========================================================
-   ✅ Dashboard (DB)
+   ✅ Dashboard (DB) con universo ABC como Excel + orden
 ========================================================= */
 async function dashboardFromDb({ from, to, area, grupo, q }) {
   const salesAgg = await dbQuery(
@@ -731,7 +748,7 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     const pct = rev > 0 ? (gp / rev) * 100 : 0;
 
     const grupoTxtRaw = String(r.grupo || "Sin grupo");
-    const grupoTxt = canonicalGroupName(grupoTxtRaw); // ✅ estabiliza variantes
+    const grupoTxt = canonicalGroupName(grupoTxtRaw);
     const areaDb = String(r.area || "");
     const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || "CONS";
 
@@ -756,23 +773,70 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
   const grupoSel = String(grupo || "__ALL__");
   const qq = String(q || "").trim().toLowerCase();
 
-  if (areaSel !== "__ALL__") items = items.filter((x) => String(x.area || "") === areaSel);
-
-  if (grupoSel !== "__ALL__") {
-    const gSelN = normGroupName(grupoSel);
-    items = items.filter((x) => normGroupName(x.grupo) === gSelN);
-  }
-
-  if (qq) items = items.filter((x) => x.itemCode.toLowerCase().includes(qq) || x.itemDesc.toLowerCase().includes(qq));
-
+  // availableGroups (según filtro área)
   let availableGroups = [];
   if (areaSel === "CONS") availableGroups = Array.from(GROUPS_CONS);
   else if (areaSel === "RCI") availableGroups = Array.from(GROUPS_RCI);
   else availableGroups = Array.from(new Set([...GROUPS_CONS, ...GROUPS_RCI]));
   availableGroups.sort((a, b) => a.localeCompare(b));
 
+  /* =========================
+     ✅ UNIVERSO ABC (NO depende de q)
+     - Sin filtros: CONS+RCI
+     - Con área: solo esa área
+     - Con grupo: solo ese grupo (dentro del área si aplica)
+  ========================= */
+  let universe = items.slice();
+
+  if (areaSel !== "__ALL__") {
+    universe = universe.filter((x) => String(x.area || "") === areaSel);
+  }
+  if (grupoSel !== "__ALL__") {
+    const gSelN = normGroupName(grupoSel);
+    universe = universe.filter((x) => normGroupName(x.grupo) === gSelN);
+  }
+
+  // ABC por métricas (A/B/C/D)
+  const abcRev = abcByMetric(universe, "revenue");
+  const abcGP = abcByMetric(universe, "gp");
+  const abcPct = abcByMetric(universe, "gpPct");
+
+  // asigna letras a todos (aunque q deje 1 item)
+  let outItems = items.map((it) => {
+    const a1 = abcRev.get(it.itemCode) || "D";
+    const a2 = abcGP.get(it.itemCode) || "D";
+    const a3 = abcPct.get(it.itemCode) || "D";
+    const total = totalFromLetters(a1, a2, a3);
+
+    return {
+      ...it,
+      abcRevenue: a1,
+      abcGP: a2,
+      abcGPPct: a3,
+      totalLabel: total.label,
+      totalTagClass: total.cls,
+      R: total.r,
+      G: total.g,
+      "%": total.p,
+      T: total.t,
+    };
+  });
+
+  // filtros de vista (incluye q)
+  if (areaSel !== "__ALL__") outItems = outItems.filter((x) => String(x.area || "") === areaSel);
+  if (grupoSel !== "__ALL__") {
+    const gSelN = normGroupName(grupoSel);
+    outItems = outItems.filter((x) => normGroupName(x.grupo) === gSelN);
+  }
+  if (qq) {
+    outItems = outItems.filter(
+      (x) => x.itemCode.toLowerCase().includes(qq) || x.itemDesc.toLowerCase().includes(qq)
+    );
+  }
+
+  // groupAgg / rank (sobre lo mostrado)
   const groupAggMap = new Map();
-  for (const it of items) {
+  for (const it of outItems) {
     const g = it.grupo || "Sin grupo";
     const cur = groupAggMap.get(g) || { grupo: g, revenue: 0, gp: 0 };
     cur.revenue += it.revenue;
@@ -785,33 +849,33 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
 
   const groupRank = new Map();
   groupAgg.forEach((g, idx) => groupRank.set(g.grupo, idx + 1));
+  outItems = outItems.map((x) => ({ ...x, rankArea: groupRank.get(x.grupo) || 9999 }));
 
-  const abcRev = abcByMetric(items, "revenue");
-  const abcGP = abcByMetric(items, "gp");
-  const abcPct = abcByMetric(items, "gpPct");
+  // ✅ orden solicitado: Revenue -> GM$ -> GM% -> TOTAL
+  outItems.sort((a, b) => {
+    const dr = (b.revenue || 0) - (a.revenue || 0);
+    if (dr) return dr;
 
-  const outItems = items.map((it) => {
-    const a1 = abcRev.get(it.itemCode) || "C";
-    const a2 = abcGP.get(it.itemCode) || "C";
-    const a3 = abcPct.get(it.itemCode) || "C";
-    const total = totalLabelFromABC(a1, a2, a3);
+    const dg = (b.gp || 0) - (a.gp || 0);
+    if (dg) return dg;
 
-    return {
-      ...it,
-      abcRevenue: a1,
-      abcGP: a2,
-      abcGPPct: a3,
-      totalLabel: total.label,
-      totalTagClass: total.cls,
-      rankArea: groupRank.get(it.grupo) || 9999,
-    };
+    const dp = (b.gpPct || 0) - (a.gpPct || 0);
+    if (dp) return dp;
+
+    // TOTAL por T (promedio) y luego por label
+    const dt = (b.T || 0) - (a.T || 0);
+    if (dt) return dt;
+
+    const rankLabel = (lab) => (lab === "AB Crítico" ? 3 : lab === "C Importante" ? 2 : 1);
+    return rankLabel(b.totalLabel) - rankLabel(a.totalLabel);
   });
 
+  // totals (sobre lo mostrado)
   const totals = outItems.reduce(
-    (a, x) => {
-      a.revenue += Number(x.revenue || 0);
-      a.gp += Number(x.gp || 0);
-      return a;
+    (acc, x) => {
+      acc.revenue += Number(x.revenue || 0);
+      acc.gp += Number(x.gp || 0);
+      return acc;
     },
     { revenue: 0, gp: 0 }
   );
@@ -828,57 +892,9 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     totals: { revenue: totals.revenue, gp: totals.gp, gpPct: gpPctTotal },
     availableGroups,
     groupAgg,
-    items: outItems.sort((a, b) => a.rankArea - b.rankArea || b.revenue - a.revenue),
+    items: outItems,
   };
 }
-
-/* =========================================================
-   ✅ Health + Auth
-========================================================= */
-app.get("/api/health", async (req, res) => {
-  return safeJson(res, 200, {
-    ok: true,
-    message: "✅ PRODIMA ESTRATIFICACION API activa",
-    sap: missingSapEnv() ? "missing" : "ok",
-    db: hasDb() ? "on" : "off",
-    last_sync_at: await getState("last_sync_at"),
-  });
-});
-
-app.post("/api/admin/login", async (req, res) => {
-  const user = String(req.body?.user || "").trim();
-  const pass = String(req.body?.pass || "").trim();
-
-  if (user !== ADMIN_USER || pass !== ADMIN_PASS) {
-    return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
-  }
-  const token = signToken({ role: "admin", user }, "12h");
-  return safeJson(res, 200, { ok: true, token });
-});
-
-/* =========================================================
-   ✅ Dashboard endpoint (DB)
-========================================================= */
-app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-
-    const fromQ = String(req.query?.from || "");
-    const toQ = String(req.query?.to || "");
-    const area = String(req.query?.area || "__ALL__");
-    const grupo = String(req.query?.grupo || "__ALL__");
-    const q = String(req.query?.q || "");
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = isISO(fromQ) ? fromQ : "2024-01-01";
-    const to = isISO(toQ) ? toQ : today;
-
-    const data = await dashboardFromDb({ from, to, area, grupo, q });
-    return safeJson(res, 200, data);
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
 
 /* =========================================================
    ✅ Item docs endpoint (modal)
@@ -958,6 +974,54 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
 });
 
 /* =========================================================
+   ✅ Health + Auth
+========================================================= */
+app.get("/api/health", async (req, res) => {
+  return safeJson(res, 200, {
+    ok: true,
+    message: "✅ PRODIMA ESTRATIFICACION API activa",
+    sap: missingSapEnv() ? "missing" : "ok",
+    db: hasDb() ? "on" : "off",
+    last_sync_at: await getState("last_sync_at"),
+  });
+});
+
+app.post("/api/admin/login", async (req, res) => {
+  const user = String(req.body?.user || "").trim();
+  const pass = String(req.body?.pass || "").trim();
+
+  if (user !== ADMIN_USER || pass !== ADMIN_PASS) {
+    return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
+  }
+  const token = signToken({ role: "admin", user }, "12h");
+  return safeJson(res, 200, { ok: true, token });
+});
+
+/* =========================================================
+   ✅ Dashboard endpoint
+========================================================= */
+app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+
+    const fromQ = String(req.query?.from || "");
+    const toQ = String(req.query?.to || "");
+    const area = String(req.query?.area || "__ALL__");
+    const grupo = String(req.query?.grupo || "__ALL__");
+    const q = String(req.query?.q || "");
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = isISO(fromQ) ? fromQ : "2024-01-01";
+    const to = isISO(toQ) ? toQ : today;
+
+    const data = await dashboardFromDb({ from, to, area, grupo, q });
+    return safeJson(res, 200, data);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+/* =========================================================
    ✅ Sync endpoint (SAP -> DB)
 ========================================================= */
 app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
@@ -990,7 +1054,10 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
       to = today;
     }
 
+    // ventas netas
     const salesSaved = await syncSales({ from, to, maxDocs });
+
+    // grupos + inventario para items del rango
     const groupsSaved = await syncItemGroupsForSalesItems({ from, to, maxItems: 2500 });
     const invSaved = await syncInventoryForSalesItems({ from, to, maxItems: 2500 });
 
@@ -1028,37 +1095,6 @@ app.get("/api/admin/estratificacion/debug-counts", verifyAdmin, async (req, res)
       inv_item_cache: r2.rows?.[0]?.c || 0,
       item_group_cache: r3.rows?.[0]?.c || 0,
       last_sync_at: await getState("last_sync_at"),
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-/* =========================================================
-   ✅ DEBUG: inventory by code
-========================================================= */
-app.get("/api/admin/estratificacion/debug-inv", verifyAdmin, async (req, res) => {
-  try {
-    const code = String(req.query?.code || "").trim();
-    if (!code) return safeJson(res, 400, { ok: false, message: "Falta ?code=" });
-
-    const db = await dbQuery(
-      `SELECT item_code,item_desc,stock,stock_min,stock_max,committed,ordered,available FROM inv_item_cache WHERE item_code=$1 LIMIT 1`,
-      [code]
-    );
-
-    let inv = null;
-    try {
-      inv = await getInventoryForItemCode(code);
-    } catch (e) {
-      inv = { error: String(e.message || e) };
-    }
-
-    return safeJson(res, 200, {
-      ok: true,
-      code,
-      db: db.rows?.[0] || null,
-      inv,
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
