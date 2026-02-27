@@ -1162,4 +1162,5 @@ process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
   } catch (e) {
     console.error("DB init error:", e.message);
   }
-  app.listen(Number(PORT), () => console.log(`Server listening on :${PORT}
+  app.listen(Number(PORT), () => console.log(`Server listening on :${PORT}`));
+})();
