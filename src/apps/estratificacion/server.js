@@ -284,7 +284,7 @@ async function createMissingHandler(req, res) {
       return {
         item_code: code,
         item_desc: r.item_desc ? String(r.item_desc) : null,
-        area: r.area ? String(r.area) : null,
+        area: (r.area && String(r.area).trim()) ? String(r.area).trim() : "EMPTY",
         group_name: "Sin grupo",
         grupo: "Sin grupo",
         updated_at: now,
