@@ -44,10 +44,10 @@ const GROUPS_RCI = new Set([
   "Equip. Y Acces. Agua",
   "Químicos Piscina",
   "Servicios",
-  "Químicos Trata. Agua",
-  "Equip. Y Acces. Pis",
-  "M.P.Res.Comer.ind.",
-]);
+  "Químicos Trat. Agua",
+  "Equip. Y Acces. Pisc",
+  "M.P.Res.Comer.Ind.",
+]);;
 
 /* =========================================================
    ✅ NORMALIZACIÓN
