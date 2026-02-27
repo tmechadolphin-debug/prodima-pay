@@ -50,7 +50,7 @@ const GROUPS_RCI = new Set([
 ]);
 
 /* =========================================================
-   ✅ NORMALIZACIÓN + CANONICALIZACIÓN + HEURÍSTICAS
+   ✅ NORMALIZACIÓN + CANONICALIZACIÓN (+ HEURÍSTICA)
 ========================================================= */
 function normGroupName(s) {
   return String(s || "")
@@ -73,10 +73,12 @@ function canonicalGroupName(groupName) {
   return CANON_GROUP.get(n) || String(groupName || "").trim();
 }
 
-// ✅ NUEVO: mapeo por "patrones" para variantes raras del SAP
+/**
+ * ✅ HEURÍSTICA: fuerza variantes del SAP a tus 12 grupos
+ * (resuelve la mayoría de "Sin grupo" por abreviaturas/puntos/mayúsculas)
+ */
 function guessCanonicalGroupName(groupNameRaw) {
   const n = normGroupName(groupNameRaw);
-
   if (!n) return "";
 
   // ---- RCI ----
@@ -99,7 +101,6 @@ function guessCanonicalGroupName(groupNameRaw) {
   if (n.includes("VINAGR")) return "Vinagres";
   if (n.includes("ROPA")) return "Cuidado De La Ropa";
 
-  // Limpieza (hogar / artículos) - preferimos Art. si dice ESPONJA/PAÑO/ART
   if (n.includes("LIMPIEZ") || n.includes("LIMPIEZA") || n.includes("CLEAN")) {
     if (n.includes("ART") || n.includes("ESPON") || n.includes("PANO") || n.includes("PAÑO")) return "Art. De Limpieza";
     return "Prod. De Limpieza";
@@ -108,6 +109,23 @@ function guessCanonicalGroupName(groupNameRaw) {
   if (n.includes("ESPECIAL") || n.includes("GMT")) return "Especialidades y GMT";
 
   return "";
+}
+
+function normalizeGrupoFinal(grupoRaw) {
+  const raw = String(grupoRaw || "").trim();
+  if (!raw) return "Sin grupo";
+
+  const canon = canonicalGroupName(raw);
+  const canonN = normGroupName(canon);
+
+  // si ya está en tus listas, perfecto
+  if (GROUPS_CONS_N.has(canonN) || GROUPS_RCI_N.has(canonN)) return canon;
+
+  // si no, prueba heurística
+  const guessed = guessCanonicalGroupName(raw);
+  if (guessed) return guessed;
+
+  return canon || "Sin grupo";
 }
 
 function inferAreaFromGroup(groupName) {
@@ -329,7 +347,9 @@ async function slLogin() {
 
   const txt = await r.text();
   let data = {};
-  try { data = JSON.parse(txt); } catch {}
+  try {
+    data = JSON.parse(txt);
+  } catch {}
 
   if (!r.ok) throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
 
@@ -368,7 +388,11 @@ async function slFetch(path, options = {}) {
 
     const txt = await r.text();
     let data = {};
-    try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+    try {
+      data = JSON.parse(txt);
+    } catch {
+      data = { raw: txt };
+    }
 
     if (!r.ok) {
       if (r.status === 401 || r.status === 403) {
@@ -388,8 +412,231 @@ async function slFetch(path, options = {}) {
 }
 
 /* =========================================================
+   ✅ Sync: Ventas netas por item (INV - CRN)
+========================================================= */
+function pickGrossProfit(ln) {
+  const candidates = [ln?.GrossProfit, ln?.GrossProfitTotal, ln?.GrossProfitFC, ln?.GrossProfitSC];
+  for (const c of candidates) {
+    const n = Number(c);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
+
+async function scanDocHeaders(entity, { from, to, maxDocs = 2500 }) {
+  const toPlus1 = addDaysISO(to, 1);
+  const batchTop = 200;
+  let skipSap = 0;
+  const out = [];
+
+  for (let page = 0; page < 300; page++) {
+    const raw = await slFetch(
+      `/${entity}?$select=DocEntry,DocNum,DocDate&` +
+        `$filter=${encodeURIComponent(`DocDate ge '${from}' and DocDate lt '${toPlus1}'`)}&` +
+        `$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skipSap}`,
+      { timeoutMs: 120000 }
+    );
+
+    const rows = Array.isArray(raw?.value) ? raw.value : [];
+    if (!rows.length) break;
+    skipSap += rows.length;
+
+    for (const r of rows) {
+      out.push({
+        DocEntry: Number(r.DocEntry),
+        DocNum: r.DocNum != null ? Number(r.DocNum) : null,
+        DocDate: String(r.DocDate || "").slice(0, 10),
+      });
+      if (out.length >= maxDocs) return out;
+    }
+  }
+  return out;
+}
+
+async function getDoc(entity, docEntry) {
+  const de = Number(docEntry);
+  if (!Number.isFinite(de) || de <= 0) return null;
+  return slFetch(`/${entity}(${de})`, { timeoutMs: 180000 });
+}
+
+async function upsertSalesLines(docType, docDate, docFull, sign) {
+  const docEntry = Number(docFull?.DocEntry || 0);
+  const docNum = docFull?.DocNum != null ? Number(docFull.DocNum) : null;
+  const lines = Array.isArray(docFull?.DocumentLines) ? docFull.DocumentLines : [];
+  if (!docEntry || !lines.length) return 0;
+
+  let inserted = 0;
+
+  for (const ln of lines) {
+    const lineNum = Number(ln?.LineNum);
+    if (!Number.isFinite(lineNum)) continue;
+
+    const itemCode = String(ln?.ItemCode || "").trim();
+    if (!itemCode) continue;
+
+    const itemDesc = String(ln?.ItemDescription || ln?.ItemName || "").trim();
+
+    // ✅ FIX NC: ABS + signo para que CRN siempre reste
+    const qtyRaw = Number(ln?.Quantity || 0);
+    const revRaw = Number(ln?.LineTotal || 0);
+    const gpRaw = Number(pickGrossProfit(ln) || 0);
+
+    const qty = Math.abs(qtyRaw) * sign;
+    const rev = Math.abs(revRaw) * sign;
+    const gp = Math.abs(gpRaw) * sign;
+
+    await dbQuery(
+      `
+      INSERT INTO sales_item_lines(
+        doc_entry,line_num,doc_type,doc_date,doc_num,item_code,item_desc,quantity,revenue,gross_profit,updated_at
+      )
+      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,NOW())
+      ON CONFLICT(doc_entry,line_num,doc_type) DO UPDATE SET
+        doc_date=EXCLUDED.doc_date,
+        doc_num=EXCLUDED.doc_num,
+        item_code=EXCLUDED.item_code,
+        item_desc=EXCLUDED.item_desc,
+        quantity=EXCLUDED.quantity,
+        revenue=EXCLUDED.revenue,
+        gross_profit=EXCLUDED.gross_profit,
+        updated_at=NOW()
+      `,
+      [docEntry, lineNum, docType, docDate, docNum, itemCode, itemDesc, qty, rev, gp]
+    );
+
+    inserted++;
+    if (inserted % 200 === 0) await sleep(10);
+  }
+
+  return inserted;
+}
+
+async function syncSales({ from, to, maxDocs = 2500 }) {
+  let saved = 0;
+
+  const invHeaders = await scanDocHeaders("Invoices", { from, to, maxDocs });
+  for (const h of invHeaders) {
+    try {
+      const full = await getDoc("Invoices", h.DocEntry);
+      saved += await upsertSalesLines("INV", h.DocDate, full, +1);
+    } catch {}
+    await sleep(10);
+  }
+
+  const crnHeaders = await scanDocHeaders("CreditNotes", { from, to, maxDocs });
+  for (const h of crnHeaders) {
+    try {
+      const full = await getDoc("CreditNotes", h.DocEntry);
+      saved += await upsertSalesLines("CRN", h.DocDate, full, -1);
+    } catch {}
+    await sleep(10);
+  }
+
+  return saved;
+}
+
+/* =========================================================
+   ✅ Inventario (solo bodegas 300,200,500,01)
+========================================================= */
+const INV_WH_ALLOWED = new Set(["300", "200", "500", "01"]);
+
+function sumInvFromWarehouseInfo(infoArr) {
+  const rowsAll = Array.isArray(infoArr) ? infoArr : [];
+  const rows = rowsAll.filter((w) => INV_WH_ALLOWED.has(String(w?.WarehouseCode ?? w?.WhsCode ?? "").trim()));
+
+  let stock = 0;
+  let committed = 0;
+  let ordered = 0;
+
+  let stockMin = 0;
+  let stockMax = 0;
+
+  for (const w of rows) {
+    stock += Number(w?.InStock ?? w?.OnHand ?? 0);
+    committed += Number(w?.Committed ?? w?.IsCommited ?? 0);
+    ordered += Number(w?.Ordered ?? w?.OnOrder ?? 0);
+
+    const mn = Number(w?.MinimalStock ?? w?.MinStock ?? 0);
+    const mx = Number(w?.MaximalStock ?? w?.MaxStock ?? 0);
+    if (Number.isFinite(mn) && mn > stockMin) stockMin = mn;
+    if (Number.isFinite(mx) && mx > stockMax) stockMax = mx;
+  }
+
+  const available = stock - committed + ordered;
+
+  return { stock, committed, ordered, available, stockMin, stockMax };
+}
+
+async function getInventoryForItemCode(code) {
+  const itemCode = String(code || "").trim();
+  if (!itemCode) return null;
+
+  const safe = itemCode.replace(/'/g, "''");
+  const a = await slFetch(`/Items('${safe}')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection`, { timeoutMs: 120000 });
+
+  const itemName = String(a?.ItemName || "").trim();
+  const inv = sumInvFromWarehouseInfo(a?.ItemWarehouseInfoCollection);
+
+  return { itemCode, itemDesc: itemName, ...inv };
+}
+
+async function syncInventoryForSalesItems({ from, to, maxItems = 1200 }) {
+  const r = await dbQuery(
+    `
+    SELECT DISTINCT item_code
+    FROM sales_item_lines
+    WHERE doc_date >= $1::date AND doc_date <= $2::date
+      AND item_code <> ''
+    LIMIT $3
+    `,
+    [from, to, Math.max(100, Math.min(5000, Number(maxItems || 1200)))]
+  );
+
+  const codes = (r.rows || []).map((x) => String(x.item_code || "").trim()).filter(Boolean);
+  let saved = 0;
+
+  for (let i = 0; i < codes.length; i++) {
+    const code = codes[i];
+    try {
+      const inv = await getInventoryForItemCode(code);
+      if (!inv) continue;
+
+      await dbQuery(
+        `
+        INSERT INTO inv_item_cache(item_code,item_desc,stock,stock_min,stock_max,committed,ordered,available,updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+        ON CONFLICT(item_code) DO UPDATE SET
+          item_desc=EXCLUDED.item_desc,
+          stock=EXCLUDED.stock,
+          stock_min=EXCLUDED.stock_min,
+          stock_max=EXCLUDED.stock_max,
+          committed=EXCLUDED.committed,
+          ordered=EXCLUDED.ordered,
+          available=EXCLUDED.available,
+          updated_at=NOW()
+        `,
+        [
+          inv.itemCode,
+          inv.itemDesc || "",
+          Number(inv.stock || 0),
+          Number(inv.stockMin || 0),
+          Number(inv.stockMax || 0),
+          Number(inv.committed || 0),
+          Number(inv.ordered || 0),
+          Number(inv.available || 0),
+        ]
+      );
+
+      saved++;
+    } catch {}
+    if ((i + 1) % 25 === 0) await sleep(15);
+  }
+
+  return saved;
+}
+
+/* =========================================================
    ✅ Sync: Grupos por Item (ItemGroups)
-   ✅ FIX: aplica heurística para no caer en "Sin grupo"
 ========================================================= */
 async function getItemGroupNameFromSap(itemCode) {
   const code = String(itemCode || "").trim();
@@ -439,13 +686,8 @@ async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
       const sap = await getItemGroupNameFromSap(code);
       const groupNameRaw = String(sap.groupName || "").trim();
 
-      // ✅ primero intenta canonical exacto, luego heurística
-      let grupo = canonicalGroupName(groupNameRaw || "");
-      if (!grupo || normGroupName(grupo) === "SIN GRUPO") {
-        const guessed = guessCanonicalGroupName(groupNameRaw);
-        if (guessed) grupo = guessed;
-      }
-
+      // ✅ FIX: normaliza (canon + heurística) para evitar "Sin grupo"
+      const grupo = normalizeGrupoFinal(groupNameRaw || "");
       const area = inferAreaFromGroup(grupo) || inferAreaFromGroup(groupNameRaw) || "";
 
       const itemDesc = (String(sap.itemName || "").trim() || descFromSales || "");
@@ -461,7 +703,7 @@ async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
           item_desc=CASE WHEN EXCLUDED.item_desc <> '' THEN EXCLUDED.item_desc ELSE item_group_cache.item_desc END,
           updated_at=NOW()
         `,
-        [code, groupNameRaw, area, grupo || "Sin grupo", itemDesc]
+        [code, groupNameRaw, area, grupo, itemDesc]
       );
 
       saved++;
@@ -473,7 +715,49 @@ async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
 }
 
 /* =========================================================
-   ✅ Dashboard: aplica heurística también en lectura
+   ✅ ABC helpers (AHORA A/B/C/D como Excel)
+========================================================= */
+function abcByMetric(rows, metricKey) {
+  const arr = rows
+    .map((r) => ({ key: r.itemCode, v: Math.max(0, Number(r[metricKey] || 0)) }))
+    .sort((a, b) => b.v - a.v);
+
+  const total = arr.reduce((a, x) => a + x.v, 0) || 0;
+  let acc = 0;
+
+  const out = new Map();
+  for (const x of arr) {
+    acc += x.v;
+    const share = total > 0 ? acc / total : 1;
+    const letter = share <= 0.8 ? "A" : share <= 0.95 ? "B" : share <= 0.99 ? "C" : "D";
+    out.set(x.key, letter);
+  }
+  return out;
+}
+
+function letterScore(l) {
+  const L = String(l || "").toUpperCase();
+  if (L === "A") return 4;
+  if (L === "B") return 3;
+  if (L === "C") return 2;
+  return 1; // D o vacío
+}
+
+function totalFromLetters(a1, a2, a3) {
+  const r = letterScore(a1);
+  const g = letterScore(a2);
+  const p = letterScore(a3);
+  const avg = (r + g + p) / 3;
+  const t = Math.round(avg * 10) / 10; // 1 decimal como Excel
+
+  if (t >= 3.5) return { label: "AB Crítico", cls: "bad", r, g, p, t };
+  if (t >= 2.0) return { label: "C Importante", cls: "warn", r, g, p, t };
+  return { label: "D", cls: "ok", r, g, p, t };
+}
+
+/* =========================================================
+   ✅ Dashboard (DB) con universo ABC como Excel + orden
+   ✅ FIX: normaliza grupos (canon + heurística) en lectura también
 ========================================================= */
 async function dashboardFromDb({ from, to, area, grupo, q }) {
   const salesAgg = await dbQuery(
@@ -496,9 +780,16 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
       COALESCE(NULLIF(s.grupo_s,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo,
       COALESCE(NULLIF(s.area_s,''), NULLIF(g.area,''), '') AS area,
       s.revenue AS revenue,
-      s.gp AS gp
+      s.gp AS gp,
+      COALESCE(i.stock,0)::float AS stock,
+      COALESCE(i.stock_min,0)::float AS stock_min,
+      COALESCE(i.stock_max,0)::float AS stock_max,
+      COALESCE(i.committed,0)::float AS committed,
+      COALESCE(i.ordered,0)::float AS ordered,
+      COALESCE(i.available,0)::float AS available
     FROM s
     LEFT JOIN item_group_cache g ON g.item_code = s.item_code
+    LEFT JOIN inv_item_cache i   ON i.item_code = s.item_code
     ORDER BY s.revenue DESC
     `,
     [from, to]
@@ -510,12 +801,7 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     const pct = rev > 0 ? (gp / rev) * 100 : 0;
 
     const grupoTxtRaw = String(r.grupo || "Sin grupo");
-    let grupoTxt = canonicalGroupName(grupoTxtRaw);
-    if (!grupoTxt || normGroupName(grupoTxt) === "SIN GRUPO") {
-      const guessed = guessCanonicalGroupName(grupoTxtRaw);
-      if (guessed) grupoTxt = guessed;
-      else grupoTxt = grupoTxtRaw;
-    }
+    const grupoTxt = normalizeGrupoFinal(grupoTxtRaw);
 
     const areaDb = String(r.area || "");
     const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || "CONS";
@@ -524,25 +810,356 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
       itemCode: String(r.item_code || ""),
       itemDesc: String(r.item_desc || ""),
       area: areaFinal,
-      grupo: grupoTxt || "Sin grupo",
+      grupo: grupoTxt,
       revenue: rev,
       gp: gp,
       gpPct: Number(pct.toFixed(2)),
+      stock: Number(r.stock || 0),
+      stockMin: Number(r.stock_min || 0),
+      stockMax: Number(r.stock_max || 0),
+      committed: Number(r.committed || 0),
+      ordered: Number(r.ordered || 0),
+      available: Number(r.available || 0),
     };
   });
 
-  // ... (el resto de tu lógica dashboard/ABC/orden queda igual que ya lo tienes)
-  // ⚠️ Aquí solo te mostré el fix de grupo; pega tu bloque actual completo después de esta construcción.
-  return { ok: true, items };
+  const areaSel = String(area || "__ALL__");
+  const grupoSel = String(grupo || "__ALL__");
+  const qq = String(q || "").trim().toLowerCase();
+
+  // availableGroups (según filtro área)
+  let availableGroups = [];
+  if (areaSel === "CONS") availableGroups = Array.from(GROUPS_CONS);
+  else if (areaSel === "RCI") availableGroups = Array.from(GROUPS_RCI);
+  else availableGroups = Array.from(new Set([...GROUPS_CONS, ...GROUPS_RCI]));
+  availableGroups.sort((a, b) => a.localeCompare(b));
+
+  /* =========================
+     ✅ UNIVERSO ABC (NO depende de q)
+  ========================= */
+  let universe = items.slice();
+
+  if (areaSel !== "__ALL__") {
+    universe = universe.filter((x) => String(x.area || "") === areaSel);
+  }
+  if (grupoSel !== "__ALL__") {
+    const gSelN = normGroupName(grupoSel);
+    universe = universe.filter((x) => normGroupName(x.grupo) === gSelN);
+  }
+
+  const abcRev = abcByMetric(universe, "revenue");
+  const abcGP = abcByMetric(universe, "gp");
+  const abcPct = abcByMetric(universe, "gpPct");
+
+  let outItems = items.map((it) => {
+    const a1 = abcRev.get(it.itemCode) || "D";
+    const a2 = abcGP.get(it.itemCode) || "D";
+    const a3 = abcPct.get(it.itemCode) || "D";
+    const total = totalFromLetters(a1, a2, a3);
+
+    return {
+      ...it,
+      abcRevenue: a1,
+      abcGP: a2,
+      abcGPPct: a3,
+      totalLabel: total.label,
+      totalTagClass: total.cls,
+      R: total.r,
+      G: total.g,
+      "%": total.p,
+      T: total.t,
+    };
+  });
+
+  // filtros de vista (incluye q)
+  if (areaSel !== "__ALL__") outItems = outItems.filter((x) => String(x.area || "") === areaSel);
+  if (grupoSel !== "__ALL__") {
+    const gSelN = normGroupName(grupoSel);
+    outItems = outItems.filter((x) => normGroupName(x.grupo) === gSelN);
+  }
+  if (qq) {
+    outItems = outItems.filter(
+      (x) => x.itemCode.toLowerCase().includes(qq) || x.itemDesc.toLowerCase().includes(qq)
+    );
+  }
+
+  // groupAgg / rank (sobre lo mostrado)
+  const groupAggMap = new Map();
+  for (const it of outItems) {
+    const g = it.grupo || "Sin grupo";
+    const cur = groupAggMap.get(g) || { grupo: g, revenue: 0, gp: 0 };
+    cur.revenue += it.revenue;
+    cur.gp += it.gp;
+    groupAggMap.set(g, cur);
+  }
+  const groupAgg = Array.from(groupAggMap.values())
+    .map((g) => ({ ...g, gpPct: g.revenue > 0 ? Number(((g.gp / g.revenue) * 100).toFixed(2)) : 0 }))
+    .sort((a, b) => b.revenue - a.revenue);
+
+  const groupRank = new Map();
+  groupAgg.forEach((g, idx) => groupRank.set(g.grupo, idx + 1));
+  outItems = outItems.map((x) => ({ ...x, rankArea: groupRank.get(x.grupo) || 9999 }));
+
+  // ✅ orden solicitado: Revenue -> GM$ -> GM% -> TOTAL
+  outItems.sort((a, b) => {
+    const dr = (b.revenue || 0) - (a.revenue || 0);
+    if (dr) return dr;
+
+    const dg = (b.gp || 0) - (a.gp || 0);
+    if (dg) return dg;
+
+    const dp = (b.gpPct || 0) - (a.gpPct || 0);
+    if (dp) return dp;
+
+    const dt = (b.T || 0) - (a.T || 0);
+    if (dt) return dt;
+
+    const rankLabel = (lab) => (lab === "AB Crítico" ? 3 : lab === "C Importante" ? 2 : 1);
+    return rankLabel(b.totalLabel) - rankLabel(a.totalLabel);
+  });
+
+  const totals = outItems.reduce(
+    (acc, x) => {
+      acc.revenue += Number(x.revenue || 0);
+      acc.gp += Number(x.gp || 0);
+      return acc;
+    },
+    { revenue: 0, gp: 0 }
+  );
+  const gpPctTotal = totals.revenue > 0 ? Number(((totals.gp / totals.revenue) * 100).toFixed(2)) : 0;
+
+  return {
+    ok: true,
+    from,
+    to,
+    area: areaSel,
+    grupo: grupoSel,
+    q: qq,
+    lastSyncAt: await getState("last_sync_at"),
+    totals: { revenue: totals.revenue, gp: totals.gp, gpPct: gpPctTotal },
+    availableGroups,
+    groupAgg,
+    items: outItems,
+  };
 }
 
 /* =========================================================
-   ⚠️ NOTA IMPORTANTE
-   Este archivo es largo y tu server.js actual tiene muchas más secciones:
-   - sync de ventas, inventario, endpoints, ABC, etc.
-   Para no romper nada, solo debes copiar estas funciones NUEVAS:
-   - guessCanonicalGroupName()
-   y aplicar sus usos en:
-   - syncItemGroupsForSalesItems()
-   - dashboardFromDb() donde arma grupoTxt
+   ✅ Item docs endpoint (modal)
 ========================================================= */
+app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+
+    const itemCode = String(req.query?.itemCode || "").trim();
+    if (!itemCode) return safeJson(res, 400, { ok: false, message: "Falta itemCode" });
+
+    const fromQ = String(req.query?.from || "");
+    const toQ = String(req.query?.to || "");
+    const areaSel = String(req.query?.area || "__ALL__");
+    const grupoSel = String(req.query?.grupo || "__ALL__");
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = isISO(fromQ) ? fromQ : "2024-01-01";
+    const to = isISO(toQ) ? toQ : today;
+
+    const q1 = await dbQuery(
+      `
+      SELECT
+        s.doc_type,
+        s.doc_date,
+        s.doc_entry,
+        s.doc_num,
+        s.item_code,
+        s.item_desc,
+        s.quantity,
+        s.revenue,
+        s.gross_profit,
+        COALESCE(NULLIF(s.area,''), NULLIF(g.area,''), '') AS area,
+        COALESCE(NULLIF(s.item_group,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo
+      FROM sales_item_lines s
+      LEFT JOIN item_group_cache g ON g.item_code = s.item_code
+      WHERE s.item_code = $1
+        AND s.doc_date >= $2::date
+        AND s.doc_date <= $3::date
+      ORDER BY s.doc_date DESC, s.doc_entry DESC, s.line_num ASC
+      LIMIT 500
+      `,
+      [itemCode, from, to]
+    );
+
+    let rows = (q1.rows || []).map((r) => {
+      const grupoTxtRaw = String(r.grupo || "Sin grupo");
+      const grupoTxt = normalizeGrupoFinal(grupoTxtRaw);
+
+      const areaDb = String(r.area || "");
+      const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || "CONS";
+
+      return {
+        docType: String(r.doc_type || ""),
+        docDate: String(r.doc_date || "").slice(0, 10),
+        docEntry: Number(r.doc_entry || 0),
+        docNum: r.doc_num != null ? Number(r.doc_num) : null,
+        itemCode: String(r.item_code || ""),
+        itemDesc: String(r.item_desc || ""),
+        quantity: Number(r.quantity || 0),
+        total: Number(r.revenue || 0),
+        gp: Number(r.gross_profit || 0),
+        area: areaFinal,
+        grupo: grupoTxt,
+      };
+    });
+
+    if (areaSel !== "__ALL__") rows = rows.filter((x) => String(x.area || "") === areaSel);
+    if (grupoSel !== "__ALL__") {
+      const gSelN = normGroupName(grupoSel);
+      rows = rows.filter((x) => normGroupName(x.grupo) === gSelN);
+    }
+
+    return safeJson(res, 200, { ok: true, itemCode, from, to, rows });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+/* =========================================================
+   ✅ Health + Auth
+========================================================= */
+app.get("/api/health", async (req, res) => {
+  return safeJson(res, 200, {
+    ok: true,
+    message: "✅ PRODIMA ESTRATIFICACION API activa",
+    sap: missingSapEnv() ? "missing" : "ok",
+    db: hasDb() ? "on" : "off",
+    last_sync_at: await getState("last_sync_at"),
+  });
+});
+
+app.post("/api/admin/login", async (req, res) => {
+  const user = String(req.body?.user || "").trim();
+  const pass = String(req.body?.pass || "").trim();
+
+  if (user !== ADMIN_USER || pass !== ADMIN_PASS) {
+    return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
+  }
+  const token = signToken({ role: "admin", user }, "12h");
+  return safeJson(res, 200, { ok: true, token });
+});
+
+/* =========================================================
+   ✅ Dashboard endpoint
+========================================================= */
+app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+
+    const fromQ = String(req.query?.from || "");
+    const toQ = String(req.query?.to || "");
+    const area = String(req.query?.area || "__ALL__");
+    const grupo = String(req.query?.grupo || "__ALL__");
+    const q = String(req.query?.q || "");
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = isISO(fromQ) ? fromQ : "2024-01-01";
+    const to = isISO(toQ) ? toQ : today;
+
+    const data = await dashboardFromDb({ from, to, area, grupo, q });
+    return safeJson(res, 200, data);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+/* =========================================================
+   ✅ Sync endpoint (SAP -> DB)
+========================================================= */
+app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    const mode = String(req.query?.mode || "days").toLowerCase();
+
+    const maxDocsRaw = Number(req.query?.maxDocs || 2500);
+    const maxDocs = Math.max(50, Math.min(20000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 2500));
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+
+    let from = "";
+    let to = today;
+
+    if (mode === "range") {
+      const fromQ = String(req.query?.from || "");
+      const toQ = String(req.query?.to || "");
+      from = isISO(fromQ) ? fromQ : "2024-01-01";
+      to = isISO(toQ) ? toQ : today;
+    } else {
+      const nRaw = Number(req.query?.n || 5);
+      const n =
+        mode === "days"
+          ? Math.max(1, Math.min(120, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5))
+          : Math.max(1, Math.min(30, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5));
+      from = addDaysISO(today, -n);
+      to = today;
+    }
+
+    // ventas netas
+    const salesSaved = await syncSales({ from, to, maxDocs });
+
+    // grupos + inventario para items del rango
+    const groupsSaved = await syncItemGroupsForSalesItems({ from, to, maxItems: 2500 });
+    const invSaved = await syncInventoryForSalesItems({ from, to, maxItems: 2500 });
+
+    await setState("last_sync_at", new Date().toISOString());
+    await setState("last_sync_from", from);
+    await setState("last_sync_to", to);
+
+    return safeJson(res, 200, {
+      ok: true,
+      mode,
+      maxDocs,
+      from,
+      to,
+      salesSaved,
+      groupsSaved,
+      invSaved,
+      lastSyncAt: await getState("last_sync_at"),
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+/* =========================================================
+   ✅ DEBUG: counts
+========================================================= */
+app.get("/api/admin/estratificacion/debug-counts", verifyAdmin, async (req, res) => {
+  try {
+    const r1 = await dbQuery(`SELECT COUNT(*)::int AS c FROM sales_item_lines`);
+    const r2 = await dbQuery(`SELECT COUNT(*)::int AS c FROM inv_item_cache`);
+    const r3 = await dbQuery(`SELECT COUNT(*)::int AS c FROM item_group_cache`);
+    return safeJson(res, 200, {
+      ok: true,
+      sales_item_lines: r1.rows?.[0]?.c || 0,
+      inv_item_cache: r2.rows?.[0]?.c || 0,
+      item_group_cache: r3.rows?.[0]?.c || 0,
+      last_sync_at: await getState("last_sync_at"),
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+/* =========================================================
+   ✅ START
+========================================================= */
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+
+(async () => {
+  try {
+    await ensureDb();
+    console.log(hasDb() ? "DB ready ✅" : "DB not configured ⚠️");
+  } catch (e) {
+    console.error("DB init error:", e.message);
+  }
+  app.listen(Number(PORT), () => console.log(`Server listening on :${PORT}
