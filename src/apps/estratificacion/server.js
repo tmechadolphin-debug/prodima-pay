@@ -615,6 +615,80 @@ app.post("/api/admin/invoices/sync", verifyAdmin, async (req, res) => {
   }
 });
 
+// ✅ POST /api/admin/item-groups/force
+// Body: { itemCodes: ["PL0242C", "PM0060C", ...] }
+app.post("/api/admin/item-groups/force", verifyAdmin, async (req, res) => {
+  try {
+    if (!sb) return safeJson(res, 500, { ok: false, message: "Faltan variables Supabase" });
+
+    const itemCodes = Array.isArray(req.body?.itemCodes) ? req.body.itemCodes : [];
+    const clean = Array.from(
+      new Set(itemCodes.map(x => String(x || "").trim()).filter(Boolean))
+    );
+
+    if (!clean.length) {
+      return safeJson(res, 400, { ok: false, message: "Envía itemCodes: [] con al menos 1 código." });
+    }
+
+    // ✅ Ajusta aquí si tu columna de grupo en sales se llama "grupo" (o algo distinto):
+    const SALES_GROUP_COL = "item_group"; // <-- cámbiala a "grupo" si aplica
+    const SALES_DATE_COL  = "doc_date";   // <-- cámbiala si tu fecha se llama distinto
+
+    // 1) Traer grupos desde sales (más reciente primero)
+    const { data: rows, error } = await sb
+      .from("sales")
+      .select(`item_code,${SALES_GROUP_COL},${SALES_DATE_COL}`)
+      .in("item_code", clean)
+      .not(SALES_GROUP_COL, "is", null)
+      .order(SALES_DATE_COL, { ascending: false });
+
+    if (error) throw new Error(error.message);
+
+    // 2) Elegir el grupo "más reciente" por item_code
+    const best = new Map();
+    for (const r of (rows || [])) {
+      const code = String(r.item_code || "").trim();
+      const grp = String(r[SALES_GROUP_COL] || "").trim();
+      if (!code || !grp) continue;
+      if (!best.has(code)) best.set(code, grp); // primera vez = más reciente
+    }
+
+    const upPayload = Array.from(best.entries()).map(([code, grp]) => ({
+      item_code: code,
+      group_name: grp,
+      updated_at: new Date().toISOString(),
+    }));
+
+    if (!upPayload.length) {
+      return safeJson(res, 200, {
+        ok: true,
+        requested: clean.length,
+        updated: 0,
+        message: "No encontré grupo en sales para esos códigos (o la columna de grupo no coincide).",
+      });
+    }
+
+    // 3) Upsert al cache
+    const { error: e2 } = await sb
+      .from("item_group_cache")
+      .upsert(upPayload, { onConflict: "item_code" });
+
+    if (e2) throw new Error(e2.message);
+
+    const missingInSales = clean.filter(c => !best.has(c));
+
+    return safeJson(res, 200, {
+      ok: true,
+      requested: clean.length,
+      updated: upPayload.length,
+      missingInSalesCount: missingInSales.length,
+      missingInSales: missingInSales.slice(0, 100),
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
 /* =========================================================
    ✅ START
 ========================================================= */
