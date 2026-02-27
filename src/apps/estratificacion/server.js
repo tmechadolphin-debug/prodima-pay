@@ -30,7 +30,6 @@ const {
 
 /* =========================================================
    ✅ GRUPOS (TU REGLA DE NEGOCIO)
-   - OJO: aquí uso EXACTAMENTE los sets que me diste al final
 ========================================================= */
 const GROUPS_CONS = new Set([
   "Prod. De Limpieza",
@@ -51,19 +50,16 @@ const GROUPS_RCI = new Set([
 ]);
 
 /* =========================================================
-   ✅ NORMALIZACIÓN (FIX RCI BLANCO)
-   - Quita acentos, mayúsculas, recorta y colapsa espacios
-   - Esto evita mismatch: "QUIMICOS PISCINA" vs "Químicos Piscina"
+   ✅ NORMALIZACIÓN
 ========================================================= */
 function normGroupName(s) {
   return String(s || "")
     .trim()
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // quita diacríticos
+    .replace(/[\u0300-\u036f]/g, "")
     .replace(/\s+/g, " ")
     .toUpperCase();
 }
-
 const GROUPS_CONS_N = new Set(Array.from(GROUPS_CONS).map(normGroupName));
 const GROUPS_RCI_N = new Set(Array.from(GROUPS_RCI).map(normGroupName));
 
@@ -177,11 +173,7 @@ async function dbQuery(text, params = []) {
 }
 
 /**
- * ✅ Tablas usadas por Estratificación (sin item_master)
- * - sales_item_lines: líneas netas (INV positivo, CRN negativo) + (opcional) item_group/area/warehouse
- * - inv_item_cache: inventario por artículo (stock/min/max/committed/ordered/available)
- * - item_group_cache: catálogo de grupo/área por artículo (group_name, grupo, area, item_desc)
- * - sync_state
+ * ✅ Tablas usadas por Estratificación
  */
 async function ensureDb() {
   if (!hasDb()) return;
@@ -197,7 +189,6 @@ async function ensureDb() {
       quantity  NUMERIC(18,4) NOT NULL DEFAULT 0,
       revenue   NUMERIC(18,2) NOT NULL DEFAULT 0,
       gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0,
-      -- opcionales (si algún día los llenas)
       item_group TEXT DEFAULT '',
       area TEXT DEFAULT '',
       warehouse TEXT DEFAULT '',
@@ -206,6 +197,7 @@ async function ensureDb() {
     );
   `);
 
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS doc_num INTEGER;`); // ✅ NUEVO (DocNum)
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_sales_item_date ON sales_item_lines(doc_date);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_sales_item_code ON sales_item_lines(item_code);`);
 
@@ -227,7 +219,6 @@ async function ensureDb() {
     CREATE TABLE IF NOT EXISTS item_group_cache (
       item_code TEXT PRIMARY KEY,
       group_name TEXT NOT NULL DEFAULT '',
-      -- normalizado para tu UI
       area TEXT NOT NULL DEFAULT '',
       grupo TEXT NOT NULL DEFAULT '',
       item_desc TEXT NOT NULL DEFAULT '',
@@ -235,7 +226,6 @@ async function ensureDb() {
     );
   `);
 
-  // columnas por si ya existía distinta
   await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS group_name TEXT NOT NULL DEFAULT '';`);
   await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS area TEXT NOT NULL DEFAULT '';`);
   await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS grupo TEXT NOT NULL DEFAULT '';`);
@@ -292,9 +282,7 @@ async function slLogin() {
 
   const txt = await r.text();
   let data = {};
-  try {
-    data = JSON.parse(txt);
-  } catch {}
+  try { data = JSON.parse(txt); } catch {}
 
   if (!r.ok) throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
 
@@ -333,11 +321,7 @@ async function slFetch(path, options = {}) {
 
     const txt = await r.text();
     let data = {};
-    try {
-      data = JSON.parse(txt);
-    } catch {
-      data = { raw: txt };
-    }
+    try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
 
     if (!r.ok) {
       if (r.status === 401 || r.status === 403) {
@@ -358,8 +342,6 @@ async function slFetch(path, options = {}) {
 
 /* =========================================================
    ✅ Sync: Ventas netas por item (INV - CRN)
-   - Invoices (INV): revenue + gp
-   - CreditNotes (CRN): revenue negativo, gp negativo
 ========================================================= */
 function pickGrossProfit(ln) {
   const candidates = [ln?.GrossProfit, ln?.GrossProfitTotal, ln?.GrossProfitFC, ln?.GrossProfitSC];
@@ -389,7 +371,11 @@ async function scanDocHeaders(entity, { from, to, maxDocs = 2500 }) {
     skipSap += rows.length;
 
     for (const r of rows) {
-      out.push({ DocEntry: Number(r.DocEntry), DocDate: String(r.DocDate || "").slice(0, 10) });
+      out.push({
+        DocEntry: Number(r.DocEntry),
+        DocNum: r.DocNum != null ? Number(r.DocNum) : null,
+        DocDate: String(r.DocDate || "").slice(0, 10),
+      });
       if (out.length >= maxDocs) return out;
     }
   }
@@ -404,6 +390,7 @@ async function getDoc(entity, docEntry) {
 
 async function upsertSalesLines(docType, docDate, docFull, sign) {
   const docEntry = Number(docFull?.DocEntry || 0);
+  const docNum = docFull?.DocNum != null ? Number(docFull.DocNum) : null; // ✅ NUEVO
   const lines = Array.isArray(docFull?.DocumentLines) ? docFull.DocumentLines : [];
   if (!docEntry || !lines.length) return 0;
 
@@ -424,11 +411,12 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
     await dbQuery(
       `
       INSERT INTO sales_item_lines(
-        doc_entry,line_num,doc_type,doc_date,item_code,item_desc,quantity,revenue,gross_profit,updated_at
+        doc_entry,line_num,doc_type,doc_date,doc_num,item_code,item_desc,quantity,revenue,gross_profit,updated_at
       )
-      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,NOW())
+      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,NOW())
       ON CONFLICT(doc_entry,line_num,doc_type) DO UPDATE SET
         doc_date=EXCLUDED.doc_date,
+        doc_num=EXCLUDED.doc_num,
         item_code=EXCLUDED.item_code,
         item_desc=EXCLUDED.item_desc,
         quantity=EXCLUDED.quantity,
@@ -436,7 +424,7 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
         gross_profit=EXCLUDED.gross_profit,
         updated_at=NOW()
       `,
-      [docEntry, lineNum, docType, docDate, itemCode, itemDesc, qty, rev, gp]
+      [docEntry, lineNum, docType, docDate, docNum, itemCode, itemDesc, qty, rev, gp]
     );
 
     inserted++;
@@ -471,7 +459,7 @@ async function syncSales({ from, to, maxDocs = 2500 }) {
 }
 
 /* =========================================================
-   ✅ Inventario por Item (el método que ya te funcionó)
+   ✅ Inventario por Item
 ========================================================= */
 function sumInvFromWarehouseInfo(infoArr) {
   const rows = Array.isArray(infoArr) ? infoArr : [];
@@ -495,14 +483,7 @@ function sumInvFromWarehouseInfo(infoArr) {
 
   const available = stock - committed + ordered;
 
-  return {
-    stock,
-    committed,
-    ordered,
-    available,
-    stockMin,
-    stockMax,
-  };
+  return { stock, committed, ordered, available, stockMin, stockMax };
 }
 
 async function getInventoryForItemCode(code) {
@@ -515,11 +496,7 @@ async function getInventoryForItemCode(code) {
   const itemName = String(a?.ItemName || "").trim();
   const inv = sumInvFromWarehouseInfo(a?.ItemWarehouseInfoCollection);
 
-  return {
-    itemCode,
-    itemDesc: itemName,
-    ...inv,
-  };
+  return { itemCode, itemDesc: itemName, ...inv };
 }
 
 async function syncInventoryForSalesItems({ from, to, maxItems = 1200 }) {
@@ -578,7 +555,7 @@ async function syncInventoryForSalesItems({ from, to, maxItems = 1200 }) {
 }
 
 /* =========================================================
-   ✅ Sync: Grupos por Item (ItemGroups)
+   ✅ Sync: Grupos por Item
 ========================================================= */
 async function getItemGroupNameFromSap(itemCode) {
   const code = String(itemCode || "").trim();
@@ -630,7 +607,7 @@ async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
       const groupName = String(sap.groupName || "").trim();
 
       const grupo = groupName || "";
-      const area = inferAreaFromGroup(grupo) || ""; // ✅ FIX: ahora sí reconoce RCI aunque venga en MAYÚSCULAS / sin acento
+      const area = inferAreaFromGroup(grupo) || "";
 
       const itemDesc = (String(sap.itemName || "").trim() || descFromSales || "");
 
@@ -657,7 +634,7 @@ async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
 }
 
 /* =========================================================
-   ✅ ABC helpers (A/B/C por contribución acumulada)
+   ✅ ABC helpers
 ========================================================= */
 function abcByMetric(rows, metricKey) {
   const arr = rows
@@ -687,8 +664,7 @@ function totalLabelFromABC(a1, a2, a3) {
 }
 
 /* =========================================================
-   ✅ Dashboard (DB) — SIN item_master
-   - Usa ventas agregadas + item_group_cache + inv_item_cache
+   ✅ Dashboard (DB)
 ========================================================= */
 async function dashboardFromDb({ from, to, area, grupo, q }) {
   const salesAgg = await dbQuery(
@@ -733,7 +709,7 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
 
     const grupoTxt = String(r.grupo || "Sin grupo");
     const areaDb = String(r.area || "");
-    const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || "CONS"; // ✅ FIX RCI
+    const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || "CONS";
 
     return {
       itemCode: String(r.item_code || ""),
@@ -758,7 +734,6 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
 
   if (areaSel !== "__ALL__") items = items.filter((x) => String(x.area || "") === areaSel);
 
-  // ✅ FIX: filtro por grupo normalizado (para que "QUIMICOS PISCINA" matchee con "Químicos Piscina")
   if (grupoSel !== "__ALL__") {
     const gSelN = normGroupName(grupoSel);
     items = items.filter((x) => normGroupName(x.grupo) === gSelN);
@@ -882,8 +857,89 @@ app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) =>
 });
 
 /* =========================================================
+   ✅ NUEVO: Item docs endpoint (para modal)
+   GET /api/admin/estratificacion/item-docs?itemCode=XXXX&from=YYYY-MM-DD&to=YYYY-MM-DD&area=CONS|RCI|__ALL__&grupo=...
+========================================================= */
+app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+
+    const itemCode = String(req.query?.itemCode || "").trim();
+    if (!itemCode) return safeJson(res, 400, { ok: false, message: "Falta itemCode" });
+
+    const fromQ = String(req.query?.from || "");
+    const toQ = String(req.query?.to || "");
+    const areaSel = String(req.query?.area || "__ALL__");
+    const grupoSel = String(req.query?.grupo || "__ALL__");
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = isISO(fromQ) ? fromQ : "2024-01-01";
+    const to = isISO(toQ) ? toQ : today;
+
+    // Traemos líneas del item en el rango
+    const q1 = await dbQuery(
+      `
+      SELECT
+        s.doc_type,
+        s.doc_date,
+        s.doc_entry,
+        s.doc_num,
+        s.item_code,
+        s.item_desc,
+        s.quantity,
+        s.revenue,
+        s.gross_profit,
+        COALESCE(NULLIF(s.area,''), NULLIF(g.area,''), '') AS area,
+        COALESCE(NULLIF(s.item_group,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo
+      FROM sales_item_lines s
+      LEFT JOIN item_group_cache g ON g.item_code = s.item_code
+      WHERE s.item_code = $1
+        AND s.doc_date >= $2::date
+        AND s.doc_date <= $3::date
+      ORDER BY s.doc_date DESC, s.doc_entry DESC, s.line_num ASC
+      LIMIT 500
+      `,
+      [itemCode, from, to]
+    );
+
+    let rows = (q1.rows || []).map((r) => {
+      const grupoTxt = String(r.grupo || "Sin grupo");
+      const areaDb = String(r.area || "");
+      const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || "CONS";
+
+      return {
+        docType: String(r.doc_type || ""),
+        docDate: String(r.doc_date || "").slice(0, 10),
+        docEntry: Number(r.doc_entry || 0),
+        docNum: r.doc_num != null ? Number(r.doc_num) : null,
+        itemCode: String(r.item_code || ""),
+        itemDesc: String(r.item_desc || ""),
+        quantity: Number(r.quantity || 0),
+        total: Number(r.revenue || 0),
+        gp: Number(r.gross_profit || 0),
+        area: areaFinal,
+        grupo: grupoTxt,
+      };
+    });
+
+    // filtros por area/grupo (mismos criterios que dashboard)
+    if (areaSel !== "__ALL__") rows = rows.filter((x) => String(x.area || "") === areaSel);
+    if (grupoSel !== "__ALL__") {
+      const gSelN = normGroupName(grupoSel);
+      rows = rows.filter((x) => normGroupName(x.grupo) === gSelN);
+    }
+
+    return safeJson(res, 200, { ok: true, itemCode, from, to, rows });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+/* =========================================================
    ✅ Sync endpoint (SAP -> DB)
-   GET /api/admin/estratificacion/sync?mode=days&n=5&maxDocs=2500
+   GET /api/admin/estratificacion/sync
+   - mode=days&n=5
+   - ✅ NUEVO: mode=range&from=2024-01-01&to=YYYY-MM-DD
 ========================================================= */
 app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
   try {
@@ -891,33 +947,44 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
     const mode = String(req.query?.mode || "days").toLowerCase();
-    const nRaw = Number(req.query?.n || 5);
-    const n =
-      mode === "days"
-        ? Math.max(1, Math.min(120, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5))
-        : Math.max(1, Math.min(30, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5));
 
     const maxDocsRaw = Number(req.query?.maxDocs || 2500);
     const maxDocs = Math.max(50, Math.min(20000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 2500));
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = addDaysISO(today, -n);
 
-    const salesSaved = await syncSales({ from, to: today, maxDocs });
-    const groupsSaved = await syncItemGroupsForSalesItems({ from, to: today, maxItems: 2500 });
-    const invSaved = await syncInventoryForSalesItems({ from, to: today, maxItems: 2500 });
+    let from = "";
+    let to = today;
+
+    if (mode === "range") {
+      const fromQ = String(req.query?.from || "");
+      const toQ = String(req.query?.to || "");
+      from = isISO(fromQ) ? fromQ : "2024-01-01";
+      to = isISO(toQ) ? toQ : today;
+    } else {
+      const nRaw = Number(req.query?.n || 5);
+      const n =
+        mode === "days"
+          ? Math.max(1, Math.min(120, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5))
+          : Math.max(1, Math.min(30, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5));
+      from = addDaysISO(today, -n);
+      to = today;
+    }
+
+    const salesSaved = await syncSales({ from, to, maxDocs });
+    const groupsSaved = await syncItemGroupsForSalesItems({ from, to, maxItems: 2500 });
+    const invSaved = await syncInventoryForSalesItems({ from, to, maxItems: 2500 });
 
     await setState("last_sync_at", new Date().toISOString());
     await setState("last_sync_from", from);
-    await setState("last_sync_to", today);
+    await setState("last_sync_to", to);
 
     return safeJson(res, 200, {
       ok: true,
       mode,
-      n,
       maxDocs,
       from,
-      to: today,
+      to,
       salesSaved,
       groupsSaved,
       invSaved,
