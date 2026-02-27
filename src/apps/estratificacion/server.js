@@ -29,6 +29,36 @@ const {
 } = process.env;
 
 /* =========================================================
+   ✅ GRUPOS (TU REGLA DE NEGOCIO)
+   - OJO: aquí uso EXACTAMENTE los sets que me diste al final
+========================================================= */
+const GROUPS_CONS = new Set([
+  "Prod. De Limpieza",
+  "Cuidado De La Ropa",
+  "Sazonadores",
+  "Art. De Limpieza",
+  "Vinagres",
+  "Especialidades y GMT",
+]);
+
+const GROUPS_RCI = new Set([
+  "Equip. Y Acces. Agua",
+  "Químicos Piscina",
+  "Servicios",
+  "Químicos Trata. Agua",
+  "Equip. Y Acces. Pis",
+  "M.P.Res.Comer.ind.",
+]);
+
+function inferAreaFromGroup(groupName) {
+  const g = String(groupName || "").trim();
+  if (!g) return "";
+  if (GROUPS_CONS.has(g)) return "CONS";
+  if (GROUPS_RCI.has(g)) return "RCI";
+  return "";
+}
+
+/* =========================================================
    ✅ CORS ROBUSTO
 ========================================================= */
 const ALLOWED_ORIGINS = new Set(
@@ -113,67 +143,6 @@ function getDateISOInOffset(offsetMin = 0) {
   const dd = String(d.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${dd}`;
 }
-function norm(s) {
-  return String(s || "")
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ");
-}
-
-/* =========================================================
-   ✅ GRUPOS / ÁREAS (TU DEFINICIÓN)
-========================================================= */
-const GROUPS_CONS = new Set([
-  "Prod. De Limpieza",
-  "Químicos Trata. Agua",
-  "Sazonadores",
-  "Químicos Piscina",
-  "Vinagres",
-  "Especialidades y GMT",
-]);
-
-const GROUPS_RCI = new Set([
-  "Equip. Y Acces. Agua",
-  "Cuidado De La Ropa",
-  "Servicios",
-  "Art. De Limpieza",
-  "Equip. Y Acces. Pis",
-  "M.P.Res.Comer.ind.",
-]);
-
-function inferAreaFromGrupo(grupo) {
-  const g = String(grupo || "").trim();
-  if (GROUPS_RCI.has(g)) return "RCI";
-  if (GROUPS_CONS.has(g)) return "CONS";
-  return "CONS";
-}
-
-function mapGroupToBusinessGroup(groupNameRaw) {
-  // Si ya viene exacto:
-  const g = String(groupNameRaw || "").trim();
-  if (GROUPS_CONS.has(g) || GROUPS_RCI.has(g)) return g;
-
-  // Fallback flexible:
-  const t = norm(g);
-  if (!t) return "";
-
-  if (t.includes("sazon")) return "Sazonadores";
-  if (t.includes("vinagr")) return "Vinagres";
-  if (t.includes("cuidado") && t.includes("ropa")) return "Cuidado De La Ropa";
-  if (t.includes("prod") && t.includes("limp")) return "Prod. De Limpieza";
-  if (t.includes("art") && t.includes("limp")) return "Art. De Limpieza";
-  if (t.includes("pisc")) return "Químicos Piscina";
-  if (t.includes("trata") && t.includes("agua")) return "Químicos Trata. Agua";
-  if (t.includes("especial") || t.includes("gmt")) return "Especialidades y GMT";
-  if (t.includes("equip") && t.includes("agua")) return "Equip. Y Acces. Agua";
-  if (t.includes("equip") && t.includes("pis")) return "Equip. Y Acces. Pis";
-  if (t.includes("serv")) return "Servicios";
-  if (t.includes("m.p") || t.includes("res") || t.includes("comer") || t.includes("ind")) return "M.P.Res.Comer.ind.";
-
-  return "";
-}
 
 /* =========================================================
    ✅ Postgres (Supabase)
@@ -190,10 +159,39 @@ async function dbQuery(text, params = []) {
   return pool.query(text, params);
 }
 
+/**
+ * ✅ Tablas usadas por Estratificación (sin item_master)
+ * - sales_item_lines: líneas netas (INV positivo, CRN negativo) + (opcional) item_group/area/warehouse
+ * - inv_item_cache: inventario por artículo (stock/min/max/committed/ordered/available)
+ * - item_group_cache: catálogo de grupo/área por artículo (group_name, grupo, area, item_desc)
+ * - sync_state
+ */
 async function ensureDb() {
   if (!hasDb()) return;
 
-  // Cache de inventario por item (SUM todas bodegas)
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS sales_item_lines (
+      doc_entry INTEGER NOT NULL,
+      line_num  INTEGER NOT NULL,
+      doc_type  TEXT NOT NULL, -- 'INV' o 'CRN'
+      doc_date  DATE NOT NULL,
+      item_code TEXT NOT NULL DEFAULT '',
+      item_desc TEXT NOT NULL DEFAULT '',
+      quantity  NUMERIC(18,4) NOT NULL DEFAULT 0,
+      revenue   NUMERIC(18,2) NOT NULL DEFAULT 0,
+      gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0,
+      -- opcionales (si algún día los llenas)
+      item_group TEXT DEFAULT '',
+      area TEXT DEFAULT '',
+      warehouse TEXT DEFAULT '',
+      updated_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (doc_entry, line_num, doc_type)
+    );
+  `);
+
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_sales_item_date ON sales_item_lines(doc_date);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_sales_item_code ON sales_item_lines(item_code);`);
+
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS inv_item_cache (
       item_code TEXT PRIMARY KEY,
@@ -208,51 +206,24 @@ async function ensureDb() {
     );
   `);
 
-  // Cache opcional de grupo por item (si ya la tienes, la usamos solo como fallback)
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS item_group_cache (
       item_code TEXT PRIMARY KEY,
-      item_desc TEXT NOT NULL DEFAULT '',
       group_name TEXT NOT NULL DEFAULT '',
-      area TEXT NOT NULL DEFAULT 'CONS',
+      -- normalizado para tu UI
+      area TEXT NOT NULL DEFAULT '',
       grupo TEXT NOT NULL DEFAULT '',
+      item_desc TEXT NOT NULL DEFAULT '',
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
 
-  // Ventas netas por item (INV positivo, CRN negativo)
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS sales_item_lines (
-      doc_entry INTEGER NOT NULL,
-      line_num  INTEGER NOT NULL,
-      doc_type  TEXT NOT NULL, -- 'INV' o 'CRN'
-      doc_date  DATE NOT NULL,
-
-      card_code TEXT NOT NULL DEFAULT '',
-      warehouse TEXT NOT NULL DEFAULT '',
-
-      item_code TEXT NOT NULL DEFAULT '',
-      item_desc TEXT NOT NULL DEFAULT '',
-      item_group TEXT NOT NULL DEFAULT '',  -- grupo (negocio)
-      area TEXT NOT NULL DEFAULT 'CONS',    -- CONS/RCI (derivado)
-
-      quantity  NUMERIC(18,4) NOT NULL DEFAULT 0,
-      revenue   NUMERIC(18,2) NOT NULL DEFAULT 0,
-      gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0,
-
-      updated_at TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY (doc_entry, line_num, doc_type)
-    );
-  `);
-
-  // migrations safe
-  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS item_group TEXT NOT NULL DEFAULT '';`);
-  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS area TEXT NOT NULL DEFAULT 'CONS';`);
-  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS card_code TEXT NOT NULL DEFAULT '';`);
-  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS warehouse TEXT NOT NULL DEFAULT '';`);
-
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_sales_item_date ON sales_item_lines(doc_date);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_sales_item_code ON sales_item_lines(item_code);`);
+  // columnas por si ya existía distinta
+  await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS group_name TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS area TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS grupo TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS item_desc TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();`);
 
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS sync_state (
@@ -304,7 +275,9 @@ async function slLogin() {
 
   const txt = await r.text();
   let data = {};
-  try { data = JSON.parse(txt); } catch {}
+  try {
+    data = JSON.parse(txt);
+  } catch {}
 
   if (!r.ok) throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
 
@@ -343,7 +316,11 @@ async function slFetch(path, options = {}) {
 
     const txt = await r.text();
     let data = {};
-    try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+    try {
+      data = JSON.parse(txt);
+    } catch {
+      data = { raw: txt };
+    }
 
     if (!r.ok) {
       if (r.status === 401 || r.status === 403) {
@@ -363,117 +340,9 @@ async function slFetch(path, options = {}) {
 }
 
 /* =========================================================
-   ✅ INVENTARIO (solo items vendidos en el rango)
-   Ruta: Items('CODE')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection
-========================================================= */
-function readNum(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : 0;
-}
-function whSum(row, keys) {
-  for (const k of keys) {
-    if (row && row[k] != null) return readNum(row[k]);
-  }
-  return 0;
-}
-
-async function fetchInventoryForItem(code) {
-  const safe = String(code || "").trim().replace(/'/g, "''");
-  if (!safe) return null;
-
-  const item = await slFetch(
-    `/Items('${safe}')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection`,
-    { timeoutMs: 90000 }
-  );
-
-  const wh = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
-  let stock = 0, committed = 0, ordered = 0, mn = 0, mx = 0;
-
-  for (const w of wh) {
-    stock += whSum(w, ["InStock", "OnHand"]);
-    committed += whSum(w, ["Committed", "IsCommited", "IsCommitted"]);
-    ordered += whSum(w, ["Ordered", "OnOrder"]);
-    mn += whSum(w, ["MinimalStock", "MinStock"]);
-    mx += whSum(w, ["MaximalStock", "MaxStock"]);
-  }
-
-  const available = stock - committed + ordered;
-
-  return {
-    itemCode: String(item?.ItemCode || code),
-    itemDesc: String(item?.ItemName || ""),
-    stock,
-    stockMin: mn,
-    stockMax: mx,
-    committed,
-    ordered,
-    available,
-  };
-}
-
-async function syncInventoryForSalesRange({ from, to, limit = 12000 }) {
-  // items SOLO del rango (para que no sea pesado)
-  const r = await dbQuery(
-    `
-    SELECT DISTINCT item_code
-    FROM sales_item_lines
-    WHERE doc_date >= $1::date AND doc_date <= $2::date
-      AND item_code <> ''
-    LIMIT $3
-    `,
-    [from, to, Math.max(100, Math.min(20000, Number(limit) || 12000))]
-  );
-
-  const codes = (r.rows || []).map((x) => String(x.item_code || "").trim()).filter(Boolean);
-
-  let saved = 0;
-  for (let i = 0; i < codes.length; i++) {
-    const code = codes[i];
-
-    let inv = null;
-    try {
-      inv = await fetchInventoryForItem(code);
-    } catch {
-      await sleep(10);
-      continue;
-    }
-    if (!inv) continue;
-
-    await dbQuery(
-      `
-      INSERT INTO inv_item_cache(item_code,item_desc,stock,stock_min,stock_max,committed,ordered,available,updated_at)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW())
-      ON CONFLICT(item_code) DO UPDATE SET
-        item_desc=EXCLUDED.item_desc,
-        stock=EXCLUDED.stock,
-        stock_min=EXCLUDED.stock_min,
-        stock_max=EXCLUDED.stock_max,
-        committed=EXCLUDED.committed,
-        ordered=EXCLUDED.ordered,
-        available=EXCLUDED.available,
-        updated_at=NOW()
-      `,
-      [
-        inv.itemCode,
-        inv.itemDesc,
-        inv.stock,
-        inv.stockMin,
-        inv.stockMax,
-        inv.committed,
-        inv.ordered,
-        inv.available,
-      ]
-    );
-
-    saved++;
-    if (saved % 40 === 0) await sleep(20);
-  }
-
-  return saved;
-}
-
-/* =========================================================
-   ✅ SALES sync (Invoices + CreditNotes)
+   ✅ Sync: Ventas netas por item (INV - CRN)
+   - Invoices (INV): revenue + gp
+   - CreditNotes (CRN): revenue negativo, gp negativo
 ========================================================= */
 function pickGrossProfit(ln) {
   const candidates = [ln?.GrossProfit, ln?.GrossProfitTotal, ln?.GrossProfitFC, ln?.GrossProfitSC];
@@ -492,10 +361,10 @@ async function scanDocHeaders(entity, { from, to, maxDocs = 2500 }) {
 
   for (let page = 0; page < 300; page++) {
     const raw = await slFetch(
-      `/${entity}?$select=DocEntry,DocDate&` +
+      `/${entity}?$select=DocEntry,DocNum,DocDate&` +
         `$filter=${encodeURIComponent(`DocDate ge '${from}' and DocDate lt '${toPlus1}'`)}&` +
         `$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skipSap}`,
-      { timeoutMs: 90000 }
+      { timeoutMs: 120000 }
     );
 
     const rows = Array.isArray(raw?.value) ? raw.value : [];
@@ -513,24 +382,11 @@ async function scanDocHeaders(entity, { from, to, maxDocs = 2500 }) {
 async function getDoc(entity, docEntry) {
   const de = Number(docEntry);
   if (!Number.isFinite(de) || de <= 0) return null;
-  return slFetch(`/${entity}(${de})`, { timeoutMs: 120000 });
-}
-
-async function dbGetGroupFallback(itemCode) {
-  try {
-    const r = await dbQuery(`SELECT grupo, area FROM item_group_cache WHERE item_code=$1 LIMIT 1`, [itemCode]);
-    if (!r.rowCount) return { grupo: "", area: "CONS" };
-    const g = String(r.rows[0]?.grupo || "");
-    const a = String(r.rows[0]?.area || "CONS");
-    return { grupo: g, area: a };
-  } catch {
-    return { grupo: "", area: "CONS" };
-  }
+  return slFetch(`/${entity}(${de})`, { timeoutMs: 180000 });
 }
 
 async function upsertSalesLines(docType, docDate, docFull, sign) {
   const docEntry = Number(docFull?.DocEntry || 0);
-  const cardCode = String(docFull?.CardCode || "").trim();
   const lines = Array.isArray(docFull?.DocumentLines) ? docFull.DocumentLines : [];
   if (!docEntry || !lines.length) return 0;
 
@@ -547,53 +403,27 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
     const qty = Number(ln?.Quantity || 0) * sign;
     const rev = Number(ln?.LineTotal || 0) * sign;
     const gp = pickGrossProfit(ln) * sign;
-    const wh = String(ln?.WarehouseCode || "").trim();
-
-    // muchas veces SL NO trae el grupo en líneas de INV/CRN, así que:
-    // 1) intentamos lo que venga
-    // 2) si no viene, hacemos fallback a item_group_cache (SIN SAP, solo DB)
-    let rawGroup = String(ln?.ItemGroup || ln?.ItemGroupName || "").trim();
-    let grupo = mapGroupToBusinessGroup(rawGroup);
-
-    let area = inferAreaFromGrupo(grupo);
-    if (!grupo) {
-      const fb = await dbGetGroupFallback(itemCode);
-      grupo = fb.grupo || "";
-      area = fb.area || inferAreaFromGrupo(grupo);
-    }
 
     await dbQuery(
       `
       INSERT INTO sales_item_lines(
-        doc_entry,line_num,doc_type,doc_date,
-        card_code,warehouse,
-        item_code,item_desc,item_group,area,
-        quantity,revenue,gross_profit,updated_at
+        doc_entry,line_num,doc_type,doc_date,item_code,item_desc,quantity,revenue,gross_profit,updated_at
       )
-      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
+      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,NOW())
       ON CONFLICT(doc_entry,line_num,doc_type) DO UPDATE SET
         doc_date=EXCLUDED.doc_date,
-        card_code=EXCLUDED.card_code,
-        warehouse=EXCLUDED.warehouse,
         item_code=EXCLUDED.item_code,
         item_desc=EXCLUDED.item_desc,
-        item_group=EXCLUDED.item_group,
-        area=EXCLUDED.area,
         quantity=EXCLUDED.quantity,
         revenue=EXCLUDED.revenue,
         gross_profit=EXCLUDED.gross_profit,
         updated_at=NOW()
       `,
-      [
-        docEntry, lineNum, docType, docDate,
-        cardCode, wh,
-        itemCode, itemDesc, grupo, area,
-        qty, rev, gp
-      ]
+      [docEntry, lineNum, docType, docDate, itemCode, itemDesc, qty, rev, gp]
     );
 
     inserted++;
-    if (inserted % 250 === 0) await sleep(15);
+    if (inserted % 200 === 0) await sleep(10);
   }
 
   return inserted;
@@ -624,7 +454,208 @@ async function syncSales({ from, to, maxDocs = 2500 }) {
 }
 
 /* =========================================================
-   ✅ ABC helpers
+   ✅ Inventario por Item (el método que ya te funcionó)
+   - /Items('CODE')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection
+   - Suma InStock/Committed/Ordered y toma min/max desde MinimalStock/MaximalStock
+========================================================= */
+function sumInvFromWarehouseInfo(infoArr) {
+  const rows = Array.isArray(infoArr) ? infoArr : [];
+  let stock = 0;
+  let committed = 0;
+  let ordered = 0;
+
+  let stockMin = 0;
+  let stockMax = 0;
+
+  // min/max: tomamos el mayor “global” si existe (en tu ejemplo viene repetido por wh)
+  for (const w of rows) {
+    stock += Number(w?.InStock ?? w?.OnHand ?? 0);
+    committed += Number(w?.Committed ?? w?.IsCommited ?? 0);
+    ordered += Number(w?.Ordered ?? w?.OnOrder ?? 0);
+
+    const mn = Number(w?.MinimalStock ?? w?.MinStock ?? 0);
+    const mx = Number(w?.MaximalStock ?? w?.MaxStock ?? 0);
+    if (Number.isFinite(mn) && mn > stockMin) stockMin = mn;
+    if (Number.isFinite(mx) && mx > stockMax) stockMax = mx;
+  }
+
+  const available = stock - committed + ordered;
+
+  return {
+    stock,
+    committed,
+    ordered,
+    available,
+    stockMin,
+    stockMax,
+  };
+}
+
+async function getInventoryForItemCode(code) {
+  const itemCode = String(code || "").trim();
+  if (!itemCode) return null;
+
+  const safe = itemCode.replace(/'/g, "''");
+  // ✅ este fue el que te dio “BINGO”
+  const a = await slFetch(
+    `/Items('${safe}')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection`,
+    { timeoutMs: 120000 }
+  );
+
+  const itemName = String(a?.ItemName || "").trim();
+  const inv = sumInvFromWarehouseInfo(a?.ItemWarehouseInfoCollection);
+
+  return {
+    itemCode,
+    itemDesc: itemName,
+    ...inv,
+  };
+}
+
+/**
+ * ✅ Inventario “ligero”:
+ * en vez de bajar TODO el catálogo, solo actualiza inventario de los artículos
+ * que aparecen en ventas (en el rango que estás sincronizando).
+ */
+async function syncInventoryForSalesItems({ from, to, maxItems = 1200 }) {
+  // sacamos lista de item_code del rango
+  const r = await dbQuery(
+    `
+    SELECT DISTINCT item_code
+    FROM sales_item_lines
+    WHERE doc_date >= $1::date AND doc_date <= $2::date
+      AND item_code <> ''
+    LIMIT $3
+    `,
+    [from, to, Math.max(100, Math.min(5000, Number(maxItems || 1200)))]
+  );
+
+  const codes = (r.rows || []).map((x) => String(x.item_code || "").trim()).filter(Boolean);
+  let saved = 0;
+
+  for (let i = 0; i < codes.length; i++) {
+    const code = codes[i];
+    try {
+      const inv = await getInventoryForItemCode(code);
+      if (!inv) continue;
+
+      await dbQuery(
+        `
+        INSERT INTO inv_item_cache(item_code,item_desc,stock,stock_min,stock_max,committed,ordered,available,updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+        ON CONFLICT(item_code) DO UPDATE SET
+          item_desc=EXCLUDED.item_desc,
+          stock=EXCLUDED.stock,
+          stock_min=EXCLUDED.stock_min,
+          stock_max=EXCLUDED.stock_max,
+          committed=EXCLUDED.committed,
+          ordered=EXCLUDED.ordered,
+          available=EXCLUDED.available,
+          updated_at=NOW()
+        `,
+        [
+          inv.itemCode,
+          inv.itemDesc || "",
+          Number(inv.stock || 0),
+          Number(inv.stockMin || 0),
+          Number(inv.stockMax || 0),
+          Number(inv.committed || 0),
+          Number(inv.ordered || 0),
+          Number(inv.available || 0),
+        ]
+      );
+
+      saved++;
+    } catch {}
+    if ((i + 1) % 25 === 0) await sleep(15);
+  }
+
+  return saved;
+}
+
+/* =========================================================
+   ✅ Sync: Grupos por Item (ItemGroups)
+   - Llena item_group_cache para códigos que aparecen en ventas
+========================================================= */
+async function getItemGroupNameFromSap(itemCode) {
+  const code = String(itemCode || "").trim();
+  if (!code) return { groupName: "", itemName: "", itmsGrpCod: null };
+
+  const safe = code.replace(/'/g, "''");
+  const item = await slFetch(`/Items('${safe}')?$select=ItemCode,ItemName,ItemsGroupCode`, { timeoutMs: 90000 });
+
+  const itmsGrpCod = item?.ItemsGroupCode != null ? Number(item.ItemsGroupCode) : null;
+  const itemName = String(item?.ItemName || "").trim();
+
+  if (!Number.isFinite(itmsGrpCod) || itmsGrpCod == null) {
+    return { groupName: "", itemName, itmsGrpCod: null };
+  }
+
+  // ItemGroups(cod)
+  try {
+    const g = await slFetch(`/ItemGroups(${itmsGrpCod})?$select=GroupName`, { timeoutMs: 90000 });
+    const groupName = String(g?.GroupName || "").trim();
+    return { groupName, itemName, itmsGrpCod };
+  } catch {
+    return { groupName: "", itemName, itmsGrpCod };
+  }
+}
+
+async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
+  const r = await dbQuery(
+    `
+    SELECT DISTINCT item_code, MAX(NULLIF(item_desc,'')) AS item_desc
+    FROM sales_item_lines
+    WHERE doc_date >= $1::date AND doc_date <= $2::date
+      AND item_code <> ''
+    GROUP BY item_code
+    LIMIT $3
+    `,
+    [from, to, Math.max(100, Math.min(8000, Number(maxItems || 1500)))]
+  );
+
+  const rows = r.rows || [];
+  let saved = 0;
+
+  for (let i = 0; i < rows.length; i++) {
+    const code = String(rows[i].item_code || "").trim();
+    const descFromSales = String(rows[i].item_desc || "").trim();
+
+    if (!code) continue;
+
+    try {
+      const sap = await getItemGroupNameFromSap(code);
+      const groupName = String(sap.groupName || "").trim();
+
+      const grupo = groupName || "";
+      const area = inferAreaFromGroup(grupo) || ""; // CONS/RCI o vacío
+
+      const itemDesc = (String(sap.itemName || "").trim() || descFromSales || "");
+
+      await dbQuery(
+        `
+        INSERT INTO item_group_cache(item_code,group_name,area,grupo,item_desc,updated_at)
+        VALUES($1,$2,$3,$4,$5,NOW())
+        ON CONFLICT(item_code) DO UPDATE SET
+          group_name=EXCLUDED.group_name,
+          area=CASE WHEN EXCLUDED.area <> '' THEN EXCLUDED.area ELSE item_group_cache.area END,
+          grupo=CASE WHEN EXCLUDED.grupo <> '' THEN EXCLUDED.grupo ELSE item_group_cache.grupo END,
+          item_desc=CASE WHEN EXCLUDED.item_desc <> '' THEN EXCLUDED.item_desc ELSE item_group_cache.item_desc END,
+          updated_at=NOW()
+        `,
+        [code, groupName, area, grupo, itemDesc]
+      );
+
+      saved++;
+    } catch {}
+    if ((i + 1) % 25 === 0) await sleep(15);
+  }
+
+  return saved;
+}
+
+/* =========================================================
+   ✅ ABC helpers (A/B/C por contribución acumulada)
 ========================================================= */
 function abcByMetric(rows, metricKey) {
   const arr = rows
@@ -654,95 +685,105 @@ function totalLabelFromABC(a1, a2, a3) {
 }
 
 /* =========================================================
-   ✅ DASHBOARD (DB) - SOLO sales_item_lines + join inventario
+   ✅ Dashboard (DB) — SIN item_master
+   - Usa ventas agregadas + item_group_cache + inv_item_cache
 ========================================================= */
 async function dashboardFromDb({ from, to, area, grupo, q }) {
-  const params = [from, to];
-  let p = 3;
-
-  let where = `s.doc_date >= $1::date AND s.doc_date <= $2::date AND s.item_code <> ''`;
-
-  if (area && area !== "__ALL__") {
-    params.push(area);
-    where += ` AND COALESCE(NULLIF(s.area,''),'CONS') = $${p++}`;
-  }
-
-  if (grupo && grupo !== "__ALL__") {
-    params.push(grupo);
-    where += ` AND COALESCE(NULLIF(s.item_group,''),'') = $${p++}`;
-  }
-
-  if (q && String(q).trim()) {
-    const qq = `%${String(q).trim().toLowerCase()}%`;
-    params.push(qq, qq);
-    where += ` AND (LOWER(s.item_code) LIKE $${p++} OR LOWER(s.item_desc) LIKE $${p++})`;
-  }
-
-  // ✅ FIX: GROUP BY válido (MAX solo en SELECT)
-  const agg = await dbQuery(
+  // ✅ query base: agrego ventas por item_code, y luego hago JOIN con caches
+  // Evita el error: "aggregate functions are not allowed in GROUP BY"
+  const salesAgg = await dbQuery(
     `
+    WITH s AS (
+      SELECT
+        item_code,
+        MAX(NULLIF(item_desc,'')) AS item_desc,
+        COALESCE(SUM(revenue),0)::numeric(18,2) AS revenue,
+        COALESCE(SUM(gross_profit),0)::numeric(18,2) AS gp,
+        MAX(NULLIF(area,'')) AS area_s,
+        MAX(NULLIF(item_group,'')) AS grupo_s
+      FROM sales_item_lines
+      WHERE doc_date >= $1::date AND doc_date <= $2::date
+      GROUP BY item_code
+    )
     SELECT
       s.item_code AS item_code,
-      COALESCE(MAX(NULLIF(s.item_desc,'')),'') AS item_desc,
-      COALESCE(NULLIF(s.area,''),'CONS') AS area,
-      COALESCE(NULLIF(s.item_group,''),'Sin grupo') AS grupo,
-      COALESCE(SUM(s.revenue),0)::numeric(18,2) AS revenue,
-      COALESCE(SUM(s.gross_profit),0)::numeric(18,2) AS gp
-    FROM sales_item_lines s
-    WHERE ${where}
-    GROUP BY s.item_code, COALESCE(NULLIF(s.area,''),'CONS'), COALESCE(NULLIF(s.item_group,''),'Sin grupo')
-    ORDER BY revenue DESC
+
+      -- ✅ descripción: ventas -> cache -> ''
+      COALESCE(NULLIF(s.item_desc,''), NULLIF(g.item_desc,''), '') AS item_desc,
+
+      -- ✅ grupo: sales -> cache.grupo -> cache.group_name -> "Sin grupo"
+      COALESCE(NULLIF(s.grupo_s,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo,
+
+      -- ✅ área: sales -> cache.area -> infer por grupo
+      COALESCE(
+        NULLIF(s.area_s,''),
+        NULLIF(g.area,''),
+        CASE
+          WHEN COALESCE(NULLIF(s.grupo_s,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), '') = ANY($3::text[]) THEN 'CONS'
+          WHEN COALESCE(NULLIF(s.grupo_s,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), '') = ANY($4::text[]) THEN 'RCI'
+          ELSE 'CONS'
+        END
+      ) AS area,
+
+      s.revenue AS revenue,
+      s.gp AS gp,
+
+      -- inventario
+      COALESCE(i.stock,0)::float AS stock,
+      COALESCE(i.stock_min,0)::float AS stock_min,
+      COALESCE(i.stock_max,0)::float AS stock_max,
+      COALESCE(i.committed,0)::float AS committed,
+      COALESCE(i.ordered,0)::float AS ordered,
+      COALESCE(i.available,0)::float AS available
+
+    FROM s
+    LEFT JOIN item_group_cache g ON g.item_code = s.item_code
+    LEFT JOIN inv_item_cache i   ON i.item_code = s.item_code
+    ORDER BY s.revenue DESC
     `,
-    params
+    [from, to, Array.from(GROUPS_CONS), Array.from(GROUPS_RCI)]
   );
 
-  // inventario cache (solo join)
-  const inv = await dbQuery(
-    `
-    SELECT item_code,
-           stock::float AS stock,
-           stock_min::float AS stock_min,
-           stock_max::float AS stock_max,
-           committed::float AS committed,
-           ordered::float AS ordered,
-           available::float AS available,
-           item_desc
-    FROM inv_item_cache
-    `,
-    []
-  );
-  const invMap = new Map((inv.rows || []).map((r) => [String(r.item_code), r]));
-
-  const items = (agg.rows || []).map((r) => {
-    const code = String(r.item_code);
+  // aplicar filtros (en JS, rápido y seguro para no romper SQL)
+  let items = (salesAgg.rows || []).map((r) => {
     const rev = Number(r.revenue || 0);
     const gp = Number(r.gp || 0);
     const pct = rev > 0 ? (gp / rev) * 100 : 0;
 
-    const invRow = invMap.get(code) || {
-      stock: 0, stock_min: 0, stock_max: 0, committed: 0, ordered: 0, available: 0, item_desc: ""
-    };
-
-    const finalDesc = String(r.item_desc || "").trim() || String(invRow.item_desc || "").trim() || "(sin descripción)";
-
     return {
-      itemCode: code,
-      itemDesc: finalDesc,
-      area: r.area || "CONS",
-      grupo: r.grupo || "Sin grupo",
+      itemCode: String(r.item_code || ""),
+      itemDesc: String(r.item_desc || ""),
+      area: String(r.area || "CONS"),
+      grupo: String(r.grupo || "Sin grupo"),
       revenue: rev,
       gp: gp,
       gpPct: Number(pct.toFixed(2)),
-      stock: Number(invRow.stock || 0),
-      stockMin: Number(invRow.stock_min || 0),
-      stockMax: Number(invRow.stock_max || 0),
-      committed: Number(invRow.committed || 0),
-      ordered: Number(invRow.ordered || 0),
-      available: Number(invRow.available || 0),
+      stock: Number(r.stock || 0),
+      stockMin: Number(r.stock_min || 0),
+      stockMax: Number(r.stock_max || 0),
+      committed: Number(r.committed || 0),
+      ordered: Number(r.ordered || 0),
+      available: Number(r.available || 0),
     };
   });
 
-  // ranking por grupo
+  // filtros
+  const areaSel = String(area || "__ALL__");
+  const grupoSel = String(grupo || "__ALL__");
+  const qq = String(q || "").trim().toLowerCase();
+
+  if (areaSel !== "__ALL__") items = items.filter((x) => String(x.area || "") === areaSel);
+  if (grupoSel !== "__ALL__") items = items.filter((x) => String(x.grupo || "") === grupoSel);
+  if (qq) items = items.filter((x) => x.itemCode.toLowerCase().includes(qq) || x.itemDesc.toLowerCase().includes(qq));
+
+  // availableGroups: SIEMPRE los 6 de consumidor o los 6 de RCI (según filtro área)
+  let availableGroups = [];
+  if (areaSel === "CONS") availableGroups = Array.from(GROUPS_CONS);
+  else if (areaSel === "RCI") availableGroups = Array.from(GROUPS_RCI);
+  else availableGroups = Array.from(new Set([...GROUPS_CONS, ...GROUPS_RCI]));
+  availableGroups.sort((a, b) => a.localeCompare(b));
+
+  // group ranking por revenue
   const groupAggMap = new Map();
   for (const it of items) {
     const g = it.grupo || "Sin grupo";
@@ -790,23 +831,18 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
   );
   const gpPctTotal = totals.revenue > 0 ? Number(((totals.gp / totals.revenue) * 100).toFixed(2)) : 0;
 
-  const groupsList =
-    area === "RCI" ? Array.from(GROUPS_RCI) :
-    area === "CONS" ? Array.from(GROUPS_CONS) :
-    Array.from(new Set([...GROUPS_CONS, ...GROUPS_RCI]));
-
   return {
     ok: true,
     from,
     to,
-    area,
-    grupo,
-    q,
+    area: areaSel,
+    grupo: grupoSel,
+    q: qq,
     lastSyncAt: await getState("last_sync_at"),
     totals: { revenue: totals.revenue, gp: totals.gp, gpPct: gpPctTotal },
-    availableGroups: ["__ALL__", ...groupsList.sort((a, b) => a.localeCompare(b))],
+    availableGroups,
     groupAgg,
-    items: outItems.sort((a, b) => (a.rankArea - b.rankArea) || (b.revenue - a.revenue)),
+    items: outItems.sort((a, b) => a.rankArea - b.rankArea || b.revenue - a.revenue),
   };
 }
 
@@ -835,7 +871,7 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ Dashboard endpoint
+   ✅ Dashboard endpoint (DB)
 ========================================================= */
 app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) => {
   try {
@@ -859,16 +895,23 @@ app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) =>
 });
 
 /* =========================================================
-   ✅ Sync endpoint (ventas + inventario SOLO de los items del rango)
+   ✅ Sync endpoint (SAP -> DB)
    GET /api/admin/estratificacion/sync?mode=days&n=5&maxDocs=2500
+   - 1) Sync ventas (INV+CRN)
+   - 2) Sync grupos SOLO para esos items vendidos
+   - 3) Sync inventario SOLO para esos items vendidos
 ========================================================= */
 app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
+    const mode = String(req.query?.mode || "days").toLowerCase();
     const nRaw = Number(req.query?.n || 5);
-    const n = Math.max(1, Math.min(120, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5));
+    const n =
+      mode === "days"
+        ? Math.max(1, Math.min(120, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5))
+        : Math.max(1, Math.min(30, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5));
 
     const maxDocsRaw = Number(req.query?.maxDocs || 2500);
     const maxDocs = Math.max(50, Math.min(20000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 2500));
@@ -876,11 +919,14 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const from = addDaysISO(today, -n);
 
-    // 1) ventas recientes
+    // 1) ventas netas
     const salesSaved = await syncSales({ from, to: today, maxDocs });
 
-    // 2) inventario SOLO para items que aparecieron en ventas/NC del rango
-    const invSaved = await syncInventoryForSalesRange({ from, to: today, limit: 12000 });
+    // 2) grupos SOLO para items del rango
+    const groupsSaved = await syncItemGroupsForSalesItems({ from, to: today, maxItems: 2500 });
+
+    // 3) inventario SOLO para items del rango
+    const invSaved = await syncInventoryForSalesItems({ from, to: today, maxItems: 2500 });
 
     await setState("last_sync_at", new Date().toISOString());
     await setState("last_sync_from", from);
@@ -888,14 +934,15 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
 
     return safeJson(res, 200, {
       ok: true,
+      mode,
       n,
       maxDocs,
       from,
       to: today,
       salesSaved,
+      groupsSaved,
       invSaved,
       lastSyncAt: await getState("last_sync_at"),
-      note: "Sync OK: ventas + inventario solo de items con movimiento en el rango.",
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -903,18 +950,56 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ Debug: verificar inventario SAP por item (rápido)
+   ✅ DEBUG: counts (para consola)
+========================================================= */
+app.get("/api/admin/estratificacion/debug-counts", verifyAdmin, async (req, res) => {
+  try {
+    const r1 = await dbQuery(`SELECT COUNT(*)::int AS c FROM sales_item_lines`);
+    const r2 = await dbQuery(`SELECT COUNT(*)::int AS c FROM inv_item_cache`);
+    const r3 = await dbQuery(`SELECT COUNT(*)::int AS c FROM item_group_cache`);
+    return safeJson(res, 200, {
+      ok: true,
+      sales_item_lines: r1.rows?.[0]?.c || 0,
+      inv_item_cache: r2.rows?.[0]?.c || 0,
+      item_group_cache: r3.rows?.[0]?.c || 0,
+      last_sync_at: await getState("last_sync_at"),
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+/* =========================================================
+   ✅ DEBUG: inventory by code (para consola)
    GET /api/admin/estratificacion/debug-inv?code=68328
 ========================================================= */
 app.get("/api/admin/estratificacion/debug-inv", verifyAdmin, async (req, res) => {
   try {
     const code = String(req.query?.code || "").trim();
-    if (!code) return safeJson(res, 400, { ok: false, message: "Falta code" });
+    if (!code) return safeJson(res, 400, { ok: false, message: "Falta ?code=" });
 
-    const inv = await fetchInventoryForItem(code);
-    return safeJson(res, 200, { ok: true, code, inv });
+    // DB
+    const db = await dbQuery(
+      `SELECT item_code,item_desc,stock,stock_min,stock_max,committed,ordered,available FROM inv_item_cache WHERE item_code=$1 LIMIT 1`,
+      [code]
+    );
+
+    // SAP directo
+    let inv = null;
+    try {
+      inv = await getInventoryForItemCode(code);
+    } catch (e) {
+      inv = { error: String(e.message || e) };
+    }
+
+    return safeJson(res, 200, {
+      ok: true,
+      code,
+      db: db.rows?.[0] || null,
+      inv,
+    });
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
 });
 
