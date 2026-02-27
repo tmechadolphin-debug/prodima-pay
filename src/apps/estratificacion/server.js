@@ -47,21 +47,31 @@ const GROUPS_RCI = new Set([
   "Químicos Trat. Agua",
   "Equip. Y Acces. Pisc",
   "M.P.Res.Comer.Ind.",
-]);;
+]);
 
 /* =========================================================
-   ✅ NORMALIZACIÓN
+   ✅ NORMALIZACIÓN + CANONICALIZACIÓN
 ========================================================= */
 function normGroupName(s) {
   return String(s || "")
     .trim()
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[\u0300-\u036f]/g, "") // quita acentos
     .replace(/\s+/g, " ")
     .toUpperCase();
 }
+
 const GROUPS_CONS_N = new Set(Array.from(GROUPS_CONS).map(normGroupName));
 const GROUPS_RCI_N = new Set(Array.from(GROUPS_RCI).map(normGroupName));
+
+const CANON_GROUP = new Map(
+  [...Array.from(GROUPS_CONS), ...Array.from(GROUPS_RCI)].map((g) => [normGroupName(g), g])
+);
+
+function canonicalGroupName(groupName) {
+  const n = normGroupName(groupName);
+  return CANON_GROUP.get(n) || String(groupName || "").trim();
+}
 
 function inferAreaFromGroup(groupName) {
   const g = normGroupName(groupName);
@@ -197,7 +207,7 @@ async function ensureDb() {
     );
   `);
 
-  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS doc_num INTEGER;`); // ✅ NUEVO (DocNum)
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS doc_num INTEGER;`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_sales_item_date ON sales_item_lines(doc_date);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_sales_item_code ON sales_item_lines(item_code);`);
 
@@ -342,6 +352,7 @@ async function slFetch(path, options = {}) {
 
 /* =========================================================
    ✅ Sync: Ventas netas por item (INV - CRN)
+   ✅ FIX NC: uso ABS() y luego signo para que SIEMPRE resten
 ========================================================= */
 function pickGrossProfit(ln) {
   const candidates = [ln?.GrossProfit, ln?.GrossProfitTotal, ln?.GrossProfitFC, ln?.GrossProfitSC];
@@ -390,7 +401,7 @@ async function getDoc(entity, docEntry) {
 
 async function upsertSalesLines(docType, docDate, docFull, sign) {
   const docEntry = Number(docFull?.DocEntry || 0);
-  const docNum = docFull?.DocNum != null ? Number(docFull.DocNum) : null; // ✅ NUEVO
+  const docNum = docFull?.DocNum != null ? Number(docFull.DocNum) : null;
   const lines = Array.isArray(docFull?.DocumentLines) ? docFull.DocumentLines : [];
   if (!docEntry || !lines.length) return 0;
 
@@ -404,9 +415,15 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
     if (!itemCode) continue;
 
     const itemDesc = String(ln?.ItemDescription || ln?.ItemName || "").trim();
-    const qty = Number(ln?.Quantity || 0) * sign;
-    const rev = Number(ln?.LineTotal || 0) * sign;
-    const gp = pickGrossProfit(ln) * sign;
+
+    // ✅ FIX: algunos sistemas traen CRN ya negativo => usamos ABS y aplicamos signo
+    const qtyRaw = Number(ln?.Quantity || 0);
+    const revRaw = Number(ln?.LineTotal || 0);
+    const gpRaw = Number(pickGrossProfit(ln) || 0);
+
+    const qty = Math.abs(qtyRaw) * sign;
+    const rev = Math.abs(revRaw) * sign;
+    const gp = Math.abs(gpRaw) * sign;
 
     await dbQuery(
       `
@@ -460,9 +477,14 @@ async function syncSales({ from, to, maxDocs = 2500 }) {
 
 /* =========================================================
    ✅ Inventario por Item
+   ✅ FIX: SOLO bodegas 300, 200, 500 y 01
 ========================================================= */
+const INV_WH_ALLOWED = new Set(["300", "200", "500", "01"]);
+
 function sumInvFromWarehouseInfo(infoArr) {
-  const rows = Array.isArray(infoArr) ? infoArr : [];
+  const rowsAll = Array.isArray(infoArr) ? infoArr : [];
+  const rows = rowsAll.filter((w) => INV_WH_ALLOWED.has(String(w?.WarehouseCode ?? w?.WhsCode ?? "").trim()));
+
   let stock = 0;
   let committed = 0;
   let ordered = 0;
@@ -555,7 +577,8 @@ async function syncInventoryForSalesItems({ from, to, maxItems = 1200 }) {
 }
 
 /* =========================================================
-   ✅ Sync: Grupos por Item
+   ✅ Sync: Grupos por Item (ItemGroups)
+   ✅ FIX: guardo "grupo" canónico
 ========================================================= */
 async function getItemGroupNameFromSap(itemCode) {
   const code = String(itemCode || "").trim();
@@ -599,15 +622,15 @@ async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
   for (let i = 0; i < rows.length; i++) {
     const code = String(rows[i].item_code || "").trim();
     const descFromSales = String(rows[i].item_desc || "").trim();
-
     if (!code) continue;
 
     try {
       const sap = await getItemGroupNameFromSap(code);
-      const groupName = String(sap.groupName || "").trim();
+      const groupNameRaw = String(sap.groupName || "").trim();
 
-      const grupo = groupName || "";
-      const area = inferAreaFromGroup(grupo) || "";
+      // ✅ guardamos el "grupo" con el nombre canónico de tu lista (si matchea)
+      const grupo = canonicalGroupName(groupNameRaw || "");
+      const area = inferAreaFromGroup(grupo) || inferAreaFromGroup(groupNameRaw) || "";
 
       const itemDesc = (String(sap.itemName || "").trim() || descFromSales || "");
 
@@ -622,7 +645,7 @@ async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
           item_desc=CASE WHEN EXCLUDED.item_desc <> '' THEN EXCLUDED.item_desc ELSE item_group_cache.item_desc END,
           updated_at=NOW()
         `,
-        [code, groupName, area, grupo, itemDesc]
+        [code, groupNameRaw, area, grupo, itemDesc]
       );
 
       saved++;
@@ -707,9 +730,10 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     const gp = Number(r.gp || 0);
     const pct = rev > 0 ? (gp / rev) * 100 : 0;
 
-    const grupoTxt = String(r.grupo || "Sin grupo");
+    const grupoTxtRaw = String(r.grupo || "Sin grupo");
+    const grupoTxt = canonicalGroupName(grupoTxtRaw); // ✅ estabiliza variantes
     const areaDb = String(r.area || "");
-    const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || "CONS";
+    const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || "CONS";
 
     return {
       itemCode: String(r.item_code || ""),
@@ -857,8 +881,7 @@ app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) =>
 });
 
 /* =========================================================
-   ✅ NUEVO: Item docs endpoint (para modal)
-   GET /api/admin/estratificacion/item-docs?itemCode=XXXX&from=YYYY-MM-DD&to=YYYY-MM-DD&area=CONS|RCI|__ALL__&grupo=...
+   ✅ Item docs endpoint (modal)
 ========================================================= */
 app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) => {
   try {
@@ -876,7 +899,6 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
     const from = isISO(fromQ) ? fromQ : "2024-01-01";
     const to = isISO(toQ) ? toQ : today;
 
-    // Traemos líneas del item en el rango
     const q1 = await dbQuery(
       `
       SELECT
@@ -903,9 +925,10 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
     );
 
     let rows = (q1.rows || []).map((r) => {
-      const grupoTxt = String(r.grupo || "Sin grupo");
+      const grupoTxtRaw = String(r.grupo || "Sin grupo");
+      const grupoTxt = canonicalGroupName(grupoTxtRaw);
       const areaDb = String(r.area || "");
-      const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || "CONS";
+      const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || "CONS";
 
       return {
         docType: String(r.doc_type || ""),
@@ -922,7 +945,6 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
       };
     });
 
-    // filtros por area/grupo (mismos criterios que dashboard)
     if (areaSel !== "__ALL__") rows = rows.filter((x) => String(x.area || "") === areaSel);
     if (grupoSel !== "__ALL__") {
       const gSelN = normGroupName(grupoSel);
@@ -937,9 +959,6 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
 
 /* =========================================================
    ✅ Sync endpoint (SAP -> DB)
-   GET /api/admin/estratificacion/sync
-   - mode=days&n=5
-   - ✅ NUEVO: mode=range&from=2024-01-01&to=YYYY-MM-DD
 ========================================================= */
 app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
   try {
@@ -996,7 +1015,7 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ DEBUG: counts (para consola)
+   ✅ DEBUG: counts
 ========================================================= */
 app.get("/api/admin/estratificacion/debug-counts", verifyAdmin, async (req, res) => {
   try {
@@ -1016,7 +1035,7 @@ app.get("/api/admin/estratificacion/debug-counts", verifyAdmin, async (req, res)
 });
 
 /* =========================================================
-   ✅ DEBUG: inventory by code (para consola)
+   ✅ DEBUG: inventory by code
 ========================================================= */
 app.get("/api/admin/estratificacion/debug-inv", verifyAdmin, async (req, res) => {
   try {
