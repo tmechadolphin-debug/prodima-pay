@@ -622,40 +622,40 @@ app.post("/api/admin/item-groups/force", verifyAdmin, async (req, res) => {
     if (!sb) return safeJson(res, 500, { ok: false, message: "Faltan variables Supabase" });
 
     const itemCodes = Array.isArray(req.body?.itemCodes) ? req.body.itemCodes : [];
-    const clean = Array.from(
-      new Set(itemCodes.map(x => String(x || "").trim()).filter(Boolean))
-    );
+    const clean = Array.from(new Set(itemCodes.map(x => String(x || "").trim()).filter(Boolean)));
 
     if (!clean.length) {
       return safeJson(res, 400, { ok: false, message: "Envía itemCodes: [] con al menos 1 código." });
     }
 
-    // ✅ Ajusta aquí si tu columna de grupo en sales se llama "grupo" (o algo distinto):
-    const SALES_GROUP_COL = "item_group"; // <-- cámbiala a "grupo" si aplica
-    const SALES_DATE_COL  = "doc_date";   // <-- cámbiala si tu fecha se llama distinto
+    // ✅ AJUSTA SOLO ESTO si tus columnas difieren:
+    const SALES_TABLE = "sales_item_lines";
+    const COL_CODE = "item_code";     // ejemplo: item_code
+    const COL_GROUP = "item_group";   // ejemplo: grupo / item_group / category
+    const COL_DATE = "doc_date";      // ejemplo: doc_date / fecha / created_at
 
-    // 1) Traer grupos desde sales (más reciente primero)
+    // 1) Buscar grupo desde sales_item_lines (más reciente primero)
     const { data: rows, error } = await sb
-      .from("sales")
-      .select(`item_code,${SALES_GROUP_COL},${SALES_DATE_COL}`)
-      .in("item_code", clean)
-      .not(SALES_GROUP_COL, "is", null)
-      .order(SALES_DATE_COL, { ascending: false });
+      .from(SALES_TABLE)
+      .select(`${COL_CODE},${COL_GROUP},${COL_DATE}`)
+      .in(COL_CODE, clean)
+      .not(COL_GROUP, "is", null)
+      .order(COL_DATE, { ascending: false });
 
     if (error) throw new Error(error.message);
 
-    // 2) Elegir el grupo "más reciente" por item_code
+    // 2) Tomar el grupo más reciente por item_code
     const best = new Map();
     for (const r of (rows || [])) {
-      const code = String(r.item_code || "").trim();
-      const grp = String(r[SALES_GROUP_COL] || "").trim();
+      const code = String(r[COL_CODE] || "").trim();
+      const grp = String(r[COL_GROUP] || "").trim();
       if (!code || !grp) continue;
-      if (!best.has(code)) best.set(code, grp); // primera vez = más reciente
+      if (!best.has(code)) best.set(code, grp);
     }
 
     const upPayload = Array.from(best.entries()).map(([code, grp]) => ({
-      item_code: code,
-      group_name: grp,
+      item_code: code,          // 👈 columna de cache
+      group_name: grp,          // 👈 columna de cache
       updated_at: new Date().toISOString(),
     }));
 
@@ -664,11 +664,12 @@ app.post("/api/admin/item-groups/force", verifyAdmin, async (req, res) => {
         ok: true,
         requested: clean.length,
         updated: 0,
-        message: "No encontré grupo en sales para esos códigos (o la columna de grupo no coincide).",
+        message:
+          "No encontré grupo en sales_item_lines para esos códigos. Revisa nombres de columnas (COL_CODE/COL_GROUP/COL_DATE).",
       });
     }
 
-    // 3) Upsert al cache
+    // 3) Upsert en cache
     const { error: e2 } = await sb
       .from("item_group_cache")
       .upsert(upPayload, { onConflict: "item_code" });
