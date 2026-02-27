@@ -661,6 +661,34 @@ async function getItemGroupNameFromSap(itemCode) {
   }
 }
 
+async function upsertItemGroupOne(itemCode, descFallback = "") {
+  const code = String(itemCode || "").trim();
+  if (!code) return null;
+
+  const sap = await getItemGroupNameFromSap(code);
+  const groupNameRaw = String(sap.groupName || "").trim();
+  const itemDesc = (String(sap.itemName || "").trim() || String(descFallback || "").trim() || "");
+
+  const grupo = normalizeGrupoFinal(groupNameRaw);
+  const area = inferAreaFromGroup(grupo) || "";
+
+  await dbQuery(
+    `
+    INSERT INTO item_group_cache(item_code,group_name,area,grupo,item_desc,updated_at)
+    VALUES($1,$2,$3,$4,$5,NOW())
+    ON CONFLICT(item_code) DO UPDATE SET
+      group_name=EXCLUDED.group_name,
+      area=CASE WHEN EXCLUDED.area <> '' THEN EXCLUDED.area ELSE item_group_cache.area END,
+      grupo=CASE WHEN EXCLUDED.grupo <> '' THEN EXCLUDED.grupo ELSE item_group_cache.grupo END,
+      item_desc=CASE WHEN EXCLUDED.item_desc <> '' THEN EXCLUDED.item_desc ELSE item_group_cache.item_desc END,
+      updated_at=NOW()
+    `,
+    [code, groupNameRaw, area, grupo, itemDesc]
+  );
+
+  return { itemCode: code, groupNameRaw, grupo, area, itemDesc };
+}
+
 async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
   const r = await dbQuery(
     `
@@ -1149,6 +1177,20 @@ app.get("/api/admin/estratificacion/debug-counts", verifyAdmin, async (req, res)
   }
 });
 
+app.get("/api/admin/estratificacion/refresh-item-group", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    const itemCode = String(req.query?.itemCode || "").trim();
+    if (!itemCode) return safeJson(res, 400, { ok: false, message: "Falta itemCode" });
+
+    const out = await upsertItemGroupOne(itemCode);
+    return safeJson(res, 200, { ok: true, refreshed: out });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
 /* =========================================================
    ✅ START
 ========================================================= */
