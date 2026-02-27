@@ -123,7 +123,7 @@ function norm(s) {
 }
 
 /* =========================================================
-   ✅ AREAS / GRUPOS (TU DEFINICIÓN)
+   ✅ GRUPOS / ÁREAS (TU DEFINICIÓN)
 ========================================================= */
 const GROUPS_CONS = new Set([
   "Prod. De Limpieza",
@@ -143,11 +143,36 @@ const GROUPS_RCI = new Set([
   "M.P.Res.Comer.ind.",
 ]);
 
-function inferAreaFromGroup(grupo) {
+function inferAreaFromGrupo(grupo) {
   const g = String(grupo || "").trim();
   if (GROUPS_RCI.has(g)) return "RCI";
   if (GROUPS_CONS.has(g)) return "CONS";
   return "CONS";
+}
+
+function mapGroupToBusinessGroup(groupNameRaw) {
+  // Si ya viene exacto:
+  const g = String(groupNameRaw || "").trim();
+  if (GROUPS_CONS.has(g) || GROUPS_RCI.has(g)) return g;
+
+  // Fallback flexible:
+  const t = norm(g);
+  if (!t) return "";
+
+  if (t.includes("sazon")) return "Sazonadores";
+  if (t.includes("vinagr")) return "Vinagres";
+  if (t.includes("cuidado") && t.includes("ropa")) return "Cuidado De La Ropa";
+  if (t.includes("prod") && t.includes("limp")) return "Prod. De Limpieza";
+  if (t.includes("art") && t.includes("limp")) return "Art. De Limpieza";
+  if (t.includes("pisc")) return "Químicos Piscina";
+  if (t.includes("trata") && t.includes("agua")) return "Químicos Trata. Agua";
+  if (t.includes("especial") || t.includes("gmt")) return "Especialidades y GMT";
+  if (t.includes("equip") && t.includes("agua")) return "Equip. Y Acces. Agua";
+  if (t.includes("equip") && t.includes("pis")) return "Equip. Y Acces. Pis";
+  if (t.includes("serv")) return "Servicios";
+  if (t.includes("m.p") || t.includes("res") || t.includes("comer") || t.includes("ind")) return "M.P.Res.Comer.ind.";
+
+  return "";
 }
 
 /* =========================================================
@@ -165,27 +190,10 @@ async function dbQuery(text, params = []) {
   return pool.query(text, params);
 }
 
-/**
- * Tablas:
- * - item_group_cache: item_code -> group_name/grupo/area + item_desc
- * - inv_item_cache: stock/min/max/committed/ordered/available por item (SUM todas bodegas)
- * - sales_item_lines: líneas netas (INV positivo, CRN negativo)
- * - sync_state
- */
 async function ensureDb() {
   if (!hasDb()) return;
 
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS item_group_cache (
-      item_code TEXT PRIMARY KEY,
-      item_desc TEXT NOT NULL DEFAULT '',
-      group_name TEXT NOT NULL DEFAULT '',
-      area TEXT NOT NULL DEFAULT 'CONS',
-      grupo TEXT NOT NULL DEFAULT '',
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
+  // Cache de inventario por item (SUM todas bodegas)
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS inv_item_cache (
       item_code TEXT PRIMARY KEY,
@@ -200,24 +208,48 @@ async function ensureDb() {
     );
   `);
 
+  // Cache opcional de grupo por item (si ya la tienes, la usamos solo como fallback)
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS item_group_cache (
+      item_code TEXT PRIMARY KEY,
+      item_desc TEXT NOT NULL DEFAULT '',
+      group_name TEXT NOT NULL DEFAULT '',
+      area TEXT NOT NULL DEFAULT 'CONS',
+      grupo TEXT NOT NULL DEFAULT '',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // Ventas netas por item (INV positivo, CRN negativo)
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS sales_item_lines (
       doc_entry INTEGER NOT NULL,
       line_num  INTEGER NOT NULL,
       doc_type  TEXT NOT NULL, -- 'INV' o 'CRN'
       doc_date  DATE NOT NULL,
+
       card_code TEXT NOT NULL DEFAULT '',
       warehouse TEXT NOT NULL DEFAULT '',
+
       item_code TEXT NOT NULL DEFAULT '',
       item_desc TEXT NOT NULL DEFAULT '',
-      item_group TEXT NOT NULL DEFAULT '',
+      item_group TEXT NOT NULL DEFAULT '',  -- grupo (negocio)
+      area TEXT NOT NULL DEFAULT 'CONS',    -- CONS/RCI (derivado)
+
       quantity  NUMERIC(18,4) NOT NULL DEFAULT 0,
       revenue   NUMERIC(18,2) NOT NULL DEFAULT 0,
       gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0,
+
       updated_at TIMESTAMP DEFAULT NOW(),
       PRIMARY KEY (doc_entry, line_num, doc_type)
     );
   `);
+
+  // migrations safe
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS item_group TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS area TEXT NOT NULL DEFAULT 'CONS';`);
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS card_code TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS warehouse TEXT NOT NULL DEFAULT '';`);
 
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_sales_item_date ON sales_item_lines(doc_date);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_sales_item_code ON sales_item_lines(item_code);`);
@@ -331,64 +363,81 @@ async function slFetch(path, options = {}) {
 }
 
 /* =========================================================
-   ✅ Inventory sync (LA RUTA QUE YA TE FUNCIONA)
-   Items('CODE')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection
+   ✅ INVENTARIO (solo items vendidos en el rango)
+   Ruta: Items('CODE')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection
 ========================================================= */
-function readWHRowNumber(x, keys = []) {
+function readNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
+function whSum(row, keys) {
   for (const k of keys) {
-    const v = x?.[k];
-    const n = Number(v);
-    if (Number.isFinite(n)) return n;
+    if (row && row[k] != null) return readNum(row[k]);
   }
   return 0;
 }
 
-async function syncInventoryNow({ maxItems = 5000 } = {}) {
-  let saved = 0;
+async function fetchInventoryForItem(code) {
+  const safe = String(code || "").trim().replace(/'/g, "''");
+  if (!safe) return null;
 
-  // Tomamos lista de items que EXISTEN en ventas o en grupos cache
-  // para no recorrer TODO el catálogo.
+  const item = await slFetch(
+    `/Items('${safe}')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection`,
+    { timeoutMs: 90000 }
+  );
+
+  const wh = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
+  let stock = 0, committed = 0, ordered = 0, mn = 0, mx = 0;
+
+  for (const w of wh) {
+    stock += whSum(w, ["InStock", "OnHand"]);
+    committed += whSum(w, ["Committed", "IsCommited", "IsCommitted"]);
+    ordered += whSum(w, ["Ordered", "OnOrder"]);
+    mn += whSum(w, ["MinimalStock", "MinStock"]);
+    mx += whSum(w, ["MaximalStock", "MaxStock"]);
+  }
+
+  const available = stock - committed + ordered;
+
+  return {
+    itemCode: String(item?.ItemCode || code),
+    itemDesc: String(item?.ItemName || ""),
+    stock,
+    stockMin: mn,
+    stockMax: mx,
+    committed,
+    ordered,
+    available,
+  };
+}
+
+async function syncInventoryForSalesRange({ from, to, limit = 12000 }) {
+  // items SOLO del rango (para que no sea pesado)
   const r = await dbQuery(
     `
     SELECT DISTINCT item_code
     FROM sales_item_lines
-    WHERE item_code <> ''
-    LIMIT $1
+    WHERE doc_date >= $1::date AND doc_date <= $2::date
+      AND item_code <> ''
+    LIMIT $3
     `,
-    [Math.max(100, Math.min(20000, Number(maxItems) || 5000))]
+    [from, to, Math.max(100, Math.min(20000, Number(limit) || 12000))]
   );
 
   const codes = (r.rows || []).map((x) => String(x.item_code || "").trim()).filter(Boolean);
 
+  let saved = 0;
   for (let i = 0; i < codes.length; i++) {
     const code = codes[i];
-    const safe = code.replace(/'/g, "''");
 
-    let item;
+    let inv = null;
     try {
-      item = await slFetch(
-        `/Items('${safe}')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection`,
-        { timeoutMs: 90000 }
-      );
+      inv = await fetchInventoryForItem(code);
     } catch {
-      await sleep(15);
+      await sleep(10);
       continue;
     }
-
-    const wh = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
-    let stock = 0, committed = 0, ordered = 0, mn = 0, mx = 0;
-
-    for (const w of wh) {
-      // Estas llaves dependen de tu SL; por tu screenshot funcionan:
-      // InStock / Committed / Ordered / MinimalStock / MaximalStock
-      stock += readWHRowNumber(w, ["InStock", "OnHand"]);
-      committed += readWHRowNumber(w, ["Committed", "IsCommited", "IsCommitted"]);
-      ordered += readWHRowNumber(w, ["Ordered", "OnOrder"]);
-      mn += readWHRowNumber(w, ["MinimalStock", "MinStock"]);
-      mx += readWHRowNumber(w, ["MaximalStock", "MaxStock"]);
-    }
-
-    const available = stock - committed + ordered;
+    if (!inv) continue;
 
     await dbQuery(
       `
@@ -405,26 +454,26 @@ async function syncInventoryNow({ maxItems = 5000 } = {}) {
         updated_at=NOW()
       `,
       [
-        code,
-        String(item?.ItemName || ""),
-        stock,
-        mn,
-        mx,
-        committed,
-        ordered,
-        available,
+        inv.itemCode,
+        inv.itemDesc,
+        inv.stock,
+        inv.stockMin,
+        inv.stockMax,
+        inv.committed,
+        inv.ordered,
+        inv.available,
       ]
     );
 
     saved++;
-    if (saved % 50 === 0) await sleep(20);
+    if (saved % 40 === 0) await sleep(20);
   }
 
   return saved;
 }
 
 /* =========================================================
-   ✅ Sales sync (Invoices + CreditNotes)
+   ✅ SALES sync (Invoices + CreditNotes)
 ========================================================= */
 function pickGrossProfit(ln) {
   const candidates = [ln?.GrossProfit, ln?.GrossProfitTotal, ln?.GrossProfitFC, ln?.GrossProfitSC];
@@ -467,6 +516,18 @@ async function getDoc(entity, docEntry) {
   return slFetch(`/${entity}(${de})`, { timeoutMs: 120000 });
 }
 
+async function dbGetGroupFallback(itemCode) {
+  try {
+    const r = await dbQuery(`SELECT grupo, area FROM item_group_cache WHERE item_code=$1 LIMIT 1`, [itemCode]);
+    if (!r.rowCount) return { grupo: "", area: "CONS" };
+    const g = String(r.rows[0]?.grupo || "");
+    const a = String(r.rows[0]?.area || "CONS");
+    return { grupo: g, area: a };
+  } catch {
+    return { grupo: "", area: "CONS" };
+  }
+}
+
 async function upsertSalesLines(docType, docDate, docFull, sign) {
   const docEntry = Number(docFull?.DocEntry || 0);
   const cardCode = String(docFull?.CardCode || "").trim();
@@ -480,17 +541,36 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
     if (!Number.isFinite(lineNum)) continue;
 
     const itemCode = String(ln?.ItemCode || "").trim();
+    if (!itemCode) continue;
+
     const itemDesc = String(ln?.ItemDescription || ln?.ItemName || "").trim();
     const qty = Number(ln?.Quantity || 0) * sign;
     const rev = Number(ln?.LineTotal || 0) * sign;
     const gp = pickGrossProfit(ln) * sign;
     const wh = String(ln?.WarehouseCode || "").trim();
-    const itemGroup = String(ln?.ItemGroup || ln?.ItemGroupName || ln?.ItemGroups || "").trim();
+
+    // muchas veces SL NO trae el grupo en líneas de INV/CRN, así que:
+    // 1) intentamos lo que venga
+    // 2) si no viene, hacemos fallback a item_group_cache (SIN SAP, solo DB)
+    let rawGroup = String(ln?.ItemGroup || ln?.ItemGroupName || "").trim();
+    let grupo = mapGroupToBusinessGroup(rawGroup);
+
+    let area = inferAreaFromGrupo(grupo);
+    if (!grupo) {
+      const fb = await dbGetGroupFallback(itemCode);
+      grupo = fb.grupo || "";
+      area = fb.area || inferAreaFromGrupo(grupo);
+    }
 
     await dbQuery(
       `
-      INSERT INTO sales_item_lines(doc_entry,line_num,doc_type,doc_date,card_code,warehouse,item_code,item_desc,item_group,quantity,revenue,gross_profit,updated_at)
-      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+      INSERT INTO sales_item_lines(
+        doc_entry,line_num,doc_type,doc_date,
+        card_code,warehouse,
+        item_code,item_desc,item_group,area,
+        quantity,revenue,gross_profit,updated_at
+      )
+      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
       ON CONFLICT(doc_entry,line_num,doc_type) DO UPDATE SET
         doc_date=EXCLUDED.doc_date,
         card_code=EXCLUDED.card_code,
@@ -498,16 +578,22 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
         item_code=EXCLUDED.item_code,
         item_desc=EXCLUDED.item_desc,
         item_group=EXCLUDED.item_group,
+        area=EXCLUDED.area,
         quantity=EXCLUDED.quantity,
         revenue=EXCLUDED.revenue,
         gross_profit=EXCLUDED.gross_profit,
         updated_at=NOW()
       `,
-      [docEntry, lineNum, docType, docDate, cardCode, wh, itemCode, itemDesc, itemGroup, qty, rev, gp]
+      [
+        docEntry, lineNum, docType, docDate,
+        cardCode, wh,
+        itemCode, itemDesc, grupo, area,
+        qty, rev, gp
+      ]
     );
 
     inserted++;
-    if (inserted % 200 === 0) await sleep(15);
+    if (inserted % 250 === 0) await sleep(15);
   }
 
   return inserted;
@@ -538,133 +624,7 @@ async function syncSales({ from, to, maxDocs = 2500 }) {
 }
 
 /* =========================================================
-   ✅ Group cache sync
-   - Usa ItemGroups (ItemsGroupCode -> ItemGroups -> GroupName)
-   - Guarda area/grupo + item_desc (fallback)
-========================================================= */
-async function sapGetItemGroupNameAndDesc(itemCode) {
-  const code = String(itemCode || "").trim();
-  if (!code) return { groupName: "", itemDesc: "" };
-
-  const safe = code.replace(/'/g, "''");
-  let item = null;
-  try {
-    item = await slFetch(`/Items('${safe}')?$select=ItemCode,ItemName,ItemsGroupCode`, { timeoutMs: 60000 });
-  } catch {
-    return { groupName: "", itemDesc: "" };
-  }
-
-  const itemDesc = String(item?.ItemName || "").trim();
-  const igc = Number(item?.ItemsGroupCode || 0);
-
-  if (!Number.isFinite(igc) || igc <= 0) {
-    return { groupName: "", itemDesc };
-  }
-
-  try {
-    const g = await slFetch(`/ItemGroups(${igc})?$select=GroupName`, { timeoutMs: 60000 });
-    const groupName = String(g?.GroupName || "").trim();
-    return { groupName, itemDesc };
-  } catch {
-    return { groupName: "", itemDesc };
-  }
-}
-
-function mapGroupToBusinessGroup(groupNameRaw) {
-  // Si SAP ya viene con los nombres exactos, perfecto.
-  const g = String(groupNameRaw || "").trim();
-  if (GROUPS_CONS.has(g) || GROUPS_RCI.has(g)) return g;
-
-  // Fallback flexible por texto (por si SAP lo trae diferente)
-  const t = norm(g);
-  if (!t) return "";
-
-  if (t.includes("sazon")) return "Sazonadores";
-  if (t.includes("vinagr")) return "Vinagres";
-  if (t.includes("cuidado") && t.includes("ropa")) return "Cuidado De La Ropa";
-  if (t.includes("prod") && t.includes("limp")) return "Prod. De Limpieza";
-  if (t.includes("art") && t.includes("limp")) return "Art. De Limpieza";
-  if (t.includes("pisc")) return "Químicos Piscina";
-  if (t.includes("agua")) return "Químicos Trata. Agua";
-  if (t.includes("especial") || t.includes("gmt")) return "Especialidades y GMT";
-  if (t.includes("equip") && t.includes("agua")) return "Equip. Y Acces. Agua";
-  if (t.includes("equip") && t.includes("pis")) return "Equip. Y Acces. Pis";
-  if (t.includes("serv")) return "Servicios";
-  if (t.includes("m.p") || t.includes("res") || t.includes("comer") || t.includes("ind")) return "M.P.Res.Comer.ind.";
-
-  return "";
-}
-
-async function syncItemGroupsFromDb({ limit = 8000 } = {}) {
-  // Tomamos todos los items distintos de ventas + inventario (si ya hay)
-  const r = await dbQuery(
-    `
-    SELECT item_code FROM (
-      SELECT DISTINCT item_code FROM sales_item_lines WHERE item_code <> ''
-      UNION
-      SELECT DISTINCT item_code FROM inv_item_cache WHERE item_code <> ''
-    ) x
-    LIMIT $1
-    `,
-    [Math.max(100, Math.min(20000, Number(limit) || 8000))]
-  );
-
-  const codes = (r.rows || []).map((x) => String(x.item_code || "").trim()).filter(Boolean);
-
-  // Mapa de desc fallback desde inv
-  const inv = await dbQuery(`SELECT item_code, item_desc FROM inv_item_cache`, []);
-  const invDescMap = new Map((inv.rows || []).map((x) => [String(x.item_code), String(x.item_desc || "")]));
-
-  // Mapa de desc fallback desde sales (última desc no vacía)
-  const salesDesc = await dbQuery(
-    `
-    SELECT item_code, MAX(item_desc) AS item_desc
-    FROM sales_item_lines
-    WHERE item_code <> '' AND item_desc <> ''
-    GROUP BY 1
-    `,
-    []
-  );
-  const salesDescMap = new Map((salesDesc.rows || []).map((x) => [String(x.item_code), String(x.item_desc || "")]));
-
-  let saved = 0;
-
-  for (let i = 0; i < codes.length; i++) {
-    const code = codes[i];
-
-    const { groupName, itemDesc: sapDesc } = await sapGetItemGroupNameAndDesc(code);
-    const grupo = mapGroupToBusinessGroup(groupName);
-    const area = inferAreaFromGroup(grupo);
-
-    const desc =
-      String(sapDesc || "").trim() ||
-      String(invDescMap.get(code) || "").trim() ||
-      String(salesDescMap.get(code) || "").trim() ||
-      "";
-
-    await dbQuery(
-      `
-      INSERT INTO item_group_cache(item_code,item_desc,group_name,area,grupo,updated_at)
-      VALUES($1,$2,$3,$4,$5,NOW())
-      ON CONFLICT(item_code) DO UPDATE SET
-        item_desc=EXCLUDED.item_desc,
-        group_name=EXCLUDED.group_name,
-        area=EXCLUDED.area,
-        grupo=EXCLUDED.grupo,
-        updated_at=NOW()
-      `,
-      [code, desc, groupName || "", area, grupo || ""]
-    );
-
-    saved++;
-    if (saved % 100 === 0) await sleep(20);
-  }
-
-  return saved;
-}
-
-/* =========================================================
-   ✅ ABC helpers (A/B/C por contribución acumulada)
+   ✅ ABC helpers
 ========================================================= */
 function abcByMetric(rows, metricKey) {
   const arr = rows
@@ -694,7 +654,7 @@ function totalLabelFromABC(a1, a2, a3) {
 }
 
 /* =========================================================
-   ✅ Dashboard (DB)
+   ✅ DASHBOARD (DB) - SOLO sales_item_lines + join inventario
 ========================================================= */
 async function dashboardFromDb({ from, to, area, grupo, q }) {
   const params = [from, to];
@@ -702,59 +662,56 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
 
   let where = `s.doc_date >= $1::date AND s.doc_date <= $2::date AND s.item_code <> ''`;
 
-  // Filtros por texto (search)
+  if (area && area !== "__ALL__") {
+    params.push(area);
+    where += ` AND COALESCE(NULLIF(s.area,''),'CONS') = $${p++}`;
+  }
+
+  if (grupo && grupo !== "__ALL__") {
+    params.push(grupo);
+    where += ` AND COALESCE(NULLIF(s.item_group,''),'') = $${p++}`;
+  }
+
   if (q && String(q).trim()) {
     const qq = `%${String(q).trim().toLowerCase()}%`;
     params.push(qq, qq);
     where += ` AND (LOWER(s.item_code) LIKE $${p++} OR LOWER(s.item_desc) LIKE $${p++})`;
   }
 
-  // Traemos grupo/area/desc desde cache
-  const joinGroup = `
-    LEFT JOIN item_group_cache g
-      ON g.item_code = s.item_code
-  `;
-
-  // Filtros de área/grupo aplicados sobre g.grupo/g.area (fallback por sets)
-  if (area && area !== "__ALL__") {
-    params.push(area);
-    where += ` AND COALESCE(NULLIF(g.area,''),'CONS') = $${p++}`;
-  }
-  if (grupo && grupo !== "__ALL__") {
-    params.push(grupo);
-    where += ` AND COALESCE(NULLIF(g.grupo,''),'') = $${p++}`;
-  }
-
-  // Agregación por item
+  // ✅ FIX: GROUP BY válido (MAX solo en SELECT)
   const agg = await dbQuery(
     `
     SELECT
       s.item_code AS item_code,
-      COALESCE(NULLIF(g.item_desc,''), NULLIF(MAX(s.item_desc),''), '') AS item_desc,
-      COALESCE(NULLIF(g.area,''),'CONS') AS area,
-      COALESCE(NULLIF(g.grupo,''),'Sin grupo') AS grupo,
+      COALESCE(MAX(NULLIF(s.item_desc,'')),'') AS item_desc,
+      COALESCE(NULLIF(s.area,''),'CONS') AS area,
+      COALESCE(NULLIF(s.item_group,''),'Sin grupo') AS grupo,
       COALESCE(SUM(s.revenue),0)::numeric(18,2) AS revenue,
       COALESCE(SUM(s.gross_profit),0)::numeric(18,2) AS gp
     FROM sales_item_lines s
-    ${joinGroup}
     WHERE ${where}
-    GROUP BY 1,2,3,4
+    GROUP BY s.item_code, COALESCE(NULLIF(s.area,''),'CONS'), COALESCE(NULLIF(s.item_group,''),'Sin grupo')
     ORDER BY revenue DESC
     `,
     params
   );
 
-  // Inventario
+  // inventario cache (solo join)
   const inv = await dbQuery(
     `
-    SELECT item_code, stock::float AS stock, stock_min::float AS stock_min, stock_max::float AS stock_max,
-           committed::float AS committed, ordered::float AS ordered, available::float AS available,
+    SELECT item_code,
+           stock::float AS stock,
+           stock_min::float AS stock_min,
+           stock_max::float AS stock_max,
+           committed::float AS committed,
+           ordered::float AS ordered,
+           available::float AS available,
            item_desc
     FROM inv_item_cache
     `,
     []
   );
-  const invMap = new Map(inv.rows.map((r) => [String(r.item_code), r]));
+  const invMap = new Map((inv.rows || []).map((r) => [String(r.item_code), r]));
 
   const items = (agg.rows || []).map((r) => {
     const code = String(r.item_code);
@@ -763,16 +720,10 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     const pct = rev > 0 ? (gp / rev) * 100 : 0;
 
     const invRow = invMap.get(code) || {
-      stock: 0,
-      stock_min: 0,
-      stock_max: 0,
-      committed: 0,
-      ordered: 0,
-      available: 0,
-      item_desc: "",
+      stock: 0, stock_min: 0, stock_max: 0, committed: 0, ordered: 0, available: 0, item_desc: ""
     };
 
-    const finalDesc = String(r.item_desc || "").trim() || String(invRow.item_desc || "").trim() || "";
+    const finalDesc = String(r.item_desc || "").trim() || String(invRow.item_desc || "").trim() || "(sin descripción)";
 
     return {
       itemCode: code,
@@ -791,14 +742,7 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     };
   });
 
-  // Available groups: SIEMPRE devolvemos los de la lista por área
-  const groupsList =
-    area === "RCI"
-      ? Array.from(GROUPS_RCI)
-      : area === "CONS"
-      ? Array.from(GROUPS_CONS)
-      : Array.from(new Set([...GROUPS_CONS, ...GROUPS_RCI]));
-
+  // ranking por grupo
   const groupAggMap = new Map();
   for (const it of items) {
     const g = it.grupo || "Sin grupo";
@@ -807,7 +751,6 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     cur.gp += it.gp;
     groupAggMap.set(g, cur);
   }
-
   const groupAgg = Array.from(groupAggMap.values())
     .map((g) => ({ ...g, gpPct: g.revenue > 0 ? Number(((g.gp / g.revenue) * 100).toFixed(2)) : 0 }))
     .sort((a, b) => b.revenue - a.revenue);
@@ -815,6 +758,7 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
   const groupRank = new Map();
   groupAgg.forEach((g, idx) => groupRank.set(g.grupo, idx + 1));
 
+  // ABC
   const abcRev = abcByMetric(items, "revenue");
   const abcGP = abcByMetric(items, "gp");
   const abcPct = abcByMetric(items, "gpPct");
@@ -845,6 +789,11 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     { revenue: 0, gp: 0 }
   );
   const gpPctTotal = totals.revenue > 0 ? Number(((totals.gp / totals.revenue) * 100).toFixed(2)) : 0;
+
+  const groupsList =
+    area === "RCI" ? Array.from(GROUPS_RCI) :
+    area === "CONS" ? Array.from(GROUPS_CONS) :
+    Array.from(new Set([...GROUPS_CONS, ...GROUPS_RCI]));
 
   return {
     ok: true,
@@ -886,7 +835,7 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ Dashboard endpoint (DB)
+   ✅ Dashboard endpoint
 ========================================================= */
 app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) => {
   try {
@@ -910,7 +859,7 @@ app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) =>
 });
 
 /* =========================================================
-   ✅ Sync endpoint (SAP -> DB)
+   ✅ Sync endpoint (ventas + inventario SOLO de los items del rango)
    GET /api/admin/estratificacion/sync?mode=days&n=5&maxDocs=2500
 ========================================================= */
 app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
@@ -918,7 +867,6 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
-    const mode = String(req.query?.mode || "days").toLowerCase();
     const nRaw = Number(req.query?.n || 5);
     const n = Math.max(1, Math.min(120, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5));
 
@@ -931,11 +879,8 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
     // 1) ventas recientes
     const salesSaved = await syncSales({ from, to: today, maxDocs });
 
-    // 2) grupos + desc
-    const groupsSaved = await syncItemGroupsFromDb({ limit: 12000 });
-
-    // 3) inventario actual (solo los items que ya existen en ventas)
-    const invSaved = await syncInventoryNow({ maxItems: 12000 });
+    // 2) inventario SOLO para items que aparecieron en ventas/NC del rango
+    const invSaved = await syncInventoryForSalesRange({ from, to: today, limit: 12000 });
 
     await setState("last_sync_at", new Date().toISOString());
     await setState("last_sync_from", from);
@@ -943,16 +888,14 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
 
     return safeJson(res, 200, {
       ok: true,
-      mode,
       n,
       maxDocs,
       from,
       to: today,
       salesSaved,
-      groupsSaved,
       invSaved,
       lastSyncAt: await getState("last_sync_at"),
-      note: "Sync OK: ventas + grupos/area + inventario (Items -> ItemWarehouseInfoCollection).",
+      note: "Sync OK: ventas + inventario solo de items con movimiento en el rango.",
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -960,20 +903,16 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
 });
 
 /* =========================================================
-   ✅ Debug counts
+   ✅ Debug: verificar inventario SAP por item (rápido)
+   GET /api/admin/estratificacion/debug-inv?code=68328
 ========================================================= */
-app.get("/api/admin/estratificacion/debug-counts", verifyAdmin, async (req, res) => {
+app.get("/api/admin/estratificacion/debug-inv", verifyAdmin, async (req, res) => {
   try {
-    const a = await dbQuery(`SELECT COUNT(*)::int AS n FROM item_group_cache`, []);
-    const b = await dbQuery(`SELECT COUNT(*)::int AS n FROM inv_item_cache`, []);
-    const c = await dbQuery(`SELECT COUNT(*)::int AS n FROM sales_item_lines`, []);
-    return safeJson(res, 200, {
-      ok: true,
-      item_group_cache: a.rows?.[0]?.n || 0,
-      inv_item_cache: b.rows?.[0]?.n || 0,
-      sales_item_lines: c.rows?.[0]?.n || 0,
-      last_sync_at: await getState("last_sync_at"),
-    });
+    const code = String(req.query?.code || "").trim();
+    if (!code) return safeJson(res, 400, { ok: false, message: "Falta code" });
+
+    const inv = await fetchInventoryForItem(code);
+    return safeJson(res, 200, { ok: true, code, inv });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
