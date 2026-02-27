@@ -1,4 +1,4 @@
-// server.js
+// src/apps/estratificacion/server.js
 import express from "express";
 import jwt from "jsonwebtoken";
 import { createClient } from "@supabase/supabase-js";
@@ -12,18 +12,24 @@ const {
   ADMIN_USER = "PRODIMA",
   ADMIN_PASS = "ADMINISTRADOR",
 
-  SAP_BASE_URL = "",
-  SAP_COMPANYDB = "",
-  SAP_USER = "",
-  SAP_PASS = "",
-
-  // Render:
-  // CORS_ORIGIN=https://prodima.com.pa,https://www.prodima.com.pa
   CORS_ORIGIN = "",
 
-  // Supabase
+  // Supabase (Render env)
   SUPABASE_URL = "",
   SUPABASE_SERVICE_ROLE = "",
+
+  // Tablas (por si cambias nombres en el futuro)
+  SALES_LINES_TABLE = "sales_item_lines",
+  ITEM_GROUP_CACHE_TABLE = "item_group_cache",
+
+  // Columnas (sales_item_lines ya confirmadas)
+  SALES_COL_CODE = "item_code",
+  SALES_COL_GROUP = "item_group",
+  SALES_COL_DATE = "doc_date",
+
+  // Columnas (cache) => AJUSTABLE
+  ITEM_GROUP_CACHE_CODE_COL = "item_code",
+  ITEM_GROUP_CACHE_GROUP_COL = "group_name", // si tu cache usa item_group/grupo, cámbialo en Render
 } = process.env;
 
 /* =========================================================
@@ -31,20 +37,6 @@ const {
 ========================================================= */
 const app = express();
 app.use(express.json({ limit: "2mb" }));
-
-/* =========================================================
-   ✅ Supabase client
-========================================================= */
-const sb =
-  SUPABASE_URL && SUPABASE_SERVICE_ROLE
-    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
-        auth: { persistSession: false },
-      })
-    : null;
-
-function missingSupabaseEnv() {
-  return !sb;
-}
 
 /* =========================================================
    ✅ CORS ROBUSTO
@@ -69,7 +61,6 @@ app.use((req, res, next) => {
   }
 
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
-  // ✅ añade headers extra si usas x-warehouse u otros
   res.setHeader(
     "Access-Control-Allow-Headers",
     "Content-Type, Authorization, x-warehouse"
@@ -107,588 +98,261 @@ function verifyAdmin(req, res, next) {
     return safeJson(res, 401, { ok: false, message: "Invalid token" });
   }
 }
-function missingSapEnv() {
-  return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
-}
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-function addDaysISO(iso, days) {
-  const d = new Date(String(iso || "").slice(0, 10));
-  if (Number.isNaN(d.getTime())) return "";
-  d.setDate(d.getDate() + Number(days || 0));
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
-}
-const TZ_OFFSET_MIN = -300; // Panamá
-function getDateISOInOffset(offsetMin = 0) {
-  const now = new Date();
-  const ms = now.getTime() + now.getTimezoneOffset() * 60000 + Number(offsetMin) * 60000;
-  const d = new Date(ms);
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
-}
-function isISO(s) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
-}
 function norm(s) {
-  return String(s || "").trim().toLowerCase();
+  return String(s || "").trim();
+}
+function uniqClean(arr) {
+  return Array.from(new Set((arr || []).map(norm).filter(Boolean)));
 }
 
 /* =========================================================
-   ✅ HEALTH
+   ✅ Supabase client (NO crashea si env mala)
 ========================================================= */
-app.get("/api/health", async (req, res) => {
+const rawUrl = String(SUPABASE_URL || "").trim();
+const rawKey = String(SUPABASE_SERVICE_ROLE || "").trim();
+
+let sb = null;
+let sbInitError = "";
+
+try {
+  if (rawUrl && rawKey && /^https?:\/\//i.test(rawUrl)) {
+    sb = createClient(rawUrl, rawKey, { auth: { persistSession: false } });
+  } else {
+    sbInitError =
+      "Supabase env inválida. SUPABASE_URL debe ser https://xxxxx.supabase.co y SUPABASE_SERVICE_ROLE debe ser sb_secret_...";
+  }
+} catch (e) {
+  sbInitError = String(e?.message || e);
+}
+
+function hasSupabase() {
+  return !!sb;
+}
+
+/* =========================================================
+   ✅ HEALTH / VERSION / ROUTES
+========================================================= */
+app.get("/api/health", (req, res) => {
   safeJson(res, 200, {
     ok: true,
-    message: "✅ PRODIMA INVOICES API activa",
-    sap: missingSapEnv() ? "missing" : "ok",
-    supabase: missingSupabaseEnv() ? "missing" : "ok",
+    message: "✅ PRODIMA ESTRATIFICACION API activa",
+    supabase: hasSupabase() ? "ok" : "missing",
+    supabaseError: hasSupabase() ? "" : sbInitError,
+    tables: {
+      salesLines: SALES_LINES_TABLE,
+      cache: ITEM_GROUP_CACHE_TABLE,
+    },
+    cacheCols: {
+      code: ITEM_GROUP_CACHE_CODE_COL,
+      group: ITEM_GROUP_CACHE_GROUP_COL,
+    },
   });
 });
 
-/* =========================================================
-   ✅ fetch wrapper (Node16/18)
-========================================================= */
-let _fetch = globalThis.fetch || null;
-async function httpFetch(url, options) {
-  if (_fetch) return _fetch(url, options);
-  const mod = await import("node-fetch");
-  _fetch = mod.default;
-  return _fetch(url, options);
-}
-
-/* =========================================================
-   ✅ SAP Service Layer
-========================================================= */
-let SL_COOKIE = "";
-let SL_COOKIE_AT = 0;
-
-async function slLogin() {
-  const url = `${SAP_BASE_URL.replace(/\/$/, "")}/Login`;
-  const body = { CompanyDB: SAP_COMPANYDB, UserName: SAP_USER, Password: SAP_PASS };
-
-  const r = await httpFetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+app.get("/api/version", (req, res) => {
+  safeJson(res, 200, {
+    ok: true,
+    commit: process.env.RENDER_GIT_COMMIT || "unknown",
+    node: process.version,
   });
+});
 
-  const txt = await r.text();
-  let data = {};
-  try { data = JSON.parse(txt); } catch {}
-
-  if (!r.ok) throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
-
-  const setCookie = r.headers.get("set-cookie") || "";
-  const cookies = [];
-  for (const part of setCookie.split(",")) {
-    const s = part.trim();
-    if (s.startsWith("B1SESSION=") || s.startsWith("ROUTEID=")) cookies.push(s.split(";")[0]);
-  }
-  SL_COOKIE = cookies.join("; ");
-  SL_COOKIE_AT = Date.now();
-}
-
-async function slFetch(path, options = {}) {
-  if (missingSapEnv()) throw new Error("Missing SAP env");
-
-  if (!SL_COOKIE || Date.now() - SL_COOKIE_AT > 25 * 60 * 1000) await slLogin();
-
-  const base = SAP_BASE_URL.replace(/\/$/, "");
-  const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
-
-  const controller = new AbortController();
-  const timeoutMs = Number(options.timeoutMs || 30000);
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
+// útil para confirmar paths en Render
+app.get("/__routes", (req, res) => {
+  const routes = [];
   try {
-    const r = await httpFetch(url, {
-      method: String(options.method || "GET").toUpperCase(),
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Cookie: SL_COOKIE,
-        ...(options.headers || {}),
-      },
-      body: options.body,
-    });
-
-    const txt = await r.text();
-    let data = {};
-    try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
-
-    if (!r.ok) {
-      if (r.status === 401 || r.status === 403) {
-        SL_COOKIE = "";
-        await slLogin();
-        return slFetch(path, options);
+    app._router.stack.forEach((m) => {
+      if (m.route && m.route.path) {
+        const methods = Object.keys(m.route.methods)
+          .filter(Boolean)
+          .map((x) => x.toUpperCase())
+          .join(",");
+        routes.push(`${methods} ${m.route.path}`);
       }
-      throw new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
-    }
-
-    return data;
-  } catch (e) {
-    if (String(e?.name) === "AbortError") throw new Error(`SAP timeout (${timeoutMs}ms) en slFetch`);
-    throw e;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
+    });
+  } catch {}
+  safeJson(res, 200, { ok: true, routes });
+});
 
 /* =========================================================
    ✅ Admin login
 ========================================================= */
 app.post("/api/admin/login", async (req, res) => {
-  const user = String(req.body?.user || "").trim();
-  const pass = String(req.body?.pass || "").trim();
+  const user = norm(req.body?.user).toUpperCase();
+  const pass = norm(req.body?.pass);
 
-  if (user !== ADMIN_USER || pass !== ADMIN_PASS) {
+  if (user !== String(ADMIN_USER || "").toUpperCase() || pass !== String(ADMIN_PASS || "")) {
     return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
   }
+
   const token = signToken({ role: "admin", user }, "12h");
   return safeJson(res, 200, { ok: true, token });
 });
 
 /* =========================================================
-   ✅ Supabase: helpers (upsert + read)
+   ✅ Core: obtener grupo más reciente desde sales_item_lines
 ========================================================= */
-async function sbUpsertHeaders(rows) {
-  if (!rows?.length) return;
-  const payload = rows.map((r) => ({
-    doc_entry: Number(r.docEntry),
-    doc_num: Number(r.docNum || 0),
-    doc_date: String(r.fecha),
-    card_code: r.cardCode || "",
-    card_name: r.cardName || "",
-    doc_total: Number(r.docTotal || 0),
+async function getLatestGroupsFromSalesLines(itemCodes) {
+  // itemCodes: array de strings ya limpios
+  // retorna Map(code -> group)
+  const best = new Map();
+  if (!itemCodes.length) return best;
+
+  const { data: rows, error } = await sb
+    .from(SALES_LINES_TABLE)
+    .select(`${SALES_COL_CODE},${SALES_COL_GROUP},${SALES_COL_DATE}`)
+    .in(SALES_COL_CODE, itemCodes)
+    .not(SALES_COL_GROUP, "is", null)
+    .order(SALES_COL_DATE, { ascending: false });
+
+  if (error) throw new Error(error.message);
+
+  for (const r of rows || []) {
+    const code = norm(r?.[SALES_COL_CODE]);
+    const grp = norm(r?.[SALES_COL_GROUP]);
+    if (!code || !grp) continue;
+    if (!best.has(code)) best.set(code, grp); // primer match es el más reciente por el order desc
+  }
+  return best;
+}
+
+async function upsertIntoCache(bestMap) {
+  const payload = Array.from(bestMap.entries()).map(([code, grp]) => ({
+    [ITEM_GROUP_CACHE_CODE_COL]: code,
+    [ITEM_GROUP_CACHE_GROUP_COL]: grp,
     updated_at: new Date().toISOString(),
   }));
 
-  const { error } = await sb.from("inv_headers").upsert(payload, { onConflict: "doc_entry" });
-  if (error) throw new Error(error.message);
-}
+  const { error } = await sb
+    .from(ITEM_GROUP_CACHE_TABLE)
+    .upsert(payload, { onConflict: ITEM_GROUP_CACHE_CODE_COL });
 
-async function sbUpsertLines(docEntry, lines) {
-  if (!lines?.length) return;
-  const payload = lines.map((ln, i) => ({
-    doc_entry: Number(docEntry),
-    line_num: Number(ln.LineNum ?? i),
-    whs_code: String(ln.WarehouseCode || "SIN_WH"),
-    line_total: Number(ln.LineTotal || 0),
-  }));
-
-  const { error } = await sb.from("inv_lines").upsert(payload, { onConflict: "doc_entry,line_num" });
-  if (error) throw new Error(error.message);
-}
-
-async function sbGetInvoices({ f, t, skip, limit, clientFilter }) {
-  let q = sb
-    .from("inv_headers")
-    .select("doc_entry,doc_num,doc_date,card_code,card_name,doc_total", { count: "exact" })
-    .gte("doc_date", f)
-    .lte("doc_date", t)
-    .order("doc_date", { ascending: false })
-    .order("doc_entry", { ascending: false });
-
-  const cf = String(clientFilter || "").trim();
-  if (cf) {
-    // filtra por CardCode o CardName
-    q = q.or(`card_code.ilike.%${cf}%,card_name.ilike.%${cf}%`);
-  }
-
-  const from = skip;
-  const to = skip + limit - 1;
-
-  const { data, count, error } = await q.range(from, to);
   if (error) throw new Error(error.message);
 
-  const invoices = (data || []).map((r) => ({
-    docEntry: r.doc_entry,
-    docNum: r.doc_num,
-    fecha: String(r.doc_date),
-    cardCode: r.card_code,
-    cardName: r.card_name,
-    docTotal: Number(r.doc_total || 0),
-  }));
-
-  return { invoices, total: Number(count || 0) };
-}
-
-async function sbDashboard({ f, t, maxDocs }) {
-  const { data: headers, error: e1 } = await sb
-    .from("inv_headers")
-    .select("doc_entry,doc_num,doc_date,card_code,card_name,doc_total")
-    .gte("doc_date", f)
-    .lte("doc_date", t)
-    .order("doc_date", { ascending: false })
-    .order("doc_entry", { ascending: false })
-    .limit(maxDocs);
-
-  if (e1) throw new Error(e1.message);
-
-  const docEntries = (headers || []).map((x) => x.doc_entry);
-
-  const invoiceSet = new Set();
-  let totalDocTotal = 0;
-
-  const byCust = new Map();
-  for (const inv of headers || []) {
-    const cust = `${inv.card_code} · ${inv.card_name}`.trim() || "SIN_CLIENTE";
-    byCust.set(cust, (byCust.get(cust) || 0) + Number(inv.doc_total || 0));
-    totalDocTotal += Number(inv.doc_total || 0);
-    invoiceSet.add(String(inv.doc_num || inv.doc_entry));
-  }
-
-  let lines = [];
-  if (docEntries.length) {
-    const { data: ln, error: e2 } = await sb
-      .from("inv_lines")
-      .select("doc_entry,line_num,whs_code,line_total")
-      .in("doc_entry", docEntries);
-
-    if (e2) throw new Error(e2.message);
-    lines = ln || [];
-  }
-
-  const byWh = new Map();
-  const byCustWh = new Map();
-
-  const headerByDe = new Map((headers || []).map((h) => [h.doc_entry, h]));
-
-  for (const ln of lines) {
-    const h = headerByDe.get(ln.doc_entry);
-    if (!h) continue;
-
-    const cust = `${h.card_code} · ${h.card_name}`.trim() || "SIN_CLIENTE";
-    const wh = String(ln.whs_code || "SIN_WH").trim() || "SIN_WH";
-    const lt = Number(ln.line_total || 0);
-
-    byWh.set(wh, (byWh.get(wh) || 0) + lt);
-
-    const key = `${cust}||${wh}`;
-    if (!byCustWh.has(key)) byCustWh.set(key, { dollars: 0, invoices: new Set() });
-
-    const cur = byCustWh.get(key);
-    cur.dollars += lt;
-    cur.invoices.add(String(h.doc_num || h.doc_entry));
-  }
-
-  const topSort = (m) =>
-    Array.from(m.entries())
-      .map(([k, v]) => ({ key: k, dollars: Number(Number(v || 0).toFixed(2)) }))
-      .sort((a, b) => b.dollars - a.dollars);
-
-  const table = Array.from(byCustWh.entries())
-    .map(([k, v]) => {
-      const [customer, warehouse] = k.split("||");
-      return {
-        customer,
-        warehouse,
-        dollars: Number(Number(v.dollars || 0).toFixed(2)),
-        invoices: v.invoices.size,
-      };
-    })
-    .sort((a, b) => b.dollars - a.dollars);
-
-  return {
-    totals: { invoices: invoiceSet.size, dollars: Number(totalDocTotal.toFixed(2)) },
-    topWarehouses: topSort(byWh).slice(0, 20),
-    topCustomers: topSort(byCust).slice(0, 20),
-    table,
-    meta: { maxDocsUsed: (headers || []).length },
-  };
+  return payload.length;
 }
 
 /* =========================================================
-   ✅ SAP -> Supabase sync por día (estable)
+   ✅ 1) FORZAR LISTA: sales_item_lines -> item_group_cache
+   POST /api/admin/item-groups/force
+   Body: { itemCodes: [...] }
 ========================================================= */
-async function syncSapToSupabaseByDay({ f, t, includeLines = true }) {
-  if (!sb) throw new Error("Missing Supabase env");
-  if (missingSapEnv()) throw new Error("Missing SAP env");
-
-  let cur = f;
-  while (cur <= t) {
-    const next = addDaysISO(cur, 1);
-
-    // headers del día
-    const raw = await slFetch(
-      `/Invoices?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName` +
-        `&$filter=${encodeURIComponent(`DocDate ge '${cur}' and DocDate lt '${next}'`)}` +
-        `&$orderby=DocEntry desc&$top=200&$skip=0`,
-      { timeoutMs: 25000 } // ✅ más alto SOLO para sync
-    );
-
-    const rows = Array.isArray(raw?.value) ? raw.value : [];
-    const headers = rows.map((inv) => ({
-      docEntry: inv.DocEntry,
-      docNum: inv.DocNum,
-      fecha: String(inv.DocDate || "").slice(0, 10),
-      cardCode: inv.CardCode,
-      cardName: inv.CardName,
-      docTotal: Number(inv.DocTotal || 0),
-    }));
-
-    await sbUpsertHeaders(headers);
-
-    if (includeLines && headers.length) {
-      // líneas (para bodegas)
-      const CONC = 3;
-      let idx = 0;
-
-      async function worker() {
-        while (idx < headers.length) {
-          const i = idx++;
-          const h = headers[i];
-          try {
-            const full = await slFetch(`/Invoices(${Number(h.docEntry)})`, { timeoutMs: 25000 });
-            const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
-            const compact = lines.map((ln) => ({
-              LineNum: ln.LineNum,
-              WarehouseCode: ln.WarehouseCode,
-              LineTotal: ln.LineTotal,
-            }));
-            await sbUpsertLines(h.docEntry, compact);
-          } catch {
-            // si una factura falla, seguimos
-          }
-          await sleep(10);
-        }
-      }
-
-      await Promise.all(Array.from({ length: CONC }, () => worker()));
-    }
-
-    cur = next;
-    await sleep(50);
-  }
-
-  // opcional: guardar estado
-  await sb
-    .from("inv_sync_state")
-    .upsert(
-      { id: 1, synced_from: f, synced_to: t, last_run_at: new Date().toISOString() },
-      { onConflict: "id" }
-    );
-}
-
-/* =========================================================
-   ✅ ENDPOINTS
-========================================================= */
-
-/**
- * GET /api/admin/invoices?from=&to=&skip=0&limit=50&client=
- * ✅ Lee Supabase primero
- * ✅ Si no hay data en Supabase para ese rango: hace sync y vuelve a leer
- */
-app.get("/api/admin/invoices", verifyAdmin, async (req, res) => {
+async function forceHandler(req, res) {
   try {
-    if (missingSupabaseEnv()) return safeJson(res, 500, { ok: false, message: "Faltan variables Supabase" });
-
-    const from = String(req.query?.from || "");
-    const to = String(req.query?.to || "");
-
-    const limitRaw = req.query?.limit != null ? Number(req.query.limit) : 50;
-    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 50));
-    const skip = req.query?.skip != null ? Math.max(0, Number(req.query.skip) || 0) : 0;
-
-    const clientFilter = String(req.query?.client || "");
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
-
-    // ✅ si el user manda uno, deben venir ambos
-    const hasAnyDate = !!String(from).trim() || !!String(to).trim();
-    let f = defaultFrom,
-      t = today;
-
-    if (hasAnyDate) {
-      if (!isISO(from) || !isISO(to)) {
-        return safeJson(res, 400, { ok: false, message: "Debes seleccionar DESDE y HASTA (YYYY-MM-DD) antes de cargar." });
-      }
-      f = from;
-      t = to;
+    if (!hasSupabase()) {
+      return safeJson(res, 500, { ok: false, message: "Faltan variables Supabase", detail: sbInitError });
     }
 
-    // 1) Supabase primero
-    let r = await sbGetInvoices({ f, t, skip, limit, clientFilter });
-
-    // 2) si no hay data y SAP está configurado, sync y reintenta
-    if (r.total === 0 && !missingSapEnv()) {
-      await syncSapToSupabaseByDay({ f, t, includeLines: false }); // headers solamente para listado
-      r = await sbGetInvoices({ f, t, skip, limit, clientFilter });
-    }
-
-    return safeJson(res, 200, {
-      ok: true,
-      invoices: r.invoices,
-      from: f,
-      to: t,
-      limit,
-      skip,
-      total: r.total,
-      source: "supabase",
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
-});
-
-/**
- * GET /api/admin/invoices/dashboard?from=&to=&maxDocs=600
- * ✅ Lee Supabase primero
- * ✅ Si no hay data: sync (headers+lines) y reintenta
- */
-app.get("/api/admin/invoices/dashboard", verifyAdmin, async (req, res) => {
-  try {
-    if (missingSupabaseEnv()) return safeJson(res, 500, { ok: false, message: "Faltan variables Supabase" });
-
-    const from = String(req.query?.from || "");
-    const to = String(req.query?.to || "");
-
-    const maxDocsRaw = Number(req.query?.maxDocs || 1500);
-    const maxDocs = Math.max(100, Math.min(2000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 1500));
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
-
-    const hasAnyDate = !!String(from).trim() || !!String(to).trim();
-    let f = defaultFrom,
-      t = today;
-
-    if (hasAnyDate) {
-      if (!isISO(from) || !isISO(to)) {
-        return safeJson(res, 400, { ok: false, message: "Debes seleccionar DESDE y HASTA (YYYY-MM-DD) antes de cargar el dashboard." });
-      }
-      f = from;
-      t = to;
-    }
-
-    // 1) Supabase dashboard
-    let dash = await sbDashboard({ f, t, maxDocs });
-
-    // 2) si está vacío y SAP existe, sync completo (headers + líneas) y reintenta
-    if (dash?.totals?.invoices === 0 && !missingSapEnv()) {
-      await syncSapToSupabaseByDay({ f, t, includeLines: true });
-      dash = await sbDashboard({ f, t, maxDocs });
-    }
-
-    return safeJson(res, 200, {
-      ok: true,
-      from: f,
-      to: t,
-      ...dash,
-      source: "supabase",
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
-});
-
-/**
- * POST /api/admin/invoices/sync
- * body: { from:"YYYY-MM-DD", to:"YYYY-MM-DD", includeLines:true/false }
- * ✅ Forzar carga SAP -> Supabase
- */
-app.post("/api/admin/invoices/sync", verifyAdmin, async (req, res) => {
-  try {
-    if (missingSupabaseEnv()) return safeJson(res, 500, { ok: false, message: "Faltan variables Supabase" });
-    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
-
-    const from = String(req.body?.from || "").trim();
-    const to = String(req.body?.to || "").trim();
-    const includeLines = req.body?.includeLines !== false; // default true
-
-    if (!isISO(from) || !isISO(to)) {
-      return safeJson(res, 400, { ok: false, message: "from/to inválidos. Usa YYYY-MM-DD." });
-    }
-
-    await syncSapToSupabaseByDay({ f: from, t: to, includeLines });
-
-    return safeJson(res, 200, { ok: true, message: "Sync completado", from, to, includeLines });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
-});
-
-// ✅ POST /api/admin/item-groups/force
-// Body: { itemCodes: ["PL0242C", "PM0060C", ...] }
-app.post("/api/admin/item-groups/force", verifyAdmin, async (req, res) => {
-  try {
-    if (!sb) return safeJson(res, 500, { ok: false, message: "Faltan variables Supabase" });
-
-    const itemCodes = Array.isArray(req.body?.itemCodes) ? req.body.itemCodes : [];
-    const clean = Array.from(new Set(itemCodes.map(x => String(x || "").trim()).filter(Boolean)));
+    const clean = uniqClean(req.body?.itemCodes);
 
     if (!clean.length) {
       return safeJson(res, 400, { ok: false, message: "Envía itemCodes: [] con al menos 1 código." });
     }
 
-    // ✅ AJUSTA SOLO ESTO si tus columnas difieren:
-    const SALES_TABLE = "sales_item_lines";
-    const COL_CODE = "item_code";     // ejemplo: item_code
-    const COL_GROUP = "item_group";   // ejemplo: grupo / item_group / category
-    const COL_DATE = "doc_date";      // ejemplo: doc_date / fecha / created_at
+    console.log("FORCE GROUPS: reading from sales_item_lines", clean.length);
 
-    // 1) Buscar grupo desde sales_item_lines (más reciente primero)
-    const { data: rows, error } = await sb
-      .from(SALES_TABLE)
-      .select(`${COL_CODE},${COL_GROUP},${COL_DATE}`)
-      .in(COL_CODE, clean)
-      .not(COL_GROUP, "is", null)
-      .order(COL_DATE, { ascending: false });
-
-    if (error) throw new Error(error.message);
-
-    // 2) Tomar el grupo más reciente por item_code
-    const best = new Map();
-    for (const r of (rows || [])) {
-      const code = String(r[COL_CODE] || "").trim();
-      const grp = String(r[COL_GROUP] || "").trim();
-      if (!code || !grp) continue;
-      if (!best.has(code)) best.set(code, grp);
-    }
-
-    const upPayload = Array.from(best.entries()).map(([code, grp]) => ({
-      item_code: code,          // 👈 columna de cache
-      group_name: grp,          // 👈 columna de cache
-      updated_at: new Date().toISOString(),
-    }));
-
-    if (!upPayload.length) {
+    const best = await getLatestGroupsFromSalesLines(clean);
+    if (best.size === 0) {
       return safeJson(res, 200, {
         ok: true,
         requested: clean.length,
         updated: 0,
-        message:
-          "No encontré grupo en sales_item_lines para esos códigos. Revisa nombres de columnas (COL_CODE/COL_GROUP/COL_DATE).",
+        message: "No encontré item_group en sales_item_lines para esos códigos.",
       });
     }
 
-    // 3) Upsert en cache
-    const { error: e2 } = await sb
-      .from("item_group_cache")
-      .upsert(upPayload, { onConflict: "item_code" });
+    const updated = await upsertIntoCache(best);
 
-    if (e2) throw new Error(e2.message);
-
-    const missingInSales = clean.filter(c => !best.has(c));
-
+    const missing = clean.filter((c) => !best.has(c));
     return safeJson(res, 200, {
       ok: true,
       requested: clean.length,
-      updated: upPayload.length,
-      missingInSalesCount: missingInSales.length,
-      missingInSales: missingInSales.slice(0, 100),
+      updated,
+      missingInSalesLinesCount: missing.length,
+      missingInSalesLines: missing.slice(0, 200),
     });
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
-});
+}
+
+app.post("/api/admin/item-groups/force", verifyAdmin, forceHandler);
+
+// ✅ alias por si sigues usando el prefijo /estratificacion
+app.post("/api/admin/estratificacion/item-groups/force", verifyAdmin, forceHandler);
+
+/* =========================================================
+   ✅ 2) BACKFILL MASIVO (sin lista)
+   POST /api/admin/item-groups/backfill-missing?limit=5000
+   - toma item_codes vendidos, saca su item_group más reciente,
+     y los mete a cache (solo lo que falte)
+========================================================= */
+async function backfillHandler(req, res) {
+  try {
+    if (!hasSupabase()) {
+      return safeJson(res, 500, { ok: false, message: "Faltan variables Supabase", detail: sbInitError });
+    }
+
+    const limitRaw = Number(req.query?.limit ?? 5000);
+    const limit = Math.max(100, Math.min(50000, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 5000));
+
+    // 1) obtener codes desde sales_item_lines (distintos)
+    // Supabase no tiene "distinct on" directo en JS client,
+    // así que tomamos filas recientes y construimos set.
+    const { data: rows, error } = await sb
+      .from(SALES_LINES_TABLE)
+      .select(`${SALES_COL_CODE},${SALES_COL_GROUP},${SALES_COL_DATE}`)
+      .not(SALES_COL_GROUP, "is", null)
+      .order(SALES_COL_DATE, { ascending: false })
+      .limit(limit);
+
+    if (error) throw new Error(error.message);
+
+    const best = new Map();
+    for (const r of rows || []) {
+      const code = norm(r?.[SALES_COL_CODE]);
+      const grp = norm(r?.[SALES_COL_GROUP]);
+      if (!code || !grp) continue;
+      if (!best.has(code)) best.set(code, grp);
+    }
+
+    if (best.size === 0) {
+      return safeJson(res, 200, { ok: true, scanned: (rows || []).length, updated: 0, message: "No data found." });
+    }
+
+    // 2) filtrar los que YA existen en cache
+    const codes = Array.from(best.keys());
+
+    const { data: existing, error: e2 } = await sb
+      .from(ITEM_GROUP_CACHE_TABLE)
+      .select(ITEM_GROUP_CACHE_CODE_COL)
+      .in(ITEM_GROUP_CACHE_CODE_COL, codes);
+
+    if (e2) throw new Error(e2.message);
+
+    const existsSet = new Set((existing || []).map((x) => norm(x?.[ITEM_GROUP_CACHE_CODE_COL])));
+    const missing = codes.filter((c) => !existsSet.has(norm(c)));
+
+    const bestMissing = new Map();
+    for (const c of missing) bestMissing.set(c, best.get(c));
+
+    const updated = bestMissing.size ? await upsertIntoCache(bestMissing) : 0;
+
+    return safeJson(res, 200, {
+      ok: true,
+      scannedRows: (rows || []).length,
+      uniqueCodesFound: best.size,
+      alreadyInCache: existsSet.size,
+      insertedNow: updated,
+      note: "Esto llena el cache solo con lo vendido (sales_item_lines).",
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+}
+
+app.post("/api/admin/item-groups/backfill-missing", verifyAdmin, backfillHandler);
+app.post("/api/admin/estratificacion/item-groups/backfill-missing", verifyAdmin, backfillHandler);
 
 /* =========================================================
    ✅ START
@@ -696,4 +360,4 @@ app.post("/api/admin/item-groups/force", verifyAdmin, async (req, res) => {
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
-app.listen(Number(PORT), () => console.log(`Invoices server listening on :${PORT}`));
+app.listen(Number(PORT), () => console.log(`Estratificacion server listening on :${PORT}`));
