@@ -50,11 +50,28 @@ const GROUPS_RCI = new Set([
   "M.P.Res.Comer.ind.",
 ]);
 
+/* =========================================================
+   ✅ NORMALIZACIÓN (FIX RCI BLANCO)
+   - Quita acentos, mayúsculas, recorta y colapsa espacios
+   - Esto evita mismatch: "QUIMICOS PISCINA" vs "Químicos Piscina"
+========================================================= */
+function normGroupName(s) {
+  return String(s || "")
+    .trim()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // quita diacríticos
+    .replace(/\s+/g, " ")
+    .toUpperCase();
+}
+
+const GROUPS_CONS_N = new Set(Array.from(GROUPS_CONS).map(normGroupName));
+const GROUPS_RCI_N = new Set(Array.from(GROUPS_RCI).map(normGroupName));
+
 function inferAreaFromGroup(groupName) {
-  const g = String(groupName || "").trim();
+  const g = normGroupName(groupName);
   if (!g) return "";
-  if (GROUPS_CONS.has(g)) return "CONS";
-  if (GROUPS_RCI.has(g)) return "RCI";
+  if (GROUPS_CONS_N.has(g)) return "CONS";
+  if (GROUPS_RCI_N.has(g)) return "RCI";
   return "";
 }
 
@@ -455,8 +472,6 @@ async function syncSales({ from, to, maxDocs = 2500 }) {
 
 /* =========================================================
    ✅ Inventario por Item (el método que ya te funcionó)
-   - /Items('CODE')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection
-   - Suma InStock/Committed/Ordered y toma min/max desde MinimalStock/MaximalStock
 ========================================================= */
 function sumInvFromWarehouseInfo(infoArr) {
   const rows = Array.isArray(infoArr) ? infoArr : [];
@@ -467,7 +482,6 @@ function sumInvFromWarehouseInfo(infoArr) {
   let stockMin = 0;
   let stockMax = 0;
 
-  // min/max: tomamos el mayor “global” si existe (en tu ejemplo viene repetido por wh)
   for (const w of rows) {
     stock += Number(w?.InStock ?? w?.OnHand ?? 0);
     committed += Number(w?.Committed ?? w?.IsCommited ?? 0);
@@ -496,11 +510,7 @@ async function getInventoryForItemCode(code) {
   if (!itemCode) return null;
 
   const safe = itemCode.replace(/'/g, "''");
-  // ✅ este fue el que te dio “BINGO”
-  const a = await slFetch(
-    `/Items('${safe}')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection`,
-    { timeoutMs: 120000 }
-  );
+  const a = await slFetch(`/Items('${safe}')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection`, { timeoutMs: 120000 });
 
   const itemName = String(a?.ItemName || "").trim();
   const inv = sumInvFromWarehouseInfo(a?.ItemWarehouseInfoCollection);
@@ -512,13 +522,7 @@ async function getInventoryForItemCode(code) {
   };
 }
 
-/**
- * ✅ Inventario “ligero”:
- * en vez de bajar TODO el catálogo, solo actualiza inventario de los artículos
- * que aparecen en ventas (en el rango que estás sincronizando).
- */
 async function syncInventoryForSalesItems({ from, to, maxItems = 1200 }) {
-  // sacamos lista de item_code del rango
   const r = await dbQuery(
     `
     SELECT DISTINCT item_code
@@ -575,7 +579,6 @@ async function syncInventoryForSalesItems({ from, to, maxItems = 1200 }) {
 
 /* =========================================================
    ✅ Sync: Grupos por Item (ItemGroups)
-   - Llena item_group_cache para códigos que aparecen en ventas
 ========================================================= */
 async function getItemGroupNameFromSap(itemCode) {
   const code = String(itemCode || "").trim();
@@ -591,7 +594,6 @@ async function getItemGroupNameFromSap(itemCode) {
     return { groupName: "", itemName, itmsGrpCod: null };
   }
 
-  // ItemGroups(cod)
   try {
     const g = await slFetch(`/ItemGroups(${itmsGrpCod})?$select=GroupName`, { timeoutMs: 90000 });
     const groupName = String(g?.GroupName || "").trim();
@@ -628,7 +630,7 @@ async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
       const groupName = String(sap.groupName || "").trim();
 
       const grupo = groupName || "";
-      const area = inferAreaFromGroup(grupo) || ""; // CONS/RCI o vacío
+      const area = inferAreaFromGroup(grupo) || ""; // ✅ FIX: ahora sí reconoce RCI aunque venga en MAYÚSCULAS / sin acento
 
       const itemDesc = (String(sap.itemName || "").trim() || descFromSales || "");
 
@@ -689,8 +691,6 @@ function totalLabelFromABC(a1, a2, a3) {
    - Usa ventas agregadas + item_group_cache + inv_item_cache
 ========================================================= */
 async function dashboardFromDb({ from, to, area, grupo, q }) {
-  // ✅ query base: agrego ventas por item_code, y luego hago JOIN con caches
-  // Evita el error: "aggregate functions are not allowed in GROUP BY"
   const salesAgg = await dbQuery(
     `
     WITH s AS (
@@ -707,54 +707,39 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     )
     SELECT
       s.item_code AS item_code,
-
-      -- ✅ descripción: ventas -> cache -> ''
       COALESCE(NULLIF(s.item_desc,''), NULLIF(g.item_desc,''), '') AS item_desc,
-
-      -- ✅ grupo: sales -> cache.grupo -> cache.group_name -> "Sin grupo"
       COALESCE(NULLIF(s.grupo_s,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo,
-
-      -- ✅ área: sales -> cache.area -> infer por grupo
-      COALESCE(
-        NULLIF(s.area_s,''),
-        NULLIF(g.area,''),
-        CASE
-          WHEN COALESCE(NULLIF(s.grupo_s,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), '') = ANY($3::text[]) THEN 'CONS'
-          WHEN COALESCE(NULLIF(s.grupo_s,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), '') = ANY($4::text[]) THEN 'RCI'
-          ELSE 'CONS'
-        END
-      ) AS area,
-
+      COALESCE(NULLIF(s.area_s,''), NULLIF(g.area,''), '') AS area,
       s.revenue AS revenue,
       s.gp AS gp,
-
-      -- inventario
       COALESCE(i.stock,0)::float AS stock,
       COALESCE(i.stock_min,0)::float AS stock_min,
       COALESCE(i.stock_max,0)::float AS stock_max,
       COALESCE(i.committed,0)::float AS committed,
       COALESCE(i.ordered,0)::float AS ordered,
       COALESCE(i.available,0)::float AS available
-
     FROM s
     LEFT JOIN item_group_cache g ON g.item_code = s.item_code
     LEFT JOIN inv_item_cache i   ON i.item_code = s.item_code
     ORDER BY s.revenue DESC
     `,
-    [from, to, Array.from(GROUPS_CONS), Array.from(GROUPS_RCI)]
+    [from, to]
   );
 
-  // aplicar filtros (en JS, rápido y seguro para no romper SQL)
   let items = (salesAgg.rows || []).map((r) => {
     const rev = Number(r.revenue || 0);
     const gp = Number(r.gp || 0);
     const pct = rev > 0 ? (gp / rev) * 100 : 0;
 
+    const grupoTxt = String(r.grupo || "Sin grupo");
+    const areaDb = String(r.area || "");
+    const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || "CONS"; // ✅ FIX RCI
+
     return {
       itemCode: String(r.item_code || ""),
       itemDesc: String(r.item_desc || ""),
-      area: String(r.area || "CONS"),
-      grupo: String(r.grupo || "Sin grupo"),
+      area: areaFinal,
+      grupo: grupoTxt,
       revenue: rev,
       gp: gp,
       gpPct: Number(pct.toFixed(2)),
@@ -767,23 +752,26 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     };
   });
 
-  // filtros
   const areaSel = String(area || "__ALL__");
   const grupoSel = String(grupo || "__ALL__");
   const qq = String(q || "").trim().toLowerCase();
 
   if (areaSel !== "__ALL__") items = items.filter((x) => String(x.area || "") === areaSel);
-  if (grupoSel !== "__ALL__") items = items.filter((x) => String(x.grupo || "") === grupoSel);
+
+  // ✅ FIX: filtro por grupo normalizado (para que "QUIMICOS PISCINA" matchee con "Químicos Piscina")
+  if (grupoSel !== "__ALL__") {
+    const gSelN = normGroupName(grupoSel);
+    items = items.filter((x) => normGroupName(x.grupo) === gSelN);
+  }
+
   if (qq) items = items.filter((x) => x.itemCode.toLowerCase().includes(qq) || x.itemDesc.toLowerCase().includes(qq));
 
-  // availableGroups: SIEMPRE los 6 de consumidor o los 6 de RCI (según filtro área)
   let availableGroups = [];
   if (areaSel === "CONS") availableGroups = Array.from(GROUPS_CONS);
   else if (areaSel === "RCI") availableGroups = Array.from(GROUPS_RCI);
   else availableGroups = Array.from(new Set([...GROUPS_CONS, ...GROUPS_RCI]));
   availableGroups.sort((a, b) => a.localeCompare(b));
 
-  // group ranking por revenue
   const groupAggMap = new Map();
   for (const it of items) {
     const g = it.grupo || "Sin grupo";
@@ -799,7 +787,6 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
   const groupRank = new Map();
   groupAgg.forEach((g, idx) => groupRank.set(g.grupo, idx + 1));
 
-  // ABC
   const abcRev = abcByMetric(items, "revenue");
   const abcGP = abcByMetric(items, "gp");
   const abcPct = abcByMetric(items, "gpPct");
@@ -897,9 +884,6 @@ app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) =>
 /* =========================================================
    ✅ Sync endpoint (SAP -> DB)
    GET /api/admin/estratificacion/sync?mode=days&n=5&maxDocs=2500
-   - 1) Sync ventas (INV+CRN)
-   - 2) Sync grupos SOLO para esos items vendidos
-   - 3) Sync inventario SOLO para esos items vendidos
 ========================================================= */
 app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
   try {
@@ -919,13 +903,8 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const from = addDaysISO(today, -n);
 
-    // 1) ventas netas
     const salesSaved = await syncSales({ from, to: today, maxDocs });
-
-    // 2) grupos SOLO para items del rango
     const groupsSaved = await syncItemGroupsForSalesItems({ from, to: today, maxItems: 2500 });
-
-    // 3) inventario SOLO para items del rango
     const invSaved = await syncInventoryForSalesItems({ from, to: today, maxItems: 2500 });
 
     await setState("last_sync_at", new Date().toISOString());
@@ -971,20 +950,17 @@ app.get("/api/admin/estratificacion/debug-counts", verifyAdmin, async (req, res)
 
 /* =========================================================
    ✅ DEBUG: inventory by code (para consola)
-   GET /api/admin/estratificacion/debug-inv?code=68328
 ========================================================= */
 app.get("/api/admin/estratificacion/debug-inv", verifyAdmin, async (req, res) => {
   try {
     const code = String(req.query?.code || "").trim();
     if (!code) return safeJson(res, 400, { ok: false, message: "Falta ?code=" });
 
-    // DB
     const db = await dbQuery(
       `SELECT item_code,item_desc,stock,stock_min,stock_max,committed,ordered,available FROM inv_item_cache WHERE item_code=$1 LIMIT 1`,
       [code]
     );
 
-    // SAP directo
     let inv = null;
     try {
       inv = await getInventoryForItemCode(code);
