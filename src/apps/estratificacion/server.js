@@ -1,7 +1,5 @@
-// src/apps/estratificacion/server.js
 import express from "express";
 import jwt from "jsonwebtoken";
-import { createClient } from "@supabase/supabase-js";
 
 /* =========================================================
    ✅ ENV
@@ -12,25 +10,21 @@ const {
   ADMIN_USER = "PRODIMA",
   ADMIN_PASS = "ADMINISTRADOR",
 
+  SAP_BASE_URL = "",
+  SAP_COMPANYDB = "",
+  SAP_USER = "",
+  SAP_PASS = "",
+
+  // ⚠️ Render:
+  // CORS_ORIGIN=https://prodima.com.pa,https://www.prodima.com.pa
   CORS_ORIGIN = "",
-
-  // Supabase (Render)
-  SUPABASE_URL = "",
-  SUPABASE_SERVICE_ROLE = "",
-
-  // Tablas
-  SALES_LINES_TABLE = "sales_item_lines",
-  CACHE_TABLE = "item_group_cache",
 } = process.env;
 
-/* =========================================================
-   ✅ APP
-========================================================= */
 const app = express();
-app.use(express.json({ limit: "3mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 /* =========================================================
-   ✅ CORS
+   ✅ CORS ROBUSTO (igual a tu quotes)
 ========================================================= */
 const ALLOWED_ORIGINS = new Set(
   String(CORS_ORIGIN || "")
@@ -52,10 +46,7 @@ app.use((req, res, next) => {
   }
 
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, x-warehouse"
-  );
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
 
   if (req.method === "OPTIONS") return res.sendStatus(204);
@@ -67,12 +58,6 @@ app.use((req, res, next) => {
 ========================================================= */
 function safeJson(res, status, obj) {
   res.status(status).json(obj);
-}
-function norm(x) {
-  return String(x || "").trim();
-}
-function uniqClean(arr) {
-  return Array.from(new Set((arr || []).map(norm).filter(Boolean)));
 }
 function signToken(payload, ttl = "12h") {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: ttl });
@@ -95,262 +80,413 @@ function verifyAdmin(req, res, next) {
     return safeJson(res, 401, { ok: false, message: "Invalid token" });
   }
 }
-
-/* =========================================================
-   ✅ Supabase client (no crashea)
-========================================================= */
-const rawUrl = String(SUPABASE_URL || "").trim();
-const rawKey = String(SUPABASE_SERVICE_ROLE || "").trim();
-
-let sb = null;
-let sbInitError = "";
-
-try {
-  if (rawUrl && rawKey && /^https?:\/\//i.test(rawUrl)) {
-    sb = createClient(rawUrl, rawKey, { auth: { persistSession: false } });
-  } else {
-    sbInitError =
-      "Supabase env inválida. SUPABASE_URL debe ser https://xxxxx.supabase.co y SUPABASE_SERVICE_ROLE debe ser sb_secret_...";
-  }
-} catch (e) {
-  sbInitError = String(e?.message || e);
+function missingSapEnv() {
+  return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
+}
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+function addDaysISO(iso, days) {
+  const d = new Date(String(iso || "").slice(0, 10));
+  if (Number.isNaN(d.getTime())) return "";
+  d.setDate(d.getDate() + Number(days || 0));
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+const TZ_OFFSET_MIN = -300;
+function getDateISOInOffset(offsetMin = 0) {
+  const now = new Date();
+  const ms = now.getTime() + now.getTimezoneOffset() * 60000 + Number(offsetMin) * 60000;
+  const d = new Date(ms);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+function isISO(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 }
 
-function hasSupabase() {
-  return !!sb;
-}
-
 /* =========================================================
-   ✅ HEALTH / VERSION / ROUTES
+   ✅ HEALTH
 ========================================================= */
-app.get("/api/health", (req, res) => {
+app.get("/api/health", async (req, res) => {
   safeJson(res, 200, {
     ok: true,
-    message: "✅ PRODIMA ESTRATIFICACION API activa",
-    supabase: hasSupabase() ? "ok" : "missing",
-    supabaseError: hasSupabase() ? "" : sbInitError,
-    tables: { salesLines: SALES_LINES_TABLE, cache: CACHE_TABLE },
+    message: "✅ PRODIMA INVOICES API activa",
+    sap: missingSapEnv() ? "missing" : "ok",
   });
 });
 
-app.get("/api/version", (req, res) => {
-  safeJson(res, 200, {
-    ok: true,
-    commit: process.env.RENDER_GIT_COMMIT || "unknown",
-    node: process.version,
-  });
-});
+/* =========================================================
+   ✅ fetch wrapper (Node16/18)
+========================================================= */
+let _fetch = globalThis.fetch || null;
+async function httpFetch(url, options) {
+  if (_fetch) return _fetch(url, options);
+  const mod = await import("node-fetch");
+  _fetch = mod.default;
+  return _fetch(url, options);
+}
 
-app.get("/__routes", (req, res) => {
-  const routes = [];
+/* =========================================================
+   ✅ SAP Service Layer
+   - timeout corto por defecto (12s)
+========================================================= */
+let SL_COOKIE = "";
+let SL_COOKIE_AT = 0;
+
+async function slLogin() {
+  const url = `${SAP_BASE_URL.replace(/\/$/, "")}/Login`;
+  const body = { CompanyDB: SAP_COMPANYDB, UserName: SAP_USER, Password: SAP_PASS };
+
+  const r = await httpFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const txt = await r.text();
+  let data = {};
   try {
-    app._router.stack.forEach((m) => {
-      if (m.route && m.route.path) {
-        const methods = Object.keys(m.route.methods)
-          .filter(Boolean)
-          .map((x) => x.toUpperCase())
-          .join(",");
-        routes.push(`${methods} ${m.route.path}`);
-      }
-    });
+    data = JSON.parse(txt);
   } catch {}
-  safeJson(res, 200, { ok: true, routes });
-});
+
+  if (!r.ok) throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
+
+  const setCookie = r.headers.get("set-cookie") || "";
+  const cookies = [];
+  for (const part of setCookie.split(",")) {
+    const s = part.trim();
+    if (s.startsWith("B1SESSION=") || s.startsWith("ROUTEID=")) cookies.push(s.split(";")[0]);
+  }
+  SL_COOKIE = cookies.join("; ");
+  SL_COOKIE_AT = Date.now();
+}
+
+async function slFetch(path, options = {}) {
+  if (missingSapEnv()) throw new Error("Missing SAP env");
+
+  if (!SL_COOKIE || Date.now() - SL_COOKIE_AT > 25 * 60 * 1000) await slLogin();
+
+  const base = SAP_BASE_URL.replace(/\/$/, "");
+  const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
+
+  const controller = new AbortController();
+  const timeoutMs = Number(options.timeoutMs || 30000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const r = await httpFetch(url, {
+      method: String(options.method || "GET").toUpperCase(),
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: SL_COOKIE,
+        ...(options.headers || {}),
+      },
+      body: options.body,
+    });
+
+    const txt = await r.text();
+    let data = {};
+    try {
+      data = JSON.parse(txt);
+    } catch {
+      data = { raw: txt };
+    }
+
+    if (!r.ok) {
+      if (r.status === 401 || r.status === 403) {
+        SL_COOKIE = "";
+        await slLogin();
+        return slFetch(path, options);
+      }
+      throw new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
+    }
+
+    return data;
+  } catch (e) {
+    if (String(e?.name) === "AbortError") throw new Error(`SAP timeout (${timeoutMs}ms) en slFetch`);
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 /* =========================================================
-   ✅ ADMIN LOGIN
+   ✅ Admin login (igual)
 ========================================================= */
 app.post("/api/admin/login", async (req, res) => {
-  const user = norm(req.body?.user).toUpperCase();
-  const pass = norm(req.body?.pass);
+  const user = String(req.body?.user || "").trim();
+  const pass = String(req.body?.pass || "").trim();
 
-  if (user !== String(ADMIN_USER || "").toUpperCase() || pass !== String(ADMIN_PASS || "")) {
+  if (user !== ADMIN_USER || pass !== ADMIN_PASS) {
     return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
   }
-
   const token = signToken({ role: "admin", user }, "12h");
   return safeJson(res, 200, { ok: true, token });
 });
 
 /* =========================================================
-   ✅ 1) LISTAR "SIN GRUPO" DESDE CACHE
-   GET /api/admin/item-groups/missing?limit=200
+   ✅ INVOICES: scan rápido (solo headers)
 ========================================================= */
-async function listMissingHandler(req, res) {
-  try {
-    if (!hasSupabase()) return safeJson(res, 500, { ok: false, message: "Faltan variables Supabase", detail: sbInitError });
+async function scanInvoices({ f, t, wantSkip, wantLimit, clientFilter }) {
+  const toPlus1 = addDaysISO(t, 1);
+  const batchTop = 200;
 
-    const limitRaw = Number(req.query?.limit ?? 200);
-    const limit = Math.max(10, Math.min(5000, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 200));
+  let skipSap = 0;
+  let totalFiltered = 0;
+  const pageRows = [];
 
-    const { data, error } = await sb
-      .from(CACHE_TABLE)
-      .select("item_code,item_desc,area,group_name,grupo,updated_at")
-      .or("group_name.eq.Sin grupo,grupo.eq.Sin grupo,group_name.is.null,grupo.is.null")
-      .order("updated_at", { ascending: false })
-      .limit(limit);
+  const cFilter = String(clientFilter || "").trim().toLowerCase();
+  const maxSapPages = 80;
 
-    if (error) throw new Error(error.message);
+  const seenDocEntry = new Set();
 
-    return safeJson(res, 200, { ok: true, count: (data || []).length, rows: data || [] });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  for (let page = 0; page < maxSapPages; page++) {
+    const raw = await slFetch(
+      `/Invoices?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName` +
+        `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
+        `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skipSap}`,
+      { timeoutMs: 12000 }
+    );
+
+    const rows = Array.isArray(raw?.value) ? raw.value : [];
+    if (!rows.length) break;
+
+    skipSap += rows.length;
+
+    for (const inv of rows) {
+      const de = Number(inv?.DocEntry);
+      if (Number.isFinite(de)) {
+        if (seenDocEntry.has(de)) continue;
+        seenDocEntry.add(de);
+      }
+
+      const idx = totalFiltered++;
+      if (idx >= wantSkip && pageRows.length < wantLimit) {
+        pageRows.push({
+          docEntry: inv.DocEntry,
+          docNum: inv.DocNum,
+          fecha: String(inv.DocDate || "").slice(0, 10),
+          cardCode: inv.CardCode,
+          cardName: inv.CardName,
+          docTotal: Number(inv.DocTotal || 0),
+        });
+      }
+    }
+
+    if (pageRows.length >= wantLimit) break;
   }
+
+  return { pageRows, totalFiltered };
 }
 
-app.get("/api/admin/item-groups/missing", verifyAdmin, listMissingHandler);
-app.get("/api/admin/estratificacion/item-groups/missing", verifyAdmin, listMissingHandler);
+/* =========================================================
+   ✅ CACHE: líneas de facturas por DocEntry
+========================================================= */
+const INV_LINES_CACHE = new Map();
+const INV_LINES_TTL_MS = 6 * 60 * 60 * 1000;
+
+function invCacheGet(key) {
+  const it = INV_LINES_CACHE.get(key);
+  if (!it) return null;
+  if (Date.now() - it.at > INV_LINES_TTL_MS) {
+    INV_LINES_CACHE.delete(key);
+    return null;
+  }
+  return it.data;
+}
+function invCacheSet(key, data) {
+  INV_LINES_CACHE.set(key, { at: Date.now(), data });
+}
+
+async function getInvoiceLinesCached(docEntry) {
+  const de = Number(docEntry);
+  if (!Number.isFinite(de) || de <= 0) return { ok: false, lines: [] };
+
+  const key = `INV:${de}`;
+  const cached = invCacheGet(key);
+  if (cached) return cached;
+
+  // ✅ Aquí SÍ viene DocumentLines (sin $expand)
+  const full = await slFetch(`/Invoices(${de})`, { timeoutMs: 18000 });
+  const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+
+  const outLines = lines.map((ln) => ({
+    WarehouseCode: String(ln?.WarehouseCode || "SIN_WH"),
+    LineTotal: Number(ln?.LineTotal || 0),
+  }));
+
+  const out = { ok: true, lines: outLines };
+  invCacheSet(key, out);
+  return out;
+}
 
 /* =========================================================
-   ✅ 2) CREAR FALTANTES EN CACHE DESDE VENTAS (sales_item_lines)
-   - Inserta registros en item_group_cache con group_name/grupo="Sin grupo"
-   POST /api/admin/item-groups/create-missing
-   Body opcional:
-     { itemCodes:[...], limitSalesRows: 5000 }
+   ✅ INVOICES LIST (headers)
+   GET /api/admin/invoices?from=&to=&skip=0&limit=50&client=
 ========================================================= */
-async function createMissingHandler(req, res) {
+app.get("/api/admin/invoices", verifyAdmin, async (req, res) => {
   try {
-    if (!hasSupabase()) return safeJson(res, 500, { ok: false, message: "Faltan variables Supabase", detail: sbInitError });
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
-    const itemCodes = Array.isArray(req.body?.itemCodes) ? req.body.itemCodes : [];
-    const clean = uniqClean(itemCodes);
+    const from = String(req.query?.from || "");
+    const to = String(req.query?.to || "");
 
-    const limitSalesRowsRaw = Number(req.body?.limitSalesRows ?? 5000);
-    const limitSalesRows = Math.max(100, Math.min(50000, Number.isFinite(limitSalesRowsRaw) ? Math.trunc(limitSalesRowsRaw) : 5000));
+    const limitRaw = req.query?.limit != null ? Number(req.query.limit) : 50;
+    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 50));
+    const skip = req.query?.skip != null ? Math.max(0, Number(req.query.skip) || 0) : 0;
 
-    // 1) candidatos: lista o últimos vendidos
-    let candidates = clean;
-    let salesRows = [];
+    const clientFilter = String(req.query?.client || "");
 
-    if (!candidates.length) {
-      const { data, error } = await sb
-        .from(SALES_LINES_TABLE)
-        .select("item_code,item_desc,area,doc_date")
-        .order("doc_date", { ascending: false })
-        .limit(limitSalesRows);
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const defaultFrom = addDaysISO(today, -30);
 
-      if (error) throw new Error(error.message);
-      salesRows = data || [];
-      candidates = Array.from(new Set(salesRows.map(r => norm(r.item_code)).filter(Boolean)));
-    }
+    const f = isISO(from) ? from : defaultFrom;
+    const t = isISO(to) ? to : today;
 
-    if (!candidates.length) {
-      return safeJson(res, 200, { ok: true, inserted: 0, message: "No hay candidatos." });
-    }
-
-    // 2) cuáles ya existen en cache
-    const { data: existing, error: e2 } = await sb
-      .from(CACHE_TABLE)
-      .select("item_code")
-      .in("item_code", candidates);
-
-    if (e2) throw new Error(e2.message);
-
-    const existsSet = new Set((existing || []).map(x => norm(x.item_code)));
-    const missing = candidates.filter(c => !existsSet.has(norm(c)));
-
-    if (!missing.length) {
-      return safeJson(res, 200, {
-        ok: true,
-        requested: candidates.length,
-        existed: existsSet.size,
-        inserted: 0,
-        message: "No hay faltantes. Ya todos existen en item_group_cache.",
-      });
-    }
-
-    // 3) buscar info de esos missing en ventas (último doc_date por item)
-    if (!salesRows.length) {
-      const { data, error } = await sb
-        .from(SALES_LINES_TABLE)
-        .select("item_code,item_desc,area,doc_date")
-        .in("item_code", missing)
-        .order("doc_date", { ascending: false });
-
-      if (error) throw new Error(error.message);
-      salesRows = data || [];
-    }
-
-    const latest = new Map();
-    for (const r of salesRows) {
-      const code = norm(r.item_code);
-      if (!code) continue;
-      if (!latest.has(code)) latest.set(code, r); // viene ordenado desc
-    }
-
-    const now = new Date().toISOString();
-    const payload = missing.map(code => {
-      const r = latest.get(code) || {};
-      return {
-        item_code: code,
-        item_desc: r.item_desc ? String(r.item_desc) : null,
-        area: (r.area && String(r.area).trim()) ? String(r.area).trim() : "EMPTY",
-        group_name: "Sin grupo",
-        grupo: "Sin grupo",
-        updated_at: now,
-      };
+    const { pageRows, totalFiltered } = await scanInvoices({
+      f,
+      t,
+      wantSkip: skip,
+      wantLimit: limit,
+      clientFilter,
     });
-
-    const { error: e3 } = await sb
-      .from(CACHE_TABLE)
-      .upsert(payload, { onConflict: "item_code" });
-
-    if (e3) throw new Error(e3.message);
 
     return safeJson(res, 200, {
       ok: true,
-      requested: candidates.length,
-      existed: existsSet.size,
-      inserted: payload.length,
-      sampleInserted: payload.slice(0, 20).map(x => x.item_code),
+      invoices: pageRows,
+      from: f,
+      to: t,
+      limit,
+      skip,
+      total: totalFiltered,
     });
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+    return safeJson(res, 500, { ok: false, message: e.message });
   }
-}
-
-app.post("/api/admin/item-groups/create-missing", verifyAdmin, createMissingHandler);
-app.post("/api/admin/estratificacion/item-groups/create-missing", verifyAdmin, createMissingHandler);
+});
 
 /* =========================================================
-   ✅ 3) ASIGNAR GRUPO MANUAL
-   POST /api/admin/item-groups/set
-   Body: { itemCodes:[...], group:"EQUIP. Y ACCES. AGUA", area:"RCI"(opcional) }
+   ✅ DASHBOARD FACTURAS: Cliente x Bodega (rápido + batch)
+   GET /api/admin/invoices/dashboard?from=&to=&maxDocs=600
 ========================================================= */
-async function setGroupHandler(req, res) {
+app.get("/api/admin/invoices/dashboard", verifyAdmin, async (req, res) => {
   try {
-    if (!hasSupabase()) return safeJson(res, 500, { ok: false, message: "Faltan variables Supabase", detail: sbInitError });
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
-    const codes = uniqClean(req.body?.itemCodes);
-    const group = norm(req.body?.group);
-    const area = req.body?.area != null ? norm(req.body.area) : null;
+    const from = String(req.query?.from || "");
+    const to = String(req.query?.to || "");
 
-    if (!codes.length) return safeJson(res, 400, { ok: false, message: "Envía itemCodes." });
-    if (!group) return safeJson(res, 400, { ok: false, message: "Envía group." });
+    const maxDocsRaw = Number(req.query?.maxDocs || 1500);
+    const maxDocs = Math.max(100, Math.min(2000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 1500));
 
-    const now = new Date().toISOString();
-    const payload = codes.map(code => ({
-      item_code: code,
-      group_name: group,
-      grupo: group,
-      ...(area ? { area } : {}),
-      updated_at: now,
-    }));
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const defaultFrom = addDaysISO(today, -30);
 
-    const { error } = await sb
-      .from(CACHE_TABLE)
-      .upsert(payload, { onConflict: "item_code" });
+    const f = isISO(from) ? from : defaultFrom;
+    const t = isISO(to) ? to : today;
 
-    if (error) throw new Error(error.message);
+    // 1) headers rápido
+    const { pageRows } = await scanInvoices({
+      f,
+      t,
+      wantSkip: 0,
+      wantLimit: maxDocs,
+      clientFilter: "",
+    });
 
-    return safeJson(res, 200, { ok: true, updated: payload.length, group });
+    const invoiceSet = new Set();
+    let totalDocTotal = 0;
+
+    const byWh = new Map();     // wh -> $ (por líneas)
+    const byCust = new Map();   // customer -> $ (DocTotal)
+    const byCustWh = new Map(); // key -> { dollars, invoices:Set }
+
+    const CONC = 5;
+    let idx = 0;
+
+    async function worker() {
+      while (idx < pageRows.length) {
+        const i = idx++;
+        const inv = pageRows[i];
+
+        const cust = `${inv.cardCode} · ${inv.cardName}`.trim() || "SIN_CLIENTE";
+
+        // ✅ "facturas totales" por cliente (DocTotal)
+        byCust.set(cust, (byCust.get(cust) || 0) + Number(inv.docTotal || 0));
+
+        totalDocTotal += Number(inv.docTotal || 0);
+        invoiceSet.add(String(inv.docNum || inv.docEntry));
+
+        // ✅ líneas para saber bodegas (WarehouseCode) SIN $expand
+        try {
+          const r = await getInvoiceLinesCached(inv.docEntry);
+          if (!r.ok) continue;
+
+          const whSeen = new Set();
+          for (const ln of r.lines) {
+            const wh = String(ln.WarehouseCode || "SIN_WH").trim() || "SIN_WH";
+            const lt = Number(ln.LineTotal || 0);
+
+            byWh.set(wh, (byWh.get(wh) || 0) + lt);
+
+            const key = `${cust}||${wh}`;
+            if (!byCustWh.has(key)) byCustWh.set(key, { dollars: 0, invoices: new Set() });
+            const cur = byCustWh.get(key);
+            cur.dollars += lt;
+
+            if (!whSeen.has(wh)) {
+              whSeen.add(wh);
+              cur.invoices.add(String(inv.docNum || inv.docEntry));
+            }
+          }
+        } catch {}
+
+        await sleep(10);
+      }
+    }
+
+    await Promise.all(Array.from({ length: CONC }, () => worker()));
+
+    const topSort = (m) =>
+      Array.from(m.entries())
+        .map(([k, v]) => ({ key: k, dollars: Number(Number(v || 0).toFixed(2)) }))
+        .sort((a, b) => b.dollars - a.dollars);
+
+    const table = Array.from(byCustWh.entries())
+      .map(([k, v]) => {
+        const [customer, warehouse] = k.split("||");
+        return {
+          customer,
+          warehouse,
+          dollars: Number(Number(v.dollars || 0).toFixed(2)),
+          invoices: v.invoices.size,
+        };
+      })
+      .sort((a, b) => b.dollars - a.dollars);
+
+    return safeJson(res, 200, {
+      ok: true,
+      from: f,
+      to: t,
+      totals: {
+        invoices: invoiceSet.size,
+        dollars: Number(totalDocTotal.toFixed(2)), // suma DocTotal (facturas totales)
+      },
+      topWarehouses: topSort(byWh).slice(0, 20),  // por líneas
+      topCustomers: topSort(byCust).slice(0, 20), // por DocTotal
+      table,
+      meta: { maxDocsUsed: pageRows.length },
+    });
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+    return safeJson(res, 500, { ok: false, message: e.message });
   }
-}
-
-app.post("/api/admin/item-groups/set", verifyAdmin, setGroupHandler);
-app.post("/api/admin/estratificacion/item-groups/set", verifyAdmin, setGroupHandler);
+});
 
 /* =========================================================
    ✅ START
@@ -358,4 +494,4 @@ app.post("/api/admin/estratificacion/item-groups/set", verifyAdmin, setGroupHand
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
-app.listen(Number(PORT), () => console.log(`Estratificacion server listening on :${PORT}`));
+app.listen(Number(PORT), () => console.log(`Invoices server listening on :${PORT}`));
