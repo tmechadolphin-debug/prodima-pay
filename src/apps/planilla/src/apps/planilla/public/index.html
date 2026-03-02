@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Prodima · Planilla (MVP)</title>
+  <style>
+    body{font-family:system-ui,Arial;margin:20px;max-width:1100px}
+    .row{display:flex;gap:10px;flex-wrap:wrap}
+    input,select,button{padding:10px;border:1px solid #ccc;border-radius:8px}
+    button{cursor:pointer}
+    .card{border:1px solid #ddd;border-radius:12px;padding:12px;margin:12px 0}
+    table{border-collapse:collapse;width:100%}
+    td,th{border-bottom:1px solid #eee;padding:8px;text-align:left}
+    small{color:#666}
+    .ok{color:green}
+    .bad{color:#b00}
+    pre{background:#111;color:#eee;padding:10px;border-radius:10px;overflow:auto}
+  </style>
+</head>
+<body>
+  <h2>📄 Prodima · Planilla (MVP)</h2>
+  <div class="card">
+    <div><b>API</b>: <span id="apiStatus">--</span></div>
+    <small>Panel MVP para cargar empleados, períodos, importar marcaciones y generar vouchers.</small>
+  </div>
+
+  <div class="card">
+    <h3>1) Empleados</h3>
+    <div class="row">
+      <input id="emp_code" placeholder="Código (ej: E001)">
+      <input id="full_name" placeholder="Nombre completo">
+      <input id="email" placeholder="Email (opcional)">
+      <select id="employee_type">
+        <option value="CLOCKS_IN">MARCA</option>
+        <option value="NO_CLOCK">NO MARCA (Gerente/Mercaderista)</option>
+      </select>
+      <select id="salary_type">
+        <option value="MONTHLY">Mensual</option>
+        <option value="BIWEEKLY">Quincenal</option>
+        <option value="HOURLY">Por hora</option>
+      </select>
+      <input id="base_salary" placeholder="Salario base" type="number" step="0.01">
+      <input id="hourly_rate" placeholder="Tarifa hora" type="number" step="0.01">
+      <button onclick="addEmployee()">➕ Crear</button>
+      <button onclick="loadEmployees()">🔄 Refrescar</button>
+    </div>
+    <div id="empTable"></div>
+  </div>
+
+  <div class="card">
+    <h3>2) Crear período</h3>
+    <div class="row">
+      <select id="period_type">
+        <option value="BIWEEKLY">Quincenal</option>
+        <option value="MONTHLY">Mensual</option>
+      </select>
+      <input id="start_date" type="date">
+      <input id="end_date" type="date">
+      <input id="label" placeholder="Label (ej: 1ra Quincena Marzo)">
+      <button onclick="createPeriod()">📅 Crear período</button>
+      <button onclick="loadPeriods()">🔄 Refrescar</button>
+    </div>
+    <div id="periods"></div>
+  </div>
+
+  <div class="card">
+    <h3>3) Importar marcaciones (TXT / XLSX)</h3>
+    <div class="row">
+      <input id="import_start" type="date">
+      <input id="import_end" type="date">
+      <input id="file" type="file" accept=".txt,.csv,.xlsx,.xls">
+      <button onclick="importTime()">⬆️ Importar</button>
+    </div>
+    <small>TXT: <code>emp_code|YYYY-MM-DD HH:mm:ss|IN</code> (event_type opcional)</small>
+    <pre id="importResult"></pre>
+  </div>
+
+  <div class="card">
+    <h3>4) Planilla (MVP)</h3>
+    <div class="row">
+      <select id="periodSelect"></select>
+      <button onclick="createPayRun()">🧾 Crear corrida</button>
+      <button onclick="calculatePayRun()">🧮 Calcular</button>
+      <button onclick="generateVouchers()">📄 Generar vouchers</button>
+      <button onclick="sendVouchers()">✉️ Enviar vouchers</button>
+    </div>
+    <pre id="payRunResult"></pre>
+  </div>
+
+<script>
+const API_BASE = location.origin; // el server sirve esta página
+let currentPayRunId = null;
+
+async function apiHealth(){
+  const r = await fetch(`${API_BASE}/api/health`);
+  const j = await r.json();
+  document.getElementById("apiStatus").innerHTML =
+    j.ok ? `<span class="ok">OK</span>` : `<span class="bad">ERROR</span>`;
+}
+apiHealth();
+
+async function loadEmployees(){
+  const r = await fetch(`${API_BASE}/api/employees`);
+  const j = await r.json();
+  if(!j.ok) return alert(j.message);
+  const rows = j.employees || [];
+  document.getElementById("empTable").innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Código</th><th>Nombre</th><th>Tipo</th><th>Salario</th><th>Email</th>
+      </tr></thead>
+      <tbody>
+        ${rows.map(e=>`
+          <tr>
+            <td>${e.emp_code}</td>
+            <td>${e.full_name}</td>
+            <td>${e.employee_type}</td>
+            <td>${e.salary_type} / ${Number(e.base_salary||0).toFixed(2)}</td>
+            <td>${e.email||""}</td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  `;
+}
+loadEmployees();
+
+async function addEmployee(){
+  const body = {
+    emp_code: document.getElementById("emp_code").value,
+    full_name: document.getElementById("full_name").value,
+    email: document.getElementById("email").value,
+    employee_type: document.getElementById("employee_type").value,
+    salary_type: document.getElementById("salary_type").value,
+    base_salary: Number(document.getElementById("base_salary").value||0),
+    hourly_rate: Number(document.getElementById("hourly_rate").value||0),
+  };
+  const r = await fetch(`${API_BASE}/api/employees`, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify(body)
+  });
+  const j = await r.json();
+  if(!j.ok) return alert(j.message);
+  alert("Empleado creado");
+  loadEmployees();
+}
+
+async function loadPeriods(){
+  const r = await fetch(`${API_BASE}/api/pay-periods`);
+  const j = await r.json();
+  if(!j.ok) return alert(j.message);
+
+  const rows = j.periods || [];
+  document.getElementById("periods").innerHTML = `
+    <table>
+      <thead><tr><th>Tipo</th><th>Inicio</th><th>Fin</th><th>Label</th></tr></thead>
+      <tbody>${rows.map(p=>`
+        <tr><td>${p.period_type}</td><td>${p.start_date}</td><td>${p.end_date}</td><td>${p.label}</td></tr>
+      `).join("")}</tbody>
+    </table>
+  `;
+
+  const sel = document.getElementById("periodSelect");
+  sel.innerHTML = rows.map(p=>`<option value="${p.id}">${p.label} (${p.start_date} → ${p.end_date})</option>`).join("");
+}
+loadPeriods();
+
+async function createPeriod(){
+  const body = {
+    period_type: document.getElementById("period_type").value,
+    start_date: document.getElementById("start_date").value,
+    end_date: document.getElementById("end_date").value,
+    label: document.getElementById("label").value,
+  };
+  const r = await fetch(`${API_BASE}/api/pay-periods`, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify(body)
+  });
+  const j = await r.json();
+  if(!j.ok) return alert(j.message);
+  alert("Periodo creado");
+  loadPeriods();
+}
+
+async function importTime(){
+  const file = document.getElementById("file").files[0];
+  if(!file) return alert("Selecciona un archivo");
+
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("period_start", document.getElementById("import_start").value);
+  fd.append("period_end", document.getElementById("import_end").value);
+  fd.append("uploaded_by", "admin");
+
+  const r = await fetch(`${API_BASE}/api/time/import`, { method:"POST", body: fd });
+  const j = await r.json();
+  document.getElementById("importResult").textContent = JSON.stringify(j, null, 2);
+  if(!j.ok) alert(j.message);
+}
+
+async function createPayRun(){
+  const period_id = document.getElementById("periodSelect").value;
+  const r = await fetch(`${API_BASE}/api/pay-runs`, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ period_id, created_by: "admin" })
+  });
+  const j = await r.json();
+  if(!j.ok) return alert(j.message);
+  currentPayRunId = j.run.id;
+  document.getElementById("payRunResult").textContent = `PayRun creado: ${currentPayRunId}`;
+}
+
+async function calculatePayRun(){
+  if(!currentPayRunId) return alert("Crea una corrida primero");
+  const r = await fetch(`${API_BASE}/api/pay-runs/${currentPayRunId}/calculate`, { method:"POST" });
+  const j = await r.json();
+  if(!j.ok) return alert(j.message);
+  document.getElementById("payRunResult").textContent = JSON.stringify(j, null, 2);
+}
+
+async function generateVouchers(){
+  if(!currentPayRunId) return alert("Crea una corrida primero");
+  const r = await fetch(`${API_BASE}/api/pay-runs/${currentPayRunId}/generate-vouchers`, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ companyName:"PRODIMA" })
+  });
+  const j = await r.json();
+  if(!j.ok) return alert(j.message);
+  document.getElementById("payRunResult").textContent = JSON.stringify(j, null, 2);
+}
+
+async function sendVouchers(){
+  if(!currentPayRunId) return alert("Crea una corrida primero");
+  const r = await fetch(`${API_BASE}/api/pay-runs/${currentPayRunId}/send-vouchers`, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ subject:"Voucher de nómina" })
+  });
+  const j = await r.json();
+  if(!j.ok) return alert(j.message);
+  document.getElementById("payRunResult").textContent = JSON.stringify(j, null, 2);
+}
+</script>
+</body>
+</html>
