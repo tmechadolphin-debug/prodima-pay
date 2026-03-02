@@ -263,6 +263,11 @@ async function ensureDb() {
   `);
 
   await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS doc_num INTEGER;`);
+
+  /* ✅ NUEVO: cliente en líneas (para el modal) */
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS card_code TEXT DEFAULT '';`);
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS card_name TEXT DEFAULT '';`);
+
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_sales_item_date ON sales_item_lines(doc_date);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_sales_item_code ON sales_item_lines(item_code);`);
 
@@ -462,6 +467,11 @@ async function getDoc(entity, docEntry) {
 async function upsertSalesLines(docType, docDate, docFull, sign) {
   const docEntry = Number(docFull?.DocEntry || 0);
   const docNum = docFull?.DocNum != null ? Number(docFull.DocNum) : null;
+
+  /* ✅ NUEVO: cliente en líneas */
+  const cardCode = String(docFull?.CardCode || "").trim();
+  const cardName = String(docFull?.CardName || "").trim();
+
   const lines = Array.isArray(docFull?.DocumentLines) ? docFull.DocumentLines : [];
   if (!docEntry || !lines.length) return 0;
 
@@ -488,12 +498,15 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
     await dbQuery(
       `
       INSERT INTO sales_item_lines(
-        doc_entry,line_num,doc_type,doc_date,doc_num,item_code,item_desc,quantity,revenue,gross_profit,updated_at
+        doc_entry,line_num,doc_type,doc_date,doc_num,card_code,card_name,
+        item_code,item_desc,quantity,revenue,gross_profit,updated_at
       )
-      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,NOW())
+      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
       ON CONFLICT(doc_entry,line_num,doc_type) DO UPDATE SET
         doc_date=EXCLUDED.doc_date,
         doc_num=EXCLUDED.doc_num,
+        card_code=EXCLUDED.card_code,
+        card_name=EXCLUDED.card_name,
         item_code=EXCLUDED.item_code,
         item_desc=EXCLUDED.item_desc,
         quantity=EXCLUDED.quantity,
@@ -501,7 +514,7 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
         gross_profit=EXCLUDED.gross_profit,
         updated_at=NOW()
       `,
-      [docEntry, lineNum, docType, docDate, docNum, itemCode, itemDesc, qty, rev, gp]
+      [docEntry, lineNum, docType, docDate, docNum, cardCode, cardName, itemCode, itemDesc, qty, rev, gp]
     );
 
     inserted++;
@@ -835,6 +848,13 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
   availableGroups.sort((a, b) => a.localeCompare(b));
 
   /* =========================
+     ✅ NUEVO: Rank Total por Revenue (NO depende de filtros)
+  ========================= */
+  const allByRev = items.slice().sort((a, b) => (b.revenue || 0) - (a.revenue || 0));
+  const rankTotalMap = new Map();
+  allByRev.forEach((it, idx) => rankTotalMap.set(it.itemCode, idx + 1));
+
+  /* =========================
      ✅ UNIVERSO ABC (NO depende de q)
   ========================= */
   let universe = items.slice();
@@ -859,6 +879,7 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
 
     return {
       ...it,
+      rankTotal: rankTotalMap.get(it.itemCode) || 999999, // ✅ NUEVO
       abcRevenue: a1,
       abcGP: a2,
       abcGPPct: a3,
@@ -969,6 +990,8 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
         s.doc_date,
         s.doc_entry,
         s.doc_num,
+        s.card_code,
+        s.card_name,
         s.item_code,
         s.item_desc,
         s.quantity,
@@ -999,6 +1022,8 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
         docDate: String(r.doc_date || "").slice(0, 10),
         docEntry: Number(r.doc_entry || 0),
         docNum: r.doc_num != null ? Number(r.doc_num) : null,
+        cardCode: String(r.card_code || ""),
+        cardName: String(r.card_name || ""),
         itemCode: String(r.item_code || ""),
         itemDesc: String(r.item_desc || ""),
         quantity: Number(r.quantity || 0),
