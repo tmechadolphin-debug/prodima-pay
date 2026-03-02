@@ -231,14 +231,101 @@ function parseWhFromComments(comments) {
 }
 
 /**
+ * ✅ FIX (CANCELADAS):
+ * Normaliza CancelStatus para que cualquier variante (csYes / tYES / Y / true / etc)
+ * quede consistente y NO se trate como "open".
+ */
+function normalizeCancelStatus(val) {
+  const raw = String(val ?? "").trim();
+  const t = raw.toLowerCase();
+  if (!t) return "";
+
+  const YES = new Set([
+    "csyes",
+    "cs_yes",
+    "yes",
+    "true",
+    "tyes",
+    "t_yes",
+    "y",
+    "1",
+    "cancelled",
+    "canceled",
+    "cancelado",
+    "anulado",
+    "anulada",
+  ]);
+  const NO = new Set(["csno", "cs_no", "no", "false", "tno", "t_no", "n", "0"]);
+
+  if (YES.has(t)) return "csYes";
+  if (NO.has(t)) return "csNo";
+
+  if (t.includes("csyes") || t.includes("tyes")) return "csYes";
+  if (t.includes("csno") || t.includes("tno")) return "csNo";
+
+  return raw;
+}
+
+/**
  * ✅ Ajuste mínimo:
  * Antes estabas descartando por "cancel" en comments y eso puede tumbar docs.
- * Aquí dejamos solo CancelStatus real.
+ * Aquí dejamos solo CancelStatus real (pero robusto).
  */
 function isCancelledLike(q) {
-  const cancelVal = q?.CancelStatus ?? q?.cancelStatus ?? q?.Cancelled ?? q?.cancelled ?? "";
-  const cancelRaw = String(cancelVal).trim().toLowerCase();
-  return cancelRaw === "csyes" || cancelRaw === "yes" || cancelRaw === "true" || cancelRaw.includes("csyes");
+  const cancelVal =
+    q?.CancelStatus ??
+    q?.cancelStatus ??
+    q?.Cancelled ??
+    q?.cancelled ??
+    q?.Canceled ??
+    q?.canceled ??
+    "";
+  const norm = normalizeCancelStatus(cancelVal);
+  return String(norm).trim().toLowerCase() === "csyes";
+}
+
+/**
+ * ✅ FIX (CANCELADAS):
+ * Estado final para UI/API: si está cancelada, NO puede ser Open aunque DocumentStatus venga Open.
+ */
+function deriveUiEstado(documentStatus, cancelStatus) {
+  const norm = normalizeCancelStatus(cancelStatus);
+  if (String(norm).toLowerCase() === "csyes") return "Cancelled";
+  return String(documentStatus || "");
+}
+
+/**
+ * ✅ FIX (OPEN global con paginado):
+ * Soporta varios nombres de query param (status/estado/state/tab/open/closed/cancelled)
+ * para filtrar en SQL, no en el frontend por página.
+ */
+function parseStatusFilterFromQuery(q) {
+  const v =
+    q?.status ??
+    q?.estado ??
+    q?.state ??
+    q?.tab ??
+    q?.filter ??
+    "";
+  const t = String(v || "").trim().toLowerCase();
+
+  if (String(q?.open || "") === "1" || String(q?.onlyOpen || "") === "1") return "open";
+  if (String(q?.closed || "") === "1" || String(q?.onlyClosed || "") === "1") return "closed";
+  if (String(q?.cancelled || "") === "1" || String(q?.canceled || "") === "1") return "cancelled";
+
+  if (!t) return "";
+
+  if (["open", "abierto", "abierta", "abiertos", "abiertas", "o"].includes(t)) return "open";
+  if (["closed", "close", "cerrado", "cerrada", "cerrados", "cerradas", "c"].includes(t)) return "closed";
+  if (["cancelled", "canceled", "cancelado", "cancelada", "anulado", "anulada"].includes(t)) return "cancelled";
+  if (["all", "todos", "todas", "*"].includes(t)) return "";
+
+  // tolerancia: "open_x", "tab_open", etc.
+  if (t.includes("open") || t.includes("abiert")) return "open";
+  if (t.includes("clos") || t.includes("cerrad")) return "closed";
+  if (t.includes("cancel") || t.includes("anul")) return "cancelled";
+
+  return "";
 }
 
 /* =========================
@@ -920,8 +1007,6 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
         scanned++;
         if (saved >= maxDocs) break;
 
-        if (isCancelledLike(q)) continue;
-
         const docNum = Number(q.DocNum);
         const docDate = String(q.DocDate || "").slice(0, 10);
         const docTime = Number(q.DocTime || 0);
@@ -953,6 +1038,9 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
           await sleep(15);
         }
 
+        // ✅ FIX (CANCELADAS): normaliza cancelStatus al guardar
+        const cancelStatusNorm = normalizeCancelStatus(q.CancelStatus ?? "");
+
         await upsertQuoteCache({
           docNum,
           docEntry: q.DocEntry,
@@ -965,7 +1053,7 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
           docTotal: Number(q.DocTotal || 0),
           deliveredTotal,
           status: q.DocumentStatus || "",
-          cancelStatus: q.CancelStatus ?? "",
+          cancelStatus: cancelStatusNorm,
           comments: q.Comments || "",
           groupName,
         });
@@ -1190,6 +1278,7 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
 /* =========================
    HISTÓRICO DB (PAGINADO)
    GET /api/admin/quotes/db?from&to&user&client&skip&limit&onlyCreated=1
+   ✅ FIX (OPEN global): soporta filtro por estado (status/estado/state/tab/open/closed/cancelled)
 ========================= */
 app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
   try {
@@ -1233,6 +1322,28 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
       params.push(`%${client}%`, `%${client}%`);
     }
 
+    // ✅ FIX (OPEN global con paginado): filtro SQL por estado/canceladas
+    const statusFilter = parseStatusFilterFromQuery(req.query);
+
+    const SQL_IS_CANCELLED =
+      `LOWER(COALESCE(q.cancel_status,'')) IN (` +
+      `'csyes','cs_yes','tyes','t_yes','yes','true','y','1','cancelled','canceled','cancelado','anulado','anulada'` +
+      `)`;
+
+    const SQL_IS_OPEN =
+      `(LOWER(COALESCE(q.status,'')) = 'o' OR LOWER(COALESCE(q.status,'')) LIKE '%open%')`;
+
+    const SQL_IS_CLOSED =
+      `(LOWER(COALESCE(q.status,'')) = 'c' OR LOWER(COALESCE(q.status,'')) LIKE '%close%')`;
+
+    if (statusFilter === "cancelled") {
+      where.push(`(${SQL_IS_CANCELLED})`);
+    } else if (statusFilter === "open") {
+      where.push(`(NOT (${SQL_IS_CANCELLED}) AND ${SQL_IS_OPEN})`);
+    } else if (statusFilter === "closed") {
+      where.push(`(NOT (${SQL_IS_CANCELLED}) AND ${SQL_IS_CLOSED})`);
+    }
+
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
     const totalR = await dbQuery(`SELECT COUNT(*)::int AS total FROM quotes_cache q ${whereSql}`, params);
@@ -1261,6 +1372,16 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
 
     const lastSyncAt = await getState("quotes_cache_last_sync");
 
+    // ✅ FIX (CANCELADAS): normaliza cancelStatus y estado final para que NO se mezclen como open
+    const quotes = (dataR.rows || []).map((r) => {
+      const cancelNorm = normalizeCancelStatus(r.cancelStatus);
+      return {
+        ...r,
+        cancelStatus: cancelNorm,
+        estado: deriveUiEstado(r.estado, cancelNorm),
+      };
+    });
+
     return safeJson(res, 200, {
       ok: true,
       from,
@@ -1269,7 +1390,7 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
       skip,
       limit,
       lastSyncAt: lastSyncAt || null,
-      quotes: dataR.rows || [],
+      quotes,
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
