@@ -268,8 +268,7 @@ function normalizeCancelStatus(val) {
 
 /**
  * ✅ Ajuste mínimo:
- * Antes estabas descartando por "cancel" en comments y eso puede tumbar docs.
- * Aquí dejamos solo CancelStatus real (pero robusto).
+ * CancelStatus real (robusto).
  */
 function isCancelledLike(q) {
   const cancelVal =
@@ -290,7 +289,8 @@ function isCancelledLike(q) {
  */
 function deriveUiEstado(documentStatus, cancelStatus) {
   const norm = normalizeCancelStatus(cancelStatus);
-  if (String(norm).toLowerCase() === "csyes") return "Cancelled";
+  if (String(norm).toLowerCase() === "csyes") return "Cancelada";
+  // (mantengo lo demás igual, solo devuelvo lo que venía de SAP/DB)
   return String(documentStatus || "");
 }
 
@@ -300,13 +300,7 @@ function deriveUiEstado(documentStatus, cancelStatus) {
  * para filtrar en SQL, no en el frontend por página.
  */
 function parseStatusFilterFromQuery(q) {
-  const v =
-    q?.status ??
-    q?.estado ??
-    q?.state ??
-    q?.tab ??
-    q?.filter ??
-    "";
+  const v = q?.status ?? q?.estado ?? q?.state ?? q?.tab ?? q?.filter ?? "";
   const t = String(v || "").trim().toLowerCase();
 
   if (String(q?.open || "") === "1" || String(q?.onlyOpen || "") === "1") return "open";
@@ -320,7 +314,6 @@ function parseStatusFilterFromQuery(q) {
   if (["cancelled", "canceled", "cancelado", "cancelada", "anulado", "anulada"].includes(t)) return "cancelled";
   if (["all", "todos", "todas", "*"].includes(t)) return "";
 
-  // tolerancia: "open_x", "tab_open", etc.
   if (t.includes("open") || t.includes("abiert")) return "open";
   if (t.includes("clos") || t.includes("cerrad")) return "closed";
   if (t.includes("cancel") || t.includes("anul")) return "cancelled";
@@ -476,7 +469,8 @@ function mapToSixCats(raw) {
 
   if (t.includes("sazon")) return "Sazonadores";
   if (t.includes("vinagr")) return "Vinagres";
-  if (t.includes("cuidado de la ropa") || (t.includes("cuidado") && t.includes("ropa"))) return "Cuidado de la Ropa";
+  if (t.includes("cuidado de la ropa") || (t.includes("cuidado") && t.includes("ropa")))
+    return "Cuidado de la Ropa";
   if (t.includes("prod") && t.includes("limp")) return "Prod. De limpieza";
   if (t.includes("art") && t.includes("limp")) return "Art. De limpieza";
   if (t.includes("especial") || t.includes("gmt")) return "Especialidades y GMT";
@@ -1133,6 +1127,7 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
 /* =========================
    DASHBOARD DB
    GET /api/admin/quotes/dashboard-db?from=YYYY-MM-DD&to=YYYY-MM-DD&onlyCreated=1
+   ✅ FIX (DASHBOARD): excluye canceladas de totales y agregados
 ========================= */
 app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
   try {
@@ -1150,7 +1145,15 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
       ? `AND LOWER(COALESCE(q.usuario,'')) IN (SELECT LOWER(username) FROM app_users WHERE is_active=TRUE)`
       : ``;
 
-    // Totales
+    // ✅ MISMA lógica robusta para detectar canceladas (sin depender de que estén "normalizadas")
+    const SQL_IS_CANCELLED =
+      `LOWER(COALESCE(q.cancel_status,'')) IN (` +
+      `'csyes','cs_yes','tyes','t_yes','yes','true','y','1','cancelled','canceled','cancelado','anulado','anulada'` +
+      `)`;
+
+    const cancelExclusion = `AND NOT (${SQL_IS_CANCELLED})`;
+
+    // Totales (sin canceladas)
     const totalsR = await dbQuery(
       `SELECT
         COUNT(*)::int AS quotes,
@@ -1158,13 +1161,14 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
         COALESCE(SUM(q.delivered_total),0)::float AS entregado
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
-       ${createdJoin}`,
+       ${createdJoin}
+       ${cancelExclusion}`,
       [from, to]
     );
     const totals = totalsR.rows[0] || { quotes: 0, cotizado: 0, entregado: 0 };
     const fillRatePct = Number(totals.cotizado) > 0 ? (Number(totals.entregado) / Number(totals.cotizado)) * 100 : 0;
 
-    // byUser
+    // byUser (sin canceladas)
     const byUserR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.usuario,''),'sin_user') AS usuario,
@@ -1174,13 +1178,14 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
        ${createdJoin}
+       ${cancelExclusion}
        GROUP BY 1
        ORDER BY cotizado DESC
        LIMIT 2000`,
       [from, to]
     );
 
-    // byWh
+    // byWh (sin canceladas)
     const byWhR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.warehouse,''),'sin_wh') AS warehouse,
@@ -1190,13 +1195,14 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
        ${createdJoin}
+       ${cancelExclusion}
        GROUP BY 1
        ORDER BY cotizado DESC
        LIMIT 2000`,
       [from, to]
     );
 
-    // byClient
+    // byClient (sin canceladas)
     const byClientR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.card_name,''), q.card_code, 'sin_cliente') AS customer,
@@ -1205,13 +1211,14 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
        ${createdJoin}
+       ${cancelExclusion}
        GROUP BY 1
        ORDER BY cotizado DESC
        LIMIT 2000`,
       [from, to]
     );
 
-    // byGroup
+    // byGroup (sin canceladas)
     const byGroupR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.group_name,''), 'Sin grupo') AS "group",
@@ -1220,6 +1227,7 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
        ${createdJoin}
+       ${cancelExclusion}
        GROUP BY 1
        ORDER BY cotizado DESC
        LIMIT 2000`,
@@ -1330,11 +1338,8 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
       `'csyes','cs_yes','tyes','t_yes','yes','true','y','1','cancelled','canceled','cancelado','anulado','anulada'` +
       `)`;
 
-    const SQL_IS_OPEN =
-      `(LOWER(COALESCE(q.status,'')) = 'o' OR LOWER(COALESCE(q.status,'')) LIKE '%open%')`;
-
-    const SQL_IS_CLOSED =
-      `(LOWER(COALESCE(q.status,'')) = 'c' OR LOWER(COALESCE(q.status,'')) LIKE '%close%')`;
+    const SQL_IS_OPEN = `(LOWER(COALESCE(q.status,'')) = 'o' OR LOWER(COALESCE(q.status,'')) LIKE '%open%')`;
+    const SQL_IS_CLOSED = `(LOWER(COALESCE(q.status,'')) = 'c' OR LOWER(COALESCE(q.status,'')) LIKE '%close%')`;
 
     if (statusFilter === "cancelled") {
       where.push(`(${SQL_IS_CANCELLED})`);
@@ -1372,7 +1377,7 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
 
     const lastSyncAt = await getState("quotes_cache_last_sync");
 
-    // ✅ FIX (CANCELADAS): normaliza cancelStatus y estado final para que NO se mezclen como open
+    // ✅ FIX (CANCELADAS): estado final + cancelStatus normalizado
     const quotes = (dataR.rows || []).map((r) => {
       const cancelNorm = normalizeCancelStatus(r.cancelStatus);
       return {
@@ -1416,8 +1421,7 @@ app.get("/api/admin/quotes/lines", verifyAdmin, async (req, res) => {
     if (!lines.length) {
       return safeJson(res, 404, {
         ok: false,
-        message:
-          "No hay líneas en cache (DB). Ejecuta Sync (Ene→Hoy o últimos días) para poblar el detalle.",
+        message: "No hay líneas en cache (DB). Ejecuta Sync (Ene→Hoy o últimos días) para poblar el detalle.",
       });
     }
 
