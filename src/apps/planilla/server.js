@@ -703,29 +703,244 @@ app.get("/api/pay-runs/:id/employee/:empId/shifts", requireSupabase, async (req,
 /* =========================================================
    Voucher PDF + Email (reusa lo tuyo; aquí solo lo dejo base)
 ========================================================= */
-function buildSlipPdfBuffer({ companyName, periodLabel, empName, empCode, gross, deductions, net }) {
+function money(n){
+  const x = Number(n || 0);
+  return x.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function line(doc, x1, y1, x2, y2){
+  doc.moveTo(x1, y1).lineTo(x2, y2).stroke();
+}
+
+function sectionTitle(doc, x, y, w, title){
+  doc.font("Helvetica-Bold").fontSize(10).text(title, x, y, { width: w, align: "center" });
+  line(doc, x, y + 14, x + w, y + 14);
+}
+
+function kv(doc, x, y, label, value, gap = 70){
+  doc.font("Helvetica-Bold").fontSize(9).text(label, x, y);
+  doc.font("Helvetica").fontSize(9).text(value ?? "", x + gap, y);
+}
+
+async function buildSlipPdfBuffer(payload){
+  const {
+    companyName = "PRODIMA, S.A.",
+    page = 1,
+
+    // Encabezado planilla
+    planillaTipo = "PLANILLA QUINCENAL",
+    periodFrom = "16/02/2026",
+    periodTo = "28/02/2026",
+    planillaNo = "7355",
+    transaccionNo = "118242",
+
+    // Empleado
+    sucursal = "PMA - PANAMA",
+    empCode = "001359",
+    empName = "RIVERA SEWELL, DANIEL",
+    cedula = "8-933-981",
+    cargo = "** SIN DEFINIR **",
+    cuenta = "0416981383956",
+    salarioHora = 6.275494,
+
+    // Horas
+    horas = {
+      diurna_h: 95.61, diurna_$: 600.00,
+      mixta_h: 0, mixta_$: 0,
+      noct_h: 0, noct_$: 0,
+      ajust_h: 0, ajust_$: 0,
+    },
+
+    ausencias = {
+      no_paga_h: 0, no_paga_$: 0,
+      pagadas_h: 0, pagadas_$: 0,
+      cmed_h: 0, cmed_$: 0,
+    },
+
+    // Descuentos legales (ejemplo)
+    descuentosLegales = [
+      { name: "Seguro Social", amount: 58.50 },
+      { name: "Seguro Educativo", amount: 7.50 },
+      { name: "Impuesto s/Renta", amount: 26.54 },
+      { name: "ISR GtoRep", amount: 0.00 },
+    ],
+
+    // Ingresos (derecha)
+    ingresos = [
+      { name: "Salario Regular", amount: 600.00 },
+      { name: "Salario s/Tiempo", amount: 0.00 },
+      { name: "Prima P./Bonif/Gratif", amount: 0.00 },
+      { name: "Comisión", amount: 0.00 },
+      { name: "Otr1 Ingr", amount: 0.00 },
+      { name: "Otr2 Ingr", amount: 0.00 },
+      { name: "Otr3 Ingr", amount: 0.00 },
+      { name: "Construcción", amount: 0.00 },
+      { name: "Ajustes", amount: 0.00 },
+      { name: "Partic. Utilidad", amount: 0.00 },
+    ],
+
+    // Totales
+    salarioBruto = 600.00,
+    totalOtros = 0.00,
+    otrosDescuentos = 0.00,
+  } = payload || {};
+
+  const totalDescLeg = descuentosLegales.reduce((a,b)=>a+Number(b.amount||0),0);
+  const salarioNeto = Number(salarioBruto||0) - totalDescLeg - Number(otrosDescuentos||0);
+
+  const PDFDocument = (await import("pdfkit")).default;
+
   return new Promise((resolve) => {
-    const doc = new PDFDocument({ size: "A4", margin: 40 });
+    const doc = new PDFDocument({ size: "A4", margin: 36 });
     const chunks = [];
     doc.on("data", (c) => chunks.push(c));
     doc.on("end", () => resolve(Buffer.concat(chunks)));
 
-    doc.fontSize(16).text(companyName || "PRODIMA - Nómina", { align: "center" });
-    doc.moveDown(0.2);
-    doc.fontSize(11).text(`Comprobante de Pago: ${periodLabel}`, { align: "center" });
-    doc.moveDown(1);
+    doc.font("Helvetica").fontSize(9);
+    doc.lineWidth(1);
 
-    doc.fontSize(11).text(`Empleado: ${empName}`);
-    doc.text(`Código: ${empCode}`);
-    doc.moveDown(1);
+    const pageW = doc.page.width;
+    const left = doc.page.margins.left;
+    const right = pageW - doc.page.margins.right;
+    let y = 28;
 
-    doc.text(`Devengado: $${Number(gross).toFixed(2)}`);
-    doc.text(`Deducciones: $${Number(deductions).toFixed(2)}`);
-    doc.moveDown(0.5);
-    doc.fontSize(13).text(`NETO: $${Number(net).toFixed(2)}`, { underline: true });
+    // ===== Header =====
+    doc.font("Helvetica-Bold").fontSize(14).text("COMPROBANTE DE PAGO", left, y, { width: right-left, align:"center" });
+    y += 16;
+    doc.font("Helvetica-Bold").fontSize(10).text(companyName, left, y, { width: right-left, align:"center" });
 
-    doc.moveDown(2);
-    doc.fontSize(9).text("Generado automáticamente.", { align: "left" });
+    doc.font("Helvetica").fontSize(9).text(`Página: ${page}`, right-80, 34, { width:80, align:"right" });
+
+    y += 16;
+    line(doc, left, y, right, y);
+    y += 8;
+
+    // Línea superior: periodo + planilla/transacción
+    doc.font("Helvetica-Bold").fontSize(9)
+      .text(`${planillaTipo}  DEL  ${periodFrom}  A  ${periodTo}`, left, y);
+    doc.font("Helvetica-Bold").fontSize(9)
+      .text(`PLANILLA #:  ${planillaNo}`, right-210, y, { width: 120, align:"left" });
+    doc.font("Helvetica-Bold").fontSize(9)
+      .text(`TRANSACCIÓN #:  ${transaccionNo}`, right-90, y, { width: 90, align:"right" });
+
+    y += 14;
+    line(doc, left, y, right, y);
+    y += 12;
+
+    // ===== 3-column layout =====
+    const colGap = 14;
+    const colW = Math.floor((right - left - colGap*2) / 3);
+    const c1 = left;
+    const c2 = left + colW + colGap;
+    const c3 = left + (colW + colGap)*2;
+
+    // ----- Left block: employee info -----
+    kv(doc, c1, y, "SUCURSAL:", sucursal, 62);
+    y += 12;
+    kv(doc, c1, y, "Código:", empCode, 62);
+    doc.font("Helvetica-Bold").text(empName, c1+120, y, { width: colW-120 });
+    y += 12;
+    kv(doc, c1, y, "Cédula:", cedula, 62);
+    y += 12;
+    kv(doc, c1, y, "Cargo:", cargo, 62);
+    y += 16;
+
+    kv(doc, c1, y, "SALARIO x HORA:", String(salarioHora), 90);
+    y += 14;
+
+    // Titles row for mid markers
+    doc.font("Helvetica-Bold").fontSize(9).text("OTRAS HORAS", c2, y-14, { width: colW, align:"center" });
+
+    // ----- Middle block: legal deductions -----
+    sectionTitle(doc, c2, y-28, colW, "DESCUENTOS LEGALES");
+
+    let yMid = y;
+    for (const d of descuentosLegales){
+      doc.font("Helvetica").fontSize(9).text(d.name, c2, yMid, { width: colW-60, align:"left" });
+      doc.text(money(d.amount), c2, yMid, { width: colW, align:"right" });
+      yMid += 12;
+    }
+    line(doc, c2, yMid+2, c2+colW, yMid+2);
+    yMid += 6;
+    doc.font("Helvetica-Bold").text(money(totalDescLeg), c2, yMid, { width: colW, align:"right" });
+
+    // ----- Right block: income list -----
+    const yRightTop = y - 28;
+    sectionTitle(doc, c3, yRightTop, colW, ""); // sin título visible, solo línea
+    let yR = y;
+    for (const it of ingresos){
+      doc.font("Helvetica").fontSize(9).text(it.name, c3, yR, { width: colW-70, align:"left" });
+      doc.text(money(it.amount), c3, yR, { width: colW, align:"right" });
+      yR += 12;
+    }
+
+    // Totals on right
+    yR += 4;
+    line(doc, c3, yR, c3+colW, yR);
+    yR += 8;
+
+    doc.font("Helvetica-Bold").text("Salario Bruto", c3, yR, { width: colW-70, align:"left" });
+    doc.text(money(salarioBruto), c3, yR, { width: colW, align:"right" });
+    yR += 12;
+
+    doc.font("Helvetica-Bold").text("Total Otros", c3, yR, { width: colW-70, align:"left" });
+    doc.text(money(totalOtros), c3, yR, { width: colW, align:"right" });
+    yR += 12;
+
+    doc.font("Helvetica-Bold").text("Descuentos Legales", c3, yR, { width: colW-70, align:"left" });
+    doc.text(money(totalDescLeg), c3, yR, { width: colW, align:"right" });
+    yR += 12;
+
+    doc.font("Helvetica-Bold").text("Otros Descuentos", c3, yR, { width: colW-70, align:"left" });
+    doc.text(money(otrosDescuentos), c3, yR, { width: colW, align:"right" });
+    yR += 12;
+
+    yR += 2;
+    line(doc, c3, yR, c3+colW, yR);
+    yR += 8;
+    doc.font("Helvetica-Bold").fontSize(10).text("SALARIO NETO", c3, yR, { width: colW-70, align:"left" });
+    doc.font("Helvetica-Bold").fontSize(10).text(`$${money(salarioNeto)}`, c3, yR, { width: colW, align:"right" });
+
+    // ===== Lower sections (left column tables) =====
+    let y2 = Math.max(yMid, yR) + 24;
+
+    // HORAS REGULARES
+    sectionTitle(doc, c1, y2, colW, "HORAS REGULARES");
+    y2 += 20;
+
+    const row = (name, h, amt) => {
+      doc.font("Helvetica").fontSize(9).text(name, c1, y2, { width: colW-120, align:"left" });
+      doc.text(money(h), c1+colW-120, y2, { width: 60, align:"right" });
+      doc.text(money(amt), c1+colW-60, y2, { width: 60, align:"right" });
+      y2 += 12;
+    };
+
+    row("Diurna", horas.diurna_h, horas.diurna_$);
+    row("Mixta", horas.mixta_h, horas.mixta_$);
+    row("Noct", horas.noct_h, horas.noct_$);
+    row("H. AJUST", horas.ajust_h, horas.ajust_$);
+
+    y2 += 8;
+
+    // AUSENCIAS - TARDANZA
+    sectionTitle(doc, c1, y2, colW, "AUSENCIAS - TARDANZA");
+    y2 += 20;
+
+    row("NO Paga", ausencias.no_paga_h, ausencias.no_paga_$);
+    row("Pagadas", ausencias.pagadas_h, ausencias.pagadas_$);
+    row("C. Med.", ausencias.cmed_h, ausencias.cmed_$);
+
+    // ===== Footer =====
+    const yFoot = doc.page.height - 120;
+    doc.font("Helvetica-Bold").fontSize(9).text("DEPOSITADO EN LA CUENTA No.", c1, yFoot);
+    doc.font("Helvetica").fontSize(9).text(cuenta, c1, yFoot + 12);
+
+    const sigY = doc.page.height - 70;
+    doc.font("Helvetica-Bold").text("RECIBIDO POR:", c1 + 150, sigY);
+    line(doc, c1 + 235, sigY + 10, c1 + 480, sigY + 10);
+
+    doc.font("Helvetica-Bold").text("PREPARADO POR:", c2 + 120, sigY);
+    line(doc, c2 + 215, sigY + 10, c3 + colW, sigY + 10);
 
     doc.end();
   });
