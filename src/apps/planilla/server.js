@@ -421,13 +421,12 @@ app.post("/api/pay-runs/:id/send-vouchers", requireSupabase, async (req, res) =>
       from: MAIL_FROM,
       to: [emp.email],
       subject: `${subject} - ${periodLabel}`,
-      html: \`
-        <p>Hola \${emp.full_name},</p>
-        <p>Aquí está tu comprobante de pago del período <b>\${periodLabel}</b>:</p>
-        <p><a href="\${signed.signedUrl}">Descargar voucher</a></p>
-        <p>— Nómina</p>
-      \`,
-    });
+      html: `
+  <p>Hola ${emp.full_name},</p>
+  <p>Aquí está tu comprobante de pago del período <b>${periodLabel}</b>:</p>
+  <p><a href="${signed.signedUrl}">Descargar voucher</a></p>
+  <p>— Nómina</p>
+`,
 
     await sb.from("pay_slips").update({ emailed_at: new Date().toISOString() }).eq("id", s.id);
     sent++;
