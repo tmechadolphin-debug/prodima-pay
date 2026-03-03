@@ -938,18 +938,12 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
     const mode = String(req.query?.mode || "days").toLowerCase(); // days|hours|minutes
     const nRaw = Number(req.query?.n || 5);
 
-    /**
-     * ✅ FIX 1 (CRÍTICO):
-     * Antes: days máximo 10 => Ene→Hoy jamás funcionaba.
-     * Ahora: days permite hasta 400 días.
-     */
     const nMax = mode === "days" ? 400 : mode === "hours" ? 48 : 720;
     const n = Math.max(1, Math.min(nMax, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5));
 
     const maxDocsRaw = Number(req.query?.maxDocs || 500);
     const maxDocs = Math.max(20, Math.min(2000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 500));
 
-    // ventana en ms (Panamá)
     const nowMs = nowInOffsetMs(TZ_OFFSET_MIN);
     const winMs =
       mode === "hours"
@@ -960,7 +954,6 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
 
     const fromMs = nowMs - winMs;
 
-    // para SL usamos DocDate por rango de días (buffer 1-2 días)
     const today = isoDateInOffset(TZ_OFFSET_MIN);
     const fromDate = mode === "days" ? addDaysISO(today, -n) : addDaysISO(today, -2);
 
@@ -972,14 +965,8 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
     let saved = 0;
     let scanned = 0;
 
-    // trazado entregado total: limitar para que sync sea rápido
     const maxTrace = Math.min(200, maxDocs);
-
-    // categorías: limitar
     const maxGroupCalc = Math.min(800, maxDocs);
-
-    // ✅ NUEVO: detalle de líneas: limitar fuerte para evitar sync eterno
-    // (Sube/baja según tu necesidad)
     const maxLinesCalc = Math.min(120, maxDocs);
 
     for (let page = 0; page < 60; page++) {
@@ -1005,7 +992,6 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
         const docDate = String(q.DocDate || "").slice(0, 10);
         const docTime = Number(q.DocTime || 0);
 
-        // filtro fino por minutos/horas (si DocTime existe)
         if (mode !== "days") {
           const ms = docDateTimeToMs(docDate, docTime);
           if (ms && ms < fromMs) continue;
@@ -1014,7 +1000,6 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
         const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
         const warehouse = parseWhFromComments(q.Comments || "") || "sin_wh";
 
-        // entregado total
         let deliveredTotal = 0;
         if (saved < maxTrace) {
           try {
@@ -1024,7 +1009,6 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
           await sleep(20);
         }
 
-        // group_name
         let groupName = null;
         if (saved < maxGroupCalc) {
           const g = await inferQuoteGroupNameByDocEntry(q.DocEntry);
@@ -1032,7 +1016,6 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
           await sleep(15);
         }
 
-        // ✅ FIX (CANCELADAS): normaliza cancelStatus al guardar
         const cancelStatusNorm = normalizeCancelStatus(q.CancelStatus ?? "");
 
         await upsertQuoteCache({
@@ -1052,18 +1035,14 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
           groupName,
         });
 
-        // ✅ NUEVO: guardar líneas (DB cache) para que el modal NO llame SAP
         if (saved < maxLinesCalc) {
           try {
-            // traer cotización completa para DocumentLines
             const qFull = await sapGetByDocEntry("Quotations", q.DocEntry);
             const qLines = Array.isArray(qFull?.DocumentLines) ? qFull.DocumentLines : [];
 
-            // entregado por itemCode (map)
             const deliveredMap = await traceQuoteLinesByItem(docNum, addDaysISO(today, -45), today);
 
-            // agrupar cotizado por itemCode
-            const quotedMap = new Map(); // itemCode -> {qtyQuoted, dollarsQuoted, desc}
+            const quotedMap = new Map();
             for (const ln of qLines) {
               const itemCode = String(ln?.ItemCode || "").trim();
               if (!itemCode) continue;
@@ -1094,9 +1073,7 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
             }
 
             await sleep(25);
-          } catch {
-            // no rompemos el sync
-          }
+          } catch {}
         }
 
         saved++;
@@ -1145,7 +1122,6 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
       ? `AND LOWER(COALESCE(q.usuario,'')) IN (SELECT LOWER(username) FROM app_users WHERE is_active=TRUE)`
       : ``;
 
-    // ✅ MISMA lógica robusta para detectar canceladas (sin depender de que estén "normalizadas")
     const SQL_IS_CANCELLED =
       `LOWER(COALESCE(q.cancel_status,'')) IN (` +
       `'csyes','cs_yes','tyes','t_yes','yes','true','y','1','cancelled','canceled','cancelado','anulado','anulada'` +
@@ -1153,7 +1129,6 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
 
     const cancelExclusion = `AND NOT (${SQL_IS_CANCELLED})`;
 
-    // Totales (sin canceladas)
     const totalsR = await dbQuery(
       `SELECT
         COUNT(*)::int AS quotes,
@@ -1168,7 +1143,6 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
     const totals = totalsR.rows[0] || { quotes: 0, cotizado: 0, entregado: 0 };
     const fillRatePct = Number(totals.cotizado) > 0 ? (Number(totals.entregado) / Number(totals.cotizado)) * 100 : 0;
 
-    // byUser (sin canceladas)
     const byUserR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.usuario,''),'sin_user') AS usuario,
@@ -1185,7 +1159,6 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
       [from, to]
     );
 
-    // byWh (sin canceladas)
     const byWhR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.warehouse,''),'sin_wh') AS warehouse,
@@ -1202,7 +1175,6 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
       [from, to]
     );
 
-    // byClient (sin canceladas)
     const byClientR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.card_name,''), q.card_code, 'sin_cliente') AS customer,
@@ -1218,7 +1190,6 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
       [from, to]
     );
 
-    // byGroup (sin canceladas)
     const byGroupR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.group_name,''), 'Sin grupo') AS "group",
@@ -1287,6 +1258,7 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
    HISTÓRICO DB (PAGINADO)
    GET /api/admin/quotes/db?from&to&user&client&skip&limit&onlyCreated=1
    ✅ FIX (OPEN global): soporta filtro por estado (status/estado/state/tab/open/closed/cancelled)
+   ✅ FIX (PAGINACIÓN): soporta page/pageIndex/offset además de skip
 ========================= */
 app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
   try {
@@ -1297,11 +1269,26 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
     const user = String(req.query?.user || "").trim().toLowerCase();
     const client = String(req.query?.client || "").trim().toLowerCase();
 
-    const skipRaw = Number(req.query?.skip || 0);
-    const limitRaw = Number(req.query?.limit || 20);
-
-    const skip = Math.max(0, Number.isFinite(skipRaw) ? Math.trunc(skipRaw) : 0);
+    // ✅ FIX: aceptar limit/pageSize/perPage
+    const limitRaw = Number(req.query?.limit ?? req.query?.pageSize ?? req.query?.perPage ?? 20);
     const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 20));
+
+    // ✅ FIX: aceptar skip/offset o page (1-based) o pageIndex (0-based)
+    const hasSkip = req.query?.skip !== undefined || req.query?.offset !== undefined;
+    let skip = 0;
+
+    if (hasSkip) {
+      const skipRaw = Number(req.query?.skip ?? req.query?.offset ?? 0);
+      skip = Math.max(0, Number.isFinite(skipRaw) ? Math.trunc(skipRaw) : 0);
+    } else if (req.query?.pageIndex !== undefined) {
+      const pageIndexRaw = Number(req.query?.pageIndex ?? 0);
+      const pageIndex = Math.max(0, Number.isFinite(pageIndexRaw) ? Math.trunc(pageIndexRaw) : 0);
+      skip = pageIndex * limit;
+    } else if (req.query?.page !== undefined || req.query?.p !== undefined) {
+      const pageRaw = Number(req.query?.page ?? req.query?.p ?? 1);
+      const page = Math.max(1, Number.isFinite(pageRaw) ? Math.trunc(pageRaw) : 1);
+      skip = (page - 1) * limit;
+    }
 
     const onlyCreated = String(req.query?.onlyCreated || "0") === "1";
 
@@ -1330,7 +1317,6 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
       params.push(`%${client}%`, `%${client}%`);
     }
 
-    // ✅ FIX (OPEN global con paginado): filtro SQL por estado/canceladas
     const statusFilter = parseStatusFilterFromQuery(req.query);
 
     const SQL_IS_CANCELLED =
@@ -1377,7 +1363,6 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
 
     const lastSyncAt = await getState("quotes_cache_last_sync");
 
-    // ✅ FIX (CANCELADAS): estado final + cancelStatus normalizado
     const quotes = (dataR.rows || []).map((r) => {
       const cancelNorm = normalizeCancelStatus(r.cancelStatus);
       return {
