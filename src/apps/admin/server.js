@@ -231,94 +231,14 @@ function parseWhFromComments(comments) {
 }
 
 /**
- * ✅ FIX (CANCELADAS):
- * Normaliza CancelStatus para que cualquier variante (csYes / tYES / Y / true / etc)
- * quede consistente y NO se trate como "open".
- */
-function normalizeCancelStatus(val) {
-  const raw = String(val ?? "").trim();
-  const t = raw.toLowerCase();
-  if (!t) return "";
-
-  const YES = new Set([
-    "csyes",
-    "cs_yes",
-    "yes",
-    "true",
-    "tyes",
-    "t_yes",
-    "y",
-    "1",
-    "cancelled",
-    "canceled",
-    "cancelado",
-    "anulado",
-    "anulada",
-  ]);
-  const NO = new Set(["csno", "cs_no", "no", "false", "tno", "t_no", "n", "0"]);
-
-  if (YES.has(t)) return "csYes";
-  if (NO.has(t)) return "csNo";
-
-  if (t.includes("csyes") || t.includes("tyes")) return "csYes";
-  if (t.includes("csno") || t.includes("tno")) return "csNo";
-
-  return raw;
-}
-
-/**
  * ✅ Ajuste mínimo:
- * CancelStatus real (robusto).
+ * Antes estabas descartando por "cancel" en comments y eso puede tumbar docs.
+ * Aquí dejamos solo CancelStatus real.
  */
 function isCancelledLike(q) {
-  const cancelVal =
-    q?.CancelStatus ??
-    q?.cancelStatus ??
-    q?.Cancelled ??
-    q?.cancelled ??
-    q?.Canceled ??
-    q?.canceled ??
-    "";
-  const norm = normalizeCancelStatus(cancelVal);
-  return String(norm).trim().toLowerCase() === "csyes";
-}
-
-/**
- * ✅ FIX (CANCELADAS):
- * Estado final para UI/API: si está cancelada, NO puede ser Open aunque DocumentStatus venga Open.
- */
-function deriveUiEstado(documentStatus, cancelStatus) {
-  const norm = normalizeCancelStatus(cancelStatus);
-  if (String(norm).toLowerCase() === "csyes") return "Cancelada";
-  // (mantengo lo demás igual, solo devuelvo lo que venía de SAP/DB)
-  return String(documentStatus || "");
-}
-
-/**
- * ✅ FIX (OPEN global con paginado):
- * Soporta varios nombres de query param (status/estado/state/tab/open/closed/cancelled)
- * para filtrar en SQL, no en el frontend por página.
- */
-function parseStatusFilterFromQuery(q) {
-  const v = q?.status ?? q?.estado ?? q?.state ?? q?.tab ?? q?.filter ?? "";
-  const t = String(v || "").trim().toLowerCase();
-
-  if (String(q?.open || "") === "1" || String(q?.onlyOpen || "") === "1") return "open";
-  if (String(q?.closed || "") === "1" || String(q?.onlyClosed || "") === "1") return "closed";
-  if (String(q?.cancelled || "") === "1" || String(q?.canceled || "") === "1") return "cancelled";
-
-  if (!t) return "";
-
-  if (["open", "abierto", "abierta", "abiertos", "abiertas", "o"].includes(t)) return "open";
-  if (["closed", "close", "cerrado", "cerrada", "cerrados", "cerradas", "c"].includes(t)) return "closed";
-  if (["cancelled", "canceled", "cancelado", "cancelada", "anulado", "anulada"].includes(t)) return "cancelled";
-  if (["all", "todos", "todas", "*"].includes(t)) return "";
-
-  if (t.includes("open") || t.includes("abiert")) return "open";
-  if (t.includes("clos") || t.includes("cerrad")) return "closed";
-  if (t.includes("cancel") || t.includes("anul")) return "cancelled";
-
-  return "";
+  const cancelVal = q?.CancelStatus ?? q?.cancelStatus ?? q?.Cancelled ?? q?.cancelled ?? "";
+  const cancelRaw = String(cancelVal).trim().toLowerCase();
+  return cancelRaw === "csyes" || cancelRaw === "yes" || cancelRaw === "true" || cancelRaw.includes("csyes");
 }
 
 /* =========================
@@ -469,8 +389,7 @@ function mapToSixCats(raw) {
 
   if (t.includes("sazon")) return "Sazonadores";
   if (t.includes("vinagr")) return "Vinagres";
-  if (t.includes("cuidado de la ropa") || (t.includes("cuidado") && t.includes("ropa")))
-    return "Cuidado de la Ropa";
+  if (t.includes("cuidado de la ropa") || (t.includes("cuidado") && t.includes("ropa"))) return "Cuidado de la Ropa";
   if (t.includes("prod") && t.includes("limp")) return "Prod. De limpieza";
   if (t.includes("art") && t.includes("limp")) return "Art. De limpieza";
   if (t.includes("especial") || t.includes("gmt")) return "Especialidades y GMT";
@@ -938,12 +857,18 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
     const mode = String(req.query?.mode || "days").toLowerCase(); // days|hours|minutes
     const nRaw = Number(req.query?.n || 5);
 
+    /**
+     * ✅ FIX 1 (CRÍTICO):
+     * Antes: days máximo 10 => Ene→Hoy jamás funcionaba.
+     * Ahora: days permite hasta 400 días.
+     */
     const nMax = mode === "days" ? 400 : mode === "hours" ? 48 : 720;
     const n = Math.max(1, Math.min(nMax, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 5));
 
     const maxDocsRaw = Number(req.query?.maxDocs || 500);
     const maxDocs = Math.max(20, Math.min(2000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 500));
 
+    // ventana en ms (Panamá)
     const nowMs = nowInOffsetMs(TZ_OFFSET_MIN);
     const winMs =
       mode === "hours"
@@ -954,6 +879,7 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
 
     const fromMs = nowMs - winMs;
 
+    // para SL usamos DocDate por rango de días (buffer 1-2 días)
     const today = isoDateInOffset(TZ_OFFSET_MIN);
     const fromDate = mode === "days" ? addDaysISO(today, -n) : addDaysISO(today, -2);
 
@@ -965,8 +891,14 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
     let saved = 0;
     let scanned = 0;
 
+    // trazado entregado total: limitar para que sync sea rápido
     const maxTrace = Math.min(200, maxDocs);
+
+    // categorías: limitar
     const maxGroupCalc = Math.min(800, maxDocs);
+
+    // ✅ NUEVO: detalle de líneas: limitar fuerte para evitar sync eterno
+    // (Sube/baja según tu necesidad)
     const maxLinesCalc = Math.min(120, maxDocs);
 
     for (let page = 0; page < 60; page++) {
@@ -988,10 +920,13 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
         scanned++;
         if (saved >= maxDocs) break;
 
+        if (isCancelledLike(q)) continue;
+
         const docNum = Number(q.DocNum);
         const docDate = String(q.DocDate || "").slice(0, 10);
         const docTime = Number(q.DocTime || 0);
 
+        // filtro fino por minutos/horas (si DocTime existe)
         if (mode !== "days") {
           const ms = docDateTimeToMs(docDate, docTime);
           if (ms && ms < fromMs) continue;
@@ -1000,6 +935,7 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
         const usuario = parseUserFromComments(q.Comments || "") || "sin_user";
         const warehouse = parseWhFromComments(q.Comments || "") || "sin_wh";
 
+        // entregado total
         let deliveredTotal = 0;
         if (saved < maxTrace) {
           try {
@@ -1009,14 +945,13 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
           await sleep(20);
         }
 
+        // group_name
         let groupName = null;
         if (saved < maxGroupCalc) {
           const g = await inferQuoteGroupNameByDocEntry(q.DocEntry);
           groupName = g ? g : null;
           await sleep(15);
         }
-
-        const cancelStatusNorm = normalizeCancelStatus(q.CancelStatus ?? "");
 
         await upsertQuoteCache({
           docNum,
@@ -1030,19 +965,23 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
           docTotal: Number(q.DocTotal || 0),
           deliveredTotal,
           status: q.DocumentStatus || "",
-          cancelStatus: cancelStatusNorm,
+          cancelStatus: q.CancelStatus ?? "",
           comments: q.Comments || "",
           groupName,
         });
 
+        // ✅ NUEVO: guardar líneas (DB cache) para que el modal NO llame SAP
         if (saved < maxLinesCalc) {
           try {
+            // traer cotización completa para DocumentLines
             const qFull = await sapGetByDocEntry("Quotations", q.DocEntry);
             const qLines = Array.isArray(qFull?.DocumentLines) ? qFull.DocumentLines : [];
 
+            // entregado por itemCode (map)
             const deliveredMap = await traceQuoteLinesByItem(docNum, addDaysISO(today, -45), today);
 
-            const quotedMap = new Map();
+            // agrupar cotizado por itemCode
+            const quotedMap = new Map(); // itemCode -> {qtyQuoted, dollarsQuoted, desc}
             for (const ln of qLines) {
               const itemCode = String(ln?.ItemCode || "").trim();
               if (!itemCode) continue;
@@ -1073,7 +1012,9 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
             }
 
             await sleep(25);
-          } catch {}
+          } catch {
+            // no rompemos el sync
+          }
         }
 
         saved++;
@@ -1104,7 +1045,6 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
 /* =========================
    DASHBOARD DB
    GET /api/admin/quotes/dashboard-db?from=YYYY-MM-DD&to=YYYY-MM-DD&onlyCreated=1
-   ✅ FIX (DASHBOARD): excluye canceladas de totales y agregados
 ========================= */
 app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
   try {
@@ -1122,13 +1062,7 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
       ? `AND LOWER(COALESCE(q.usuario,'')) IN (SELECT LOWER(username) FROM app_users WHERE is_active=TRUE)`
       : ``;
 
-    const SQL_IS_CANCELLED =
-      `LOWER(COALESCE(q.cancel_status,'')) IN (` +
-      `'csyes','cs_yes','tyes','t_yes','yes','true','y','1','cancelled','canceled','cancelado','anulado','anulada'` +
-      `)`;
-
-    const cancelExclusion = `AND NOT (${SQL_IS_CANCELLED})`;
-
+    // Totales
     const totalsR = await dbQuery(
       `SELECT
         COUNT(*)::int AS quotes,
@@ -1136,13 +1070,13 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
         COALESCE(SUM(q.delivered_total),0)::float AS entregado
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
-       ${createdJoin}
-       ${cancelExclusion}`,
+       ${createdJoin}`,
       [from, to]
     );
     const totals = totalsR.rows[0] || { quotes: 0, cotizado: 0, entregado: 0 };
     const fillRatePct = Number(totals.cotizado) > 0 ? (Number(totals.entregado) / Number(totals.cotizado)) * 100 : 0;
 
+    // byUser
     const byUserR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.usuario,''),'sin_user') AS usuario,
@@ -1152,13 +1086,13 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
        ${createdJoin}
-       ${cancelExclusion}
        GROUP BY 1
        ORDER BY cotizado DESC
        LIMIT 2000`,
       [from, to]
     );
 
+    // byWh
     const byWhR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.warehouse,''),'sin_wh') AS warehouse,
@@ -1168,13 +1102,13 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
        ${createdJoin}
-       ${cancelExclusion}
        GROUP BY 1
        ORDER BY cotizado DESC
        LIMIT 2000`,
       [from, to]
     );
 
+    // byClient
     const byClientR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.card_name,''), q.card_code, 'sin_cliente') AS customer,
@@ -1183,13 +1117,13 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
        ${createdJoin}
-       ${cancelExclusion}
        GROUP BY 1
        ORDER BY cotizado DESC
        LIMIT 2000`,
       [from, to]
     );
 
+    // byGroup
     const byGroupR = await dbQuery(
       `SELECT
         COALESCE(NULLIF(q.group_name,''), 'Sin grupo') AS "group",
@@ -1198,7 +1132,6 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
        ${createdJoin}
-       ${cancelExclusion}
        GROUP BY 1
        ORDER BY cotizado DESC
        LIMIT 2000`,
@@ -1257,8 +1190,6 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
 /* =========================
    HISTÓRICO DB (PAGINADO)
    GET /api/admin/quotes/db?from&to&user&client&skip&limit&onlyCreated=1
-   ✅ FIX (OPEN global): soporta filtro por estado (status/estado/state/tab/open/closed/cancelled)
-   ✅ FIX (PAGINACIÓN): soporta page/pageIndex/offset además de skip
 ========================= */
 app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
   try {
@@ -1269,26 +1200,11 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
     const user = String(req.query?.user || "").trim().toLowerCase();
     const client = String(req.query?.client || "").trim().toLowerCase();
 
-    // ✅ FIX: aceptar limit/pageSize/perPage
-    const limitRaw = Number(req.query?.limit ?? req.query?.pageSize ?? req.query?.perPage ?? 20);
+    const skipRaw = Number(req.query?.skip || 0);
+    const limitRaw = Number(req.query?.limit || 20);
+
+    const skip = Math.max(0, Number.isFinite(skipRaw) ? Math.trunc(skipRaw) : 0);
     const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 20));
-
-    // ✅ FIX: aceptar skip/offset o page (1-based) o pageIndex (0-based)
-    const hasSkip = req.query?.skip !== undefined || req.query?.offset !== undefined;
-    let skip = 0;
-
-    if (hasSkip) {
-      const skipRaw = Number(req.query?.skip ?? req.query?.offset ?? 0);
-      skip = Math.max(0, Number.isFinite(skipRaw) ? Math.trunc(skipRaw) : 0);
-    } else if (req.query?.pageIndex !== undefined) {
-      const pageIndexRaw = Number(req.query?.pageIndex ?? 0);
-      const pageIndex = Math.max(0, Number.isFinite(pageIndexRaw) ? Math.trunc(pageIndexRaw) : 0);
-      skip = pageIndex * limit;
-    } else if (req.query?.page !== undefined || req.query?.p !== undefined) {
-      const pageRaw = Number(req.query?.page ?? req.query?.p ?? 1);
-      const page = Math.max(1, Number.isFinite(pageRaw) ? Math.trunc(pageRaw) : 1);
-      skip = (page - 1) * limit;
-    }
 
     const onlyCreated = String(req.query?.onlyCreated || "0") === "1";
 
@@ -1315,24 +1231,6 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
     if (client) {
       where.push(`(LOWER(COALESCE(q.card_code,'')) LIKE $${p++} OR LOWER(COALESCE(q.card_name,'')) LIKE $${p++})`);
       params.push(`%${client}%`, `%${client}%`);
-    }
-
-    const statusFilter = parseStatusFilterFromQuery(req.query);
-
-    const SQL_IS_CANCELLED =
-      `LOWER(COALESCE(q.cancel_status,'')) IN (` +
-      `'csyes','cs_yes','tyes','t_yes','yes','true','y','1','cancelled','canceled','cancelado','anulado','anulada'` +
-      `)`;
-
-    const SQL_IS_OPEN = `(LOWER(COALESCE(q.status,'')) = 'o' OR LOWER(COALESCE(q.status,'')) LIKE '%open%')`;
-    const SQL_IS_CLOSED = `(LOWER(COALESCE(q.status,'')) = 'c' OR LOWER(COALESCE(q.status,'')) LIKE '%close%')`;
-
-    if (statusFilter === "cancelled") {
-      where.push(`(${SQL_IS_CANCELLED})`);
-    } else if (statusFilter === "open") {
-      where.push(`(NOT (${SQL_IS_CANCELLED}) AND ${SQL_IS_OPEN})`);
-    } else if (statusFilter === "closed") {
-      where.push(`(NOT (${SQL_IS_CANCELLED}) AND ${SQL_IS_CLOSED})`);
     }
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
@@ -1363,15 +1261,6 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
 
     const lastSyncAt = await getState("quotes_cache_last_sync");
 
-    const quotes = (dataR.rows || []).map((r) => {
-      const cancelNorm = normalizeCancelStatus(r.cancelStatus);
-      return {
-        ...r,
-        cancelStatus: cancelNorm,
-        estado: deriveUiEstado(r.estado, cancelNorm),
-      };
-    });
-
     return safeJson(res, 200, {
       ok: true,
       from,
@@ -1380,7 +1269,7 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
       skip,
       limit,
       lastSyncAt: lastSyncAt || null,
-      quotes,
+      quotes: dataR.rows || [],
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -1406,7 +1295,8 @@ app.get("/api/admin/quotes/lines", verifyAdmin, async (req, res) => {
     if (!lines.length) {
       return safeJson(res, 404, {
         ok: false,
-        message: "No hay líneas en cache (DB). Ejecuta Sync (Ene→Hoy o últimos días) para poblar el detalle.",
+        message:
+          "No hay líneas en cache (DB). Ejecuta Sync (Ene→Hoy o últimos días) para poblar el detalle.",
       });
     }
 
