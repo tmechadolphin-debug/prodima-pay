@@ -6,41 +6,50 @@ import * as XLSX from "xlsx";
 import PDFDocument from "pdfkit";
 import { createClient } from "@supabase/supabase-js";
 import { Resend } from "resend";
+import path from "path";
+import { fileURLToPath } from "url";
 
+/* =========================================================
+   PATHS
+========================================================= */
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/* =========================================================
+   ENV
+========================================================= */
 const {
   PORT = 3000,
-  CORS_ORIGIN = "https://prodima.com.pa,https://www.prodima.com.pa",
+  CORS_ORIGIN = "",
 
   SUPABASE_URL = "",
   SUPABASE_SERVICE_ROLE = "",
 
   RESEND_API_KEY = "",
-  MAIL_FROM = "Planilla <nomina@prodima.com.pa>",
+  MAIL_FROM = "Planilla <nomina@localhost>",
 
   VOUCHER_BUCKET = "payroll-vouchers",
-
-  // Panamá UTC-5
-  TZ_OFFSET_MIN = "-300",
-
-  // Multiplicador horas extra (simple)
-  OVERTIME_MULT = "1.5",
 } = process.env;
 
-const TZ_OFF = Number(TZ_OFFSET_MIN || -300);
-const OT_MULT = Number(OVERTIME_MULT || 1.5);
-
+/* =========================================================
+   APP
+========================================================= */
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "5mb" }));
 
 app.use(
   cors({
-    origin: CORS_ORIGIN
-      ? CORS_ORIGIN.split(",").map((s) => s.trim()).filter(Boolean)
-      : true,
+    origin: CORS_ORIGIN ? CORS_ORIGIN.split(",").map((s) => s.trim()) : true,
     credentials: true,
   })
 );
 
+// Servir frontend mínimo
+app.use("/", express.static(path.join(__dirname, "public")));
+
+/* =========================================================
+   Supabase + Email
+========================================================= */
 const sb =
   SUPABASE_URL && SUPABASE_SERVICE_ROLE
     ? createClient(SUPABASE_URL.trim(), SUPABASE_SERVICE_ROLE.trim(), {
@@ -55,58 +64,15 @@ function requireSupabase(req, res, next) {
   next();
 }
 
-function safeNum(x, d = 0) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : d;
-}
-
-function toLocalDateISO(tsIso) {
-  // Convierte timestamptz a fecha local (Panamá) YYYY-MM-DD
-  const d = new Date(tsIso);
-  const ms = d.getTime() + d.getTimezoneOffset() * 60000 + TZ_OFF * 60000;
-  const u = new Date(ms);
-  const y = u.getUTCFullYear();
-  const m = String(u.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(u.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
-}
-
-function minutesBetween(aIso, bIso) {
-  const a = new Date(aIso).getTime();
-  const b = new Date(bIso).getTime();
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
-  return Math.max(0, Math.round((b - a) / 60000));
-}
-
-function addDays(dateISO, n) {
-  const d = new Date(dateISO + "T00:00:00Z");
-  d.setUTCDate(d.getUTCDate() + n);
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
-}
-
-function dayOfWeekISO(dateISO) {
-  // 1=Mon ... 7=Sun
-  const d = new Date(dateISO + "T00:00:00Z");
-  const js = d.getUTCDay(); // 0=Sun
-  return js === 0 ? 7 : js;
-}
-
-function isWorkday(mask, dowISO) {
-  // Mon=1->bit0, Tue=2->bit1 ... Sun=64->bit6
-  const bit = 1 << (dowISO - 1);
-  return (mask & bit) !== 0;
-}
-
+/* =========================================================
+   HEALTH
+========================================================= */
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     supabase: !!sb,
     mail: !!resend,
-    tzOffsetMin: TZ_OFF,
-    overtimeMult: OT_MULT,
+    bucket: VOUCHER_BUCKET,
   });
 });
 
@@ -121,16 +87,18 @@ app.get("/api/employees", requireSupabase, async (req, res) => {
 
 app.post("/api/employees", requireSupabase, async (req, res) => {
   const p = req.body || {};
-  if (!p.emp_code || !p.full_name) return res.status(400).json({ ok: false, message: "emp_code y full_name requeridos" });
+  if (!p.emp_code || !p.full_name) {
+    return res.status(400).json({ ok: false, message: "emp_code y full_name requeridos" });
+  }
 
   const payload = {
     emp_code: String(p.emp_code).trim(),
     full_name: String(p.full_name).trim(),
     email: p.email ? String(p.email).trim() : null,
     employee_type: p.employee_type === "NO_CLOCK" ? "NO_CLOCK" : "CLOCKS_IN",
-    salary_type: String(p.salary_type || "BIWEEKLY").toUpperCase(), // BIWEEKLY | MONTHLY | HOURLY
-    base_salary: safeNum(p.base_salary, 0),
-    hourly_rate: safeNum(p.hourly_rate, 0),
+    salary_type: (p.salary_type || "MONTHLY").toUpperCase(),
+    base_salary: Number(p.base_salary || 0),
+    hourly_rate: Number(p.hourly_rate || 0),
     department: p.department || null,
     is_active: p.is_active !== false,
   };
@@ -141,58 +109,8 @@ app.post("/api/employees", requireSupabase, async (req, res) => {
 });
 
 /* =========================================================
-   SHIFT TEMPLATES + ASSIGN
+   PAY PERIODS
 ========================================================= */
-app.get("/api/shifts/templates", requireSupabase, async (req, res) => {
-  const { data, error } = await sb.from("shift_templates").select("*").order("created_at", { ascending: false });
-  if (error) return res.status(500).json({ ok: false, message: error.message });
-  res.json({ ok: true, templates: data });
-});
-
-app.post("/api/shifts/templates", requireSupabase, async (req, res) => {
-  const b = req.body || {};
-  if (!b.name || !b.start_time || !b.end_time) {
-    return res.status(400).json({ ok: false, message: "name, start_time, end_time requeridos" });
-  }
-  const payload = {
-    name: String(b.name),
-    start_time: b.start_time,
-    end_time: b.end_time,
-    break_minutes: Math.max(0, Math.trunc(safeNum(b.break_minutes, 60))),
-    grace_minutes: Math.max(0, Math.trunc(safeNum(b.grace_minutes, 5))),
-    workdays_mask: Math.max(0, Math.trunc(safeNum(b.workdays_mask, 31))), // Mon-Fri default
-  };
-  const { data, error } = await sb.from("shift_templates").insert(payload).select("*").single();
-  if (error) return res.status(500).json({ ok: false, message: error.message });
-  res.json({ ok: true, template: data });
-});
-
-app.post("/api/employees/:id/shift", requireSupabase, async (req, res) => {
-  const empId = req.params.id;
-  const { shift_id, effective_from, effective_to } = req.body || {};
-  if (!shift_id || !effective_from) return res.status(400).json({ ok: false, message: "shift_id y effective_from requeridos" });
-
-  const payload = {
-    emp_id: empId,
-    shift_id,
-    effective_from,
-    effective_to: effective_to || null,
-  };
-
-  const { data, error } = await sb.from("employee_shift_assignments").insert(payload).select("*").single();
-  if (error) return res.status(500).json({ ok: false, message: error.message });
-  res.json({ ok: true, assignment: data });
-});
-
-/* =========================================================
-   PAY PERIODS + RUNS
-========================================================= */
-app.get("/api/pay-periods", requireSupabase, async (req, res) => {
-  const { data, error } = await sb.from("pay_periods").select("*").order("start_date", { ascending: false });
-  if (error) return res.status(500).json({ ok: false, message: error.message });
-  res.json({ ok: true, periods: data });
-});
-
 app.post("/api/pay-periods", requireSupabase, async (req, res) => {
   const { period_type, start_date, end_date, label } = req.body || {};
   if (!period_type || !start_date || !end_date || !label) {
@@ -209,29 +127,28 @@ app.post("/api/pay-periods", requireSupabase, async (req, res) => {
   res.json({ ok: true, period: data });
 });
 
-app.post("/api/pay-runs", requireSupabase, async (req, res) => {
-  const { period_id, created_by = "admin" } = req.body || {};
-  if (!period_id) return res.status(400).json({ ok: false, message: "period_id requerido" });
-
-  const { data: run, error } = await sb
-    .from("pay_runs")
-    .insert({ period_id, status: "DRAFT", created_by })
-    .select("*")
-    .single();
-
+app.get("/api/pay-periods", requireSupabase, async (req, res) => {
+  const { data, error } = await sb.from("pay_periods").select("*").order("start_date", { ascending: false });
   if (error) return res.status(500).json({ ok: false, message: error.message });
-  res.json({ ok: true, run });
+  res.json({ ok: true, periods: data });
 });
 
 /* =========================================================
-   IMPORT TIME FILE (TXT / XLSX) -> time_raw
+   IMPORT TIME FILE (TXT / XLSX)
 ========================================================= */
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
 
+/**
+ * TXT esperado (ejemplo):
+ * emp_code|2026-03-01 08:01:00|IN
+ * emp_code|2026-03-01 17:03:00|OUT
+ *
+ * XLSX: columnas emp_code, ts, event_type (opcional)
+ */
 app.post("/api/time/import", requireSupabase, upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
-    const { period_start, period_end, uploaded_by = "admin" } = req.body || {};
+    const { period_start, period_end, uploaded_by = "system" } = req.body || {};
     if (!file) return res.status(400).json({ ok: false, message: "Archivo requerido" });
 
     const filename = file.originalname || "upload";
@@ -303,7 +220,6 @@ app.post("/api/time/import", requireSupabase, upload.single("file"), async (req,
 
     if (!rows.length) return res.json({ ok: true, import: imp, inserted: 0, message: "No se detectaron filas válidas" });
 
-    // insert chunks
     let inserted = 0;
     const CHUNK = 1000;
     for (let i = 0; i < rows.length; i += CHUNK) {
@@ -320,475 +236,141 @@ app.post("/api/time/import", requireSupabase, upload.single("file"), async (req,
 });
 
 /* =========================================================
-   BUILD SHIFTS: time_raw -> work_shifts (por pay_run)
+   PAYROLL CALC (MVP)
+   - NO_CLOCK: cobra base sin depender de marcaciones
+   - CLOCKS_IN: MVP cobra base igual; luego agregas ausencias/tardanzas/extras
 ========================================================= */
-async function getEmployeeShiftForDate(empId, dateISO) {
-  // Busca asignación vigente; si no hay, usa plantilla STD
-  const { data: assigns } = await sb
-    .from("employee_shift_assignments")
-    .select("*, shift_templates(*)")
-    .eq("emp_id", empId)
-    .lte("effective_from", dateISO)
-    .or(`effective_to.is.null,effective_to.gte.${dateISO}`)
-    .order("effective_from", { ascending: false })
-    .limit(1);
+app.post("/api/pay-runs", requireSupabase, async (req, res) => {
+  const { period_id, created_by = "system" } = req.body || {};
+  if (!period_id) return res.status(400).json({ ok: false, message: "period_id requerido" });
 
-  if (assigns && assigns.length) return assigns[0].shift_templates;
+  const { data: period, error: e1 } = await sb.from("pay_periods").select("*").eq("id", period_id).single();
+  if (e1) return res.status(500).json({ ok: false, message: e1.message });
 
-  // fallback: plantilla STD
-  const { data: t } = await sb
-    .from("shift_templates")
+  const { data: run, error: e2 } = await sb
+    .from("pay_runs")
+    .insert({ period_id, status: "DRAFT", created_by })
     .select("*")
-    .eq("name", "STD 07:30-17:00 (Mon-Fri)")
-    .limit(1);
-  return t && t.length ? t[0] : null;
-}
+    .single();
 
-app.post("/api/pay-runs/:id/build-shifts", requireSupabase, async (req, res) => {
-  try {
-    const payRunId = req.params.id;
+  if (e2) return res.status(500).json({ ok: false, message: e2.message });
 
-    const { data: run, error: e0 } = await sb
-      .from("pay_runs")
-      .select("*, pay_periods(*)")
-      .eq("id", payRunId)
-      .single();
-    if (e0) return res.status(500).json({ ok: false, message: e0.message });
-
-    const p = run.pay_periods;
-    const start = p.start_date;
-    const end = p.end_date;
-
-    const { data: emps, error: e1 } = await sb.from("employees").select("*").eq("is_active", true);
-    if (e1) return res.status(500).json({ ok: false, message: e1.message });
-
-    // Traer todas las marcaciones del rango (para todos)
-    const { data: marks, error: e2 } = await sb
-      .from("time_raw")
-      .select("emp_code,ts,event_type")
-      .gte("ts", start + "T00:00:00Z")
-      .lte("ts", end + "T23:59:59Z")
-      .order("ts", { ascending: true });
-
-    if (e2) return res.status(500).json({ ok: false, message: e2.message });
-
-    // Agrupar marcaciones por emp_code + date
-    const byEmpDate = new Map(); // key => [ts...]
-    for (const m of (marks || [])) {
-      const code = String(m.emp_code || "").trim();
-      if (!code) continue;
-      const d = toLocalDateISO(m.ts);
-      const key = code + "||" + d;
-      if (!byEmpDate.has(key)) byEmpDate.set(key, []);
-      byEmpDate.get(key).push(m);
-    }
-
-    // borrar shifts previos de este run (rebuild)
-    await sb.from("work_shifts").delete().eq("pay_run_id", payRunId);
-
-    const payload = [];
-    let created = 0;
-
-    for (const emp of emps) {
-      const empCode = String(emp.emp_code || "").trim();
-      if (!empCode) continue;
-
-      // si NO_CLOCK, igual creamos rows (para reportes), pero sin in/out
-      for (let d = start; d <= end; d = addDays(d, 1)) {
-        const tmpl = await getEmployeeShiftForDate(emp.id, d);
-        if (!tmpl) continue;
-
-        const dow = dayOfWeekISO(d);
-        const laborable = isWorkday(Number(tmpl.workdays_mask || 31), dow);
-
-        // si no es laborable, no creamos jornada (por defecto sábados NO)
-        if (!laborable) continue;
-
-        const key = empCode + "||" + d;
-        const dayMarks = byEmpDate.get(key) || [];
-
-        const scheduled_start = tmpl.start_time;
-        const scheduled_end = tmpl.end_time;
-        const break_minutes = Number(tmpl.break_minutes || 60);
-        const grace_minutes = Number(tmpl.grace_minutes || 5);
-
-        let in_ts = null;
-        let out_ts = null;
-
-        if (emp.employee_type === "CLOCKS_IN") {
-          // regla simple: primera marca del día = entrada, última marca = salida
-          if (dayMarks.length) {
-            in_ts = dayMarks[0].ts;
-            out_ts = dayMarks[dayMarks.length - 1].ts;
-          }
-        }
-
-        let status = "OK";
-        let absent = false;
-
-        if (emp.employee_type === "CLOCKS_IN" && !in_ts && !out_ts) {
-          status = "NO_MARKS";
-          absent = true;
-        } else if (emp.employee_type === "CLOCKS_IN" && (!in_ts || !out_ts || in_ts === out_ts)) {
-          status = "INCOMPLETE";
-        }
-
-        // cálculo minutos
-        let worked_minutes = 0;
-        let late_minutes = 0;
-        let overtime_minutes = 0;
-
-        if (in_ts && out_ts && in_ts !== out_ts) {
-          worked_minutes = Math.max(0, minutesBetween(in_ts, out_ts) - break_minutes);
-
-          // tardanza: comparar hora local de in_ts con start+grace
-          // Convertimos in_ts a hora local (Panamá)
-          const inLocalDate = toLocalDateISO(in_ts);
-          // construimos ISO local "fecha + start_time", luego pasamos a UTC aproximado con offset
-          const graceStart = tmpl.start_time; // time string
-          const [hh, mm] = String(graceStart).split(":").map(Number);
-          const graceTotal = hh * 60 + mm + grace_minutes;
-
-          const inD = new Date(in_ts);
-          const ms = inD.getTime() + inD.getTimezoneOffset() * 60000 + TZ_OFF * 60000;
-          const loc = new Date(ms);
-          const inMin = loc.getUTCHours() * 60 + loc.getUTCMinutes();
-
-          late_minutes = Math.max(0, inMin - graceTotal);
-
-          // overtime si salida > scheduled_end
-          const [eh, em] = String(tmpl.end_time).split(":").map(Number);
-          const endMin = eh * 60 + em;
-
-          const outD = new Date(out_ts);
-          const ms2 = outD.getTime() + outD.getTimezoneOffset() * 60000 + TZ_OFF * 60000;
-          const loc2 = new Date(ms2);
-          const outMin = loc2.getUTCHours() * 60 + loc2.getUTCMinutes();
-
-          overtime_minutes = Math.max(0, outMin - endMin);
-        }
-
-        payload.push({
-          pay_run_id: payRunId,
-          emp_id: emp.id,
-          emp_code: empCode,
-          work_date: d,
-          scheduled_start,
-          scheduled_end,
-          break_minutes,
-          grace_minutes,
-          in_ts,
-          out_ts,
-          worked_minutes,
-          late_minutes,
-          overtime_minutes,
-          absent,
-          status,
-          notes: null,
-        });
-
-        created++;
-      }
-    }
-
-    // upsert en chunks
-    const CH = 1000;
-    for (let i = 0; i < payload.length; i += CH) {
-      const chunk = payload.slice(i, i + CH);
-      const { error } = await sb.from("work_shifts").insert(chunk);
-      if (error) return res.status(500).json({ ok: false, message: error.message });
-    }
-
-    return res.json({ ok: true, payRunId, daysCreated: created, rows: payload.length });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message || String(e) });
-  }
+  res.json({ ok: true, run, period });
 });
 
-/* =========================================================
-   CALCULATE DETAILED: work_shifts -> pay_items + pay_slips + summary
-========================================================= */
-app.post("/api/pay-runs/:id/calculate-detailed", requireSupabase, async (req, res) => {
-  try {
-    const payRunId = req.params.id;
-
-    const { data: run, error: e0 } = await sb
-      .from("pay_runs")
-      .select("*, pay_periods(*)")
-      .eq("id", payRunId)
-      .single();
-    if (e0) return res.status(500).json({ ok: false, message: e0.message });
-
-    const period = run.pay_periods;
-
-    const { data: emps, error: e1 } = await sb.from("employees").select("*").eq("is_active", true);
-    if (e1) return res.status(500).json({ ok: false, message: e1.message });
-
-    // asegurarnos de que existan work_shifts
-    const { data: wsCount } = await sb.from("work_shifts").select("id", { count: "exact", head: true }).eq("pay_run_id", payRunId);
-
-    // limpiar cálculos previos
-    await sb.from("pay_items").delete().eq("pay_run_id", payRunId);
-    await sb.from("pay_slips").delete().eq("pay_run_id", payRunId);
-    await sb.from("pay_run_employee_summary").delete().eq("pay_run_id", payRunId);
-
-    const items = [];
-    const slips = [];
-    const summaries = [];
-
-    for (const emp of emps) {
-      // base periodo
-      let periodBase = safeNum(emp.base_salary, 0);
-      if (String(emp.salary_type || "").toUpperCase() === "MONTHLY" && period.period_type === "BIWEEKLY") {
-        periodBase = periodBase / 2;
-      }
-      periodBase = Number(periodBase.toFixed(2));
-
-      if (emp.employee_type === "NO_CLOCK") {
-        // paga fijo
-        items.push({
-          pay_run_id: payRunId,
-          emp_id: emp.id,
-          concept: "BASE_SALARY",
-          amount: periodBase,
-          meta: { mode: "NO_CLOCK" },
-        });
-
-        const gross = periodBase;
-        const deductions = 0;
-        const net = gross;
-
-        slips.push({ pay_run_id: payRunId, emp_id: emp.id, gross, deductions, net, pdf_path: null });
-
-        summaries.push({
-          pay_run_id: payRunId,
-          emp_id: emp.id,
-          emp_code: emp.emp_code,
-          full_name: emp.full_name,
-          expected_minutes: 0,
-          worked_minutes: 0,
-          late_minutes: 0,
-          absent_days: 0,
-          overtime_minutes: 0,
-          gross,
-          deductions,
-          net,
-        });
-        continue;
-      }
-
-      // CLOCKS_IN -> basado en work_shifts
-      const { data: shifts, error: eS } = await sb
-        .from("work_shifts")
-        .select("*")
-        .eq("pay_run_id", payRunId)
-        .eq("emp_id", emp.id)
-        .order("work_date", { ascending: true });
-
-      if (eS) return res.status(500).json({ ok: false, message: eS.message });
-
-      // expected minutes por día: (end-start)-break
-      let expected = 0;
-      let worked = 0;
-      let late = 0;
-      let absentDays = 0;
-      let ot = 0;
-
-      for (const s of (shifts || [])) {
-        const [sh, sm] = String(s.scheduled_start).split(":").map(Number);
-        const [eh, em] = String(s.scheduled_end).split(":").map(Number);
-        const sched = Math.max(0, (eh * 60 + em) - (sh * 60 + sm) - Number(s.break_minutes || 60));
-        expected += sched;
-        worked += Number(s.worked_minutes || 0);
-        late += Number(s.late_minutes || 0);
-        ot += Number(s.overtime_minutes || 0);
-        if (s.absent) absentDays += 1;
-      }
-
-      // rate por minuto en el periodo (solo basado en expected para que ausencias descuenten)
-      // si no hay expected (raro), paga fijo
-      let gross = 0;
-      if (expected > 0) {
-        const ratePerMin = periodBase / expected;
-        gross = worked * ratePerMin;
-
-        // overtime (simple): paga extra a OT_MULT sobre rate normal
-        gross += ot * ratePerMin * (OT_MULT - 1);
-      } else {
-        gross = periodBase;
-      }
-
-      gross = Number(gross.toFixed(2));
-      const deductions = 0;
-      const net = Number((gross - deductions).toFixed(2));
-
-      items.push({
-        pay_run_id: payRunId,
-        emp_id: emp.id,
-        concept: "BASE_SALARY_BY_MINUTES",
-        amount: gross,
-        meta: { expected_minutes: expected, worked_minutes: worked, overtime_minutes: ot, late_minutes: late, absent_days: absentDays },
-      });
-
-      slips.push({ pay_run_id: payRunId, emp_id: emp.id, gross, deductions, net, pdf_path: null });
-
-      summaries.push({
-        pay_run_id: payRunId,
-        emp_id: emp.id,
-        emp_code: emp.emp_code,
-        full_name: emp.full_name,
-        expected_minutes: expected,
-        worked_minutes: worked,
-        late_minutes: late,
-        absent_days: absentDays,
-        overtime_minutes: ot,
-        gross,
-        deductions,
-        net,
-      });
-    }
-
-    // insertar
-    if (items.length) {
-      const { error } = await sb.from("pay_items").insert(items);
-      if (error) return res.status(500).json({ ok: false, message: error.message });
-    }
-    if (slips.length) {
-      const { error } = await sb.from("pay_slips").insert(slips);
-      if (error) return res.status(500).json({ ok: false, message: error.message });
-    }
-    if (summaries.length) {
-      const { error } = await sb.from("pay_run_employee_summary").insert(summaries);
-      if (error) return res.status(500).json({ ok: false, message: error.message });
-    }
-
-    await sb.from("pay_runs").update({ status: "CALCULATED" }).eq("id", payRunId);
-
-    return res.json({ ok: true, payRunId, employees: summaries.length });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message || String(e) });
-  }
-});
-
-/* =========================================================
-   REPORTS: summary + employee details
-========================================================= */
-app.get("/api/pay-runs/:id/summary", requireSupabase, async (req, res) => {
+app.post("/api/pay-runs/:id/calculate", requireSupabase, async (req, res) => {
   const payRunId = req.params.id;
-  const { data, error } = await sb
-    .from("pay_run_employee_summary")
-    .select("*")
-    .eq("pay_run_id", payRunId)
-    .order("full_name", { ascending: true });
 
-  if (error) return res.status(500).json({ ok: false, message: error.message });
-  res.json({ ok: true, rows: data || [] });
-});
+  const { data: run, error: e0 } = await sb.from("pay_runs").select("*, pay_periods(*)").eq("id", payRunId).single();
+  if (e0) return res.status(500).json({ ok: false, message: e0.message });
 
-app.get("/api/pay-runs/:id/employee/:empId/shifts", requireSupabase, async (req, res) => {
-  const payRunId = req.params.id;
-  const empId = req.params.empId;
+  const period = run.pay_periods;
 
-  const { data, error } = await sb
-    .from("work_shifts")
-    .select("*")
-    .eq("pay_run_id", payRunId)
-    .eq("emp_id", empId)
-    .order("work_date", { ascending: true });
+  const { data: emps, error: e1 } = await sb.from("employees").select("*").eq("is_active", true);
+  if (e1) return res.status(500).json({ ok: false, message: e1.message });
 
-  if (error) return res.status(500).json({ ok: false, message: error.message });
-  res.json({ ok: true, shifts: data || [] });
+  // limpiar items/slips anteriores
+  await sb.from("pay_items").delete().eq("pay_run_id", payRunId);
+  await sb.from("pay_slips").delete().eq("pay_run_id", payRunId);
+
+  const payItems = [];
+  const slips = [];
+
+  for (const emp of emps) {
+    let base = Number(emp.base_salary || 0);
+
+    // prorrateo simple: si salario mensual y periodo quincenal => /2
+    if (String(emp.salary_type || "").toUpperCase() === "MONTHLY" && period.period_type === "BIWEEKLY") {
+      base = base / 2;
+    }
+
+    base = Number(base.toFixed(2));
+
+    payItems.push({
+      pay_run_id: payRunId,
+      emp_id: emp.id,
+      concept: "BASE_SALARY",
+      amount: base,
+      meta: { employee_type: emp.employee_type, salary_type: emp.salary_type },
+    });
+
+    const gross = base;
+    const deductions = 0;
+    const net = Number((gross - deductions).toFixed(2));
+
+    slips.push({
+      pay_run_id: payRunId,
+      emp_id: emp.id,
+      gross,
+      deductions,
+      net,
+      pdf_path: null,
+    });
+  }
+
+  const { error: e2 } = await sb.from("pay_items").insert(payItems);
+  if (e2) return res.status(500).json({ ok: false, message: e2.message });
+
+  const { error: e3 } = await sb.from("pay_slips").insert(slips);
+  if (e3) return res.status(500).json({ ok: false, message: e3.message });
+
+  const { error: e4 } = await sb.from("pay_runs").update({ status: "CALCULATED" }).eq("id", payRunId);
+  if (e4) return res.status(500).json({ ok: false, message: e4.message });
+
+  res.json({ ok: true, payRunId, employees: emps.length });
 });
 
 /* =========================================================
-   Voucher PDF + Email (reusa lo tuyo; aquí solo lo dejo base)
+   PDF Layout (tipo "Comprobante de pago" como tu ejemplo)
 ========================================================= */
-function money(n){
+function money(n) {
   const x = Number(n || 0);
   return x.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
-
-function line(doc, x1, y1, x2, y2){
+function line(doc, x1, y1, x2, y2) {
   doc.moveTo(x1, y1).lineTo(x2, y2).stroke();
 }
-
-function sectionTitle(doc, x, y, w, title){
+function sectionTitle(doc, x, y, w, title) {
   doc.font("Helvetica-Bold").fontSize(10).text(title, x, y, { width: w, align: "center" });
   line(doc, x, y + 14, x + w, y + 14);
 }
-
-function kv(doc, x, y, label, value, gap = 70){
+function kv(doc, x, y, label, value, gap = 70) {
   doc.font("Helvetica-Bold").fontSize(9).text(label, x, y);
   doc.font("Helvetica").fontSize(9).text(value ?? "", x + gap, y);
 }
 
-async function buildSlipPdfBuffer(payload){
+function buildSlipPdfBuffer(payload) {
   const {
     companyName = "PRODIMA, S.A.",
     page = 1,
 
-    // Encabezado planilla
     planillaTipo = "PLANILLA QUINCENAL",
-    periodFrom = "16/02/2026",
-    periodTo = "28/02/2026",
-    planillaNo = "7355",
-    transaccionNo = "118242",
+    periodFrom = "",
+    periodTo = "",
+    planillaNo = "--",
+    transaccionNo = "--",
 
-    // Empleado
     sucursal = "PMA - PANAMA",
-    empCode = "001359",
-    empName = "RIVERA SEWELL, DANIEL",
-    cedula = "8-933-981",
-    cargo = "** SIN DEFINIR **",
-    cuenta = "0416981383956",
-    salarioHora = 6.275494,
+    empCode = "",
+    empName = "",
+    cedula = "",
+    cargo = "",
+    cuenta = "",
+    salarioHora = 0,
 
-    // Horas
-    horas = {
-      diurna_h: 95.61, diurna_$: 600.00,
-      mixta_h: 0, mixta_$: 0,
-      noct_h: 0, noct_$: 0,
-      ajust_h: 0, ajust_$: 0,
-    },
+    horas = { diurna_h: 0, diurna_$: 0, mixta_h: 0, mixta_$: 0, noct_h: 0, noct_$: 0, ajust_h: 0, ajust_$: 0 },
+    ausencias = { no_paga_h: 0, no_paga_$: 0, pagadas_h: 0, pagadas_$: 0, cmed_h: 0, cmed_$: 0 },
 
-    ausencias = {
-      no_paga_h: 0, no_paga_$: 0,
-      pagadas_h: 0, pagadas_$: 0,
-      cmed_h: 0, cmed_$: 0,
-    },
+    descuentosLegales = [],
+    ingresos = [],
 
-    // Descuentos legales (ejemplo)
-    descuentosLegales = [
-      { name: "Seguro Social", amount: 58.50 },
-      { name: "Seguro Educativo", amount: 7.50 },
-      { name: "Impuesto s/Renta", amount: 26.54 },
-      { name: "ISR GtoRep", amount: 0.00 },
-    ],
-
-    // Ingresos (derecha)
-    ingresos = [
-      { name: "Salario Regular", amount: 600.00 },
-      { name: "Salario s/Tiempo", amount: 0.00 },
-      { name: "Prima P./Bonif/Gratif", amount: 0.00 },
-      { name: "Comisión", amount: 0.00 },
-      { name: "Otr1 Ingr", amount: 0.00 },
-      { name: "Otr2 Ingr", amount: 0.00 },
-      { name: "Otr3 Ingr", amount: 0.00 },
-      { name: "Construcción", amount: 0.00 },
-      { name: "Ajustes", amount: 0.00 },
-      { name: "Partic. Utilidad", amount: 0.00 },
-    ],
-
-    // Totales
-    salarioBruto = 600.00,
-    totalOtros = 0.00,
-    otrosDescuentos = 0.00,
+    salarioBruto = 0,
+    totalOtros = 0,
+    otrosDescuentos = 0,
   } = payload || {};
 
-  const totalDescLeg = descuentosLegales.reduce((a,b)=>a+Number(b.amount||0),0);
-  const salarioNeto = Number(salarioBruto||0) - totalDescLeg - Number(otrosDescuentos||0);
-
-  const PDFDocument = (await import("pdfkit")).default;
+  const totalDescLeg = (descuentosLegales || []).reduce((a, b) => a + Number(b.amount || 0), 0);
+  const salarioNeto = Number(salarioBruto || 0) - totalDescLeg - Number(otrosDescuentos || 0);
 
   return new Promise((resolve) => {
     const doc = new PDFDocument({ size: "A4", margin: 36 });
@@ -804,114 +386,102 @@ async function buildSlipPdfBuffer(payload){
     const right = pageW - doc.page.margins.right;
     let y = 28;
 
-    // ===== Header =====
-    doc.font("Helvetica-Bold").fontSize(14).text("COMPROBANTE DE PAGO", left, y, { width: right-left, align:"center" });
+    // Header
+    doc.font("Helvetica-Bold").fontSize(14).text("COMPROBANTE DE PAGO", left, y, { width: right - left, align: "center" });
     y += 16;
-    doc.font("Helvetica-Bold").fontSize(10).text(companyName, left, y, { width: right-left, align:"center" });
-
-    doc.font("Helvetica").fontSize(9).text(`Página: ${page}`, right-80, 34, { width:80, align:"right" });
+    doc.font("Helvetica-Bold").fontSize(10).text(companyName, left, y, { width: right - left, align: "center" });
+    doc.font("Helvetica").fontSize(9).text(`Página: ${page}`, right - 80, 34, { width: 80, align: "right" });
 
     y += 16;
     line(doc, left, y, right, y);
     y += 8;
 
-    // Línea superior: periodo + planilla/transacción
-    doc.font("Helvetica-Bold").fontSize(9)
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(9)
       .text(`${planillaTipo}  DEL  ${periodFrom}  A  ${periodTo}`, left, y);
-    doc.font("Helvetica-Bold").fontSize(9)
-      .text(`PLANILLA #:  ${planillaNo}`, right-210, y, { width: 120, align:"left" });
-    doc.font("Helvetica-Bold").fontSize(9)
-      .text(`TRANSACCIÓN #:  ${transaccionNo}`, right-90, y, { width: 90, align:"right" });
+
+    doc.font("Helvetica-Bold").fontSize(9).text(`PLANILLA #:  ${planillaNo}`, right - 210, y, { width: 120, align: "left" });
+    doc.font("Helvetica-Bold").fontSize(9).text(`TRANSACCIÓN #:  ${transaccionNo}`, right - 90, y, { width: 90, align: "right" });
 
     y += 14;
     line(doc, left, y, right, y);
     y += 12;
 
-    // ===== 3-column layout =====
+    // 3 columns
     const colGap = 14;
-    const colW = Math.floor((right - left - colGap*2) / 3);
+    const colW = Math.floor((right - left - colGap * 2) / 3);
     const c1 = left;
     const c2 = left + colW + colGap;
-    const c3 = left + (colW + colGap)*2;
+    const c3 = left + (colW + colGap) * 2;
 
-    // ----- Left block: employee info -----
+    // Left: employee
     kv(doc, c1, y, "SUCURSAL:", sucursal, 62);
     y += 12;
     kv(doc, c1, y, "Código:", empCode, 62);
-    doc.font("Helvetica-Bold").text(empName, c1+120, y, { width: colW-120 });
+    doc.font("Helvetica-Bold").text(empName, c1 + 120, y, { width: colW - 120 });
     y += 12;
     kv(doc, c1, y, "Cédula:", cedula, 62);
     y += 12;
     kv(doc, c1, y, "Cargo:", cargo, 62);
     y += 16;
-
     kv(doc, c1, y, "SALARIO x HORA:", String(salarioHora), 90);
-    y += 14;
 
-    // Titles row for mid markers
-    doc.font("Helvetica-Bold").fontSize(9).text("OTRAS HORAS", c2, y-14, { width: colW, align:"center" });
-
-    // ----- Middle block: legal deductions -----
-    sectionTitle(doc, c2, y-28, colW, "DESCUENTOS LEGALES");
-
+    // Middle: legal deductions
+    sectionTitle(doc, c2, y - 28, colW, "DESCUENTOS LEGALES");
     let yMid = y;
-    for (const d of descuentosLegales){
-      doc.font("Helvetica").fontSize(9).text(d.name, c2, yMid, { width: colW-60, align:"left" });
-      doc.text(money(d.amount), c2, yMid, { width: colW, align:"right" });
+    for (const d of descuentosLegales || []) {
+      doc.font("Helvetica").fontSize(9).text(d.name, c2, yMid, { width: colW - 60, align: "left" });
+      doc.text(money(d.amount), c2, yMid, { width: colW, align: "right" });
       yMid += 12;
     }
-    line(doc, c2, yMid+2, c2+colW, yMid+2);
+    line(doc, c2, yMid + 2, c2 + colW, yMid + 2);
     yMid += 6;
-    doc.font("Helvetica-Bold").text(money(totalDescLeg), c2, yMid, { width: colW, align:"right" });
+    doc.font("Helvetica-Bold").text(money(totalDescLeg), c2, yMid, { width: colW, align: "right" });
 
-    // ----- Right block: income list -----
-    const yRightTop = y - 28;
-    sectionTitle(doc, c3, yRightTop, colW, ""); // sin título visible, solo línea
+    // Right: incomes + totals
     let yR = y;
-    for (const it of ingresos){
-      doc.font("Helvetica").fontSize(9).text(it.name, c3, yR, { width: colW-70, align:"left" });
-      doc.text(money(it.amount), c3, yR, { width: colW, align:"right" });
+    for (const it of ingresos || []) {
+      doc.font("Helvetica").fontSize(9).text(it.name, c3, yR, { width: colW - 70, align: "left" });
+      doc.text(money(it.amount), c3, yR, { width: colW, align: "right" });
       yR += 12;
     }
-
-    // Totals on right
     yR += 4;
-    line(doc, c3, yR, c3+colW, yR);
+    line(doc, c3, yR, c3 + colW, yR);
     yR += 8;
 
-    doc.font("Helvetica-Bold").text("Salario Bruto", c3, yR, { width: colW-70, align:"left" });
-    doc.text(money(salarioBruto), c3, yR, { width: colW, align:"right" });
+    doc.font("Helvetica-Bold").text("Salario Bruto", c3, yR, { width: colW - 70 });
+    doc.text(money(salarioBruto), c3, yR, { width: colW, align: "right" });
     yR += 12;
 
-    doc.font("Helvetica-Bold").text("Total Otros", c3, yR, { width: colW-70, align:"left" });
-    doc.text(money(totalOtros), c3, yR, { width: colW, align:"right" });
+    doc.font("Helvetica-Bold").text("Total Otros", c3, yR, { width: colW - 70 });
+    doc.text(money(totalOtros), c3, yR, { width: colW, align: "right" });
     yR += 12;
 
-    doc.font("Helvetica-Bold").text("Descuentos Legales", c3, yR, { width: colW-70, align:"left" });
-    doc.text(money(totalDescLeg), c3, yR, { width: colW, align:"right" });
+    doc.font("Helvetica-Bold").text("Descuentos Legales", c3, yR, { width: colW - 70 });
+    doc.text(money(totalDescLeg), c3, yR, { width: colW, align: "right" });
     yR += 12;
 
-    doc.font("Helvetica-Bold").text("Otros Descuentos", c3, yR, { width: colW-70, align:"left" });
-    doc.text(money(otrosDescuentos), c3, yR, { width: colW, align:"right" });
+    doc.font("Helvetica-Bold").text("Otros Descuentos", c3, yR, { width: colW - 70 });
+    doc.text(money(otrosDescuentos), c3, yR, { width: colW, align: "right" });
     yR += 12;
 
     yR += 2;
-    line(doc, c3, yR, c3+colW, yR);
+    line(doc, c3, yR, c3 + colW, yR);
     yR += 8;
-    doc.font("Helvetica-Bold").fontSize(10).text("SALARIO NETO", c3, yR, { width: colW-70, align:"left" });
-    doc.font("Helvetica-Bold").fontSize(10).text(`$${money(salarioNeto)}`, c3, yR, { width: colW, align:"right" });
+    doc.font("Helvetica-Bold").fontSize(10).text("SALARIO NETO", c3, yR, { width: colW - 70 });
+    doc.font("Helvetica-Bold").fontSize(10).text(`$${money(salarioNeto)}`, c3, yR, { width: colW, align: "right" });
 
-    // ===== Lower sections (left column tables) =====
+    // Lower left tables
     let y2 = Math.max(yMid, yR) + 24;
 
-    // HORAS REGULARES
     sectionTitle(doc, c1, y2, colW, "HORAS REGULARES");
     y2 += 20;
 
     const row = (name, h, amt) => {
-      doc.font("Helvetica").fontSize(9).text(name, c1, y2, { width: colW-120, align:"left" });
-      doc.text(money(h), c1+colW-120, y2, { width: 60, align:"right" });
-      doc.text(money(amt), c1+colW-60, y2, { width: 60, align:"right" });
+      doc.font("Helvetica").fontSize(9).text(name, c1, y2, { width: colW - 120 });
+      doc.text(money(h), c1 + colW - 120, y2, { width: 60, align: "right" });
+      doc.text(money(amt), c1 + colW - 60, y2, { width: 60, align: "right" });
       y2 += 12;
     };
 
@@ -921,8 +491,6 @@ async function buildSlipPdfBuffer(payload){
     row("H. AJUST", horas.ajust_h, horas.ajust_$);
 
     y2 += 8;
-
-    // AUSENCIAS - TARDANZA
     sectionTitle(doc, c1, y2, colW, "AUSENCIAS - TARDANZA");
     y2 += 20;
 
@@ -930,7 +498,7 @@ async function buildSlipPdfBuffer(payload){
     row("Pagadas", ausencias.pagadas_h, ausencias.pagadas_$);
     row("C. Med.", ausencias.cmed_h, ausencias.cmed_$);
 
-    // ===== Footer =====
+    // Footer
     const yFoot = doc.page.height - 120;
     doc.font("Helvetica-Bold").fontSize(9).text("DEPOSITADO EN LA CUENTA No.", c1, yFoot);
     doc.font("Helvetica").fontSize(9).text(cuenta, c1, yFoot + 12);
@@ -946,9 +514,19 @@ async function buildSlipPdfBuffer(payload){
   });
 }
 
+/* =========================================================
+   GENERATE VOUCHERS (PDF + Storage)
+========================================================= */
+function formatISODateToDDMMYYYY(isoDate) {
+  const s = String(isoDate || "").slice(0, 10);
+  if (!s || s.length !== 10) return s;
+  const [y, m, d] = s.split("-");
+  return `${d}/${m}/${y}`;
+}
+
 app.post("/api/pay-runs/:id/generate-vouchers", requireSupabase, async (req, res) => {
   const payRunId = req.params.id;
-  const { companyName = "PRODIMA" } = req.body || {};
+  const { companyName = "PRODIMA, S.A." } = req.body || {};
 
   const { data: run, error: e0 } = await sb
     .from("pay_runs")
@@ -957,11 +535,15 @@ app.post("/api/pay-runs/:id/generate-vouchers", requireSupabase, async (req, res
     .single();
   if (e0) return res.status(500).json({ ok: false, message: e0.message });
 
-  const periodLabel = run.pay_periods?.label || "Periodo";
+  const p = run.pay_periods;
+  const periodLabel = p?.label || "Periodo";
+  const periodFrom = formatISODateToDDMMYYYY(p?.start_date);
+  const periodTo = formatISODateToDDMMYYYY(p?.end_date);
+  const planillaTipo = p?.period_type === "MONTHLY" ? "PLANILLA MENSUAL" : "PLANILLA QUINCENAL";
 
   const { data: slips, error: e1 } = await sb
     .from("pay_slips")
-    .select("*, employees(emp_code,full_name,email)")
+    .select("*, employees(emp_code,full_name,email,hourly_rate)")
     .eq("pay_run_id", payRunId);
   if (e1) return res.status(500).json({ ok: false, message: e1.message });
 
@@ -969,14 +551,31 @@ app.post("/api/pay-runs/:id/generate-vouchers", requireSupabase, async (req, res
 
   for (const s of slips) {
     const emp = s.employees;
+
+    // En MVP: solo salario regular
+    const gross = Number(s.gross || 0);
+
     const pdf = await buildSlipPdfBuffer({
       companyName,
-      periodLabel,
-      empName: emp.full_name,
+      planillaTipo,
+      periodFrom,
+      periodTo,
+      planillaNo: String(payRunId).slice(0, 6),
+      transaccionNo: String(s.id).slice(0, 6),
+
+      sucursal: "PMA - PANAMA",
       empCode: emp.emp_code,
-      gross: Number(s.gross || 0),
-      deductions: Number(s.deductions || 0),
-      net: Number(s.net || 0),
+      empName: emp.full_name,
+      cedula: "", // agrega en employees si quieres
+      cargo: "",  // agrega en employees si quieres
+      cuenta: "", // agrega en employees si quieres
+      salarioHora: Number(emp.hourly_rate || 0),
+
+      descuentosLegales: [], // en MVP vacío; luego lo calculas
+      ingresos: [{ name: "Salario Regular", amount: gross }],
+      salarioBruto: gross,
+      totalOtros: 0,
+      otrosDescuentos: 0,
     });
 
     const filePath = `payruns/${payRunId}/${emp.emp_code}.pdf`;
@@ -985,6 +584,7 @@ app.post("/api/pay-runs/:id/generate-vouchers", requireSupabase, async (req, res
       contentType: "application/pdf",
       upsert: true,
     });
+
     if (upErr) return res.status(500).json({ ok: false, message: upErr.message });
 
     const { error: u2 } = await sb.from("pay_slips").update({ pdf_path: filePath }).eq("id", s.id);
@@ -993,9 +593,12 @@ app.post("/api/pay-runs/:id/generate-vouchers", requireSupabase, async (req, res
     generated++;
   }
 
-  res.json({ ok: true, payRunId, generated });
+  res.json({ ok: true, payRunId, periodLabel, generated });
 });
 
+/* =========================================================
+   SEND VOUCHERS (EMAIL)
+========================================================= */
 app.post("/api/pay-runs/:id/send-vouchers", requireSupabase, async (req, res) => {
   if (!resend) return res.status(400).json({ ok: false, message: "Email provider not configured (RESEND_API_KEY)" });
 
@@ -1027,15 +630,19 @@ app.post("/api/pay-runs/:id/send-vouchers", requireSupabase, async (req, res) =>
     const { data: signed, error: se } = await sb.storage.from(VOUCHER_BUCKET).createSignedUrl(s.pdf_path, 60 * 60 * 24);
     if (se) continue;
 
+    // ✅ Sin escapes raros: template literal normal
+    const html = `
+      <p>Hola ${emp.full_name},</p>
+      <p>Aquí está tu comprobante de pago del período <b>${periodLabel}</b>:</p>
+      <p><a href="${signed.signedUrl}">Descargar voucher</a></p>
+      <p>— Nómina</p>
+    `;
+
     await resend.emails.send({
       from: MAIL_FROM,
       to: [emp.email],
       subject: `${subject} - ${periodLabel}`,
-      html:
-        "<p>Hola " + emp.full_name + ",</p>" +
-        "<p>Tu voucher del período <b>" + periodLabel + "</b>:</p>" +
-        '<p><a href="' + signed.signedUrl + '">Descargar voucher</a></p>' +
-        "<p>— Nómina</p>",
+      html,
     });
 
     await sb.from("pay_slips").update({ emailed_at: new Date().toISOString() }).eq("id", s.id);
@@ -1046,5 +653,11 @@ app.post("/api/pay-runs/:id/send-vouchers", requireSupabase, async (req, res) =>
 
   res.json({ ok: true, payRunId, sent });
 });
+
+/* =========================================================
+   START
+========================================================= */
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
 app.listen(Number(PORT), () => console.log(`Planilla server listening on :${PORT}`));
