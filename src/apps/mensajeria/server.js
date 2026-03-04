@@ -1,4 +1,4 @@
-// server.js (Mensajería Interna PRODIMA)
+// server.js (Mensajería Interna PRODIMA) — con courier_comment + closed_at + endpoints mensajero
 import express from "express";
 import pg from "pg";
 import jwt from "jsonwebtoken";
@@ -119,10 +119,15 @@ async function ensureDb() {
     );
   `);
 
+  // ✅ NUEVO: columnas para comentario del mensajero + fecha cierre
+  await dbQuery(`ALTER TABLE msg_requests ADD COLUMN IF NOT EXISTS courier_comment TEXT DEFAULT '';`);
+  await dbQuery(`ALTER TABLE msg_requests ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP;`);
+
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_msg_requests_created_at ON msg_requests(created_at);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_msg_requests_status ON msg_requests(status);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_msg_requests_dept ON msg_requests(requester_department);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_msg_requests_created_by ON msg_requests(created_by_user_id);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_msg_requests_assigned_to ON msg_requests(assigned_to_user_id);`);
 }
 
 /* =========================
@@ -163,6 +168,10 @@ function verifyUser(req, res, next) {
     return safeJson(res, 401, { ok: false, message: "Invalid token" });
   }
 }
+function isCourierRole(role) {
+  const r = String(role || "").trim().toLowerCase();
+  return r === "courier" || r === "mercaderista";
+}
 
 /* =========================
    PIN hashing (crypto pbkdf2)
@@ -197,7 +206,7 @@ function verifyPin(pin, stored) {
 function normStatus(s) {
   const t = String(s || "").trim().toLowerCase();
   if (["open", "abierta", "abierto"].includes(t)) return "open";
-  if (["in_progress", "en progreso", "progreso"].includes(t)) return "in_progress";
+  if (["in_progress", "en progreso", "progreso", "in progress"].includes(t)) return "in_progress";
   if (["closed", "cerrada", "cerrado"].includes(t)) return "closed";
   if (["cancelled", "canceled", "cancelada", "cancelado"].includes(t)) return "cancelled";
   return t;
@@ -334,7 +343,8 @@ app.post("/api/admin/messaging/users", verifyAdmin, async (req, res) => {
     const username = String(req.body?.username || "").trim().toLowerCase();
     const fullName = String(req.body?.fullName || "").trim();
     const department = String(req.body?.department || "").trim();
-    const role = String(req.body?.role || "requester").trim();
+    const roleRaw = String(req.body?.role || "requester").trim().toLowerCase();
+    const role = roleRaw === "courier" || roleRaw === "mercaderista" ? "courier" : "requester";
     const email = String(req.body?.email || "").trim();
     const phone = String(req.body?.phone || "").trim();
     const pin = String(req.body?.pin || "").trim();
@@ -350,7 +360,7 @@ app.post("/api/admin/messaging/users", verifyAdmin, async (req, res) => {
       `INSERT INTO msg_users(username, full_name, department, role, email, phone, pin_hash, is_active, created_at, updated_at)
        VALUES($1,$2,$3,$4,$5,$6,$7,TRUE,NOW(),NOW())
        RETURNING id`,
-      [username, fullName, department, role === "courier" ? "courier" : "requester", email, phone, pinHash]
+      [username, fullName, department, role, email, phone, pinHash]
     );
 
     return safeJson(res, 200, { ok: true, id: Number(r.rows?.[0]?.id || 0) });
@@ -372,11 +382,7 @@ app.patch("/api/admin/messaging/users/:id", verifyAdmin, async (req, res) => {
     const isActive = req.body?.isActive;
     if (typeof isActive !== "boolean") return safeJson(res, 400, { ok: false, message: "isActive requerido (boolean)" });
 
-    await dbQuery(
-      `UPDATE msg_users SET is_active=$2, updated_at=NOW() WHERE id=$1`,
-      [id, isActive]
-    );
-
+    await dbQuery(`UPDATE msg_users SET is_active=$2, updated_at=NOW() WHERE id=$1`, [id, isActive]);
     return safeJson(res, 200, { ok: true });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -400,7 +406,7 @@ app.patch("/api/admin/messaging/users/:id/pin", verifyAdmin, async (req, res) =>
 });
 
 /* =========================
-   USER: CREATE REQUEST + LIST MY REQUESTS
+   USER (SOLICITANTE): CREATE REQUEST + LIST MY REQUESTS
 ========================= */
 app.post("/api/user/requests", verifyUser, async (req, res) => {
   try {
@@ -408,12 +414,17 @@ app.post("/api/user/requests", verifyUser, async (req, res) => {
 
     const userId = Number(req.user.userId);
     const uR = await dbQuery(
-      `SELECT id, username, full_name, department, email, phone, is_active
+      `SELECT id, username, full_name, department, email, phone, is_active, role
        FROM msg_users WHERE id=$1 LIMIT 1`,
       [userId]
     );
     const u = uR.rows?.[0];
     if (!u || !u.is_active) return safeJson(res, 401, { ok: false, message: "Usuario inactivo" });
+
+    // Si es mensajero, por diseño NO crea solicitudes aquí (tu frontend ya lo oculta)
+    if (isCourierRole(u.role)) {
+      return safeJson(res, 403, { ok: false, message: "Mensajero no crea solicitudes desde este módulo." });
+    }
 
     const requestType = String(req.body?.requestType || "").trim();
     const contactPersonPhone = String(req.body?.contactPersonPhone || "").trim();
@@ -431,13 +442,15 @@ app.post("/api/user/requests", verifyUser, async (req, res) => {
         created_by_user_id, created_by_username,
         requester_name, requester_department, requester_email, requester_phone,
         request_type, contact_person_phone, address_details, description, priority,
-        status, status_updated_at, updated_at
+        status, status_updated_at, updated_at,
+        courier_comment, closed_at
       )
       VALUES(
         $1,$2,
         $3,$4,$5,$6,
         $7,$8,$9,$10,$11,
-        'open', NOW(), NOW()
+        'open', NOW(), NOW(),
+        '', NULL
       )
       RETURNING id`,
       [
@@ -480,7 +493,8 @@ app.get("/api/user/requests", verifyUser, async (req, res) => {
     const r = await dbQuery(
       `SELECT
         id, created_at, request_type, priority, status,
-        assigned_to_name, assigned_to_user_id, address_details
+        assigned_to_name, assigned_to_user_id, address_details,
+        courier_comment, closed_at
        FROM msg_requests
        WHERE ${where.join(" AND ")}
        ORDER BY created_at DESC
@@ -497,9 +511,146 @@ app.get("/api/user/requests", verifyUser, async (req, res) => {
       assignedToName: x.assigned_to_name || "",
       assignedToUserId: x.assigned_to_user_id != null ? Number(x.assigned_to_user_id) : null,
       addressDetails: x.address_details || "",
+      courierComment: x.courier_comment || "",
+      closedAt: x.closed_at || null,
     }));
 
     return safeJson(res, 200, { ok: true, requests });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+/* =========================
+   USER (MENSAJERO): LIST + UPDATE
+   ✅ FIX 404: endpoints que tu frontend está llamando
+========================= */
+
+// GET /api/user/courier/requests?scope=assigned|all&status=open|...
+app.get("/api/user/courier/requests", verifyUser, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
+    const userId = Number(req.user.userId);
+
+    const uR = await dbQuery(
+      `SELECT id, role, is_active FROM msg_users WHERE id=$1 LIMIT 1`,
+      [userId]
+    );
+    const u = uR.rows?.[0];
+    if (!u || !u.is_active) return safeJson(res, 401, { ok: false, message: "Usuario inactivo" });
+    if (!isCourierRole(u.role)) return safeJson(res, 403, { ok: false, message: "Solo mensajeros." });
+
+    const scope = String(req.query?.scope || "assigned").trim().toLowerCase(); // assigned | all
+    const status = normStatus(req.query?.status || "");
+
+    const where = [];
+    const params = [];
+    let p = 1;
+
+    if (scope !== "all") {
+      where.push(`r.assigned_to_user_id=$${p++}`);
+      params.push(userId);
+    }
+
+    if (status && status !== "__all__") {
+      where.push(`r.status=$${p++}`);
+      params.push(status);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const r = await dbQuery(
+      `SELECT
+        r.id, r.created_at, r.updated_at,
+        r.created_by_username,
+        r.requester_name, r.requester_department,
+        r.request_type, r.priority, r.status,
+        r.contact_person_phone, r.address_details, r.description,
+        r.assigned_to_user_id, r.assigned_to_name,
+        r.courier_comment, r.closed_at
+       FROM msg_requests r
+       ${whereSql}
+       ORDER BY r.created_at DESC
+       LIMIT 500`,
+      params
+    );
+
+    const requests = (r.rows || []).map((x) => ({
+      id: Number(x.id),
+      createdAt: x.created_at,
+      updatedAt: x.updated_at,
+      createdByUsername: x.created_by_username || "",
+      requesterName: x.requester_name || "",
+      department: x.requester_department || "",
+      requestType: x.request_type || "",
+      priority: x.priority || "",
+      status: x.status || "open",
+      contactPersonPhone: x.contact_person_phone || "",
+      addressDetails: x.address_details || "",
+      description: x.description || "",
+      assignedToUserId: x.assigned_to_user_id != null ? Number(x.assigned_to_user_id) : null,
+      assignedToName: x.assigned_to_name || "",
+      courierComment: x.courier_comment || "",
+      closedAt: x.closed_at || null,
+    }));
+
+    return safeJson(res, 200, { ok: true, scope, status: status || "__ALL__", requests });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+// PATCH /api/user/courier/requests/:id  { status, comment }
+app.patch("/api/user/courier/requests/:id", verifyUser, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
+    const userId = Number(req.user.userId);
+    const id = Number(req.params.id || 0);
+    if (!id) return safeJson(res, 400, { ok: false, message: "id inválido" });
+
+    // validar usuario courier
+    const uR = await dbQuery(`SELECT id, role, is_active FROM msg_users WHERE id=$1 LIMIT 1`, [userId]);
+    const u = uR.rows?.[0];
+    if (!u || !u.is_active) return safeJson(res, 401, { ok: false, message: "Usuario inactivo" });
+    if (!isCourierRole(u.role)) return safeJson(res, 403, { ok: false, message: "Solo mensajeros." });
+
+    // validar que la solicitud esté asignada a este mensajero (seguridad)
+    const curR = await dbQuery(
+      `SELECT id, assigned_to_user_id, status FROM msg_requests WHERE id=$1 LIMIT 1`,
+      [id]
+    );
+    const cur = curR.rows?.[0];
+    if (!cur) return safeJson(res, 404, { ok: false, message: "Solicitud no encontrada" });
+
+    const assignedTo = cur.assigned_to_user_id != null ? Number(cur.assigned_to_user_id) : null;
+    if (!assignedTo || assignedTo !== userId) {
+      return safeJson(res, 403, { ok: false, message: "Solo puedes actualizar solicitudes asignadas a ti." });
+    }
+
+    const status = normStatus(req.body?.status || "");
+    const comment = String(req.body?.comment || "").trim();
+
+    if (!["open", "in_progress", "closed", "cancelled"].includes(status)) {
+      return safeJson(res, 400, { ok: false, message: "status inválido" });
+    }
+
+    // Si cierra, set closed_at NOW(); si no está cerrada, closed_at NULL
+    const closedAtSql = status === "closed" ? "NOW()" : "NULL";
+
+    await dbQuery(
+      `UPDATE msg_requests
+       SET status=$2,
+           courier_comment=$3,
+           closed_at=${closedAtSql},
+           status_updated_at=NOW(),
+           updated_at=NOW()
+       WHERE id=$1`,
+      [id, status, comment]
+    );
+
+    return safeJson(res, 200, { ok: true });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -552,7 +703,8 @@ app.get("/api/admin/messaging/requests", verifyAdmin, async (req, res) => {
         r.created_by_username,
         r.requester_name, r.requester_department,
         r.request_type, r.priority, r.status,
-        r.assigned_to_user_id, r.assigned_to_name
+        r.assigned_to_user_id, r.assigned_to_name,
+        r.courier_comment, r.closed_at
        FROM msg_requests r
        ${whereSql}
        ORDER BY r.created_at DESC
@@ -572,6 +724,8 @@ app.get("/api/admin/messaging/requests", verifyAdmin, async (req, res) => {
       status: r.status,
       assignedToUserId: r.assigned_to_user_id != null ? Number(r.assigned_to_user_id) : null,
       assignedToName: r.assigned_to_name || "",
+      courierComment: r.courier_comment || "",
+      closedAt: r.closed_at || null,
     }));
 
     return safeJson(res, 200, { ok: true, total, page, limit, requests });
@@ -597,7 +751,7 @@ app.patch("/api/admin/messaging/requests/:id/assign", verifyAdmin, async (req, r
         [courierUserId]
       );
       const u = uR.rows?.[0];
-      if (!u || !u.is_active || String(u.role) !== "courier") {
+      if (!u || !u.is_active || !isCourierRole(u.role)) {
         return safeJson(res, 400, { ok: false, message: "Mensajero inválido/inactivo" });
       }
       assignedName = String(u.full_name || "");
@@ -631,9 +785,11 @@ app.patch("/api/admin/messaging/requests/:id/status", verifyAdmin, async (req, r
       return safeJson(res, 400, { ok: false, message: "status inválido" });
     }
 
+    const closedAtSql = status === "closed" ? "NOW()" : "NULL";
+
     await dbQuery(
       `UPDATE msg_requests
-       SET status=$2, status_updated_at=NOW(), updated_at=NOW()
+       SET status=$2, status_updated_at=NOW(), updated_at=NOW(), closed_at=${closedAtSql}
        WHERE id=$1`,
       [id, status]
     );
@@ -652,8 +808,8 @@ app.get("/api/admin/messaging/dashboard", verifyAdmin, async (req, res) => {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
 
     const today = new Date();
-    const defaultFrom = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,"0")}-01`;
-    const defaultTo = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,"0")}-${String(today.getDate()).padStart(2,"0")}`;
+    const defaultFrom = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-01`;
+    const defaultTo = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
 
     const from = isISODate(req.query?.from) ? String(req.query.from) : defaultFrom;
     const to = isISODate(req.query?.to) ? String(req.query.to) : defaultTo;
@@ -670,14 +826,9 @@ app.get("/api/admin/messaging/dashboard", verifyAdmin, async (req, res) => {
 
     const whereSql = `WHERE ${where.join(" AND ")}`;
 
-    // Totales
-    const totR = await dbQuery(
-      `SELECT COUNT(*)::int AS total FROM msg_requests r ${whereSql}`,
-      params
-    );
+    const totR = await dbQuery(`SELECT COUNT(*)::int AS total FROM msg_requests r ${whereSql}`, params);
     const totals = { total: Number(totR.rows?.[0]?.total || 0) };
 
-    // Por estatus
     const byStatusR = await dbQuery(
       `SELECT r.status, COUNT(*)::int AS c
        FROM msg_requests r
@@ -688,7 +839,7 @@ app.get("/api/admin/messaging/dashboard", verifyAdmin, async (req, res) => {
     );
 
     const statusLabel = (s) => {
-      const t = String(s||"");
+      const t = String(s || "");
       if (t === "open") return "Abiertas";
       if (t === "in_progress") return "En progreso";
       if (t === "closed") return "Cerradas";
@@ -696,13 +847,12 @@ app.get("/api/admin/messaging/dashboard", verifyAdmin, async (req, res) => {
       return t;
     };
 
-    const byStatus = (byStatusR.rows || []).map(x => ({
+    const byStatus = (byStatusR.rows || []).map((x) => ({
       status: x.status,
       statusLabel: statusLabel(x.status),
       count: Number(x.c || 0),
     }));
 
-    // Por departamento
     const byDeptR = await dbQuery(
       `SELECT COALESCE(NULLIF(r.requester_department,''),'(Sin depto)') AS d, COUNT(*)::int AS c
        FROM msg_requests r
@@ -711,12 +861,11 @@ app.get("/api/admin/messaging/dashboard", verifyAdmin, async (req, res) => {
        ORDER BY c DESC`,
       params
     );
-    const byDepartment = (byDeptR.rows || []).map(x => ({
+    const byDepartment = (byDeptR.rows || []).map((x) => ({
       department: x.d,
       count: Number(x.c || 0),
     }));
 
-    // Por día
     const byDayR = await dbQuery(
       `SELECT to_char(r.created_at::date,'YYYY-MM-DD') AS day, COUNT(*)::int AS c
        FROM msg_requests r
@@ -725,14 +874,15 @@ app.get("/api/admin/messaging/dashboard", verifyAdmin, async (req, res) => {
        ORDER BY r.created_at::date ASC`,
       params
     );
-    const byDay = (byDayR.rows || []).map(x => ({
+    const byDay = (byDayR.rows || []).map((x) => ({
       day: x.day,
       count: Number(x.c || 0),
     }));
 
     return safeJson(res, 200, {
       ok: true,
-      from, to,
+      from,
+      to,
       department: department || "__ALL__",
       totals,
       byStatus,
