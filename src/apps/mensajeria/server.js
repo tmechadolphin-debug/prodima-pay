@@ -1,4 +1,8 @@
-// server.js (Mensajería Interna PRODIMA) — Notificaciones por Google Apps Script + fechas sin desfase
+// server.js (Mensajería Interna PRODIMA)
+// ✅ Notificaciones por Google Apps Script (solicitante + mensajería + supervisores + couriers)
+// ✅ Fechas sin desfase (strings en hora Panamá)
+// ✅ Auto-asignación: todas las solicitudes nuevas se asignan automáticamente a "victor"
+
 import express from "express";
 import pg from "pg";
 import jwt from "jsonwebtoken";
@@ -32,6 +36,11 @@ const {
 
   // ✅ Supervisores
   SUPERVISOR_NOTIFY_TO = "logistica2@prodima.com.pa,melanie.choy@prodima.com.pa,malena.torrero@prodima.com.pa",
+
+  // ✅ Auto-asignación a Victor
+  AUTO_ASSIGN_ENABLED = "1",              // "1" = activo
+  AUTO_ASSIGN_COURIER_USERNAME = "victor",// username del mensajero Victor en msg_users
+  AUTO_ASSIGN_STRICT = "0",               // "1" = si no existe Victor, falla la creación
 } = process.env;
 
 /* =========================
@@ -78,13 +87,15 @@ async function dbQuery(text, params = []) {
   return pool.query(text, params);
 }
 
-async function ensureDb() {
-  if (!hasDb()) return;
-
-  // Asegura zona horaria de la sesión DB (Panamá)
+// Asegura TZ de sesión en Panamá
+if (hasDb()) {
   pool.on("connect", (client) => {
     client.query("SET TIME ZONE 'America/Panama'").catch(() => {});
   });
+}
+
+async function ensureDb() {
+  if (!hasDb()) return;
 
   // Usuarios de mensajería (solicitantes + mensajeros)
   await dbQuery(`
@@ -134,7 +145,7 @@ async function ensureDb() {
     );
   `);
 
-  // ✅ columnas comentario del mensajero + fecha cierre
+  // columnas comentario del mensajero + fecha cierre
   await dbQuery(`ALTER TABLE msg_requests ADD COLUMN IF NOT EXISTS courier_comment TEXT DEFAULT '';`);
   await dbQuery(`ALTER TABLE msg_requests ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP;`);
 
@@ -244,7 +255,6 @@ function fmtTsSql(col) {
 function isEmail(s) {
   return /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(String(s || "").trim());
 }
-
 function parseEmailList(csv) {
   return String(csv || "")
     .split(",")
@@ -311,6 +321,28 @@ async function notifyViaGAS({ event, requesterEmail, notifyTo, data }) {
   } catch (err) {
     console.error("GAS notify error:", err?.message || err);
   }
+}
+
+/* =========================
+   AUTO-ASIGNACIÓN: buscar mensajero "victor"
+========================= */
+async function getAutoAssignCourier() {
+  if (String(AUTO_ASSIGN_ENABLED) !== "1") return null;
+
+  const username = String(AUTO_ASSIGN_COURIER_USERNAME || "").trim().toLowerCase();
+  if (!username) return null;
+
+  const r = await dbQuery(
+    `SELECT id, full_name
+     FROM msg_users
+     WHERE is_active=TRUE
+       AND role='courier'
+       AND LOWER(username)=LOWER($1)
+     LIMIT 1`,
+    [username]
+  );
+  const u = r.rows?.[0];
+  return u ? { id: Number(u.id), name: String(u.full_name || "") } : null;
 }
 
 /* =========================
@@ -536,12 +568,21 @@ app.post("/api/user/requests", verifyUser, async (req, res) => {
     if (!addressDetails) return safeJson(res, 400, { ok: false, message: "Falta addressDetails" });
     if (!description) return safeJson(res, 400, { ok: false, message: "Falta description" });
 
+    // ✅ Auto-asignación a Victor
+    const autoCourier = await getAutoAssignCourier();
+    if (!autoCourier && String(AUTO_ASSIGN_STRICT) === "1") {
+      return safeJson(res, 500, { ok: false, message: "Auto-asignación activa pero no existe mensajero 'victor' (activo)." });
+    }
+    const assignedToUserId = autoCourier ? autoCourier.id : null;
+    const assignedToName = autoCourier ? autoCourier.name : "";
+
     const r = await dbQuery(
       `INSERT INTO msg_requests(
         created_by_user_id, created_by_username,
         requester_name, requester_department, requester_email, requester_phone,
         request_type, contact_person_phone, address_details, description, priority,
         status, status_updated_at, updated_at,
+        assigned_to_user_id, assigned_to_name, assigned_at,
         courier_comment, closed_at
       )
       VALUES(
@@ -549,6 +590,7 @@ app.post("/api/user/requests", verifyUser, async (req, res) => {
         $3,$4,$5,$6,
         $7,$8,$9,$10,$11,
         'open', NOW(), NOW(),
+        $12,$13, CASE WHEN $12::bigint IS NULL THEN NULL ELSE NOW() END,
         '', NULL
       )
       RETURNING
@@ -567,6 +609,8 @@ app.post("/api/user/requests", verifyUser, async (req, res) => {
         addressDetails,
         description,
         priority,
+        assignedToUserId,
+        assignedToName,
       ]
     );
 
@@ -591,7 +635,7 @@ app.post("/api/user/requests", verifyUser, async (req, res) => {
           contactPersonPhone,
           addressDetails,
           description,
-          assignedToName: "",
+          assignedToName: assignedToName || "",
           courierComment: "",
           createdAt: createdAtLocal,
           closedAt: null,
@@ -708,7 +752,7 @@ app.get("/api/user/courier/requests", verifyUser, async (req, res) => {
         ${fmtTsSql("r.closed_at")} AS closed_at_local
        FROM msg_requests r
        ${whereSql}
-       ORDER BY r.created_at DESC, r.id DESC
+       ORDER BY r.created_at DESC
        LIMIT 500`,
       params
     );
@@ -747,11 +791,13 @@ app.patch("/api/user/courier/requests/:id", verifyUser, async (req, res) => {
     const id = Number(req.params.id || 0);
     if (!id) return safeJson(res, 400, { ok: false, message: "id inválido" });
 
+    // validar usuario courier
     const uR = await dbQuery(`SELECT id, role, is_active FROM msg_users WHERE id=$1 LIMIT 1`, [userId]);
     const u = uR.rows?.[0];
     if (!u || !u.is_active) return safeJson(res, 401, { ok: false, message: "Usuario inactivo" });
     if (!isCourierRole(u.role)) return safeJson(res, 403, { ok: false, message: "Solo mensajeros." });
 
+    // validar que la solicitud esté asignada a este mensajero (seguridad)
     const curR = await dbQuery(
       `SELECT id, assigned_to_user_id, status, courier_comment
        FROM msg_requests WHERE id=$1 LIMIT 1`,
@@ -788,7 +834,7 @@ app.patch("/api/user/courier/requests/:id", verifyUser, async (req, res) => {
       [id, status, comment]
     );
 
-    // ✅ Notificación si cambió estado o comentario
+    // Notificación si cambió estado o comentario
     const changed = (oldStatus !== status) || (oldComment !== comment);
     if (changed) {
       const reqR = await dbQuery(
@@ -952,7 +998,7 @@ app.patch("/api/admin/messaging/requests/:id/assign", verifyAdmin, async (req, r
       [id, courierUserId, assignedName]
     );
 
-    // ✅ Notificación: asignación
+    // Notificación: asignación
     try {
       const reqR = await dbQuery(
         `SELECT
@@ -1033,10 +1079,9 @@ app.patch("/api/admin/messaging/requests/:id/status", verifyAdmin, async (req, r
       [id, status]
     );
 
-    // ✅ Notificación: cambio de estado (admin)
+    // Notificación: cambio de estado (admin)
     if (oldStatus !== status) {
       try {
-        // refrescar tiempos post-update
         const afterR = await dbQuery(
           `SELECT
              ${fmtTsSql("created_at")} AS created_at_local,
