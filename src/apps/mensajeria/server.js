@@ -22,6 +22,13 @@ const {
 
   // CORS_ORIGIN=https://prodima.com.pa,https://www.prodima.com.pa
   CORS_ORIGIN = "",
+
+  // ✅ Google Apps Script Webhook
+  GAS_WEBHOOK_URL = "",
+  GAS_WEBHOOK_SECRET = "",
+
+  // ✅ Buzón/grupo de mensajería (opcional; default el que dijiste)
+  COURIER_MAILBOX = "mensajeria@prodima.com.pa",
 } = process.env;
 
 /* =========================
@@ -217,6 +224,75 @@ function normStatus(s) {
 }
 function isISODate(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
+}
+
+/* =========================
+   EMAIL NOTIFICATIONS via Google Apps Script (Webhook)
+========================= */
+function isEmail(s) {
+  return /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(String(s || "").trim());
+}
+
+// Fetch helper: Node 18+ tiene fetch; Node <18 usa node-fetch si lo instalas.
+async function _getFetch() {
+  if (typeof fetch !== "undefined") return fetch;
+  const mod = await import("node-fetch"); // npm i node-fetch
+  return mod.default;
+}
+
+async function getActiveCourierEmails() {
+  const r = await dbQuery(
+    `SELECT email
+     FROM msg_users
+     WHERE is_active=TRUE
+       AND role='courier'
+       AND COALESCE(email,'') <> ''`
+  );
+  return (r.rows || [])
+    .map((x) => String(x.email || "").trim().toLowerCase())
+    .filter((x) => isEmail(x));
+}
+
+async function buildCourierRecipients() {
+  // Siempre incluir el buzón de mensajería (si existe)
+  const base = [];
+  if (COURIER_MAILBOX && isEmail(COURIER_MAILBOX)) base.push(String(COURIER_MAILBOX).trim().toLowerCase());
+
+  // + incluir todos los couriers activos por tabla
+  const couriers = await getActiveCourierEmails();
+  const all = [...base, ...couriers];
+
+  // dedupe
+  const uniq = [...new Set(all.map((x) => x.trim().toLowerCase()).filter(Boolean))];
+  return uniq.join(",");
+}
+
+async function notifyViaGAS({ event, requesterEmail, courierTo, data }) {
+  if (!GAS_WEBHOOK_URL || !GAS_WEBHOOK_SECRET) return;
+
+  const payload = {
+    secret: GAS_WEBHOOK_SECRET,
+    event,
+    requesterEmail: requesterEmail || "",
+    courierTo: courierTo || "",
+    data: data || {},
+  };
+
+  try {
+    const f = await _getFetch();
+    const resp = await f(GAS_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      console.error("GAS notify failed:", resp.status, t);
+    }
+  } catch (err) {
+    console.error("GAS notify error:", err?.message || err);
+  }
 }
 
 /* =========================
@@ -472,7 +548,32 @@ app.post("/api/user/requests", verifyUser, async (req, res) => {
       ]
     );
 
-    return safeJson(res, 200, { ok: true, id: Number(r.rows?.[0]?.id || 0) });
+    const newId = Number(r.rows?.[0]?.id || 0);
+
+    // ✅ Notificación: creada (a solicitante + mensajeros)
+    try {
+      const courierTo = await buildCourierRecipients();
+      void notifyViaGAS({
+        event: "created",
+        requesterEmail: String(u.email || ""),
+        courierTo,
+        data: {
+          id: newId,
+          status: "open",
+          requestType,
+          priority,
+          department: String(u.department || ""),
+          requesterName: String(u.full_name || ""),
+          contactPersonPhone,
+          addressDetails,
+          description,
+          assignedToName: "",
+          courierComment: "",
+        },
+      });
+    } catch (_) {}
+
+    return safeJson(res, 200, { ok: true, id: newId });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -622,7 +723,8 @@ app.patch("/api/user/courier/requests/:id", verifyUser, async (req, res) => {
 
     // validar que la solicitud esté asignada a este mensajero (seguridad)
     const curR = await dbQuery(
-      `SELECT id, assigned_to_user_id, status FROM msg_requests WHERE id=$1 LIMIT 1`,
+      `SELECT id, assigned_to_user_id, status, courier_comment
+       FROM msg_requests WHERE id=$1 LIMIT 1`,
       [id]
     );
     const cur = curR.rows?.[0];
@@ -632,6 +734,9 @@ app.patch("/api/user/courier/requests/:id", verifyUser, async (req, res) => {
     if (!assignedTo || assignedTo !== userId) {
       return safeJson(res, 403, { ok: false, message: "Solo puedes actualizar solicitudes asignadas a ti." });
     }
+
+    const oldStatus = String(cur.status || "");
+    const oldComment = String(cur.courier_comment || "");
 
     const status = normStatus(req.body?.status || "");
     const comment = String(req.body?.comment || "").trim();
@@ -653,6 +758,43 @@ app.patch("/api/user/courier/requests/:id", verifyUser, async (req, res) => {
        WHERE id=$1`,
       [id, status, comment]
     );
+
+    // ✅ Notificación: cambio de estado y/o comentario
+    const changed = (oldStatus !== status) || (oldComment !== comment);
+    if (changed) {
+      const reqR = await dbQuery(
+        `SELECT id, requester_email, requester_name, requester_department,
+                request_type, priority, contact_person_phone, address_details, description,
+                assigned_to_name, courier_comment
+         FROM msg_requests
+         WHERE id=$1 LIMIT 1`,
+        [id]
+      );
+      const reqRow = reqR.rows?.[0];
+      if (reqRow) {
+        const courierTo = await buildCourierRecipients();
+        void notifyViaGAS({
+          event: "status_changed",
+          requesterEmail: reqRow.requester_email || "",
+          courierTo,
+          data: {
+            id,
+            oldStatus,
+            newStatus: status,
+            status,
+            requestType: reqRow.request_type,
+            priority: reqRow.priority,
+            department: reqRow.requester_department,
+            requesterName: reqRow.requester_name,
+            contactPersonPhone: reqRow.contact_person_phone,
+            addressDetails: reqRow.address_details,
+            description: reqRow.description,
+            assignedToName: reqRow.assigned_to_name || "",
+            courierComment: comment || reqRow.courier_comment || "",
+          },
+        });
+      }
+    }
 
     return safeJson(res, 200, { ok: true });
   } catch (e) {
@@ -771,6 +913,37 @@ app.patch("/api/admin/messaging/requests/:id/assign", verifyAdmin, async (req, r
       [id, courierUserId, assignedName]
     );
 
+    // ✅ Notificación: asignación (o desasignación)
+    try {
+      const reqR = await dbQuery(
+        `SELECT id, requester_email, requester_name, requester_department,
+                request_type, priority, contact_person_phone, address_details, description,
+                assigned_to_name
+         FROM msg_requests WHERE id=$1 LIMIT 1`,
+        [id]
+      );
+      const reqRow = reqR.rows?.[0];
+      if (reqRow) {
+        const courierTo = await buildCourierRecipients();
+        void notifyViaGAS({
+          event: "assigned",
+          requesterEmail: reqRow.requester_email || "",
+          courierTo,
+          data: {
+            id,
+            requestType: reqRow.request_type,
+            priority: reqRow.priority,
+            department: reqRow.requester_department,
+            requesterName: reqRow.requester_name,
+            contactPersonPhone: reqRow.contact_person_phone,
+            addressDetails: reqRow.address_details,
+            description: reqRow.description,
+            assignedToName: reqRow.assigned_to_name || "",
+          },
+        });
+      }
+    } catch (_) {}
+
     return safeJson(res, 200, { ok: true });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -789,6 +962,19 @@ app.patch("/api/admin/messaging/requests/:id/status", verifyAdmin, async (req, r
       return safeJson(res, 400, { ok: false, message: "status inválido" });
     }
 
+    // Leer estado previo + datos para notificar
+    const beforeR = await dbQuery(
+      `SELECT id, status, requester_email, requester_name, requester_department,
+              request_type, priority, contact_person_phone, address_details, description,
+              assigned_to_name, courier_comment
+       FROM msg_requests
+       WHERE id=$1 LIMIT 1`,
+      [id]
+    );
+    const before = beforeR.rows?.[0];
+    if (!before) return safeJson(res, 404, { ok: false, message: "Solicitud no encontrada" });
+    const oldStatus = String(before.status || "");
+
     const closedAtSql = status === "closed" ? "NOW()" : "NULL";
 
     await dbQuery(
@@ -797,6 +983,33 @@ app.patch("/api/admin/messaging/requests/:id/status", verifyAdmin, async (req, r
        WHERE id=$1`,
       [id, status]
     );
+
+    // ✅ Notificación: cambio de estado (admin)
+    if (oldStatus !== status) {
+      try {
+        const courierTo = await buildCourierRecipients();
+        void notifyViaGAS({
+          event: "status_changed",
+          requesterEmail: before.requester_email || "",
+          courierTo,
+          data: {
+            id,
+            oldStatus,
+            newStatus: status,
+            status,
+            requestType: before.request_type,
+            priority: before.priority,
+            department: before.requester_department,
+            requesterName: before.requester_name,
+            contactPersonPhone: before.contact_person_phone,
+            addressDetails: before.address_details,
+            description: before.description,
+            assignedToName: before.assigned_to_name || "",
+            courierComment: before.courier_comment || "",
+          },
+        });
+      } catch (_) {}
+    }
 
     return safeJson(res, 200, { ok: true });
   } catch (e) {
