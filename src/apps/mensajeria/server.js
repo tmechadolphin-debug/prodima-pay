@@ -1,4 +1,4 @@
-// server.js (Mensajería Interna PRODIMA) — con courier_comment + closed_at + endpoints mensajero
+// server.js (Mensajería Interna PRODIMA) — Notificaciones por Google Apps Script + fechas sin desfase
 import express from "express";
 import pg from "pg";
 import jwt from "jsonwebtoken";
@@ -27,8 +27,11 @@ const {
   GAS_WEBHOOK_URL = "",
   GAS_WEBHOOK_SECRET = "",
 
-  // ✅ Buzón/grupo de mensajería (opcional; default el que dijiste)
+  // ✅ Buzón/grupo mensajería
   COURIER_MAILBOX = "mensajeria@prodima.com.pa",
+
+  // ✅ Supervisores
+  SUPERVISOR_NOTIFY_TO = "logistica2@prodima.com.pa,melanie.choy@prodima.com.pa,malena.torrero@prodima.com.pa",
 } = process.env;
 
 /* =========================
@@ -78,9 +81,10 @@ async function dbQuery(text, params = []) {
 async function ensureDb() {
   if (!hasDb()) return;
 
-pool.on("connect", (client) => {
-  client.query("SET TIME ZONE 'America/Panama'").catch(() => {});
-});
+  // Asegura zona horaria de la sesión DB (Panamá)
+  pool.on("connect", (client) => {
+    client.query("SET TIME ZONE 'America/Panama'").catch(() => {});
+  });
 
   // Usuarios de mensajería (solicitantes + mensajeros)
   await dbQuery(`
@@ -130,7 +134,7 @@ pool.on("connect", (client) => {
     );
   `);
 
-  // ✅ NUEVO: columnas para comentario del mensajero + fecha cierre
+  // ✅ columnas comentario del mensajero + fecha cierre
   await dbQuery(`ALTER TABLE msg_requests ADD COLUMN IF NOT EXISTS courier_comment TEXT DEFAULT '';`);
   await dbQuery(`ALTER TABLE msg_requests ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP;`);
 
@@ -186,7 +190,6 @@ function isCourierRole(role) {
 
 /* =========================
    PIN hashing (crypto pbkdf2)
-   Guardamos: pbkdf2$iter$salt$hashHex
 ========================= */
 const PIN_ITER = 120_000;
 
@@ -227,10 +230,26 @@ function isISODate(s) {
 }
 
 /* =========================
+   FECHAS “LOCAL PANAMÁ” (evita desfase 5 horas)
+   Retornamos strings sin "Z" para que el frontend no las interprete como UTC.
+========================= */
+const SQL_DT_FMT = `YYYY-MM-DD"T"HH24:MI:SS`;
+function fmtTsSql(col) {
+  return `to_char(${col}, '${SQL_DT_FMT}')`;
+}
+
+/* =========================
    EMAIL NOTIFICATIONS via Google Apps Script (Webhook)
 ========================= */
 function isEmail(s) {
   return /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(String(s || "").trim());
+}
+
+function parseEmailList(csv) {
+  return String(csv || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter((x) => isEmail(x));
 }
 
 // Fetch helper: Node 18+ tiene fetch; Node <18 usa node-fetch si lo instalas.
@@ -253,28 +272,27 @@ async function getActiveCourierEmails() {
     .filter((x) => isEmail(x));
 }
 
-async function buildCourierRecipients() {
-  // Siempre incluir el buzón de mensajería (si existe)
+async function buildNotifyRecipientsForCouriersAndSupervisors() {
   const base = [];
   if (COURIER_MAILBOX && isEmail(COURIER_MAILBOX)) base.push(String(COURIER_MAILBOX).trim().toLowerCase());
 
-  // + incluir todos los couriers activos por tabla
+  const supervisors = parseEmailList(SUPERVISOR_NOTIFY_TO);
   const couriers = await getActiveCourierEmails();
-  const all = [...base, ...couriers];
 
-  // dedupe
+  const all = [...base, ...supervisors, ...couriers];
   const uniq = [...new Set(all.map((x) => x.trim().toLowerCase()).filter(Boolean))];
+
   return uniq.join(",");
 }
 
-async function notifyViaGAS({ event, requesterEmail, courierTo, data }) {
+async function notifyViaGAS({ event, requesterEmail, notifyTo, data }) {
   if (!GAS_WEBHOOK_URL || !GAS_WEBHOOK_SECRET) return;
 
   const payload = {
     secret: GAS_WEBHOOK_SECRET,
     event,
     requesterEmail: requesterEmail || "",
-    courierTo: courierTo || "",
+    notifyTo: notifyTo || "",
     data: data || {},
   };
 
@@ -392,7 +410,9 @@ app.get("/api/admin/messaging/users", verifyAdmin, async (req, res) => {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
 
     const r = await dbQuery(
-      `SELECT id, username, full_name, department, role, email, phone, is_active, created_at
+      `SELECT
+         id, username, full_name, department, role, email, phone, is_active,
+         ${fmtTsSql("created_at")} AS created_at_local
        FROM msg_users
        ORDER BY id DESC
        LIMIT 2000`
@@ -407,7 +427,7 @@ app.get("/api/admin/messaging/users", verifyAdmin, async (req, res) => {
       email: u.email || "",
       phone: u.phone || "",
       isActive: Boolean(u.is_active),
-      createdAt: u.created_at,
+      createdAt: u.created_at_local || null,
     }));
 
     return safeJson(res, 200, { ok: true, users });
@@ -501,7 +521,6 @@ app.post("/api/user/requests", verifyUser, async (req, res) => {
     const u = uR.rows?.[0];
     if (!u || !u.is_active) return safeJson(res, 401, { ok: false, message: "Usuario inactivo" });
 
-    // Si es mensajero, por diseño NO crea solicitudes aquí (tu frontend ya lo oculta)
     if (isCourierRole(u.role)) {
       return safeJson(res, 403, { ok: false, message: "Mensajero no crea solicitudes desde este módulo." });
     }
@@ -532,7 +551,10 @@ app.post("/api/user/requests", verifyUser, async (req, res) => {
         'open', NOW(), NOW(),
         '', NULL
       )
-      RETURNING id`,
+      RETURNING
+        id,
+        ${fmtTsSql("created_at")} AS created_at_local,
+        ${fmtTsSql("status_updated_at")} AS status_updated_at_local`,
       [
         Number(u.id),
         String(u.username || ""),
@@ -549,14 +571,16 @@ app.post("/api/user/requests", verifyUser, async (req, res) => {
     );
 
     const newId = Number(r.rows?.[0]?.id || 0);
+    const createdAtLocal = r.rows?.[0]?.created_at_local || null;
+    const statusUpdatedAtLocal = r.rows?.[0]?.status_updated_at_local || null;
 
-    // ✅ Notificación: creada (a solicitante + mensajeros)
+    // ✅ Notificación: creada (solicitante + mensajeros + supervisores + buzón)
     try {
-      const courierTo = await buildCourierRecipients();
+      const notifyTo = await buildNotifyRecipientsForCouriersAndSupervisors();
       void notifyViaGAS({
         event: "created",
         requesterEmail: String(u.email || ""),
-        courierTo,
+        notifyTo,
         data: {
           id: newId,
           status: "open",
@@ -569,6 +593,9 @@ app.post("/api/user/requests", verifyUser, async (req, res) => {
           description,
           assignedToName: "",
           courierComment: "",
+          createdAt: createdAtLocal,
+          closedAt: null,
+          statusUpdatedAt: statusUpdatedAtLocal,
         },
       });
     } catch (_) {}
@@ -597,9 +624,12 @@ app.get("/api/user/requests", verifyUser, async (req, res) => {
 
     const r = await dbQuery(
       `SELECT
-        id, created_at, request_type, priority, status,
+        id,
+        ${fmtTsSql("created_at")} AS created_at_local,
+        request_type, priority, status,
         assigned_to_name, assigned_to_user_id, address_details,
-        courier_comment, closed_at
+        courier_comment,
+        ${fmtTsSql("closed_at")} AS closed_at_local
        FROM msg_requests
        WHERE ${where.join(" AND ")}
        ORDER BY created_at DESC
@@ -609,7 +639,7 @@ app.get("/api/user/requests", verifyUser, async (req, res) => {
 
     const requests = (r.rows || []).map((x) => ({
       id: Number(x.id),
-      createdAt: x.created_at,
+      createdAt: x.created_at_local || null,
       requestType: x.request_type,
       priority: x.priority,
       status: x.status,
@@ -617,7 +647,7 @@ app.get("/api/user/requests", verifyUser, async (req, res) => {
       assignedToUserId: x.assigned_to_user_id != null ? Number(x.assigned_to_user_id) : null,
       addressDetails: x.address_details || "",
       courierComment: x.courier_comment || "",
-      closedAt: x.closed_at || null,
+      closedAt: x.closed_at_local || null,
     }));
 
     return safeJson(res, 200, { ok: true, requests });
@@ -628,7 +658,6 @@ app.get("/api/user/requests", verifyUser, async (req, res) => {
 
 /* =========================
    USER (MENSAJERO): LIST + UPDATE
-   ✅ FIX 404: endpoints que tu frontend está llamando
 ========================= */
 
 // GET /api/user/courier/requests?scope=assigned|all&status=open|...
@@ -667,13 +696,16 @@ app.get("/api/user/courier/requests", verifyUser, async (req, res) => {
 
     const r = await dbQuery(
       `SELECT
-        r.id, r.created_at, r.updated_at,
+        r.id,
+        ${fmtTsSql("r.created_at")} AS created_at_local,
+        ${fmtTsSql("r.updated_at")} AS updated_at_local,
         r.created_by_username,
         r.requester_name, r.requester_department,
         r.request_type, r.priority, r.status,
         r.contact_person_phone, r.address_details, r.description,
         r.assigned_to_user_id, r.assigned_to_name,
-        r.courier_comment, r.closed_at
+        r.courier_comment,
+        ${fmtTsSql("r.closed_at")} AS closed_at_local
        FROM msg_requests r
        ${whereSql}
        ORDER BY r.created_at DESC
@@ -683,8 +715,8 @@ app.get("/api/user/courier/requests", verifyUser, async (req, res) => {
 
     const requests = (r.rows || []).map((x) => ({
       id: Number(x.id),
-      createdAt: x.created_at,
-      updatedAt: x.updated_at,
+      createdAt: x.created_at_local || null,
+      updatedAt: x.updated_at_local || null,
       createdByUsername: x.created_by_username || "",
       requesterName: x.requester_name || "",
       department: x.requester_department || "",
@@ -697,7 +729,7 @@ app.get("/api/user/courier/requests", verifyUser, async (req, res) => {
       assignedToUserId: x.assigned_to_user_id != null ? Number(x.assigned_to_user_id) : null,
       assignedToName: x.assigned_to_name || "",
       courierComment: x.courier_comment || "",
-      closedAt: x.closed_at || null,
+      closedAt: x.closed_at_local || null,
     }));
 
     return safeJson(res, 200, { ok: true, scope, status: status || "__ALL__", requests });
@@ -715,13 +747,11 @@ app.patch("/api/user/courier/requests/:id", verifyUser, async (req, res) => {
     const id = Number(req.params.id || 0);
     if (!id) return safeJson(res, 400, { ok: false, message: "id inválido" });
 
-    // validar usuario courier
     const uR = await dbQuery(`SELECT id, role, is_active FROM msg_users WHERE id=$1 LIMIT 1`, [userId]);
     const u = uR.rows?.[0];
     if (!u || !u.is_active) return safeJson(res, 401, { ok: false, message: "Usuario inactivo" });
     if (!isCourierRole(u.role)) return safeJson(res, 403, { ok: false, message: "Solo mensajeros." });
 
-    // validar que la solicitud esté asignada a este mensajero (seguridad)
     const curR = await dbQuery(
       `SELECT id, assigned_to_user_id, status, courier_comment
        FROM msg_requests WHERE id=$1 LIMIT 1`,
@@ -745,7 +775,6 @@ app.patch("/api/user/courier/requests/:id", verifyUser, async (req, res) => {
       return safeJson(res, 400, { ok: false, message: "status inválido" });
     }
 
-    // Si cierra, set closed_at NOW(); si no está cerrada, closed_at NULL
     const closedAtSql = status === "closed" ? "NOW()" : "NULL";
 
     await dbQuery(
@@ -759,24 +788,28 @@ app.patch("/api/user/courier/requests/:id", verifyUser, async (req, res) => {
       [id, status, comment]
     );
 
-    // ✅ Notificación: cambio de estado y/o comentario
+    // ✅ Notificación si cambió estado o comentario
     const changed = (oldStatus !== status) || (oldComment !== comment);
     if (changed) {
       const reqR = await dbQuery(
-        `SELECT id, requester_email, requester_name, requester_department,
-                request_type, priority, contact_person_phone, address_details, description,
-                assigned_to_name, courier_comment
+        `SELECT
+          id, requester_email, requester_name, requester_department,
+          request_type, priority, contact_person_phone, address_details, description,
+          assigned_to_name, courier_comment,
+          ${fmtTsSql("created_at")} AS created_at_local,
+          ${fmtTsSql("closed_at")} AS closed_at_local,
+          ${fmtTsSql("status_updated_at")} AS status_updated_at_local
          FROM msg_requests
          WHERE id=$1 LIMIT 1`,
         [id]
       );
       const reqRow = reqR.rows?.[0];
       if (reqRow) {
-        const courierTo = await buildCourierRecipients();
+        const notifyTo = await buildNotifyRecipientsForCouriersAndSupervisors();
         void notifyViaGAS({
           event: "status_changed",
           requesterEmail: reqRow.requester_email || "",
-          courierTo,
+          notifyTo,
           data: {
             id,
             oldStatus,
@@ -791,6 +824,9 @@ app.patch("/api/user/courier/requests/:id", verifyUser, async (req, res) => {
             description: reqRow.description,
             assignedToName: reqRow.assigned_to_name || "",
             courierComment: comment || reqRow.courier_comment || "",
+            createdAt: reqRow.created_at_local || null,
+            closedAt: reqRow.closed_at_local || null,
+            statusUpdatedAt: reqRow.status_updated_at_local || null,
           },
         });
       }
@@ -845,12 +881,15 @@ app.get("/api/admin/messaging/requests", verifyAdmin, async (req, res) => {
 
     const dataR = await dbQuery(
       `SELECT
-        r.id, r.created_at, r.updated_at,
+        r.id,
+        ${fmtTsSql("r.created_at")} AS created_at_local,
+        ${fmtTsSql("r.updated_at")} AS updated_at_local,
         r.created_by_username,
         r.requester_name, r.requester_department,
         r.request_type, r.priority, r.status,
         r.assigned_to_user_id, r.assigned_to_name,
-        r.courier_comment, r.closed_at
+        r.courier_comment,
+        ${fmtTsSql("r.closed_at")} AS closed_at_local
        FROM msg_requests r
        ${whereSql}
        ORDER BY r.created_at DESC
@@ -860,8 +899,8 @@ app.get("/api/admin/messaging/requests", verifyAdmin, async (req, res) => {
 
     const requests = (dataR.rows || []).map((r) => ({
       id: Number(r.id),
-      createdAt: r.created_at,
-      updatedAt: r.updated_at,
+      createdAt: r.created_at_local || null,
+      updatedAt: r.updated_at_local || null,
       createdByUsername: r.created_by_username,
       requesterName: r.requester_name,
       department: r.requester_department,
@@ -871,7 +910,7 @@ app.get("/api/admin/messaging/requests", verifyAdmin, async (req, res) => {
       assignedToUserId: r.assigned_to_user_id != null ? Number(r.assigned_to_user_id) : null,
       assignedToName: r.assigned_to_name || "",
       courierComment: r.courier_comment || "",
-      closedAt: r.closed_at || null,
+      closedAt: r.closed_at_local || null,
     }));
 
     return safeJson(res, 200, { ok: true, total, page, limit, requests });
@@ -913,22 +952,26 @@ app.patch("/api/admin/messaging/requests/:id/assign", verifyAdmin, async (req, r
       [id, courierUserId, assignedName]
     );
 
-    // ✅ Notificación: asignación (o desasignación)
+    // ✅ Notificación: asignación
     try {
       const reqR = await dbQuery(
-        `SELECT id, requester_email, requester_name, requester_department,
-                request_type, priority, contact_person_phone, address_details, description,
-                assigned_to_name
+        `SELECT
+           id, requester_email, requester_name, requester_department,
+           request_type, priority, contact_person_phone, address_details, description,
+           assigned_to_name,
+           ${fmtTsSql("created_at")} AS created_at_local,
+           ${fmtTsSql("closed_at")} AS closed_at_local,
+           ${fmtTsSql("status_updated_at")} AS status_updated_at_local
          FROM msg_requests WHERE id=$1 LIMIT 1`,
         [id]
       );
       const reqRow = reqR.rows?.[0];
       if (reqRow) {
-        const courierTo = await buildCourierRecipients();
+        const notifyTo = await buildNotifyRecipientsForCouriersAndSupervisors();
         void notifyViaGAS({
           event: "assigned",
           requesterEmail: reqRow.requester_email || "",
-          courierTo,
+          notifyTo,
           data: {
             id,
             requestType: reqRow.request_type,
@@ -939,6 +982,9 @@ app.patch("/api/admin/messaging/requests/:id/assign", verifyAdmin, async (req, r
             addressDetails: reqRow.address_details,
             description: reqRow.description,
             assignedToName: reqRow.assigned_to_name || "",
+            createdAt: reqRow.created_at_local || null,
+            closedAt: reqRow.closed_at_local || null,
+            statusUpdatedAt: reqRow.status_updated_at_local || null,
           },
         });
       }
@@ -962,19 +1008,22 @@ app.patch("/api/admin/messaging/requests/:id/status", verifyAdmin, async (req, r
       return safeJson(res, 400, { ok: false, message: "status inválido" });
     }
 
-    // Leer estado previo + datos para notificar
     const beforeR = await dbQuery(
-      `SELECT id, status, requester_email, requester_name, requester_department,
-              request_type, priority, contact_person_phone, address_details, description,
-              assigned_to_name, courier_comment
+      `SELECT
+        id, status, requester_email, requester_name, requester_department,
+        request_type, priority, contact_person_phone, address_details, description,
+        assigned_to_name, courier_comment,
+        ${fmtTsSql("created_at")} AS created_at_local,
+        ${fmtTsSql("closed_at")} AS closed_at_local,
+        ${fmtTsSql("status_updated_at")} AS status_updated_at_local
        FROM msg_requests
        WHERE id=$1 LIMIT 1`,
       [id]
     );
     const before = beforeR.rows?.[0];
     if (!before) return safeJson(res, 404, { ok: false, message: "Solicitud no encontrada" });
-    const oldStatus = String(before.status || "");
 
+    const oldStatus = String(before.status || "");
     const closedAtSql = status === "closed" ? "NOW()" : "NULL";
 
     await dbQuery(
@@ -987,11 +1036,22 @@ app.patch("/api/admin/messaging/requests/:id/status", verifyAdmin, async (req, r
     // ✅ Notificación: cambio de estado (admin)
     if (oldStatus !== status) {
       try {
-        const courierTo = await buildCourierRecipients();
+        // refrescar tiempos post-update
+        const afterR = await dbQuery(
+          `SELECT
+             ${fmtTsSql("created_at")} AS created_at_local,
+             ${fmtTsSql("closed_at")} AS closed_at_local,
+             ${fmtTsSql("status_updated_at")} AS status_updated_at_local
+           FROM msg_requests WHERE id=$1 LIMIT 1`,
+          [id]
+        );
+        const after = afterR.rows?.[0] || {};
+
+        const notifyTo = await buildNotifyRecipientsForCouriersAndSupervisors();
         void notifyViaGAS({
           event: "status_changed",
           requesterEmail: before.requester_email || "",
-          courierTo,
+          notifyTo,
           data: {
             id,
             oldStatus,
@@ -1006,6 +1066,9 @@ app.patch("/api/admin/messaging/requests/:id/status", verifyAdmin, async (req, r
             description: before.description,
             assignedToName: before.assigned_to_name || "",
             courierComment: before.courier_comment || "",
+            createdAt: after.created_at_local || before.created_at_local || null,
+            closedAt: after.closed_at_local || null,
+            statusUpdatedAt: after.status_updated_at_local || null,
           },
         });
       } catch (_) {}
