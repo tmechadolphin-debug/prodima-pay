@@ -708,7 +708,7 @@ app.get("/api/user/courier/requests", verifyUser, async (req, res) => {
         ${fmtTsSql("r.closed_at")} AS closed_at_local
        FROM msg_requests r
        ${whereSql}
-       ORDER BY r.created_at DESC
+       ORDER BY r.created_at DESC, r.id DESC
        LIMIT 500`,
       params
     );
