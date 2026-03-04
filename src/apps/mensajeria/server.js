@@ -71,6 +71,10 @@ async function dbQuery(text, params = []) {
 async function ensureDb() {
   if (!hasDb()) return;
 
+pool.on("connect", (client) => {
+  client.query("SET TIME ZONE 'America/Panama'").catch(() => {});
+});
+
   // Usuarios de mensajería (solicitantes + mensajeros)
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS msg_users (
