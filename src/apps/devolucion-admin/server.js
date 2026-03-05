@@ -1,7 +1,5 @@
 // server.js (ADMIN DEVOLUCIONES) — COMPLETO
-// ✅ Dashboard + Histórico (DB) + Usuarios + Líneas + Cambiar estado Open/Closed
-// ✅ CORS robusto para Render
-// ✅ ESM (import). Si tu proyecto NO usa "type":"module", avísame y te lo convierto a require().
+// ESM: usa "type":"module" en package.json
 
 import express from "express";
 import pg from "pg";
@@ -25,10 +23,10 @@ const {
   ADMIN_PASS = "ADMINISTRADOR",
 
   // Render:
-  // CORS_ORIGIN=https://tu-dominio.com,https://www.tu-dominio.com
+  // CORS_ORIGIN=https://tu-admin-web.com,https://www.tu-admin-web.com
   CORS_ORIGIN = "",
 
-  // Listas para filtros en Admin (mismos que Pedidos)
+  // Listas para filtros en Admin
   RETURN_MOTIVOS = "Producto vencido,Cliente rechazó,Producto dañado,Error de facturación,Otro",
   RETURN_CAUSAS = "Empaque roto,Pedido incorrecto,Producto incorrecto,Faltante,Otro",
 } = process.env;
@@ -47,6 +45,7 @@ const allowAll = ALLOWED_ORIGINS.size === 0;
 app.use((req, res, next) => {
   const origin = req.headers.origin;
 
+  // si no configuras CORS_ORIGIN -> allowAll
   if (allowAll && origin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
@@ -106,12 +105,12 @@ async function ensureDb() {
     );
   `);
 
-  // Cabecera solicitudes de devolución (cache DB)
+  // Cabecera devoluciones
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS return_requests (
       id BIGSERIAL PRIMARY KEY,
-      req_num BIGINT UNIQUE NOT NULL,          -- SAP DocNum (o número asignado)
-      req_entry BIGINT,                         -- SAP DocEntry
+      req_num BIGINT UNIQUE NOT NULL,
+      req_entry BIGINT,
       doc_date DATE,
       doc_time INT,
       card_code TEXT,
@@ -128,7 +127,7 @@ async function ensureDb() {
     );
   `);
 
-  // Líneas solicitudes
+  // Líneas devoluciones
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS return_lines (
       id BIGSERIAL PRIMARY KEY,
@@ -164,7 +163,7 @@ function signToken(payload, ttl = "12h") {
 
 function readBearer(req) {
   const auth = String(req.headers.authorization || "");
-  const m = auth.match(/^Bearer\s+(.+)$/i);
+  const m = auth.match(/^Bearer\\s+(.+)$/i);
   return m ? m[1] : "";
 }
 
@@ -187,8 +186,8 @@ function norm(s) {
     .trim()
     .toLowerCase()
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ");
+    .replace(/[\\u0300-\\u036f]/g, "")
+    .replace(/\\s+/g, " ");
 }
 
 async function hashPin(pin) {
@@ -211,7 +210,7 @@ function provinceToWarehouseServer(province) {
 app.get("/api/health", async (req, res) => {
   safeJson(res, 200, {
     ok: true,
-    message: "✅ PRODIMA ADMIN DEVOLUCIONES API activa",
+    message: "✅ PRODIMA DEVOLUCIONES ADMIN API activa",
     db: hasDb() ? "on" : "off",
     motivos: MOTIVOS.length,
     causas: CAUSAS.length,
@@ -244,7 +243,6 @@ app.post("/api/admin/login", async (req, res) => {
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
-
     const r = await dbQuery(
       `SELECT id, username, full_name, province, warehouse_code, is_active, created_at
        FROM app_users
@@ -327,7 +325,6 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
   }
 });
 
-// (Opcional) Cambiar PIN
 app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
@@ -518,8 +515,8 @@ app.get("/api/admin/returns/dashboard-db", verifyAdmin, async (req, res) => {
 });
 
 /* =========================
-   HISTÓRICO (DB, paginado + filtros)
-   GET /api/admin/returns/db?from&to&user&client&motivo&causa&openOnly=1&skip&limit&onlyCreated=1
+   HISTÓRICO (DB)
+   GET /api/admin/returns/db?...&skip&limit&openOnly=1
 ========================= */
 app.get("/api/admin/returns/db", verifyAdmin, async (req, res) => {
   try {
@@ -606,15 +603,7 @@ app.get("/api/admin/returns/db", verifyAdmin, async (req, res) => {
       [...params, skip, limit]
     );
 
-    return safeJson(res, 200, {
-      ok: true,
-      from,
-      to,
-      total,
-      skip,
-      limit,
-      rows: dataR.rows || [],
-    });
+    return safeJson(res, 200, { ok: true, from, to, total, skip, limit, rows: dataR.rows || [] });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -622,7 +611,6 @@ app.get("/api/admin/returns/db", verifyAdmin, async (req, res) => {
 
 /* =========================
    LÍNEAS (DB)
-   GET /api/admin/returns/lines?reqNum=123
 ========================= */
 app.get("/api/admin/returns/lines", verifyAdmin, async (req, res) => {
   try {
@@ -670,7 +658,6 @@ app.get("/api/admin/returns/lines", verifyAdmin, async (req, res) => {
 
 /* =========================
    CAMBIAR ESTADO (DB)
-   PATCH /api/admin/returns/:reqNum/status { status:"Open"|"Closed" }
 ========================= */
 app.patch("/api/admin/returns/:reqNum/status", verifyAdmin, async (req, res) => {
   try {
@@ -679,9 +666,8 @@ app.patch("/api/admin/returns/:reqNum/status", verifyAdmin, async (req, res) => 
     const reqNum = Number(req.params.reqNum || 0);
     if (!Number.isFinite(reqNum) || reqNum <= 0) return safeJson(res, 400, { ok: false, message: "reqNum inválido" });
 
-    const status = String(req.body?.status || "").trim();
-    const s = status.toLowerCase();
-    const finalStatus = s.includes("open") ? "Open" : s.includes("close") ? "Closed" : "";
+    const status = String(req.body?.status || "").trim().toLowerCase();
+    const finalStatus = status.includes("open") ? "Open" : status.includes("close") ? "Closed" : "";
     if (!finalStatus) return safeJson(res, 400, { ok: false, message: "status inválido (usa Open/Closed)" });
 
     const r = await dbQuery(
