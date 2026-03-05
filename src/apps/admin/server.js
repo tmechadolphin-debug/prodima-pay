@@ -2,7 +2,7 @@
 import express from "express";
 import pg from "pg";
 import jwt from "jsonwebtoken";
-import crypto from "crypto";
+import bcrypt from "bcryptjs";
 
 const { Pool } = pg;
 
@@ -231,10 +231,9 @@ function parseWhFromComments(comments) {
   return m ? String(m[1]).trim() : "";
 }
 
-function hashPin(pin){
-  const salt = crypto.randomBytes(16).toString("hex");
-  const key = crypto.scryptSync(String(pin), salt, 64).toString("hex");
-  return `${salt}:${key}`;
+async function hashPin(pin){
+  const saltRounds = 10;
+  return bcrypt.hash(String(pin), saltRounds);
 }
 
 function provinceToWarehouseServer(province){
