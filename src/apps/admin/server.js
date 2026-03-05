@@ -1163,96 +1163,83 @@ app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
    DASHBOARD DB
    GET /api/admin/quotes/dashboard-db?from=YYYY-MM-DD&to=YYYY-MM-DD&onlyCreated=1
 ========================= */
-app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
+app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
 
     const fromQ = String(req.query?.from || "").slice(0, 10);
     const toQ = String(req.query?.to || "").slice(0, 10);
+    const user = String(req.query?.user || "").trim().toLowerCase();
+    const client = String(req.query?.client || "").trim().toLowerCase();
+
+    const skipRaw = Number(req.query?.skip || 0);
+    const limitRaw = Number(req.query?.limit || 20);
+
+    const skip = Math.max(0, Number.isFinite(skipRaw) ? Math.trunc(skipRaw) : 0);
+    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 20));
+
     const onlyCreated = String(req.query?.onlyCreated || "0") === "1";
+    const openOnly = String(req.query?.openOnly || "0") === "1"; // ✅ NUEVO
 
     const today = isoDateInOffset(TZ_OFFSET_MIN);
     const from = /^\d{4}-\d{2}-\d{2}$/.test(fromQ) ? fromQ : addDaysISO(today, -30);
     const to = /^\d{4}-\d{2}-\d{2}$/.test(toQ) ? toQ : today;
 
-    const createdJoin = onlyCreated
-      ? `AND LOWER(COALESCE(q.usuario,'')) IN (SELECT LOWER(username) FROM app_users WHERE is_active=TRUE)`
-      : ``;
+    const where = [];
+    const params = [];
+    let p = 1;
 
-    // Totales
-    const totalsR = await dbQuery(
-      `SELECT
-        COUNT(*)::int AS quotes,
-        COALESCE(SUM(q.doc_total),0)::float AS cotizado,
-        COALESCE(SUM(q.delivered_total),0)::float AS entregado
-       FROM quotes_cache q
-       WHERE q.doc_date BETWEEN $1 AND $2
-       ${createdJoin}`,
-      [from, to]
-    );
-    const totals = totalsR.rows[0] || { quotes: 0, cotizado: 0, entregado: 0 };
-    const fillRatePct = Number(totals.cotizado) > 0 ? (Number(totals.entregado) / Number(totals.cotizado)) * 100 : 0;
+    where.push(`q.doc_date BETWEEN $${p++} AND $${p++}`);
+    params.push(from, to);
 
-    // byUser
-    const byUserR = await dbQuery(
-      `SELECT
-        COALESCE(NULLIF(q.usuario,''),'sin_user') AS usuario,
-        COUNT(*)::int AS cnt,
-        COALESCE(SUM(q.doc_total),0)::float AS cotizado,
-        COALESCE(SUM(q.delivered_total),0)::float AS entregado
-       FROM quotes_cache q
-       WHERE q.doc_date BETWEEN $1 AND $2
-       ${createdJoin}
-       GROUP BY 1
-       ORDER BY cotizado DESC
-       LIMIT 2000`,
-      [from, to]
-    );
+    if (onlyCreated) {
+      where.push(`LOWER(COALESCE(q.usuario,'')) IN (SELECT LOWER(username) FROM app_users WHERE is_active=TRUE)`);
+    }
 
-    // byWh
-    const byWhR = await dbQuery(
-      `SELECT
-        COALESCE(NULLIF(q.warehouse,''),'sin_wh') AS warehouse,
-        COUNT(*)::int AS cnt,
-        COALESCE(SUM(q.doc_total),0)::float AS cotizado,
-        COALESCE(SUM(q.delivered_total),0)::float AS entregado
-       FROM quotes_cache q
-       WHERE q.doc_date BETWEEN $1 AND $2
-       ${createdJoin}
-       GROUP BY 1
-       ORDER BY cotizado DESC
-       LIMIT 2000`,
-      [from, to]
-    );
+    if (user) {
+      where.push(`LOWER(COALESCE(q.usuario,'')) LIKE $${p++}`);
+      params.push(`%${user}%`);
+    }
 
-    // byClient
-    const byClientR = await dbQuery(
-      `SELECT
-        COALESCE(NULLIF(q.card_name,''), q.card_code, 'sin_cliente') AS customer,
-        COUNT(*)::int AS cnt,
-        COALESCE(SUM(q.doc_total),0)::float AS cotizado
-       FROM quotes_cache q
-       WHERE q.doc_date BETWEEN $1 AND $2
-       ${createdJoin}
-       GROUP BY 1
-       ORDER BY cotizado DESC
-       LIMIT 2000`,
-      [from, to]
-    );
+    if (client) {
+      where.push(`(LOWER(COALESCE(q.card_code,'')) LIKE $${p++} OR LOWER(COALESCE(q.card_name,'')) LIKE $${p++})`);
+      params.push(`%${client}%`, `%${client}%`);
+    }
 
-    // byGroup
-    const byGroupR = await dbQuery(
+    // ✅ NUEVO: OpenOnly real en backend (para que pagine sobre abiertas)
+    if (openOnly) {
+      where.push(`LOWER(COALESCE(q.status,'')) LIKE '%open%'`);
+      where.push(`NOT (
+        LOWER(COALESCE(q.cancel_status,'')) LIKE '%csyes%' OR
+        LOWER(COALESCE(q.cancel_status,'')) LIKE '%cancel%' OR
+        LOWER(COALESCE(q.status,'')) LIKE '%cancel%'
+      )`);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const totalR = await dbQuery(`SELECT COUNT(*)::int AS total FROM quotes_cache q ${whereSql}`, params);
+    const total = Number(totalR.rows?.[0]?.total || 0);
+
+    const dataR = await dbQuery(
       `SELECT
-        COALESCE(NULLIF(q.group_name,''), 'Sin grupo') AS "group",
-        COUNT(*)::int AS cnt,
-        COALESCE(SUM(q.doc_total),0)::float AS cotizado
+        q.doc_num AS "docNum",
+        q.doc_entry AS "docEntry",
+        q.doc_date AS "fecha",
+        q.card_code AS "cardCode",
+        q.card_name AS "cardName",
+        q.usuario AS "usuario",
+        q.warehouse AS "warehouse",
+        q.status AS "estado",
+        q.cancel_status AS "cancelStatus",
+        q.comments AS "comments",
+        q.doc_total::float AS "montoCotizacion",
+        q.delivered_total::float AS "montoEntregado"
        FROM quotes_cache q
-       WHERE q.doc_date BETWEEN $1 AND $2
-       ${createdJoin}
-       GROUP BY 1
-       ORDER BY cotizado DESC
-       LIMIT 2000`,
-      [from, to]
+       ${whereSql}
+       ORDER BY q.doc_date DESC, q.doc_num DESC
+       OFFSET $${p++} LIMIT $${p++}`,
+      [...params, skip, limit]
     );
 
     const lastSyncAt = await getState("quotes_cache_last_sync");
@@ -1261,43 +1248,11 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
       ok: true,
       from,
       to,
+      total,
+      skip,
+      limit,
       lastSyncAt: lastSyncAt || null,
-      totals: {
-        quotes: Number(totals.quotes || 0),
-        cotizado: Number(totals.cotizado || 0),
-        entregado: Number(totals.entregado || 0),
-        fillRatePct: Number(fillRatePct.toFixed(2)),
-      },
-      byUser: (byUserR.rows || []).map((r) => ({
-        usuario: r.usuario,
-        cnt: Number(r.cnt || 0),
-        cotizado: Number(r.cotizado || 0),
-        entregado: Number(r.entregado || 0),
-        fillRatePct:
-          Number(r.cotizado || 0) > 0
-            ? Number(((Number(r.entregado || 0) / Number(r.cotizado || 0)) * 100).toFixed(2))
-            : 0,
-      })),
-      byWh: (byWhR.rows || []).map((r) => ({
-        warehouse: r.warehouse,
-        cnt: Number(r.cnt || 0),
-        cotizado: Number(r.cotizado || 0),
-        entregado: Number(r.entregado || 0),
-        fillRatePct:
-          Number(r.cotizado || 0) > 0
-            ? Number(((Number(r.entregado || 0) / Number(r.cotizado || 0)) * 100).toFixed(2))
-            : 0,
-      })),
-      byClient: (byClientR.rows || []).map((r) => ({
-        customer: r.customer,
-        cnt: Number(r.cnt || 0),
-        cotizado: Number(r.cotizado || 0),
-      })),
-      byGroup: (byGroupR.rows || []).map((r) => ({
-        group: r.group,
-        cnt: Number(r.cnt || 0),
-        cotizado: Number(r.cotizado || 0),
-      })),
+      quotes: dataR.rows || [],
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -1316,6 +1271,7 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
     const toQ = String(req.query?.to || "").slice(0, 10);
     const user = String(req.query?.user || "").trim().toLowerCase();
     const client = String(req.query?.client || "").trim().toLowerCase();
+    const openOnly = String(req.query?.openOnly || "0") === "1";
 
     const skipRaw = Number(req.query?.skip || 0);
     const limitRaw = Number(req.query?.limit || 20);
