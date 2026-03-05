@@ -2,6 +2,7 @@
 import express from "express";
 import pg from "pg";
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
 
 const { Pool } = pg;
 
@@ -228,6 +229,21 @@ function parseUserFromComments(comments) {
 function parseWhFromComments(comments) {
   const m = String(comments || "").match(/\[wh:([^\]]+)\]/i);
   return m ? String(m[1]).trim() : "";
+}
+
+function hashPin(pin){
+  const salt = crypto.randomBytes(16).toString("hex");
+  const key = crypto.scryptSync(String(pin), salt, 64).toString("hex");
+  return `${salt}:${key}`;
+}
+
+function provinceToWarehouseServer(province){
+  const p = norm(province);
+  if (p === "chiriqui" || p === "bocas del toro") return "200";
+  if (p === "veraguas" || p === "cocle" || p === "los santos" || p === "herrera") return "500";
+  if (p === "panama" || p === "panama oeste" || p === "colon") return "300";
+  if (p === "rci") return "01";
+  return "";
 }
 
 /**
@@ -720,6 +736,108 @@ app.get("/api/admin/users", verifyAdmin, async (req, res) => {
     return safeJson(res, 200, { ok: true, users: r.rows });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+// ✅ CREAR USUARIO
+app.post("/api/admin/users", verifyAdmin, async (req, res) => {
+  try{
+    if (!hasDb()) return safeJson(res, 500, { ok:false, message:"DB no configurada" });
+
+    const username = String(req.body?.username || "").trim().toLowerCase();
+    const full_name = String(req.body?.full_name ?? req.body?.fullName ?? "").trim();
+    const pin = String(req.body?.pin || "").trim();
+    const province = String(req.body?.province || "").trim();
+
+    if(!username) return safeJson(res, 400, { ok:false, message:"Username requerido" });
+    if(!full_name) return safeJson(res, 400, { ok:false, message:"Nombre requerido" });
+    if(!pin || pin.length < 4) return safeJson(res, 400, { ok:false, message:"PIN mínimo 4" });
+    if(!province) return safeJson(res, 400, { ok:false, message:"Provincia requerida" });
+
+    const warehouse_code = provinceToWarehouseServer(province);
+    const pin_hash = hashPin(pin);
+
+    const r = await dbQuery(
+      `INSERT INTO app_users(username, full_name, pin_hash, province, warehouse_code, is_active)
+       VALUES ($1,$2,$3,$4,$5,TRUE)
+       RETURNING id, username, full_name, province, warehouse_code, is_active, created_at`,
+      [username, full_name, pin_hash, province, warehouse_code]
+    );
+
+    return safeJson(res, 200, { ok:true, user: r.rows[0] });
+  }catch(e){
+    // username duplicado
+    if (String(e?.code) === "23505") {
+      return safeJson(res, 409, { ok:false, message:"Ese username ya existe" });
+    }
+    return safeJson(res, 500, { ok:false, message: e.message || String(e) });
+  }
+});
+
+// ✅ ACTIVAR/DESACTIVAR
+app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
+  try{
+    if (!hasDb()) return safeJson(res, 500, { ok:false, message:"DB no configurada" });
+
+    const id = Number(req.params.id || 0);
+    if(!Number.isFinite(id) || id <= 0) return safeJson(res, 400, { ok:false, message:"ID inválido" });
+
+    const r = await dbQuery(
+      `UPDATE app_users
+       SET is_active = NOT is_active
+       WHERE id = $1
+       RETURNING id, username, full_name, province, warehouse_code, is_active, created_at`,
+      [id]
+    );
+
+    if(!r.rowCount) return safeJson(res, 404, { ok:false, message:"Usuario no encontrado" });
+    return safeJson(res, 200, { ok:true, user: r.rows[0] });
+  }catch(e){
+    return safeJson(res, 500, { ok:false, message: e.message || String(e) });
+  }
+});
+
+// ✅ ELIMINAR
+app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
+  try{
+    if (!hasDb()) return safeJson(res, 500, { ok:false, message:"DB no configurada" });
+
+    const id = Number(req.params.id || 0);
+    if(!Number.isFinite(id) || id <= 0) return safeJson(res, 400, { ok:false, message:"ID inválido" });
+
+    const r = await dbQuery(`DELETE FROM app_users WHERE id=$1`, [id]);
+    if(!r.rowCount) return safeJson(res, 404, { ok:false, message:"Usuario no encontrado" });
+
+    return safeJson(res, 200, { ok:true });
+  }catch(e){
+    return safeJson(res, 500, { ok:false, message: e.message || String(e) });
+  }
+});
+
+// ✅ CAMBIAR PIN
+app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
+  try{
+    if (!hasDb()) return safeJson(res, 500, { ok:false, message:"DB no configurada" });
+
+    const id = Number(req.params.id || 0);
+    const pin = String(req.body?.pin || "").trim();
+
+    if(!Number.isFinite(id) || id <= 0) return safeJson(res, 400, { ok:false, message:"ID inválido" });
+    if(!pin || pin.length < 4) return safeJson(res, 400, { ok:false, message:"PIN mínimo 4" });
+
+    const pin_hash = hashPin(pin);
+
+    const r = await dbQuery(
+      `UPDATE app_users
+       SET pin_hash=$2
+       WHERE id=$1`,
+      [id, pin_hash]
+    );
+
+    if(!r.rowCount) return safeJson(res, 404, { ok:false, message:"Usuario no encontrado" });
+    return safeJson(res, 200, { ok:true });
+  }catch(e){
+    return safeJson(res, 500, { ok:false, message: e.message || String(e) });
   }
 });
 
