@@ -754,7 +754,7 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
     if(!province) return safeJson(res, 400, { ok:false, message:"Provincia requerida" });
 
     const warehouse_code = provinceToWarehouseServer(province);
-    const pin_hash = hashPin(pin);
+    const pin_hash = await hashPin(pin); // ✅ obligatorio
 
     const r = await dbQuery(
       `INSERT INTO app_users(username, full_name, pin_hash, province, warehouse_code, is_active)
@@ -824,7 +824,7 @@ app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
     if(!Number.isFinite(id) || id <= 0) return safeJson(res, 400, { ok:false, message:"ID inválido" });
     if(!pin || pin.length < 4) return safeJson(res, 400, { ok:false, message:"PIN mínimo 4" });
 
-    const pin_hash = hashPin(pin);
+    const pin_hash = await hashPin(pin); // ✅ obligatorio
 
     const r = await dbQuery(
       `UPDATE app_users
