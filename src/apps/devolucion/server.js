@@ -819,29 +819,59 @@ async function upsertReturnLine(line) {
 }
 
 async function createSapReturnRequest(payload) {
-  // Ajusta según tu SAP si ya sabes el nombre exacto del objeto
-  const tryPaths = [
-    { path: "/ReturnsRequests", label: "ReturnsRequests" },
-    { path: "/ReturnRequests", label: "ReturnRequests" },
-    { path: "/ReturnsRequest", label: "ReturnsRequest" },
-    { path: "/ReturnRequest", label: "ReturnRequest" },
-    { path: "/Returns", label: "Returns (fallback)" },
-  ];
+  // ✅ Permite forzar por ENV si ya sabes el entity
+  const forced = String(process.env.SAP_RETURN_ENTITY || "").trim();
+  const candidates = forced
+    ? [forced]
+    : ["Returns", "Drafts"]; // ✅ primero intenta documento real, luego borrador
 
   let lastErr = null;
-  for (const t of tryPaths) {
+
+  for (const entity of candidates) {
     try {
-      const created = await slFetch(t.path, { method: "POST", body: JSON.stringify(payload) });
-      return { created, used: t.label };
+      // Drafts requiere DocObjectCode para decir qué tipo de documento es
+      const body = entity === "Drafts"
+        ? { DocObjectCode: "oReturns", ...payload }
+        : payload;
+
+      const created = await slFetch(`/${entity}`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+
+      return { created, used: entity };
     } catch (e) {
       lastErr = e;
-      const msg = String(e?.message || e);
-      if (msg.includes("404") || msg.includes("Not Found") || msg.includes("405")) continue;
+      const msg = String(e?.message || e).toLowerCase();
+
+      // ✅ ESTE ES EL FIX:
+      // cuando SAP dice "Unrecognized resource path" => ese endpoint NO existe,
+      // entonces seguimos probando el siguiente.
+      const isUnknownPath =
+        msg.includes("unrecognized resource path") ||
+        msg.includes("resource path") && msg.includes("unrecognized");
+
+      // también toleramos "not found" / "cannot find" / 404 / 405 en texto
+      const looksMissing =
+        isUnknownPath ||
+        msg.includes("not found") ||
+        msg.includes("cannot find") ||
+        msg.includes("http 404") ||
+        msg.includes("error 404") ||
+        msg.includes("http 405") ||
+        msg.includes("error 405");
+
+      if (looksMissing) {
+        continue; // ✅ prueba el siguiente endpoint
+      }
+
+      // Si NO es "endpoint inexistente", entonces sí es un error real (payload/validación)
       throw e;
     }
   }
+
   throw new Error(
-    `No pude crear en SAP. Probé: ${tryPaths.map((x) => x.label).join(", ")}. Último error: ${String(
+    `No pude crear la solicitud en SAP. Probé: ${candidates.join(", ")}. Último error: ${String(
       lastErr?.message || lastErr
     )}`
   );
