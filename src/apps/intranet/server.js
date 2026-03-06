@@ -269,6 +269,45 @@ app.post("/api/admin/users", verifyAdmin, async (req, res) => {
   }
 });
 
+app.patch("/api/admin/users/:id", verifyAdmin, async (req, res) => {
+  try{
+    if (!hasDb()) return safeJson(res, 500, { ok:false, message:"DB no configurada" });
+
+    const id = Number(req.params.id || 0);
+    const full_name = String(req.body?.full_name || "").trim();
+    const role = String(req.body?.role || "user").trim().toLowerCase();
+    const permissions = Array.isArray(req.body?.permissions) ? req.body.permissions : [];
+
+    if(!Number.isFinite(id) || id <= 0) return safeJson(res, 400, { ok:false, message:"ID inválido" });
+    if(!full_name) return safeJson(res, 400, { ok:false, message:"Nombre requerido" });
+    if(!["user","admin"].includes(role)) return safeJson(res, 400, { ok:false, message:"Rol inválido" });
+
+    const finalPermissions = role === "admin" ? ["*"] : permissions;
+
+    const r = await dbQuery(
+      `UPDATE portal_users
+       SET full_name=$2,
+           role=$3,
+           permissions_json=$4::jsonb
+       WHERE id=$1
+       RETURNING id, username, full_name, role, is_active, permissions_json, created_at`,
+      [id, full_name, role, JSON.stringify(finalPermissions)]
+    );
+
+    if(!r.rowCount) return safeJson(res, 404, { ok:false, message:"Usuario no encontrado" });
+
+    return safeJson(res, 200, {
+      ok:true,
+      user:{
+        ...r.rows[0],
+        permissions: r.rows[0].permissions_json
+      }
+    });
+  }catch(e){
+    return safeJson(res, 500, { ok:false, message:e.message || String(e) });
+  }
+});
+
 app.patch("/api/admin/users/:id/toggle", verifyAdmin, async (req, res) => {
   try{
     if(!hasDb()) return safeJson(res, 500, { ok:false, message:"DB no configurada" });
