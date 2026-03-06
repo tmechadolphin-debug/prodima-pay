@@ -1,3 +1,6 @@
+// server.js (DEVOLUCIÓN NORMAL) — COMPLETO
+// ESM: "type":"module"
+
 import express from "express";
 import cors from "cors";
 import pg from "pg";
@@ -9,12 +12,13 @@ const { Pool } = pg;
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-/* =========================================================
+/* =========================
    ENV (Render)
-========================================================= */
+========================= */
 const {
   PORT = 3000,
   CORS_ORIGIN = "*",
+
   DATABASE_URL = "",
   JWT_SECRET = "change_me",
 
@@ -26,27 +30,25 @@ const {
   SAP_WAREHOUSE = "300",
   SAP_PRICE_LIST = "Lista de Precios 99 2018",
 
-  // users con bodega libre
-  ADMIN_FREE_WHS_USERS = "soto,liliana,daniel11,respinosa,test",
-  // fallback bodegas
-  WAREHOUSE_FALLBACK = "200,300,500,01",
-
-    // ✅ listas de códigos permitidos por bodega (comma separated)
+  // listas permitidas por bodega (opcional)
   ACTIVE_CODES_200 = "",
   ACTIVE_CODES_300 = "",
   ACTIVE_CODES_500 = "",
 
-  // Motivos/Causas (CSV)
+  // usuarios que pueden elegir bodega libre
+  ADMIN_FREE_WHS_USERS = "soto,liliana,daniel11,respinosa,test",
+
+  // fallback bodegas (si SAP no responde)
+  WAREHOUSE_FALLBACK = "200,300,500,01",
+
+  // ✅ Motivo/Causa (para dropdowns)
   RETURN_MOTIVOS = "Producto vencido,Cliente rechazó,Producto dañado,Error de facturación,Otro",
   RETURN_CAUSAS = "Empaque roto,Pedido incorrecto,Producto incorrecto,Faltante,Otro",
-
-  // opcional: si lo pones, NO hace discover en metadata
-  SAP_RETURN_ENTITY = "",
 } = process.env;
 
-/* =========================================================
+/* =========================
    CORS
-========================================================= */
+========================= */
 app.use(
   cors({
     origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
@@ -54,12 +56,15 @@ app.use(
   })
 );
 
-/* =========================================================
+/* =========================
    DB
-========================================================= */
+========================= */
 const pool = new Pool({
   connectionString: DATABASE_URL || undefined,
-  ssl: DATABASE_URL && DATABASE_URL.includes("sslmode") ? { rejectUnauthorized: false } : undefined,
+  ssl:
+    DATABASE_URL && DATABASE_URL.includes("sslmode")
+      ? { rejectUnauthorized: false }
+      : undefined,
 });
 
 function hasDb() { return Boolean(DATABASE_URL); }
@@ -81,12 +86,11 @@ async function ensureDb() {
     );
   `);
 
-  // Solicitudes de devolución (cache DB)
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS return_requests (
       id BIGSERIAL PRIMARY KEY,
-      req_num BIGINT UNIQUE NOT NULL,          -- SAP DocNum
-      req_entry BIGINT,                         -- SAP DocEntry
+      req_num BIGINT UNIQUE NOT NULL,
+      req_entry BIGINT,
       doc_date DATE,
       doc_time INT,
       card_code TEXT,
@@ -125,80 +129,11 @@ async function ensureDb() {
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_return_lines_req ON return_lines(req_num);`);
 }
 
-/* =========================================================
-   Time helpers (Panamá UTC-5)
-========================================================= */
-const TZ_OFFSET_MIN = -300;
-
-function getDateISOInOffset(offsetMin = 0) {
-  const now = new Date();
-  const ms = now.getTime() + now.getTimezoneOffset() * 60_000 + Number(offsetMin) * 60_000;
-  const d = new Date(ms);
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
-}
-
-/* =========================================================
-   Warehouse map + override
-========================================================= */
-function parseCsvSet(str) {
-  return new Set(
-    String(str || "")
-      .split(",")
-      .map((x) => x.trim().toLowerCase())
-      .filter(Boolean)
-  );
-}
-const ADMIN_FREE_WHS_SET = parseCsvSet(ADMIN_FREE_WHS_USERS);
-
-function provinceToWarehouse(province) {
-  const p = String(province || "").trim().toLowerCase();
-  if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
-  if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera") return "500";
-  if (p === "panamá" || p === "panama" || p === "panamá oeste" || p === "panama oeste" || p === "colón" || p === "colon")
-    return "300";
-  if (p === "rci") return "01";
-  return SAP_WAREHOUSE || "300";
-}
-
-function canOverrideWarehouse(req) {
-  const u = String(req.user?.username || "").trim().toLowerCase();
-  return u && ADMIN_FREE_WHS_SET.has(u);
-}
-function getRequestedWarehouse(req) {
-  const fromBody = String(req.body?.whsCode || req.body?.WhsCode || req.body?.warehouse || "").trim();
-  if (fromBody) return fromBody;
-  const whHeader = String(req.headers["x-warehouse"] || "").trim();
-  if (whHeader) return whHeader;
-  const whQuery = String(req.query?.warehouse || req.query?.wh || "").trim();
-  if (whQuery) return whQuery;
-  return "";
-}
-function getWarehouseFromUserToken(req) {
-  const whToken = String(req.user?.warehouse_code || "").trim();
-  if (whToken) return whToken;
-  const prov = String(req.user?.province || "").trim();
-  if (prov) return provinceToWarehouse(prov);
-  return SAP_WAREHOUSE || "300";
-}
-function getWarehouseFromReq(req) {
-  if (req.user && canOverrideWarehouse(req)) {
-    const requested = getRequestedWarehouse(req);
-    if (requested) return requested;
-  }
-  return getWarehouseFromUserToken(req);
-}
-
-/* =========================================================
-   Auth helpers
-========================================================= */
+/* =========================
+   Helpers (Auth)
+========================= */
 function safeJson(res, status, obj) { res.status(status).json(obj); }
-
-function signToken(payload, ttl = "12h") {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: ttl });
-}
+function signToken(payload, ttl = "12h") { return jwt.sign(payload, JWT_SECRET, { expiresIn: ttl }); }
 function signUserToken(u, ttl = "30d") {
   return signToken(
     {
@@ -229,60 +164,100 @@ function verifyUser(req, res, next) {
     return safeJson(res, 401, { ok: false, message: "Invalid token" });
   }
 }
+function missingSapEnv() { return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS; }
 
-/* =========================================================
-   Motivos / Causas
-========================================================= */
-function parseCsvList(str) {
-  return String(str || "")
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
-}
-const MOTIVOS = parseCsvList(RETURN_MOTIVOS);
-const CAUSAS = parseCsvList(RETURN_CAUSAS);
-
-function assertMotivoCausa(motivo, causa) {
-  const m = String(motivo || "").trim();
-  const c = String(causa || "").trim();
-  if (!m) throw new Error("Motivo es obligatorio");
-  if (!c) throw new Error("Causa es obligatoria");
-  // si deseas “bloquear” a listas exactas:
-  if (MOTIVOS.length && !MOTIVOS.includes(m)) throw new Error("Motivo inválido (no está en lista)");
-  if (CAUSAS.length && !CAUSAS.includes(c)) throw new Error("Causa inválida (no está en lista)");
+/* =========================
+   Time helpers (Panamá UTC-5)
+========================= */
+const TZ_OFFSET_MIN = -300;
+function getDateISOInOffset(offsetMin = 0) {
+  const now = new Date();
+  const ms = now.getTime() + now.getTimezoneOffset() * 60_000 + Number(offsetMin) * 60_000;
+  const d = new Date(ms);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
 }
 
-/* =========================================================
-   HEALTH
-========================================================= */
-function missingSapEnv() {
-  return !SAP_BASE_URL || !SAP_COMPANYDB || !SAP_USER || !SAP_PASS;
+/* =========================
+   Warehouse map + override
+========================= */
+function provinceToWarehouse(province) {
+  const p = String(province || "").trim().toLowerCase();
+  if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
+  if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera") return "500";
+  if (p === "panamá" || p === "panama" || p === "panamá oeste" || p === "panama oeste" || p === "colón" || p === "colon")
+    return "300";
+  if (p === "rci") return "01";
+  return SAP_WAREHOUSE || "300";
+}
+function parseCsvSet(str) {
+  return new Set(
+    String(str || "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean)
+  );
+}
+const ADMIN_FREE_WHS_SET = parseCsvSet(ADMIN_FREE_WHS_USERS);
+
+function canOverrideWarehouse(req) {
+  const u = String(req.user?.username || "").trim().toLowerCase();
+  return u && ADMIN_FREE_WHS_SET.has(u);
+}
+function getWarehouseFromUserToken(req) {
+  const whToken = String(req.user?.warehouse_code || "").trim();
+  if (whToken) return whToken;
+  const prov = String(req.user?.province || "").trim();
+  if (prov) return provinceToWarehouse(prov);
+  return SAP_WAREHOUSE || "300";
+}
+function getRequestedWarehouse(req) {
+  const fromBody = String(req.body?.whsCode || req.body?.WhsCode || req.body?.warehouse || "").trim();
+  if (fromBody) return fromBody;
+  const whHeader = String(req.headers["x-warehouse"] || "").trim();
+  if (whHeader) return whHeader;
+  return "";
+}
+function getWarehouseFromReq(req) {
+  if (req.user && canOverrideWarehouse(req)) {
+    const requested = getRequestedWarehouse(req);
+    if (requested) return requested;
+  }
+  return getWarehouseFromUserToken(req);
 }
 
-app.get("/api/health", async (req, res) => {
-  safeJson(res, 200, {
-    ok: true,
-    app: "devoluciones-pedidos-api",
-    message: "✅ PRODIMA DEVOLUCIONES (PEDIDOS) API activa",
-    db: hasDb() ? "on" : "off",
-    sap: missingSapEnv() ? "missing" : "ok",
-    warehouse_default: SAP_WAREHOUSE,
-    motivos: MOTIVOS.length,
-    causas: CAUSAS.length,
-  });
-});
+/* =========================
+   Allowed items by warehouse (opcional)
+========================= */
+function parseCodesEnv(str) {
+  return String(str || "").split(",").map((x) => x.trim()).filter(Boolean);
+}
+const ALLOWED_BY_WH = {
+  "200": parseCodesEnv(ACTIVE_CODES_200),
+  "300": parseCodesEnv(ACTIVE_CODES_300),
+  "500": parseCodesEnv(ACTIVE_CODES_500),
+};
+function isRestrictedWarehouse(wh) { return wh === "200" || wh === "300" || wh === "500"; }
+function getAllowedSetForWh(wh) {
+  if (!isRestrictedWarehouse(wh)) return null;
+  const arr = Array.isArray(ALLOWED_BY_WH[wh]) ? ALLOWED_BY_WH[wh] : [];
+  return new Set(arr.map((x) => String(x).trim()));
+}
+function assertItemAllowedOrThrow(wh, itemCode) {
+  const code = String(itemCode || "").trim();
+  if (!code) throw new Error("ItemCode vacío");
+  if (!isRestrictedWarehouse(wh)) return true;
 
-/* =========================================================
-   SAP Service Layer (cookie + fetch)
-========================================================= */
-let _fetch = globalThis.fetch || null;
-async function httpFetch(url, options) {
-  if (_fetch) return _fetch(url, options);
-  const mod = await import("node-fetch");
-  _fetch = mod.default;
-  return _fetch(url, options);
+  const set = getAllowedSetForWh(wh);
+  // si NO configuraste lista => NO bloqueamos
+  if (!set || set.size === 0) return true;
+
+  if (!set.has(code)) throw new Error(`ItemCode no permitido en bodega ${wh}: ${code}`);
+  return true;
 }
 
+/* =========================
+   SAP Service Layer (cookie)
+========================= */
 let SL_COOKIE = "";
 let SL_COOKIE_AT = 0;
 
@@ -290,7 +265,7 @@ async function slLogin() {
   const url = `${SAP_BASE_URL.replace(/\/$/, "")}/Login`;
   const body = { CompanyDB: SAP_COMPANYDB, UserName: SAP_USER, Password: SAP_PASS };
 
-  const r = await httpFetch(url, {
+  const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -312,14 +287,14 @@ async function slLogin() {
   SL_COOKIE_AT = Date.now();
 }
 
-async function slFetchJson(path, options = {}) {
+async function slFetch(path, options = {}) {
   if (missingSapEnv()) throw new Error("Missing SAP env");
   if (!SL_COOKIE || Date.now() - SL_COOKIE_AT > 25 * 60 * 1000) await slLogin();
 
   const base = SAP_BASE_URL.replace(/\/$/, "");
   const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
 
-  const r = await httpFetch(url, {
+  const r = await fetch(url, {
     method: String(options.method || "GET").toUpperCase(),
     headers: {
       "Content-Type": "application/json",
@@ -337,44 +312,16 @@ async function slFetchJson(path, options = {}) {
     if (r.status === 401 || r.status === 403) {
       SL_COOKIE = "";
       await slLogin();
-      return slFetchJson(path, options);
+      return slFetch(path, options);
     }
     throw new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
   }
   return data;
 }
 
-async function slFetchText(path, options = {}) {
-  if (missingSapEnv()) throw new Error("Missing SAP env");
-  if (!SL_COOKIE || Date.now() - SL_COOKIE_AT > 25 * 60 * 1000) await slLogin();
-
-  const base = SAP_BASE_URL.replace(/\/$/, "");
-  const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
-
-  const r = await httpFetch(url, {
-    method: String(options.method || "GET").toUpperCase(),
-    headers: {
-      Cookie: SL_COOKIE,
-      ...(options.headers || {}),
-    },
-    body: options.body,
-  });
-
-  const txt = await r.text();
-  if (!r.ok) {
-    if (r.status === 401 || r.status === 403) {
-      SL_COOKIE = "";
-      await slLogin();
-      return slFetchText(path, options);
-    }
-    throw new Error(`SAP text error ${r.status}: ${txt}`);
-  }
-  return txt;
-}
-
-/* =========================================================
-   SAP: PriceList cache + Item helper (re-uso para total)
-========================================================= */
+/* =========================
+   PRICE LIST + ITEM (igual que pedidos)
+========================= */
 let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
 const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
 
@@ -383,17 +330,18 @@ async function getPriceListNoByNameCached(name) {
   if (PRICE_LIST_CACHE.name === name && PRICE_LIST_CACHE.no !== null && now - PRICE_LIST_CACHE.ts < PRICE_LIST_TTL_MS) {
     return PRICE_LIST_CACHE.no;
   }
+
   const safe = name.replace(/'/g, "''");
   let no = null;
 
   try {
-    const r1 = await slFetchJson(`/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`);
+    const r1 = await slFetch(`/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`);
     if (r1?.value?.length) no = r1.value[0].PriceListNo;
   } catch {}
 
   if (no === null) {
     try {
-      const r2 = await slFetchJson(`/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`);
+      const r2 = await slFetch(`/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`);
       if (r2?.value?.length) no = r2.value[0].PriceListNo;
     } catch {}
   }
@@ -407,86 +355,89 @@ function getPriceFromPriceList(itemFull, priceListNo) {
   const row = Array.isArray(itemFull?.ItemPrices)
     ? itemFull.ItemPrices.find((p) => Number(p?.PriceList) === listNo)
     : null;
+
   const price = row && row.Price != null ? Number(row.Price) : null;
   return Number.isFinite(price) ? price : null;
 }
 
-function getSalesUomFactor(itemFull) {
-  const directFields = [
-    itemFull?.SalesItemsPerUnit,
-    itemFull?.SalesQtyPerPackUnit,
-    itemFull?.SalesQtyPerPackage,
-    itemFull?.SalesPackagingUnit,
-  ];
-  for (const v of directFields) {
-    const n = Number(v);
-    if (Number.isFinite(n) && n > 0) return n;
+function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
+  const item = {
+    ItemCode: itemFull.ItemCode ?? code,
+    ItemName: itemFull.ItemName ?? `Producto ${code}`,
+    SalesUnit: itemFull.SalesUnit ?? "",
+  };
+
+  const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
+  const price = priceUnit != null ? priceUnit : 0;
+
+  let warehouseRow = null;
+  if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
+    warehouseRow =
+      itemFull.ItemWarehouseInfoCollection.find(
+        (w) => String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
+      ) || null;
   }
-  const coll = itemFull?.ItemUnitOfMeasurementCollection;
-  if (!Array.isArray(coll) || !coll.length) return null;
 
-  let row =
-    coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("sales")) ||
-    coll.find((x) => String(x?.UoMType || "").toLowerCase().includes("iut_sales")) ||
-    null;
+  const onHand = warehouseRow?.InStock != null ? Number(warehouseRow.InStock) : null;
+  const committed = warehouseRow?.Committed != null ? Number(warehouseRow.Committed) : null;
+  let available = null;
+  if (Number.isFinite(onHand) && Number.isFinite(committed)) available = onHand - committed;
 
-  if (!row) row = coll.find((x) => Number(x?.BaseQuantity) > 1) || null;
-  if (!row) return null;
-
-  const b = Number(row?.BaseQuantity ?? row?.BaseQty ?? null);
-  const a = Number(row?.AlternateQuantity ?? row?.AltQty ?? row?.AlternativeQuantity ?? null);
-
-  if (Number.isFinite(b) && b > 0 && Number.isFinite(a) && a > 0) {
-    const f = b / a;
-    return Number.isFinite(f) && f > 0 ? f : null;
-  }
-  if (Number.isFinite(b) && b > 0) return b;
-  return null;
+  return {
+    item,
+    price,
+    stock: {
+      warehouse: warehouseCode,
+      available: Number.isFinite(available) ? available : null,
+    },
+  };
 }
 
-async function sapGetItemFull(code) {
-  const safe = encodeURIComponent(code);
-  try {
-    return await slFetchJson(
-      `/Items('${safe}')?$select=ItemCode,ItemName,SalesUnit,ItemPrices,ItemWarehouseInfoCollection&$expand=ItemUnitOfMeasurementCollection($select=UoMType,BaseQuantity,AlternateQuantity)`
-    );
-  } catch {
-    return await slFetchJson(`/Items('${safe}')`);
+async function getOneItem(code, priceListNo, warehouseCode) {
+  const itemFull = await slFetch(
+    `/Items('${encodeURIComponent(code)}')` +
+      `?$select=ItemCode,ItemName,SalesUnit,ItemPrices,ItemWarehouseInfoCollection`
+  );
+
+  // si no vino warehouse info, intentamos colección
+  if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
+    try {
+      const whInfo = await slFetch(
+        `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,Committed`
+      );
+      if (Array.isArray(whInfo?.value)) itemFull.ItemWarehouseInfoCollection = whInfo.value;
+    } catch {}
   }
+
+  return buildItemResponse(itemFull, code, priceListNo, warehouseCode);
 }
 
-/* =========================================================
-   ✅ Discover entity set para Return Request via $metadata
-========================================================= */
-let RETURN_ENTITY_CACHE = { name: "", ts: 0 };
-const RETURN_ENTITY_TTL_MS = 6 * 60 * 60 * 1000;
-
-async function discoverReturnEntitySet() {
-  if (SAP_RETURN_ENTITY) return String(SAP_RETURN_ENTITY).trim();
-  const now = Date.now();
-  if (RETURN_ENTITY_CACHE.name && now - RETURN_ENTITY_CACHE.ts < RETURN_ENTITY_TTL_MS) return RETURN_ENTITY_CACHE.name;
-
-  const xml = await slFetchText(`/$metadata`, { headers: { "Accept": "application/xml" } });
-
-  const names = [];
-  const re = /EntitySet\s+Name="([^"]+)"/g;
-  let m;
-  while ((m = re.exec(xml))) names.push(m[1]);
-
-  const pick =
-    names.find((n) => /return/i.test(n) && /request/i.test(n)) ||
-    names.find((n) => /return/i.test(n) && /req/i.test(n)) ||
-    names.find((n) => /return/i.test(n)) ||
-    "";
-
-  if (!pick) throw new Error("No pude descubrir el entity set de Return Request en $metadata");
-  RETURN_ENTITY_CACHE = { name: pick, ts: now };
-  return pick;
+/* =========================
+   HEALTH + META
+========================= */
+function parseCsvList(str) {
+  return String(str || "").split(",").map((x) => x.trim()).filter(Boolean);
 }
+const MOTIVOS = parseCsvList(RETURN_MOTIVOS);
+const CAUSAS  = parseCsvList(RETURN_CAUSAS);
 
-/* =========================================================
-   USER LOGIN (igual)
-========================================================= */
+app.get("/api/health", async (req, res) => {
+  safeJson(res, 200, {
+    ok: true,
+    app: "devoluciones-api",
+    message: "✅ PRODIMA DEVOLUCIONES API activa",
+    db: hasDb() ? "on" : "off",
+    sap: missingSapEnv() ? "missing" : "ok",
+  });
+});
+
+app.get("/api/meta", verifyUser, async (req, res) => {
+  return safeJson(res, 200, { ok: true, motivos: MOTIVOS, causas: CAUSAS });
+});
+
+/* =========================
+   LOGIN USER
+========================= */
 async function handleUserLogin(req, res) {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
@@ -498,7 +449,9 @@ async function handleUserLogin(req, res) {
 
     const r = await dbQuery(
       `SELECT id, username, full_name, pin_hash, province, warehouse_code, is_active
-       FROM app_users WHERE username=$1 LIMIT 1`,
+       FROM app_users
+       WHERE username=$1
+       LIMIT 1`,
       [username]
     );
 
@@ -512,8 +465,10 @@ async function handleUserLogin(req, res) {
     let wh = String(u.warehouse_code || "").trim();
     if (!wh) {
       wh = provinceToWarehouse(u.province || "");
-      try { await dbQuery(`UPDATE app_users SET warehouse_code=$1 WHERE id=$2`, [wh, u.id]); } catch {}
-      u.warehouse_code = wh;
+      try {
+        await dbQuery(`UPDATE app_users SET warehouse_code=$1 WHERE id=$2`, [wh, u.id]);
+        u.warehouse_code = wh;
+      } catch {}
     }
 
     const token = signUserToken(u, "30d");
@@ -532,34 +487,26 @@ async function handleUserLogin(req, res) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 }
-
-app.post("/api/login", handleUserLogin);
 app.post("/api/auth/login", handleUserLogin);
 
-app.get("/api/auth/me", verifyUser, (req, res) => safeJson(res, 200, { ok: true, user: req.user }));
-
-/* =========================================================
-   Meta devoluciones
-========================================================= */
-app.get("/api/returns/meta", verifyUser, async (req, res) => {
-  return safeJson(res, 200, { ok: true, motivos: MOTIVOS, causas: CAUSAS });
-});
-
-/* =========================================================
-   SAP helpers (warehouses/customers/items) — igual que antes
-========================================================= */
+/* =========================
+   SAP: Warehouses / Customers / Items
+========================= */
 app.get("/api/sap/warehouses", verifyUser, async (req, res) => {
   try {
     if (missingSapEnv()) {
-      const fb = String(WAREHOUSE_FALLBACK || "300").split(",").map((x) => x.trim()).filter(Boolean);
+      const fb = String(WAREHOUSE_FALLBACK || "300")
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
       return res.json({ ok: true, warehouses: fb.map((w) => ({ WarehouseCode: w })) });
     }
 
     let raw;
     try {
-      raw = await slFetchJson(`/Warehouses?$select=WarehouseCode,WarehouseName&$orderby=WarehouseCode asc&$top=200`);
+      raw = await slFetch(`/Warehouses?$select=WarehouseCode,WarehouseName&$orderby=WarehouseCode asc&$top=200`);
     } catch {
-      raw = await slFetchJson(`/Warehouses?$select=WhsCode,WhsName&$orderby=WhsCode asc&$top=200`);
+      raw = await slFetch(`/Warehouses?$select=WhsCode,WhsName&$orderby=WhsCode asc&$top=200`);
     }
 
     const values = Array.isArray(raw?.value) ? raw.value : [];
@@ -571,7 +518,10 @@ app.get("/api/sap/warehouses", verifyUser, async (req, res) => {
       .filter((w) => String(w.WarehouseCode || "").trim());
 
     if (!warehouses.length) {
-      const fb = String(WAREHOUSE_FALLBACK || "300").split(",").map((x) => x.trim()).filter(Boolean);
+      const fb = String(WAREHOUSE_FALLBACK || "300")
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
       return res.json({ ok: true, warehouses: fb.map((w) => ({ WarehouseCode: w, WarehouseName: "" })) });
     }
 
@@ -593,26 +543,24 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
 
     let r;
     try {
-      r = await slFetchJson(
+      r = await slFetch(
         `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=contains(CardName,'${safe}') or contains(CardCode,'${safe}')&$orderby=CardName asc&$top=${top}`
       );
     } catch {
-      r = await slFetchJson(
+      r = await slFetch(
         `/BusinessPartners?$select=CardCode,CardName,Phone1,EmailAddress&$filter=substringof('${safe}',CardName) or substringof('${safe}',CardCode)&$orderby=CardName asc&$top=${top}`
       );
     }
 
     const values = Array.isArray(r?.value) ? r.value : [];
-    return res.json({
-      ok: true,
-      q,
-      results: values.map((x) => ({
-        CardCode: x.CardCode,
-        CardName: x.CardName,
-        Phone1: x.Phone1 || "",
-        EmailAddress: x.EmailAddress || "",
-      })),
-    });
+    const results = values.map((x) => ({
+      CardCode: x.CardCode,
+      CardName: x.CardName,
+      Phone1: x.Phone1 || "",
+      EmailAddress: x.EmailAddress || "",
+    }));
+
+    return res.json({ ok: true, q, results });
   } catch (err) {
     return res.status(500).json({ ok: false, message: err.message });
   }
@@ -625,7 +573,7 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "CardCode vacío." });
 
-    const bp = await slFetchJson(
+    const bp = await slFetch(
       `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Phone1,Phone2,EmailAddress,Address,City,Country,ZipCode`
     );
 
@@ -655,18 +603,21 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
     const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
     if (q.length < 2) return res.json({ ok: true, q, results: [] });
 
+    const warehouseCode = getWarehouseFromReq(req);
+    const allowedSet = getAllowedSetForWh(warehouseCode);
+
     const safe = q.replace(/'/g, "''");
     const preTop = Math.min(100, top * 5);
 
     let raw;
     try {
-      raw = await slFetchJson(
+      raw = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor` +
           `&$filter=${encodeURIComponent(`(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))`)}` +
           `&$orderby=ItemName asc&$top=${preTop}`
       );
     } catch {
-      raw = await slFetchJson(
+      raw = await slFetch(
         `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor` +
           `&$filter=${encodeURIComponent(`(substringof('${safe}',ItemCode) or substringof('${safe}',ItemName))`)}` +
           `&$orderby=ItemName asc&$top=${preTop}`
@@ -674,12 +625,19 @@ app.get("/api/sap/items/search", verifyUser, async (req, res) => {
     }
 
     const values = Array.isArray(raw?.value) ? raw.value : [];
-    const results = values.slice(0, top).map((it) => ({
+    let filtered = values.filter((it) => it?.ItemCode);
+
+    if (allowedSet && allowedSet.size > 0) {
+      filtered = filtered.filter((it) => allowedSet.has(String(it.ItemCode).trim()));
+    }
+
+    const results = filtered.slice(0, top).map((it) => ({
       ItemCode: it.ItemCode,
       ItemName: it.ItemName,
-      SalesUnit: "Caja",
+      SalesUnit: it.SalesUnit || "",
     }));
-    return res.json({ ok: true, q, results });
+
+    return res.json({ ok: true, q, warehouse: warehouseCode, results });
   } catch (err) {
     return res.status(500).json({ ok: false, message: err.message });
   }
@@ -692,55 +650,45 @@ app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
     const code = String(req.params.code || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
 
-    const wh = getWarehouseFromReq(req);
+    const warehouseCode = getWarehouseFromReq(req);
+    assertItemAllowedOrThrow(warehouseCode, code);
+
     const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
-    const itemFull = await sapGetItemFull(code);
-
-    const unitPrice = getPriceFromPriceList(itemFull, priceListNo);
-    const factor = getSalesUomFactor(itemFull);
-    const priceCaja = unitPrice != null && factor != null ? unitPrice * factor : unitPrice;
-
-    // stock por bodega (si está)
-    let warehouseRow = null;
-    if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
-      warehouseRow = itemFull.ItemWarehouseInfoCollection.find(
-        (w) => String(w?.WarehouseCode || "").trim() === String(wh || "").trim()
-      ) || null;
-    }
-    const onHand = warehouseRow?.InStock != null ? Number(warehouseRow.InStock) : null;
-    const committed = warehouseRow?.Committed != null ? Number(warehouseRow.Committed) : null;
-    const available = Number.isFinite(onHand) && Number.isFinite(committed) ? onHand - committed : null;
+    const r = await getOneItem(code, priceListNo, warehouseCode);
 
     return res.json({
       ok: true,
-      item: { ItemCode: itemFull.ItemCode ?? code, ItemName: itemFull.ItemName ?? `Producto ${code}` },
-      warehouse: wh,
+      item: r.item,
+      warehouse: warehouseCode,
       priceList: SAP_PRICE_LIST,
       priceListNo,
-      price: Number(priceCaja ?? 0),
-      stock: { available },
+      price: Number(r.price ?? 0),
+      stock: r.stock,
+      disponible: r?.stock?.available ?? null,
     });
   } catch (err) {
     return res.status(400).json({ ok: false, message: err.message });
   }
 });
 
-/* =========================================================
-   ✅ CREATE RETURN REQUEST (SAP primero, luego Supabase)
-   POST /api/returns/create
-========================================================= */
-async function upsertReturnRequest(r) {
+/* =========================
+   ✅ CREAR SOLICITUD DEVOLUCIÓN:
+   SAP primero -> luego Supabase
+========================= */
+async function upsertReturnRequestHead(head) {
   await dbQuery(
     `INSERT INTO return_requests(
       req_num, req_entry, doc_date, doc_time,
-      card_code, card_name, usuario, warehouse, motivo, causa,
-      total_amount, total_qty, status, comments, updated_at
-    ) VALUES (
+      card_code, card_name, usuario, warehouse,
+      motivo, causa, total_amount, total_qty,
+      status, comments, updated_at
+     ) VALUES(
       $1,$2,$3,$4,
-      $5,$6,$7,$8,$9,$10,
-      $11,$12,$13,$14,NOW()
-    )
-    ON CONFLICT (req_num) DO UPDATE SET
+      $5,$6,$7,$8,
+      $9,$10,$11,$12,
+      $13,$14,NOW()
+     )
+     ON CONFLICT (req_num) DO UPDATE SET
       req_entry=EXCLUDED.req_entry,
       doc_date=EXCLUDED.doc_date,
       doc_time=EXCLUDED.doc_time,
@@ -752,34 +700,34 @@ async function upsertReturnRequest(r) {
       causa=EXCLUDED.causa,
       total_amount=EXCLUDED.total_amount,
       total_qty=EXCLUDED.total_qty,
-      status=COALESCE(return_requests.status,'Open'),
+      status=EXCLUDED.status,
       comments=EXCLUDED.comments,
       updated_at=NOW()`,
     [
-      Number(r.reqNum),
-      Number(r.reqEntry || 0) || null,
-      String(r.docDate || "").slice(0, 10) || null,
-      Number(r.docTime || 0) || 0,
-      String(r.cardCode || ""),
-      String(r.cardName || ""),
-      String(r.usuario || ""),
-      String(r.warehouse || ""),
-      String(r.motivo || ""),
-      String(r.causa || ""),
-      Number(r.totalAmount || 0),
-      Number(r.totalQty || 0),
-      String(r.status || "Open"),
-      String(r.comments || ""),
+      Number(head.reqNum),
+      Number(head.reqEntry || 0) || null,
+      String(head.docDate || "").slice(0,10) || null,
+      Number(head.docTime || 0) || 0,
+      String(head.cardCode || ""),
+      String(head.cardName || ""),
+      String(head.usuario || ""),
+      String(head.warehouse || ""),
+      String(head.motivo || ""),
+      String(head.causa || ""),
+      Number(head.totalAmount || 0),
+      Number(head.totalQty || 0),
+      String(head.status || "Open"),
+      String(head.comments || ""),
     ]
   );
 }
 
-async function upsertReturnLine(ln) {
+async function upsertReturnLine(line) {
   await dbQuery(
     `INSERT INTO return_lines(
       req_num, doc_date, item_code, item_desc, qty, price, line_total, updated_at
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-    ON CONFLICT (req_num, item_code) DO UPDATE SET
+     ) VALUES($1,$2,$3,$4,$5,$6,$7,NOW())
+     ON CONFLICT (req_num, item_code) DO UPDATE SET
       doc_date=EXCLUDED.doc_date,
       item_desc=EXCLUDED.item_desc,
       qty=EXCLUDED.qty,
@@ -787,162 +735,155 @@ async function upsertReturnLine(ln) {
       line_total=EXCLUDED.line_total,
       updated_at=NOW()`,
     [
-      Number(ln.reqNum),
-      String(ln.docDate || "").slice(0, 10) || null,
-      String(ln.itemCode || ""),
-      String(ln.itemDesc || ""),
-      Number(ln.qty || 0),
-      Number(ln.price || 0),
-      Number(ln.lineTotal || 0),
+      Number(line.reqNum),
+      String(line.docDate || "").slice(0,10) || null,
+      String(line.itemCode || ""),
+      String(line.itemDesc || ""),
+      Number(line.qty || 0),
+      Number(line.price || 0),
+      Number(line.lineTotal || 0),
     ]
   );
 }
 
-app.post("/api/returns/create", verifyUser, async (req, res) => {
+async function createSapReturnRequest(payload) {
+  // Intentamos varias entidades para ser robustos (depende de tu SAP)
+  const tryPaths = [
+    { path: "/ReturnsRequests", label: "ReturnsRequests" },
+    { path: "/ReturnRequests",  label: "ReturnRequests"  },
+    { path: "/ReturnsRequest",  label: "ReturnsRequest"  },
+    { path: "/ReturnRequest",   label: "ReturnRequest"   },
+    // fallback: crea devolución (documento) si tu SAP no tiene “request”
+    { path: "/Returns",         label: "Returns (fallback)" },
+  ];
+
+  let lastErr = null;
+  for (const t of tryPaths) {
+    try {
+      const created = await slFetch(t.path, { method:"POST", body: JSON.stringify(payload) });
+      return { created, used: t.label };
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e?.message || e);
+      // si es 404/405 o entidad no existe, intentamos la siguiente
+      if (msg.includes("404") || msg.includes("Not Found") || msg.includes("405")) continue;
+      // otros errores (validación SAP) => no seguir
+      throw e;
+    }
+  }
+  throw new Error(`No pude crear en SAP. Probé: ${tryPaths.map(x=>x.label).join(", ")}. Último error: ${String(lastErr?.message || lastErr)}`);
+}
+
+app.post("/api/sap/return-request", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+    if (!hasDb()) return safeJson(res, 500, { ok:false, message:"DB no configurada" });
+    if (missingSapEnv()) return safeJson(res, 400, { ok:false, message:"Faltan variables SAP" });
 
     const cardCode = String(req.body?.cardCode || "").trim();
     const motivo = String(req.body?.motivo || "").trim();
-    const causa = String(req.body?.causa || "").trim();
-    const commentsRaw = String(req.body?.comments || "").trim();
+    const causa  = String(req.body?.causa || "").trim();
+    const commentsUser = String(req.body?.comments || "").trim();
 
-    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
+    const wh = getWarehouseFromReq(req);
 
-    if (!cardCode) return safeJson(res, 400, { ok: false, message: "cardCode requerido" });
-    if (!lines.length) return safeJson(res, 400, { ok: false, message: "lines requerido" });
+    const linesIn = Array.isArray(req.body?.lines) ? req.body.lines : [];
+    const cleanLines = linesIn
+      .map(l => ({
+        ItemCode: String(l.itemCode || "").trim(),
+        Quantity: Number(l.qty || 0),
+        Price: Number(l.price || 0),
+        ItemDesc: String(l.itemDesc || "").trim()
+      }))
+      .filter(x => x.ItemCode && x.Quantity > 0);
 
-    assertMotivoCausa(motivo, causa);
+    if(!cardCode) return safeJson(res, 400, { ok:false, message:"cardCode requerido" });
+    if(!motivo) return safeJson(res, 400, { ok:false, message:"Motivo requerido" });
+    if(!causa)  return safeJson(res, 400, { ok:false, message:"Causa requerida" });
+    if(!cleanLines.length) return safeJson(res, 400, { ok:false, message:"Agrega al menos 1 línea (qty>0)" });
 
-    const warehouse = getWarehouseFromReq(req);
-    const creator = req.user?.username || "unknown";
+    // Validar allowed items
+    for(const ln of cleanLines) assertItemAllowedOrThrow(wh, ln.ItemCode);
+
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
+    const creator = String(req.user?.username || "unknown").trim().toLowerCase();
 
-    const cleanLines = lines
-      .map((l) => ({ ItemCode: String(l.itemCode || "").trim(), Quantity: Number(l.qty || 0) }))
-      .filter((x) => x.ItemCode && x.Quantity > 0);
+    // Guardamos tags en comments para trazabilidad
+    const baseComments = [`[user:${creator}]`, `[wh:${wh}]`, `[motivo:${motivo}]`, `[causa:${causa}]`].join(" ");
+    const finalComments = commentsUser ? `${baseComments} ${commentsUser}` : baseComments;
 
-    if (!cleanLines.length) return safeJson(res, 400, { ok: false, message: "No hay líneas válidas (qty>0)." });
+    const DocumentLines = cleanLines.map(ln => ({
+      ItemCode: ln.ItemCode,
+      Quantity: ln.Quantity,
+      WarehouseCode: wh
+    }));
 
-    // 1) Crear en SAP
-    const entity = await discoverReturnEntitySet();
-
-    const tag = [`[user:${creator}]`, `[wh:${warehouse}]`, `[motivo:${motivo}]`, `[causa:${causa}]`].join(" ");
-    const sapComments = commentsRaw ? `${tag} ${commentsRaw}` : tag;
-
-    const payloadSap = {
+    // Payload SAP
+    const sapPayload = {
       CardCode: cardCode,
       DocDate: docDate,
       DocDueDate: docDate,
-      Comments: sapComments,
-      JournalMemo: "Solicitud de devolución (web)",
-      DocumentLines: cleanLines.map((ln) => ({
-        ItemCode: ln.ItemCode,
-        Quantity: ln.Quantity,
-        WarehouseCode: warehouse,
-      })),
+      Comments: finalComments,
+      JournalMemo: "Solicitud de devolución web",
+      DocumentLines
     };
 
-    let created;
-    try {
-      created = await slFetchJson(`/${entity}`, { method: "POST", body: JSON.stringify(payloadSap) });
-    } catch (e) {
-      // fallback: algunos SL usan plural/singular distinto
-      // (por si metadata no devolvió lo correcto o cambió)
-      const fallbacks = ["ReturnRequest", "ReturnRequests", "ReturnsRequest", "ReturnsRequests"];
-      let lastErr = e;
-      for (const cand of fallbacks) {
-        try {
-          created = await slFetchJson(`/${cand}`, { method: "POST", body: JSON.stringify(payloadSap) });
-          break;
-        } catch (ee) {
-          lastErr = ee;
-        }
-      }
-      if (!created) throw lastErr;
-    }
+    // 1) Crear en SAP
+    const { created, used } = await createSapReturnRequest(sapPayload);
 
-    const reqEntry = created?.DocEntry;
-    const reqNum = created?.DocNum;
-    if (!reqNum) throw new Error("SAP creó el documento, pero no devolvió DocNum");
+    const reqEntry = Number(created?.DocEntry || 0) || null;
+    const reqNum   = Number(created?.DocNum || 0) || null;
+    if(!reqNum) throw new Error(`SAP no devolvió DocNum. Respuesta: ${JSON.stringify(created).slice(0,300)}`);
 
-    // 2) Guardar en Supabase (con totales calculados)
-    let cardName = "";
-    try {
-      const bp = await slFetchJson(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardName`);
-      cardName = String(bp?.CardName || "").trim();
-    } catch {}
+    // 2) Guardar en Supabase (usando DocNum como req_num)
+    const totalQty = cleanLines.reduce((a,b)=> a + Number(b.Quantity||0), 0);
+    const totalAmount = cleanLines.reduce((a,b)=> a + (Number(b.Quantity||0) * Number(b.Price||0)), 0);
 
-    // totales: usamos price list para estimado
-    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
+    await upsertReturnRequestHead({
+      reqNum,
+      reqEntry,
+      docDate,
+      docTime: 0,
+      cardCode,
+      cardName: String(req.body?.cardName || ""),
+      usuario: creator,
+      warehouse: wh,
+      motivo,
+      causa,
+      totalAmount,
+      totalQty,
+      status: "Open",
+      comments: commentsUser || "",
+    });
 
-    let totalAmount = 0;
-    let totalQty = 0;
-
-    for (const ln of cleanLines) {
-      totalQty += Number(ln.Quantity || 0);
-
-      let itemDesc = "";
-      let priceCaja = 0;
-      try {
-        const itemFull = await sapGetItemFull(ln.ItemCode);
-        itemDesc = String(itemFull?.ItemName || "").trim();
-        const unitPrice = getPriceFromPriceList(itemFull, priceListNo);
-        const factor = getSalesUomFactor(itemFull);
-        priceCaja = Number(unitPrice != null && factor != null ? unitPrice * factor : unitPrice || 0);
-      } catch {}
-
-      const lineTotal = Number((Number(ln.Quantity || 0) * Number(priceCaja || 0)).toFixed(6));
-      totalAmount += lineTotal;
-
-      if (hasDb()) {
-        await upsertReturnLine({
-          reqNum,
-          docDate,
-          itemCode: ln.ItemCode,
-          itemDesc,
-          qty: ln.Quantity,
-          price: priceCaja,
-          lineTotal,
-        });
-      }
-    }
-
-    if (hasDb()) {
-      await upsertReturnRequest({
+    for(const ln of cleanLines){
+      await upsertReturnLine({
         reqNum,
-        reqEntry,
         docDate,
-        docTime: 0,
-        cardCode,
-        cardName,
-        usuario: creator,
-        warehouse,
-        motivo,
-        causa,
-        totalAmount,
-        totalQty,
-        status: "Open",
-        comments: commentsRaw,
+        itemCode: ln.ItemCode,
+        itemDesc: ln.ItemDesc || "",
+        qty: ln.Quantity,
+        price: ln.Price,
+        lineTotal: Number(ln.Quantity||0) * Number(ln.Price||0),
       });
     }
 
     return safeJson(res, 200, {
       ok: true,
       message: "Solicitud creada en SAP y guardada en Supabase",
-      reqNum,
       reqEntry,
-      warehouse,
-      savedDb: hasDb(),
+      reqNum,
+      warehouse: wh,
+      sapEntityUsed: used,
     });
+
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+    return safeJson(res, 500, { ok:false, message: e.message || String(e) });
   }
 });
 
-/* =========================================================
+/* =========================
    START
-========================================================= */
+========================= */
 (async () => {
   try {
     await ensureDb();
@@ -950,5 +891,6 @@ app.post("/api/returns/create", verifyUser, async (req, res) => {
   } catch (e) {
     console.error("DB init error:", e.message);
   }
-  app.listen(Number(PORT), () => console.log(`DEVOLUCIONES PEDIDOS API listening on :${PORT}`));
+
+  app.listen(Number(PORT), () => console.log(`DEVOLUCIONES API listening on :${PORT}`));
 })();
