@@ -1,3 +1,4 @@
+// server.js (ADMIN DEVOLUCIONES)
 import express from "express";
 import pg from "pg";
 import jwt from "jsonwebtoken";
@@ -7,9 +8,6 @@ const { Pool } = pg;
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-/* =========================================================
-   ENV
-========================================================= */
 const {
   PORT = 3000,
   DATABASE_URL = "",
@@ -17,11 +15,10 @@ const {
   ADMIN_USER = "PRODIMA",
   ADMIN_PASS = "ADMINISTRADOR",
   CORS_ORIGIN = "",
+  RETURN_MOTIVOS = "Producto vencido,Cliente rechazó,Producto dañado,Error de facturación,Otro",
+  RETURN_CAUSAS = "Empaque roto,Pedido incorrecto,Producto incorrecto,Faltante,Otro",
 } = process.env;
 
-/* =========================================================
-   CORS
-========================================================= */
 const ALLOWED_ORIGINS = new Set(
   String(CORS_ORIGIN || "")
     .split(",")
@@ -32,7 +29,6 @@ const allowAll = ALLOWED_ORIGINS.size === 0;
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-
   if (allowAll && origin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
@@ -40,7 +36,6 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
-
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
@@ -48,9 +43,6 @@ app.use((req, res, next) => {
   next();
 });
 
-/* =========================================================
-   DB
-========================================================= */
 const pool = new Pool({
   connectionString: DATABASE_URL || undefined,
   ssl:
@@ -62,10 +54,17 @@ const pool = new Pool({
 function hasDb() {
   return Boolean(DATABASE_URL);
 }
-
 async function dbQuery(text, params = []) {
   return pool.query(text, params);
 }
+function parseCsvList(str) {
+  return String(str || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+const MOTIVOS = parseCsvList(RETURN_MOTIVOS);
+const CAUSAS = parseCsvList(RETURN_CAUSAS);
 
 async function ensureDb() {
   if (!hasDb()) return;
@@ -86,113 +85,98 @@ async function ensureDb() {
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS return_requests (
       id BIGSERIAL PRIMARY KEY,
-      request_no TEXT UNIQUE NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW(),
-      created_by_user_id INTEGER,
-      created_by_username TEXT DEFAULT '',
-      created_by_name TEXT DEFAULT '',
-      province TEXT DEFAULT '',
-      warehouse_code TEXT DEFAULT '',
-      card_code TEXT NOT NULL,
-      card_name TEXT DEFAULT '',
-      causa TEXT NOT NULL,
-      motivo TEXT NOT NULL,
-      comments TEXT DEFAULT '',
-      total_lines INTEGER DEFAULT 0,
+      req_num BIGINT UNIQUE NOT NULL,
+      req_entry BIGINT,
+      doc_date DATE,
+      doc_time INT,
+      card_code TEXT,
+      card_name TEXT,
+      usuario TEXT,
+      warehouse TEXT,
+      motivo TEXT,
+      causa TEXT,
+      total_amount NUMERIC(19,6) DEFAULT 0,
       total_qty NUMERIC(19,6) DEFAULT 0,
-      status TEXT DEFAULT 'CREATED',
-      sap_entity TEXT DEFAULT '',
-      sap_doc_entry BIGINT,
-      sap_doc_num BIGINT,
-      sap_payload JSONB,
-      sap_response JSONB,
-      raw_error TEXT DEFAULT ''
+      status TEXT DEFAULT 'Open',
+      comments TEXT,
+      updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  const headerAlter = [
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS req_num BIGINT`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS req_entry BIGINT`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS doc_date DATE`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS doc_time INT`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS card_code TEXT`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS card_name TEXT`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS usuario TEXT`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS warehouse TEXT`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS motivo TEXT`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS causa TEXT`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS total_amount NUMERIC(19,6) DEFAULT 0`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS total_qty NUMERIC(19,6) DEFAULT 0`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'Open'`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS comments TEXT`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()`,
+  ];
+  for (const q of headerAlter) {
+    try { await dbQuery(q); } catch {}
+  }
 
   await dbQuery(`
-    CREATE TABLE IF NOT EXISTS return_request_lines (
+    CREATE TABLE IF NOT EXISTS return_lines (
       id BIGSERIAL PRIMARY KEY,
-      request_id BIGINT NOT NULL REFERENCES return_requests(id) ON DELETE CASCADE,
-      line_num INTEGER NOT NULL,
+      req_num BIGINT NOT NULL,
+      doc_date DATE,
       item_code TEXT NOT NULL,
-      item_name TEXT DEFAULT '',
-      quantity NUMERIC(19,6) DEFAULT 0
+      item_desc TEXT DEFAULT '',
+      qty NUMERIC(19,6) DEFAULT 0,
+      price NUMERIC(19,6) DEFAULT 0,
+      line_total NUMERIC(19,6) DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(req_num, item_code)
     );
   `);
 
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_rr_admin_created_at ON return_requests(created_at);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_rr_admin_user ON return_requests(created_by_username);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_rr_admin_card ON return_requests(card_code);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_rr_admin_ca ON return_requests(causa);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_rr_admin_mo ON return_requests(motivo);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_rr_admin_status ON return_requests(status);`);
-}
+  const lineAlter = [
+    `ALTER TABLE return_lines ADD COLUMN IF NOT EXISTS req_num BIGINT`,
+    `ALTER TABLE return_lines ADD COLUMN IF NOT EXISTS doc_date DATE`,
+    `ALTER TABLE return_lines ADD COLUMN IF NOT EXISTS item_code TEXT`,
+    `ALTER TABLE return_lines ADD COLUMN IF NOT EXISTS item_desc TEXT DEFAULT ''`,
+    `ALTER TABLE return_lines ADD COLUMN IF NOT EXISTS qty NUMERIC(19,6) DEFAULT 0`,
+    `ALTER TABLE return_lines ADD COLUMN IF NOT EXISTS price NUMERIC(19,6) DEFAULT 0`,
+    `ALTER TABLE return_lines ADD COLUMN IF NOT EXISTS line_total NUMERIC(19,6) DEFAULT 0`,
+    `ALTER TABLE return_lines ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()`,
+  ];
+  for (const q of lineAlter) {
+    try { await dbQuery(q); } catch {}
+  }
 
-/* =========================================================
-   HELPERS
-========================================================= */
-const TZ_OFFSET_MIN = -300;
+  try {
+    await dbQuery(`CREATE UNIQUE INDEX IF NOT EXISTS idx_return_requests_req_num ON return_requests(req_num);`);
+    await dbQuery(`CREATE INDEX IF NOT EXISTS idx_returns_date ON return_requests(doc_date);`);
+    await dbQuery(`CREATE INDEX IF NOT EXISTS idx_returns_user ON return_requests(usuario);`);
+    await dbQuery(`CREATE INDEX IF NOT EXISTS idx_returns_wh ON return_requests(warehouse);`);
+    await dbQuery(`CREATE INDEX IF NOT EXISTS idx_returns_card ON return_requests(card_code);`);
+    await dbQuery(`CREATE INDEX IF NOT EXISTS idx_return_lines_req ON return_lines(req_num);`);
+  } catch {}
+}
 
 function safeJson(res, status, obj) {
-  return res.status(status).json(obj);
+  res.status(status).json(obj);
 }
-
-function nowInOffsetMs(offsetMin = 0) {
-  const now = new Date();
-  return now.getTime() + now.getTimezoneOffset() * 60000 + Number(offsetMin) * 60000;
-}
-
-function isoDateInOffset(offsetMin = 0) {
-  const d = new Date(nowInOffsetMs(offsetMin));
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
-}
-
-function addDaysISO(iso, days) {
-  const d = new Date(String(iso || "").slice(0, 10) + "T00:00:00");
-  if (Number.isNaN(d.getTime())) return "";
-  d.setDate(d.getDate() + Number(days || 0));
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
-}
-
-function norm(s) {
-  return String(s || "")
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ");
-}
-
-function provinceToWarehouseServer(province) {
-  const p = norm(province);
-  if (p === "chiriqui" || p === "bocas del toro") return "200";
-  if (p === "veraguas" || p === "cocle" || p === "los santos" || p === "herrera") return "500";
-  if (p === "panama" || p === "panama oeste" || p === "colon") return "300";
-  if (p === "rci") return "01";
-  return "";
-}
-
 function signToken(payload, ttl = "12h") {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: ttl });
 }
-
 function readBearer(req) {
   const auth = String(req.headers.authorization || "");
   const m = auth.match(/^Bearer\s+(.+)$/i);
   return m ? m[1] : "";
 }
-
 function verifyAdmin(req, res, next) {
   const token = readBearer(req);
   if (!token) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
-
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (decoded?.role !== "admin") return safeJson(res, 403, { ok: false, message: "Forbidden" });
@@ -202,26 +186,40 @@ function verifyAdmin(req, res, next) {
     return safeJson(res, 401, { ok: false, message: "Invalid token" });
   }
 }
-
+function norm(s) {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ");
+}
 async function hashPin(pin) {
   return bcrypt.hash(String(pin), 10);
 }
+function provinceToWarehouseServer(province) {
+  const p = norm(province);
+  if (p === "chiriqui" || p === "bocas del toro") return "200";
+  if (p === "veraguas" || p === "cocle" || p === "los santos" || p === "herrera") return "500";
+  if (p === "panama" || p === "panama oeste" || p === "colon") return "300";
+  if (p === "rci") return "01";
+  return "300";
+}
 
-/* =========================================================
-   HEALTH
-========================================================= */
 app.get("/api/health", async (req, res) => {
-  return safeJson(res, 200, {
+  safeJson(res, 200, {
     ok: true,
-    app: "devolucion-admin-api",
+    message: "✅ PRODIMA DEVOLUCIONES ADMIN API activa",
     db: hasDb() ? "on" : "off",
-    nowPanama: new Date(nowInOffsetMs(TZ_OFFSET_MIN)).toISOString().replace("Z", ""),
+    motivos: MOTIVOS.length,
+    causas: CAUSAS.length,
   });
 });
 
-/* =========================================================
-   ADMIN LOGIN
-========================================================= */
+app.get("/api/admin/meta", verifyAdmin, async (req, res) => {
+  return safeJson(res, 200, { ok: true, motivos: MOTIVOS, causas: CAUSAS });
+});
+
 app.post("/api/admin/login", async (req, res) => {
   const user = String(req.body?.user || "").trim();
   const pass = String(req.body?.pass || "").trim();
@@ -232,9 +230,6 @@ app.post("/api/admin/login", async (req, res) => {
   return safeJson(res, 200, { ok: true, token });
 });
 
-/* =========================================================
-   USERS
-========================================================= */
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
@@ -308,7 +303,6 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
     const id = Number(req.params.id || 0);
     if (!Number.isFinite(id) || id <= 0) return safeJson(res, 400, { ok: false, message: "ID inválido" });
-
     const r = await dbQuery(`DELETE FROM app_users WHERE id=$1`, [id]);
     if (!r.rowCount) return safeJson(res, 404, { ok: false, message: "Usuario no encontrado" });
     return safeJson(res, 200, { ok: true });
@@ -320,12 +314,10 @@ app.delete("/api/admin/users/:id", verifyAdmin, async (req, res) => {
 app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
-
     const id = Number(req.params.id || 0);
     const pin = String(req.body?.pin || "").trim();
     if (!Number.isFinite(id) || id <= 0) return safeJson(res, 400, { ok: false, message: "ID inválido" });
     if (!pin || pin.length < 4) return safeJson(res, 400, { ok: false, message: "PIN mínimo 4" });
-
     const pin_hash = await hashPin(pin);
     const r = await dbQuery(`UPDATE app_users SET pin_hash=$2 WHERE id=$1`, [id, pin_hash]);
     if (!r.rowCount) return safeJson(res, 404, { ok: false, message: "Usuario no encontrado" });
@@ -335,109 +327,123 @@ app.patch("/api/admin/users/:id/pin", verifyAdmin, async (req, res) => {
   }
 });
 
-/* =========================================================
-   DASHBOARD
-========================================================= */
-app.get("/api/admin/requests/dashboard", verifyAdmin, async (req, res) => {
+app.get("/api/admin/returns/dashboard-db", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
 
     const fromQ = String(req.query?.from || "").slice(0, 10);
     const toQ = String(req.query?.to || "").slice(0, 10);
+    const motivo = String(req.query?.motivo || "").trim();
     const onlyCreated = String(req.query?.onlyCreated || "0") === "1";
 
-    const today = isoDateInOffset(TZ_OFFSET_MIN);
-    const from = /^\d{4}-\d{2}-\d{2}$/.test(fromQ) ? fromQ : addDaysISO(today, -30);
-    const to = /^\d{4}-\d{2}-\d{2}$/.test(toQ) ? toQ : today;
+    const now = new Date();
+    const fromDef = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
+    const toDef = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+      new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate()
+    ).padStart(2, "0")}`;
 
-    const createdJoin = onlyCreated
-      ? `AND LOWER(COALESCE(r.created_by_username,'')) IN (SELECT LOWER(username) FROM app_users WHERE is_active=TRUE)`
-      : ``;
+    const from = /^\d{4}-\d{2}-\d{2}$/.test(fromQ) ? fromQ : fromDef;
+    const to = /^\d{4}-\d{2}-\d{2}$/.test(toQ) ? toQ : toDef;
+
+    const where = [];
+    const params = [];
+    let p = 1;
+
+    where.push(`r.doc_date BETWEEN $${p++} AND $${p++}`);
+    params.push(from, to);
+
+    if (onlyCreated) {
+      where.push(`LOWER(COALESCE(r.usuario,'')) IN (SELECT LOWER(username) FROM app_users WHERE is_active=TRUE)`);
+    }
+    if (motivo && motivo !== "__ALL__") {
+      where.push(`r.motivo = $${p++}`);
+      params.push(motivo);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
     const totalsR = await dbQuery(
       `SELECT
-         COUNT(*)::int AS requests,
-         COALESCE(SUM(r.total_qty),0)::float AS total_qty,
-         COALESCE(SUM(r.total_lines),0)::int AS total_lines,
-         COALESCE(SUM(CASE WHEN COALESCE(r.sap_doc_num,0) > 0 THEN 1 ELSE 0 END),0)::int AS sent_to_sap,
-         COALESCE(SUM(CASE WHEN UPPER(COALESCE(r.status,'')) LIKE 'CREATED%' THEN 1 ELSE 0 END),0)::int AS created_ok
+        COUNT(*)::int AS requests,
+        COALESCE(SUM(r.total_amount),0)::float AS total_amount,
+        COALESCE(SUM(r.total_qty),0)::float AS total_qty,
+        CASE WHEN COUNT(*)>0 THEN (COALESCE(SUM(r.total_amount),0) / COUNT(*))::float ELSE 0 END AS avg_amount
        FROM return_requests r
-       WHERE r.created_at::date BETWEEN $1 AND $2
-       ${createdJoin}`,
-      [from, to]
+       ${whereSql}`,
+      params
     );
+    const totals = totalsR.rows?.[0] || { requests: 0, total_amount: 0, total_qty: 0, avg_amount: 0 };
 
-    const byUserR = await dbQuery(
-      `SELECT
-         COALESCE(NULLIF(r.created_by_username,''),'sin_user') AS usuario,
-         COUNT(*)::int AS cnt,
-         COALESCE(SUM(r.total_qty),0)::float AS total_qty
+    const byStatusR = await dbQuery(
+      `SELECT COALESCE(NULLIF(r.status,''),'Open') AS status,
+              COUNT(*)::int AS cnt,
+              COALESCE(SUM(r.total_amount),0)::float AS amount
        FROM return_requests r
-       WHERE r.created_at::date BETWEEN $1 AND $2
-       ${createdJoin}
+       ${whereSql}
        GROUP BY 1
-       ORDER BY cnt DESC, total_qty DESC
-       LIMIT 2000`,
-      [from, to]
-    );
-
-    const byWhR = await dbQuery(
-      `SELECT
-         COALESCE(NULLIF(r.warehouse_code,''),'sin_wh') AS warehouse,
-         COUNT(*)::int AS cnt,
-         COALESCE(SUM(r.total_qty),0)::float AS total_qty
-       FROM return_requests r
-       WHERE r.created_at::date BETWEEN $1 AND $2
-       ${createdJoin}
-       GROUP BY 1
-       ORDER BY cnt DESC, total_qty DESC
-       LIMIT 2000`,
-      [from, to]
-    );
-
-    const byCausaR = await dbQuery(
-      `SELECT
-         COALESCE(NULLIF(r.causa,''),'Sin causa') AS causa,
-         COUNT(*)::int AS cnt,
-         COALESCE(SUM(r.total_qty),0)::float AS total_qty
-       FROM return_requests r
-       WHERE r.created_at::date BETWEEN $1 AND $2
-       ${createdJoin}
-       GROUP BY 1
-       ORDER BY cnt DESC, total_qty DESC
-       LIMIT 2000`,
-      [from, to]
+       ORDER BY amount DESC`,
+      params
     );
 
     const byMotivoR = await dbQuery(
-      `SELECT
-         COALESCE(NULLIF(r.motivo,''),'Sin motivo') AS motivo,
-         COUNT(*)::int AS cnt,
-         COALESCE(SUM(r.total_qty),0)::float AS total_qty
+      `SELECT COALESCE(NULLIF(r.motivo,''),'Sin motivo') AS motivo,
+              COUNT(*)::int AS cnt,
+              COALESCE(SUM(r.total_amount),0)::float AS amount
        FROM return_requests r
-       WHERE r.created_at::date BETWEEN $1 AND $2
-       ${createdJoin}
+       ${whereSql}
        GROUP BY 1
-       ORDER BY cnt DESC, total_qty DESC
+       ORDER BY amount DESC
        LIMIT 2000`,
-      [from, to]
+      params
+    );
+
+    const byCausaR = await dbQuery(
+      `SELECT COALESCE(NULLIF(r.causa,''),'Sin causa') AS causa,
+              COUNT(*)::int AS cnt,
+              COALESCE(SUM(r.total_amount),0)::float AS amount
+       FROM return_requests r
+       ${whereSql}
+       GROUP BY 1
+       ORDER BY amount DESC
+       LIMIT 2000`,
+      params
+    );
+
+    const byUserR = await dbQuery(
+      `SELECT COALESCE(NULLIF(r.usuario,''),'sin_user') AS usuario,
+              COUNT(*)::int AS cnt,
+              COALESCE(SUM(r.total_amount),0)::float AS amount
+       FROM return_requests r
+       ${whereSql}
+       GROUP BY 1
+       ORDER BY amount DESC
+       LIMIT 2000`,
+      params
+    );
+
+    const byWhR = await dbQuery(
+      `SELECT COALESCE(NULLIF(r.warehouse,''),'sin_wh') AS warehouse,
+              COUNT(*)::int AS cnt,
+              COALESCE(SUM(r.total_amount),0)::float AS amount
+       FROM return_requests r
+       ${whereSql}
+       GROUP BY 1
+       ORDER BY amount DESC
+       LIMIT 2000`,
+      params
     );
 
     const byClientR = await dbQuery(
-      `SELECT
-         COALESCE(NULLIF(r.card_name,''), r.card_code, 'sin_cliente') AS customer,
-         COUNT(*)::int AS cnt,
-         COALESCE(SUM(r.total_qty),0)::float AS total_qty
+      `SELECT COALESCE(NULLIF(r.card_name,''), r.card_code, 'sin_cliente') AS customer,
+              COUNT(*)::int AS cnt,
+              COALESCE(SUM(r.total_amount),0)::float AS amount
        FROM return_requests r
-       WHERE r.created_at::date BETWEEN $1 AND $2
-       ${createdJoin}
+       ${whereSql}
        GROUP BY 1
-       ORDER BY cnt DESC, total_qty DESC
+       ORDER BY amount DESC
        LIMIT 2000`,
-      [from, to]
+      params
     );
-
-    const totals = totalsR.rows?.[0] || {};
 
     return safeJson(res, 200, {
       ok: true,
@@ -445,26 +451,23 @@ app.get("/api/admin/requests/dashboard", verifyAdmin, async (req, res) => {
       to,
       totals: {
         requests: Number(totals.requests || 0),
-        total_qty: Number(totals.total_qty || 0),
-        total_lines: Number(totals.total_lines || 0),
-        sent_to_sap: Number(totals.sent_to_sap || 0),
-        created_ok: Number(totals.created_ok || 0),
+        totalAmount: Number(totals.total_amount || 0),
+        totalQty: Number(totals.total_qty || 0),
+        avgAmount: Number(totals.avg_amount || 0),
       },
-      byUser: byUserR.rows || [],
-      byWh: byWhR.rows || [],
-      byCausa: byCausaR.rows || [],
-      byMotivo: byMotivoR.rows || [],
-      byClient: byClientR.rows || [],
+      byStatus: (byStatusR.rows || []).map((x) => ({ status: x.status, cnt: Number(x.cnt || 0), amount: Number(x.amount || 0) })),
+      byMotivo: (byMotivoR.rows || []).map((x) => ({ motivo: x.motivo, cnt: Number(x.cnt || 0), amount: Number(x.amount || 0) })),
+      byCausa: (byCausaR.rows || []).map((x) => ({ causa: x.causa, cnt: Number(x.cnt || 0), amount: Number(x.amount || 0) })),
+      byUser: (byUserR.rows || []).map((x) => ({ usuario: x.usuario, cnt: Number(x.cnt || 0), amount: Number(x.amount || 0) })),
+      byWh: (byWhR.rows || []).map((x) => ({ warehouse: x.warehouse, cnt: Number(x.cnt || 0), amount: Number(x.amount || 0) })),
+      byClient: (byClientR.rows || []).map((x) => ({ customer: x.customer, cnt: Number(x.cnt || 0), amount: Number(x.amount || 0) })),
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
 });
 
-/* =========================================================
-   REQUESTS LIST
-========================================================= */
-app.get("/api/admin/requests", verifyAdmin, async (req, res) => {
+app.get("/api/admin/returns/db", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
 
@@ -472,146 +475,151 @@ app.get("/api/admin/requests", verifyAdmin, async (req, res) => {
     const toQ = String(req.query?.to || "").slice(0, 10);
     const user = String(req.query?.user || "").trim().toLowerCase();
     const client = String(req.query?.client || "").trim().toLowerCase();
-    const causa = String(req.query?.causa || "").trim().toLowerCase();
-    const motivo = String(req.query?.motivo || "").trim().toLowerCase();
-    const status = String(req.query?.status || "").trim().toLowerCase();
+    const motivo = String(req.query?.motivo || "").trim();
+    const causa = String(req.query?.causa || "").trim();
     const onlyCreated = String(req.query?.onlyCreated || "0") === "1";
-
+    const openOnly = String(req.query?.openOnly || "0") === "1";
     const skipRaw = Number(req.query?.skip || 0);
     const limitRaw = Number(req.query?.limit || 20);
     const skip = Math.max(0, Number.isFinite(skipRaw) ? Math.trunc(skipRaw) : 0);
     const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 20));
 
-    const today = isoDateInOffset(TZ_OFFSET_MIN);
-    const from = /^\d{4}-\d{2}-\d{2}$/.test(fromQ) ? fromQ : addDaysISO(today, -30);
-    const to = /^\d{4}-\d{2}-\d{2}$/.test(toQ) ? toQ : today;
+    const now = new Date();
+    const fromDef = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
+    const toDef = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+      new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate()
+    ).padStart(2, "0")}`;
+    const from = /^\d{4}-\d{2}-\d{2}$/.test(fromQ) ? fromQ : fromDef;
+    const to = /^\d{4}-\d{2}-\d{2}$/.test(toQ) ? toQ : toDef;
 
     const where = [];
     const params = [];
     let p = 1;
-
-    where.push(`r.created_at::date BETWEEN $${p++} AND $${p++}`);
+    where.push(`r.doc_date BETWEEN $${p++} AND $${p++}`);
     params.push(from, to);
 
     if (onlyCreated) {
-      where.push(`LOWER(COALESCE(r.created_by_username,'')) IN (SELECT LOWER(username) FROM app_users WHERE is_active=TRUE)`);
+      where.push(`LOWER(COALESCE(r.usuario,'')) IN (SELECT LOWER(username) FROM app_users WHERE is_active=TRUE)`);
     }
-
     if (user) {
-      where.push(`LOWER(COALESCE(r.created_by_username,'')) LIKE $${p++}`);
+      where.push(`LOWER(COALESCE(r.usuario,'')) LIKE $${p++}`);
       params.push(`%${user}%`);
     }
-
     if (client) {
       where.push(`(LOWER(COALESCE(r.card_code,'')) LIKE $${p++} OR LOWER(COALESCE(r.card_name,'')) LIKE $${p++})`);
       params.push(`%${client}%`, `%${client}%`);
     }
-
-    if (causa) {
-      where.push(`LOWER(COALESCE(r.causa,'')) LIKE $${p++}`);
-      params.push(`%${causa}%`);
+    if (motivo && motivo !== "__ALL__") {
+      where.push(`r.motivo = $${p++}`);
+      params.push(motivo);
     }
-
-    if (motivo) {
-      where.push(`LOWER(COALESCE(r.motivo,'')) LIKE $${p++}`);
-      params.push(`%${motivo}%`);
+    if (causa && causa !== "__ALL__") {
+      where.push(`r.causa = $${p++}`);
+      params.push(causa);
     }
-
-    if (status) {
-      where.push(`LOWER(COALESCE(r.status,'')) LIKE $${p++}`);
-      params.push(`%${status}%`);
+    if (openOnly) {
+      where.push(`LOWER(COALESCE(r.status,'')) LIKE '%open%'`);
     }
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
-
     const totalR = await dbQuery(`SELECT COUNT(*)::int AS total FROM return_requests r ${whereSql}`, params);
     const total = Number(totalR.rows?.[0]?.total || 0);
 
     const dataR = await dbQuery(
       `SELECT
-         r.id,
-         r.request_no AS "requestNo",
-         r.created_at,
-         r.created_by_username AS usuario,
-         r.created_by_name AS "fullName",
-         r.warehouse_code AS warehouse,
-         r.card_code AS "cardCode",
-         r.card_name AS "cardName",
-         r.causa,
-         r.motivo,
-         r.total_lines AS "totalLines",
-         r.total_qty::float AS "totalQty",
-         r.status,
-         r.sap_doc_entry AS "sapDocEntry",
-         r.sap_doc_num AS "sapDocNum",
-         r.comments
+        r.req_num AS "reqNum",
+        r.req_entry AS "reqEntry",
+        r.doc_date AS "fecha",
+        r.card_code AS "cardCode",
+        r.card_name AS "cardName",
+        r.usuario AS "usuario",
+        r.warehouse AS "warehouse",
+        r.motivo AS "motivo",
+        r.causa AS "causa",
+        r.status AS "status",
+        r.total_amount::float AS "totalAmount",
+        r.total_qty::float AS "totalQty",
+        r.comments AS "comments"
        FROM return_requests r
        ${whereSql}
-       ORDER BY r.id DESC
+       ORDER BY r.doc_date DESC, r.req_num DESC
        OFFSET $${p++} LIMIT $${p++}`,
       [...params, skip, limit]
     );
 
-    return safeJson(res, 200, {
-      ok: true,
-      from,
-      to,
-      total,
-      skip,
-      limit,
-      requests: dataR.rows || [],
-    });
+    return safeJson(res, 200, { ok: true, from, to, total, skip, limit, rows: dataR.rows || [] });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
 });
 
-/* =========================================================
-   REQUEST LINES
-========================================================= */
-app.get("/api/admin/requests/lines", verifyAdmin, async (req, res) => {
+app.get("/api/admin/returns/lines", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+    const reqNum = Number(req.query?.reqNum || 0);
+    if (!Number.isFinite(reqNum) || reqNum <= 0) return safeJson(res, 400, { ok: false, message: "reqNum inválido" });
 
-    const requestId = Number(req.query?.requestId || 0);
-    if (!Number.isFinite(requestId) || requestId <= 0) {
-      return safeJson(res, 400, { ok: false, message: "requestId inválido" });
-    }
-
-    const head = await dbQuery(
-      `SELECT id, request_no, created_at, card_code, card_name, causa, motivo, status, sap_doc_num
-       FROM return_requests WHERE id=$1 LIMIT 1`,
-      [requestId]
+    const headR = await dbQuery(
+      `SELECT req_num AS "reqNum", doc_date AS "docDate", status AS "status"
+       FROM return_requests
+       WHERE req_num=$1
+       LIMIT 1`,
+      [reqNum]
     );
+    const head = headR.rows?.[0];
+    if (!head) return safeJson(res, 404, { ok: false, message: "Solicitud no encontrada" });
 
-    const h = head.rows?.[0];
-    if (!h) return safeJson(res, 404, { ok: false, message: "Solicitud no encontrada" });
-
-    const lines = await dbQuery(
+    const linesR = await dbQuery(
       `SELECT
-         line_num AS "lineNum",
-         item_code AS "itemCode",
-         item_name AS "itemName",
-         quantity::float AS quantity
-       FROM return_request_lines
-       WHERE request_id=$1
-       ORDER BY line_num ASC, id ASC`,
-      [requestId]
+        req_num AS "reqNum",
+        doc_date AS "docDate",
+        item_code AS "itemCode",
+        item_desc AS "itemDesc",
+        qty::float AS "qty",
+        price::float AS "price",
+        line_total::float AS "lineTotal"
+       FROM return_lines
+       WHERE req_num=$1
+       ORDER BY line_total DESC, item_code ASC`,
+      [reqNum]
     );
 
     return safeJson(res, 200, {
       ok: true,
-      request: h,
-      lines: lines.rows || [],
+      reqNum: head.reqNum,
+      docDate: head.docDate,
+      status: head.status || "Open",
+      lines: linesR.rows || [],
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
 });
 
-/* =========================================================
-   START
-========================================================= */
+app.patch("/api/admin/returns/:reqNum/status", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+    const reqNum = Number(req.params.reqNum || 0);
+    if (!Number.isFinite(reqNum) || reqNum <= 0) return safeJson(res, 400, { ok: false, message: "reqNum inválido" });
+    const status = String(req.body?.status || "").trim().toLowerCase();
+    const finalStatus = status.includes("open") ? "Open" : status.includes("close") ? "Closed" : "";
+    if (!finalStatus) return safeJson(res, 400, { ok: false, message: "status inválido (usa Open/Closed)" });
+
+    const r = await dbQuery(
+      `UPDATE return_requests
+       SET status=$2, updated_at=NOW()
+       WHERE req_num=$1
+       RETURNING req_num AS "reqNum", status`,
+      [reqNum, finalStatus]
+    );
+
+    if (!r.rowCount) return safeJson(res, 404, { ok: false, message: "Solicitud no encontrada" });
+    return safeJson(res, 200, { ok: true, reqNum, status: r.rows[0].status });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
@@ -622,6 +630,5 @@ process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
   } catch (e) {
     console.error("DB init error:", e.message);
   }
-
-  app.listen(Number(PORT), () => console.log(`DEVOLUCION ADMIN API listening on :${PORT}`));
+  app.listen(Number(PORT), () => console.log(`ADMIN DEVOLUCIONES API listening on :${PORT}`));
 })();
