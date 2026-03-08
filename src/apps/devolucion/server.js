@@ -1,4 +1,3 @@
-// src/apps/devolucion/server.js
 import express from "express";
 import cors from "cors";
 import pg from "pg";
@@ -6,73 +5,58 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
 const { Pool } = pg;
-
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 /* =========================================================
-   ✅ ENV (Render)
+   ENV
 ========================================================= */
 const {
   PORT = 3000,
   CORS_ORIGIN = "*",
-
   DATABASE_URL = "",
   JWT_SECRET = "change_me",
 
-  // SAP B1 Service Layer
   SAP_BASE_URL = "",
   SAP_COMPANYDB = "",
   SAP_USER = "",
   SAP_PASS = "",
 
-  // Defaults
   SAP_WAREHOUSE = "300",
-  SAP_PRICE_LIST = "Lista de Precios 99 2018",
+  SAP_PRICE_LIST = "",
+  SAP_RETURN_ENTITY = "ReturnRequests",
+  SAP_WEB_CARD_CODE = "",
 
-  // ✅ Entidad de SAP para devoluciones:
-  // - "Returns" (Devolución)
-  // - "ReturnRequest" (Solicitud de devolución, si tu SL lo tiene)
-  SAP_RETURN_ENTITY = "Returns",
+  SAP_RETURN_CAUSE_UDF = "",
+  SAP_RETURN_MOTIVE_UDF = "",
+  SAP_RETURN_LOCALNO_UDF = "",
 
-  // ✅ Dimensión 1 requerida por tu cuenta 5101-01-01 (Distribution Rule)
-  // PON AQUÍ EL CÓDIGO REAL DE DIM 1 EN SAP (Financials -> Cost Accounting -> Distribution Rules)
-  SAP_DIM1_DEFAULT = "",
-  SAP_DIM1_200 = "",
-  SAP_DIM1_300 = "",
-  SAP_DIM1_500 = "",
-  SAP_DIM1_01 = "",
+  RETURN_CAUSAS = "Producto vencido,Producto dañado,Error de despacho,Cliente rechazó,Empaque defectuoso,Otro",
+  RETURN_MOTIVOS = "Cambio,Crédito,Reposición,Revisión comercial,Revisión calidad,Otro",
 
-  // ✅ Listas desplegables (comma separated)
-  // Ej: "Producto vencido,Empaque dañado,Error de despacho"
-  RETURN_MOTIVOS = "",
-  // Ej: "Cliente devolvió,Almacén,Transporte"
-  RETURN_CAUSAS = "",
-
-  // ✅ listas de códigos permitidos por bodega (comma separated)
+  ACTIVE_CODES_01 = "",
   ACTIVE_CODES_200 = "",
   ACTIVE_CODES_300 = "",
   ACTIVE_CODES_500 = "",
-
-  // ✅ usuarios que pueden elegir cualquier bodega (comma separated)
   ADMIN_FREE_WHS_USERS = "soto,liliana,daniel11,respinosa,test",
-
-  // ✅ fallback bodegas (si SAP no responde)
+  ALLOWED_STOCK_WH = "200,300,500,01",
   WAREHOUSE_FALLBACK = "200,300,500,01",
 } = process.env;
 
 /* =========================================================
-   ✅ CORS
+   CORS
 ========================================================= */
 app.use(
   cors({
-    origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
+    origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN.split(",").map((x) => x.trim()).filter(Boolean),
     credentials: false,
+    allowedHeaders: ["Content-Type", "Authorization", "x-warehouse"],
+    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
   })
 );
 
 /* =========================================================
-   ✅ DB (Postgres / Supabase)
+   DB
 ========================================================= */
 const pool = new Pool({
   connectionString: DATABASE_URL || undefined,
@@ -85,19 +69,14 @@ const pool = new Pool({
 function hasDb() {
   return Boolean(DATABASE_URL);
 }
+
 async function dbQuery(text, params = []) {
   return pool.query(text, params);
 }
 
-/**
- * ✅ Migración tolerante:
- * - Crea tablas si no existen
- * - Si existen pero les faltan columnas, las agrega (evita errores tipo "column doc_date does not exist")
- */
 async function ensureDb() {
   if (!hasDb()) return;
 
-  // Usuarios (compartida con pedidos)
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS app_users (
       id SERIAL PRIMARY KEY,
@@ -111,108 +90,63 @@ async function ensureDb() {
     );
   `);
 
-  // Cache de devoluciones (header)
   await dbQuery(`
-    CREATE TABLE IF NOT EXISTS returns_cache (
+    CREATE TABLE IF NOT EXISTS return_requests (
       id BIGSERIAL PRIMARY KEY,
-      doc_num BIGINT UNIQUE,
-      doc_entry BIGINT,
-      doc_date DATE,
-      doc_time INT,
-      card_code TEXT,
-      card_name TEXT,
-      usuario TEXT,
-      warehouse TEXT,
-      status TEXT,
-      cancel_status TEXT,
-      motivo TEXT,
-      causa TEXT,
-      comments TEXT,
-      updated_at TIMESTAMP DEFAULT NOW()
+      request_no TEXT UNIQUE NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      created_by_user_id INTEGER,
+      created_by_username TEXT DEFAULT '',
+      created_by_name TEXT DEFAULT '',
+      province TEXT DEFAULT '',
+      warehouse_code TEXT DEFAULT '',
+      card_code TEXT NOT NULL,
+      card_name TEXT DEFAULT '',
+      causa TEXT NOT NULL,
+      motivo TEXT NOT NULL,
+      comments TEXT DEFAULT '',
+      total_lines INTEGER DEFAULT 0,
+      total_qty NUMERIC(19,6) DEFAULT 0,
+      status TEXT DEFAULT 'CREATED',
+      sap_entity TEXT DEFAULT '',
+      sap_doc_entry BIGINT,
+      sap_doc_num BIGINT,
+      sap_payload JSONB,
+      sap_response JSONB,
+      raw_error TEXT DEFAULT ''
     );
   `);
 
-  // Agregar columnas faltantes sin romper si la tabla ya existía con otro esquema
-  const alterCols = [
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS doc_num BIGINT UNIQUE`,
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS doc_entry BIGINT`,
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS doc_date DATE`,
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS doc_time INT`,
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS card_code TEXT`,
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS card_name TEXT`,
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS usuario TEXT`,
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS warehouse TEXT`,
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS status TEXT`,
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS cancel_status TEXT`,
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS motivo TEXT`,
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS causa TEXT`,
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS comments TEXT`,
-    `ALTER TABLE returns_cache ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()`,
-  ];
-  for (const q of alterCols) {
-    try {
-      await dbQuery(q);
-    } catch {
-      // tolerante
-    }
-  }
-
-  // Cache de líneas (detalle)
   await dbQuery(`
-    CREATE TABLE IF NOT EXISTS return_lines_cache (
+    CREATE TABLE IF NOT EXISTS return_request_lines (
       id BIGSERIAL PRIMARY KEY,
-      doc_num BIGINT,
-      doc_date DATE,
+      request_id BIGINT NOT NULL REFERENCES return_requests(id) ON DELETE CASCADE,
+      line_num INTEGER NOT NULL,
       item_code TEXT NOT NULL,
-      item_desc TEXT DEFAULT '',
-      qty_requested NUMERIC(19,6) DEFAULT 0,
-      updated_at TIMESTAMP DEFAULT NOW(),
-      UNIQUE(doc_num, item_code)
+      item_name TEXT DEFAULT '',
+      quantity NUMERIC(19,6) DEFAULT 0
     );
   `);
 
-  const alterLineCols = [
-    `ALTER TABLE return_lines_cache ADD COLUMN IF NOT EXISTS doc_num BIGINT`,
-    `ALTER TABLE return_lines_cache ADD COLUMN IF NOT EXISTS doc_date DATE`,
-    `ALTER TABLE return_lines_cache ADD COLUMN IF NOT EXISTS item_code TEXT`,
-    `ALTER TABLE return_lines_cache ADD COLUMN IF NOT EXISTS item_desc TEXT DEFAULT ''`,
-    `ALTER TABLE return_lines_cache ADD COLUMN IF NOT EXISTS qty_requested NUMERIC(19,6) DEFAULT 0`,
-    `ALTER TABLE return_lines_cache ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()`,
-  ];
-  for (const q of alterLineCols) {
-    try {
-      await dbQuery(q);
-    } catch {}
-  }
-
-  // Estado (last sync / etc.)
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS app_state (
-      k TEXT PRIMARY KEY,
-      v TEXT NOT NULL,
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // Indexes tolerantes
-  try {
-    await dbQuery(`CREATE INDEX IF NOT EXISTS idx_returns_cache_date ON returns_cache(doc_date);`);
-    await dbQuery(`CREATE INDEX IF NOT EXISTS idx_returns_cache_user ON returns_cache(usuario);`);
-    await dbQuery(`CREATE INDEX IF NOT EXISTS idx_returns_cache_wh ON returns_cache(warehouse);`);
-    await dbQuery(`CREATE INDEX IF NOT EXISTS idx_returns_cache_card ON returns_cache(card_code);`);
-    await dbQuery(`CREATE INDEX IF NOT EXISTS idx_return_lines_doc ON return_lines_cache(doc_num);`);
-  } catch {}
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_rr_created_at ON return_requests(created_at);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_rr_user ON return_requests(created_by_username);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_rr_card ON return_requests(card_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_rr_wh ON return_requests(warehouse_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_rr_lines_request ON return_request_lines(request_id);`);
 }
 
 /* =========================================================
-   ✅ Time helpers (Panamá UTC-5)
+   HELPERS
 ========================================================= */
-const TZ_OFFSET_MIN = -300;
+const TZ_OFFSET_MIN = -300; // Panamá UTC-5
+
+function safeJson(res, status, obj) {
+  return res.status(status).json(obj);
+}
 
 function getDateISOInOffset(offsetMin = 0) {
   const now = new Date();
-  const ms =
-    now.getTime() + now.getTimezoneOffset() * 60_000 + Number(offsetMin) * 60_000;
+  const ms = now.getTime() + now.getTimezoneOffset() * 60000 + Number(offsetMin) * 60000;
   const d = new Date(ms);
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
@@ -220,23 +154,20 @@ function getDateISOInOffset(offsetMin = 0) {
   return `${y}-${m}-${dd}`;
 }
 
-/* =========================================================
-   ✅ Warehouse map + override (igual a pedidos)
-========================================================= */
+function norm(s) {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ");
+}
+
 function provinceToWarehouse(province) {
-  const p = String(province || "").trim().toLowerCase();
-  if (p === "chiriquí" || p === "chiriqui" || p === "bocas del toro") return "200";
-  if (p === "veraguas" || p === "coclé" || p === "cocle" || p === "los santos" || p === "herrera")
-    return "500";
-  if (
-    p === "panamá" ||
-    p === "panama" ||
-    p === "panamá oeste" ||
-    p === "panama oeste" ||
-    p === "colón" ||
-    p === "colon"
-  )
-    return "300";
+  const p = norm(province);
+  if (p === "chiriqui" || p === "bocas del toro") return "200";
+  if (p === "veraguas" || p === "cocle" || p === "los santos" || p === "herrera") return "500";
+  if (p === "panama" || p === "panama oeste" || p === "colon") return "300";
   if (p === "rci") return "01";
   return SAP_WAREHOUSE || "300";
 }
@@ -249,7 +180,40 @@ function parseCsvSet(str) {
       .filter(Boolean)
   );
 }
+
+function parseCodesEnv(str) {
+  return String(str || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function parseListEnv(str) {
+  const raw = String(str || "").trim();
+  if (!raw) return [];
+
+  if ((raw.startsWith("[") && raw.endsWith("]")) || (raw.startsWith("{") && raw.endsWith("}"))) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.map((x) => String(x).trim()).filter(Boolean);
+    } catch {}
+  }
+
+  return raw
+    .split(/\r?\n|;|,/)
+    .map((x) => String(x).trim())
+    .filter(Boolean);
+}
+
 const ADMIN_FREE_WHS_SET = parseCsvSet(ADMIN_FREE_WHS_USERS);
+const ALLOWED_STOCK_WH_SET = parseCsvSet(ALLOWED_STOCK_WH);
+
+const ALLOWED_BY_WH = {
+  "01": parseCodesEnv(ACTIVE_CODES_01),
+  "200": parseCodesEnv(ACTIVE_CODES_200),
+  "300": parseCodesEnv(ACTIVE_CODES_300),
+  "500": parseCodesEnv(ACTIVE_CODES_500),
+};
 
 function canOverrideWarehouse(req) {
   const u = String(req.user?.username || "").trim().toLowerCase();
@@ -287,25 +251,8 @@ function getWarehouseFromReq(req) {
   return getWarehouseFromUserToken(req);
 }
 
-/* =========================================================
-   ✅ Allowed items by warehouse (200/300/500)
-========================================================= */
-function parseCodesEnv(str) {
-  return String(str || "")
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
-}
-
-const STATIC_ALLOWED = { "200": [], "300": [], "500": [] };
-const ALLOWED_BY_WH = {
-  "200": parseCodesEnv(ACTIVE_CODES_200).length ? parseCodesEnv(ACTIVE_CODES_200) : STATIC_ALLOWED["200"],
-  "300": parseCodesEnv(ACTIVE_CODES_300).length ? parseCodesEnv(ACTIVE_CODES_300) : STATIC_ALLOWED["300"],
-  "500": parseCodesEnv(ACTIVE_CODES_500).length ? parseCodesEnv(ACTIVE_CODES_500) : STATIC_ALLOWED["500"],
-};
-
 function isRestrictedWarehouse(wh) {
-  return wh === "200" || wh === "300" || wh === "500";
+  return wh === "01" || wh === "200" || wh === "300" || wh === "500";
 }
 
 function getAllowedSetForWh(wh) {
@@ -321,33 +268,26 @@ function assertItemAllowedOrThrow(wh, itemCode) {
   if (!isRestrictedWarehouse(wh)) return true;
 
   const set = getAllowedSetForWh(wh);
-  // ✅ si NO configuraste lista, no bloqueamos
   if (!set || set.size === 0) return true;
-
   if (!set.has(code)) throw new Error(`ItemCode no permitido en bodega ${wh}: ${code}`);
   return true;
 }
 
-/* =========================================================
-   ✅ DIM1 (Distribution Rule) según bodega
-   - Esto arregla el error: 540000062 ... needs DR assignment for dimension 1
-========================================================= */
-function getDim1ForWh(warehouse) {
-  const wh = String(warehouse || "").trim();
-  const byWh = {
-    "200": SAP_DIM1_200,
-    "300": SAP_DIM1_300,
-    "500": SAP_DIM1_500,
-    "01": SAP_DIM1_01,
-  };
-  return String(byWh[wh] || SAP_DIM1_DEFAULT || "").trim();
+function buildRequestNo(id) {
+  const ymd = getDateISOInOffset(TZ_OFFSET_MIN).replace(/-/g, "");
+  return `SD-${ymd}-${String(id).padStart(6, "0")}`;
 }
 
-/* =========================================================
-   ✅ Helpers auth
-========================================================= */
-function safeJson(res, status, obj) {
-  res.status(status).json(obj);
+function buildComments({ requestNo, username, warehouse, causa, motivo, comments }) {
+  const parts = [
+    `[req:${requestNo}]`,
+    `[user:${username || "unknown"}]`,
+    `[wh:${warehouse || ""}]`,
+    `[causa:${causa}]`,
+    `[motivo:${motivo}]`,
+  ];
+  if (comments) parts.push(String(comments).trim());
+  return parts.join(" ").slice(0, 254);
 }
 
 function signToken(payload, ttl = "12h") {
@@ -393,41 +333,7 @@ function missingSapEnv() {
 }
 
 /* =========================================================
-   ✅ HEALTH
-========================================================= */
-app.get("/api/health", async (req, res) => {
-  safeJson(res, 200, {
-    ok: true,
-    app: "devoluciones-api",
-    message: "✅ PRODIMA DEVOLUCIONES API activa",
-    db: hasDb() ? "on" : "off",
-    sap: missingSapEnv() ? "missing" : "ok",
-    return_entity: SAP_RETURN_ENTITY,
-    dim1_default_set: !!String(SAP_DIM1_DEFAULT || "").trim(),
-    warehouse_default: SAP_WAREHOUSE,
-    priceList: SAP_PRICE_LIST,
-  });
-});
-
-/* =========================================================
-   ✅ Opciones (Motivo / Causa) para dropdowns
-========================================================= */
-function parseCsvList(str) {
-  return String(str || "")
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
-}
-app.get("/api/returns/options", verifyUser, async (req, res) => {
-  return safeJson(res, 200, {
-    ok: true,
-    motivos: parseCsvList(RETURN_MOTIVOS),
-    causas: parseCsvList(RETURN_CAUSAS),
-  });
-});
-
-/* =========================================================
-   ✅ SAP Service Layer (Session cookie)
+   SAP Service Layer
 ========================================================= */
 let SL_COOKIE = "";
 let SL_COOKIE_AT = 0;
@@ -476,7 +382,6 @@ async function slFetch(path, options = {}) {
 
   const base = SAP_BASE_URL.replace(/\/$/, "");
   const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
-
   const method = String(options.method || "GET").toUpperCase();
 
   const r = await fetch(url, {
@@ -510,7 +415,142 @@ async function slFetch(path, options = {}) {
 }
 
 /* =========================================================
-   ✅ USER LOGIN (mercaderistas)
+   ITEM HELPERS
+========================================================= */
+let PRICE_LIST_CACHE = { name: "", no: null, ts: 0 };
+const PRICE_LIST_TTL_MS = 6 * 60 * 60 * 1000;
+const ITEM_CACHE = new Map();
+const ITEM_TTL_MS = 10 * 60 * 1000;
+
+async function getPriceListNoByNameCached(name) {
+  if (!name) return null;
+  const now = Date.now();
+  if (
+    PRICE_LIST_CACHE.name === name &&
+    PRICE_LIST_CACHE.no !== null &&
+    now - PRICE_LIST_CACHE.ts < PRICE_LIST_TTL_MS
+  ) {
+    return PRICE_LIST_CACHE.no;
+  }
+
+  const safe = name.replace(/'/g, "''");
+  let no = null;
+
+  try {
+    const r1 = await slFetch(`/PriceLists?$select=PriceListNo,PriceListName&$filter=PriceListName eq '${safe}'`);
+    if (r1?.value?.length) no = r1.value[0].PriceListNo;
+  } catch {}
+
+  if (no === null) {
+    try {
+      const r2 = await slFetch(`/PriceLists?$select=PriceListNo,ListName&$filter=ListName eq '${safe}'`);
+      if (r2?.value?.length) no = r2.value[0].PriceListNo;
+    } catch {}
+  }
+
+  PRICE_LIST_CACHE = { name, no, ts: now };
+  return no;
+}
+
+function getPriceFromPriceList(itemFull, priceListNo) {
+  const listNo = Number(priceListNo);
+  const row = Array.isArray(itemFull?.ItemPrices)
+    ? itemFull.ItemPrices.find((p) => Number(p?.PriceList) === listNo)
+    : null;
+  const price = row && row.Price != null ? Number(row.Price) : null;
+  return Number.isFinite(price) ? price : null;
+}
+
+function getSalesUomFactor(itemFull) {
+  const directFields = [
+    itemFull?.SalesItemsPerUnit,
+    itemFull?.SalesQtyPerPackUnit,
+    itemFull?.SalesQtyPerPackage,
+    itemFull?.SalesPackagingUnit,
+  ];
+  for (const v of directFields) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+function buildItemResponse(itemFull, code, priceListNo, warehouseCode) {
+  const item = {
+    ItemCode: itemFull.ItemCode ?? code,
+    ItemName: itemFull.ItemName ?? `Producto ${code}`,
+    SalesUnit: itemFull.SalesUnit ?? "",
+    InventoryItem: itemFull.InventoryItem ?? null,
+    Valid: itemFull.Valid ?? null,
+    FrozenFor: itemFull.FrozenFor ?? null,
+  };
+
+  const priceUnit = getPriceFromPriceList(itemFull, priceListNo);
+  const factorCaja = getSalesUomFactor(itemFull);
+  const priceCaja = priceUnit != null && factorCaja != null ? priceUnit * factorCaja : priceUnit;
+
+  let warehouseRow = null;
+  if (Array.isArray(itemFull?.ItemWarehouseInfoCollection)) {
+    warehouseRow =
+      itemFull.ItemWarehouseInfoCollection.find(
+        (w) => String(w?.WarehouseCode || "").trim() === String(warehouseCode || "").trim()
+      ) || null;
+  }
+
+  const onHand = warehouseRow?.InStock != null ? Number(warehouseRow.InStock) : null;
+  const committed = warehouseRow?.Committed != null ? Number(warehouseRow.Committed) : null;
+  const ordered = warehouseRow?.Ordered != null ? Number(warehouseRow.Ordered) : null;
+
+  let available = null;
+  if (Number.isFinite(onHand) && Number.isFinite(committed)) available = onHand - committed;
+
+  return {
+    item,
+    price: priceCaja,
+    priceUnit,
+    factorCaja,
+    stock: {
+      warehouse: warehouseCode,
+      onHand: Number.isFinite(onHand) ? onHand : null,
+      committed: Number.isFinite(committed) ? committed : null,
+      ordered: Number.isFinite(ordered) ? ordered : null,
+      available: Number.isFinite(available) ? available : null,
+      hasStock: available != null ? available > 0 : null,
+    },
+  };
+}
+
+async function getOneItem(code, priceListNo, warehouseCode) {
+  const now = Date.now();
+  const key = `${code}::${warehouseCode}::${priceListNo || "noprice"}`;
+  const cached = ITEM_CACHE.get(key);
+  if (cached && now - cached.ts < ITEM_TTL_MS) return cached.data;
+
+  let itemFull;
+  try {
+    itemFull = await slFetch(
+      `/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,SalesUnit,InventoryItem,Valid,FrozenFor,ItemPrices,ItemWarehouseInfoCollection`
+    );
+  } catch {
+    itemFull = await slFetch(`/Items('${encodeURIComponent(code)}')`);
+  }
+
+  if (!Array.isArray(itemFull?.ItemWarehouseInfoCollection) && ALLOWED_STOCK_WH_SET.has(String(warehouseCode).toLowerCase())) {
+    try {
+      const whInfo = await slFetch(
+        `/Items('${encodeURIComponent(code)}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,Committed,Ordered`
+      );
+      if (Array.isArray(whInfo?.value)) itemFull.ItemWarehouseInfoCollection = whInfo.value;
+    } catch {}
+  }
+
+  const data = buildItemResponse(itemFull, code, priceListNo, warehouseCode);
+  ITEM_CACHE.set(key, { ts: now, data });
+  return data;
+}
+
+/* =========================================================
+   LOGIN USER
 ========================================================= */
 async function handleUserLogin(req, res) {
   try {
@@ -519,13 +559,13 @@ async function handleUserLogin(req, res) {
     const username = String(req.body?.username || req.body?.user || "").trim().toLowerCase();
     const pin = String(req.body?.pin || req.body?.pass || "").trim();
 
-    if (!username || !pin) return safeJson(res, 400, { ok: false, message: "username y pin requeridos" });
+    if (!username || !pin) {
+      return safeJson(res, 400, { ok: false, message: "username y pin requeridos" });
+    }
 
     const r = await dbQuery(
       `SELECT id, username, full_name, pin_hash, province, warehouse_code, is_active
-       FROM app_users
-       WHERE username=$1
-       LIMIT 1`,
+       FROM app_users WHERE username=$1 LIMIT 1`,
       [username]
     );
 
@@ -562,14 +602,37 @@ async function handleUserLogin(req, res) {
   }
 }
 
+/* =========================================================
+   HEALTH + AUTH
+========================================================= */
+app.get("/api/health", async (req, res) => {
+  safeJson(res, 200, {
+    ok: true,
+    app: "solicitud-devoluciones-api",
+    message: "✅ PRODIMA SOLICITUDES DE DEVOLUCIÓN API activa",
+    db: hasDb() ? "on" : "off",
+    sap: missingSapEnv() ? "missing" : "ok",
+    returnEntity: SAP_RETURN_ENTITY || "ReturnRequests",
+    causes: parseListEnv(RETURN_CAUSAS).length,
+    motives: parseListEnv(RETURN_MOTIVOS).length,
+  });
+});
+
 app.post("/api/login", handleUserLogin);
 app.post("/api/auth/login", handleUserLogin);
 app.get("/api/me", verifyUser, async (req, res) => safeJson(res, 200, { ok: true, user: req.user }));
 app.get("/api/auth/me", verifyUser, async (req, res) => safeJson(res, 200, { ok: true, user: req.user }));
 
+app.get("/api/return/meta", verifyUser, async (req, res) => {
+  return safeJson(res, 200, {
+    ok: true,
+    causas: parseListEnv(RETURN_CAUSAS),
+    motivos: parseListEnv(RETURN_MOTIVOS),
+  });
+});
+
 /* =========================================================
-   ✅ SAP endpoints mínimos (bodegas / clientes / items)
-   (copiados de pedidos para que el front funcione igual)
+   SAP LOOKUPS
 ========================================================= */
 app.get("/api/sap/warehouses", verifyUser, async (req, res) => {
   try {
@@ -619,7 +682,6 @@ app.get("/api/sap/customers/search", verifyUser, async (req, res) => {
     if (q.length < 2) return res.json({ ok: true, results: [] });
 
     const safe = q.replace(/'/g, "''");
-
     let r;
     try {
       r = await slFetch(
@@ -674,239 +736,304 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
   }
 });
 
-/* =========================================================
-   ✅ Guardar en Supabase SOLO si SAP creó OK
-========================================================= */
-async function upsertReturnCache(row) {
-  if (!hasDb()) return;
-  const r = row || {};
-  await dbQuery(
-    `INSERT INTO returns_cache(
-      doc_num, doc_entry, doc_date, doc_time,
-      card_code, card_name, usuario, warehouse,
-      status, cancel_status, motivo, causa, comments, updated_at
-    ) VALUES(
-      $1,$2,$3,$4,
-      $5,$6,$7,$8,
-      $9,$10,$11,$12,$13,NOW()
-    )
-    ON CONFLICT (doc_num) DO UPDATE SET
-      doc_entry=EXCLUDED.doc_entry,
-      doc_date=EXCLUDED.doc_date,
-      doc_time=EXCLUDED.doc_time,
-      card_code=EXCLUDED.card_code,
-      card_name=EXCLUDED.card_name,
-      usuario=EXCLUDED.usuario,
-      warehouse=EXCLUDED.warehouse,
-      status=EXCLUDED.status,
-      cancel_status=EXCLUDED.cancel_status,
-      motivo=EXCLUDED.motivo,
-      causa=EXCLUDED.causa,
-      comments=EXCLUDED.comments,
-      updated_at=NOW()`,
-    [
-      r.docNum != null ? Number(r.docNum) : null,
-      r.docEntry != null ? Number(r.docEntry) : null,
-      r.docDate ? String(r.docDate).slice(0, 10) : null,
-      Number(r.docTime || 0) || 0,
-      String(r.cardCode || ""),
-      String(r.cardName || ""),
-      String(r.usuario || ""),
-      String(r.warehouse || ""),
-      String(r.status || ""),
-      String(r.cancelStatus || ""),
-      String(r.motivo || ""),
-      String(r.causa || ""),
-      String(r.comments || ""),
-    ]
-  );
-}
-
-async function upsertReturnLineCache(row) {
-  if (!hasDb()) return;
-  const r = row || {};
-  await dbQuery(
-    `INSERT INTO return_lines_cache(
-      doc_num, doc_date, item_code, item_desc, qty_requested, updated_at
-    ) VALUES ($1,$2,$3,$4,$5,NOW())
-    ON CONFLICT (doc_num, item_code) DO UPDATE SET
-      doc_date=EXCLUDED.doc_date,
-      item_desc=EXCLUDED.item_desc,
-      qty_requested=EXCLUDED.qty_requested,
-      updated_at=NOW()`,
-    [
-      r.docNum != null ? Number(r.docNum) : null,
-      r.docDate ? String(r.docDate).slice(0, 10) : null,
-      String(r.itemCode || ""),
-      String(r.itemDesc || ""),
-      Number(r.qtyRequested || 0),
-    ]
-  );
-}
-
-/* =========================================================
-   ✅ CREAR SOLICITUD/DEVOLUCIÓN EN SAP + guardar en Supabase
-   POST /api/sap/return
-   body: { cardCode, motivo, causa, comments?, lines:[{itemCode, qty}] , whsCode? }
-========================================================= */
-function truncate(s, max = 240) {
-  const x = String(s || "").trim();
-  return x.length > max ? x.slice(0, max) : x;
-}
-
-app.post("/api/sap/return", verifyUser, async (req, res) => {
+app.get("/api/sap/item/:code", verifyUser, async (req, res) => {
   try {
     if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
-    const cardCode = String(req.body?.cardCode || "").trim();
-    const motivo = String(req.body?.motivo || "").trim();
-    const causa = String(req.body?.causa || "").trim();
-    const extraComments = String(req.body?.comments || "").trim();
-    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
-
-    if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
-    if (!motivo) return res.status(400).json({ ok: false, message: "Motivo requerido." });
-    if (!causa) return res.status(400).json({ ok: false, message: "Causa requerida." });
-    if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
+    const code = String(req.params.code || "").trim();
+    if (!code) return res.status(400).json({ ok: false, message: "ItemCode vacío." });
 
     const warehouseCode = getWarehouseFromReq(req);
+    assertItemAllowedOrThrow(warehouseCode, code);
 
-    const cleanLines = lines
-      .map((l) => ({
-        ItemCode: String(l.itemCode || "").trim(),
-        Quantity: Number(l.qty || 0),
-      }))
-      .filter((x) => x.ItemCode && x.Quantity > 0);
-
-    if (!cleanLines.length) return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
-
-    // validar allowed items por bodega
-    for (const ln of cleanLines) assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
-
-    // ✅ Dimensión 1 (Distribution Rule) obligatoria en tu SAP
-    const dim1 = getDim1ForWh(warehouseCode);
-    if (!dim1) {
-      return res.status(400).json({
-        ok: false,
-        message:
-          "SAP requiere Dimensión 1 (Distribution Rule) para esa cuenta. Configura SAP_DIM1_DEFAULT (o SAP_DIM1_300/200/500/01) con un código válido.",
-      });
-    }
-
-    const DocumentLines = cleanLines.map((ln) => ({
-      ItemCode: ln.ItemCode,
-      Quantity: ln.Quantity,
-      WarehouseCode: warehouseCode,
-
-      // ✅ Dimensión 1
-      CostingCode: dim1,
-      // ✅ Dimensión 1 para COGS (clave para tu error 5101-01-01)
-      COGSCostingCode: dim1,
-    }));
-
-    const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
-    const creator = String(req.user?.username || "unknown").trim();
-
-    // guardamos motivo/causa en comments para auditoría
-    const baseComments = [
-      `[user:${creator}]`,
-      `[wh:${warehouseCode}]`,
-      `[motivo:${truncate(motivo, 60)}]`,
-      `[causa:${truncate(causa, 60)}]`,
-    ].join(" ");
-
-    const Comments = truncate(`${baseComments}${extraComments ? " " + extraComments : ""}`, 240);
-
-    const payload = {
-      CardCode: cardCode,
-      DocDate: docDate,
-      DocDueDate: docDate,
-      Comments,
-      JournalMemo: "Solicitud devolución web",
-      DocumentLines,
-    };
-
-    // ✅ 1) Crear en SAP (si falla, NO guardamos en Supabase)
-    const entity = String(SAP_RETURN_ENTITY || "Returns").trim();
-    const created = await slFetch(`/${entity}`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-
-    const docEntry = created?.DocEntry ?? created?.docEntry ?? null;
-    const docNum = created?.DocNum ?? created?.docNum ?? null;
-
-    if (!docEntry && !docNum) {
-      // SAP respondió raro: evitamos “guardar fantasma”
-      return res.status(500).json({
-        ok: false,
-        message: "SAP creó pero no devolvió DocEntry/DocNum. No se guardó en Supabase.",
-        raw: created,
-      });
-    }
-
-    // ✅ 2) Guardar en Supabase (header + líneas)
-    try {
-      await upsertReturnCache({
-        docNum,
-        docEntry,
-        docDate,
-        docTime: 0,
-        cardCode,
-        cardName: "", // si quieres, puedes buscar en SAP el nombre
-        usuario: creator,
-        warehouse: warehouseCode,
-        status: "Open",
-        cancelStatus: "",
-        motivo,
-        causa,
-        comments: Comments,
-      });
-
-      // guardamos líneas
-      for (const ln of cleanLines) {
-        await upsertReturnLineCache({
-          docNum,
-          docDate,
-          itemCode: ln.ItemCode,
-          itemDesc: "",
-          qtyRequested: ln.Quantity,
-        });
-      }
-    } catch (e) {
-      // SAP sí creó, pero DB falló: devolvemos warning
-      return res.status(200).json({
-        ok: true,
-        message: "✅ Creada en SAP, ⚠️ pero falló guardado en Supabase",
-        docEntry,
-        docNum,
-        warehouse: warehouseCode,
-        bodega: warehouseCode,
-        warning: String(e?.message || e),
-      });
-    }
+    const priceListNo = await getPriceListNoByNameCached(SAP_PRICE_LIST);
+    const r = await getOneItem(code, priceListNo, warehouseCode);
 
     return res.json({
       ok: true,
-      message: "✅ Solicitud/Devolución creada en SAP y guardada en Supabase",
-      docEntry,
-      docNum,
+      item: r.item,
       warehouse: warehouseCode,
-      bodega: warehouseCode,
-      dim1Used: dim1,
-      entityUsed: entity,
+      price: Number(r.price ?? 0),
+      priceUnit: r.priceUnit,
+      factorCaja: r.factorCaja,
+      stock: r.stock,
+      disponible: r?.stock?.available ?? null,
+      enStock: r?.stock?.hasStock ?? null,
     });
   } catch (err) {
-    return res.status(400).json({ ok: false, message: String(err?.message || err) });
+    return res.status(400).json({ ok: false, message: err.message });
+  }
+});
+
+app.get("/api/sap/items/search", verifyUser, async (req, res) => {
+  try {
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+
+    const q = String(req.query?.q || "").trim();
+    const top = Math.min(Math.max(Number(req.query?.top || 15), 5), 50);
+    if (q.length < 2) return res.json({ ok: true, q, results: [] });
+
+    const warehouseCode = getWarehouseFromReq(req);
+    const allowedSet = getAllowedSetForWh(warehouseCode);
+    const safe = q.replace(/'/g, "''");
+    const preTop = Math.min(100, top * 5);
+
+    let raw;
+    try {
+      raw = await slFetch(
+        `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor&$filter=${encodeURIComponent(
+          `(contains(ItemCode,'${safe}') or contains(ItemName,'${safe}'))`
+        )}&$orderby=ItemName asc&$top=${preTop}`
+      );
+    } catch {
+      raw = await slFetch(
+        `/Items?$select=ItemCode,ItemName,SalesUnit,Valid,FrozenFor&$filter=${encodeURIComponent(
+          `(substringof('${safe}',ItemCode) or substringof('${safe}',ItemName))`
+        )}&$orderby=ItemName asc&$top=${preTop}`
+      );
+    }
+
+    const values = Array.isArray(raw?.value) ? raw.value : [];
+
+    function isActiveSapItem(it) {
+      const v = String(it?.Valid ?? "").toLowerCase();
+      const f = String(it?.FrozenFor ?? "").toLowerCase();
+      const validOk = !v || v.includes("tyes") || v === "yes" || v === "true";
+      const frozenOk = !f || f.includes("tno") || f === "no" || f === "false";
+      return validOk && frozenOk;
+    }
+
+    let filtered = values.filter((it) => it?.ItemCode).filter(isActiveSapItem);
+    if (allowedSet && allowedSet.size > 0) {
+      filtered = filtered.filter((it) => allowedSet.has(String(it.ItemCode).trim()));
+    }
+
+    const results = filtered.slice(0, top).map((it) => ({
+      ItemCode: it.ItemCode,
+      ItemName: it.ItemName,
+      SalesUnit: it.SalesUnit || "",
+    }));
+
+    return res.json({ ok: true, q, warehouse: warehouseCode, results });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err.message });
   }
 });
 
 /* =========================================================
-   ✅ START
+   CREATE RETURN REQUEST
 ========================================================= */
-process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
-process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+app.post("/api/return-request", verifyUser, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
 
+    const cardCode = String(req.body?.cardCode || SAP_WEB_CARD_CODE || "").trim();
+    const causa = String(req.body?.causa || "").trim();
+    const motivo = String(req.body?.motivo || "").trim();
+    const comments = String(req.body?.comments || "").trim();
+    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
+    const warehouseCode = getWarehouseFromReq(req);
+
+    if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
+    if (!causa) return res.status(400).json({ ok: false, message: "causa requerida." });
+    if (!motivo) return res.status(400).json({ ok: false, message: "motivo requerido." });
+    if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
+
+    const cleanLines = lines
+      .map((l, idx) => ({
+        lineNum: idx,
+        ItemCode: String(l.itemCode || l.ItemCode || "").trim(),
+        ItemName: String(l.itemName || l.ItemName || "").trim(),
+        Quantity: Number(l.qty || l.quantity || l.Quantity || 0),
+      }))
+      .filter((x) => x.ItemCode && x.Quantity > 0);
+
+    if (!cleanLines.length) {
+      return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
+    }
+
+    for (const ln of cleanLines) assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
+
+    const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
+    const username = req.user?.username || "unknown";
+    const fullName = req.user?.full_name || username;
+
+    const bp = await slFetch(
+      `/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`
+    );
+    const cardName = String(bp?.CardName || "").trim();
+
+    await client.query("BEGIN");
+
+    const ins = await client.query(
+      `INSERT INTO return_requests(
+         request_no, created_by_user_id, created_by_username, created_by_name, province,
+         warehouse_code, card_code, card_name, causa, motivo, comments,
+         total_lines, total_qty, status, sap_entity
+       ) VALUES (
+         $1,$2,$3,$4,$5,
+         $6,$7,$8,$9,$10,$11,
+         $12,$13,$14,$15
+       ) RETURNING id`,
+      [
+        `TMP-${Date.now()}`,
+        req.user?.id || null,
+        username,
+        fullName,
+        req.user?.province || "",
+        warehouseCode,
+        cardCode,
+        cardName,
+        causa,
+        motivo,
+        comments,
+        cleanLines.length,
+        cleanLines.reduce((a, b) => a + Number(b.Quantity || 0), 0),
+        "CREATING",
+        SAP_RETURN_ENTITY || "ReturnRequests",
+      ]
+    );
+
+    const requestId = Number(ins.rows[0].id);
+    const requestNo = buildRequestNo(requestId);
+
+    await client.query(`UPDATE return_requests SET request_no=$1 WHERE id=$2`, [requestNo, requestId]);
+
+    for (let i = 0; i < cleanLines.length; i++) {
+      const ln = cleanLines[i];
+      let itemName = ln.ItemName;
+      if (!itemName) {
+        try {
+          const r = await getOneItem(ln.ItemCode, await getPriceListNoByNameCached(SAP_PRICE_LIST), warehouseCode);
+          itemName = r?.item?.ItemName || "";
+        } catch {}
+      }
+
+      await client.query(
+        `INSERT INTO return_request_lines(request_id, line_num, item_code, item_name, quantity)
+         VALUES($1,$2,$3,$4,$5)`,
+        [requestId, i, ln.ItemCode, itemName || "", ln.Quantity]
+      );
+      ln.ItemName = itemName || "";
+    }
+
+    const sapPayload = {
+      CardCode: cardCode,
+      DocDate: docDate,
+      DocDueDate: docDate,
+      Comments: buildComments({ requestNo, username, warehouse: warehouseCode, causa, motivo, comments }),
+      JournalMemo: `Solicitud devolución web ${requestNo}`.slice(0, 50),
+      DocumentLines: cleanLines.map((ln) => ({
+        ItemCode: ln.ItemCode,
+        Quantity: ln.Quantity,
+        WarehouseCode: warehouseCode,
+      })),
+    };
+
+    if (SAP_RETURN_CAUSE_UDF) sapPayload[SAP_RETURN_CAUSE_UDF] = causa;
+    if (SAP_RETURN_MOTIVE_UDF) sapPayload[SAP_RETURN_MOTIVE_UDF] = motivo;
+    if (SAP_RETURN_LOCALNO_UDF) sapPayload[SAP_RETURN_LOCALNO_UDF] = requestNo;
+
+    let created;
+    let fallback = false;
+
+    try {
+      created = await slFetch(`/${SAP_RETURN_ENTITY || "ReturnRequests"}`, {
+        method: "POST",
+        body: JSON.stringify(sapPayload),
+      });
+    } catch (err1) {
+      const msg1 = String(err1?.message || err1);
+      const isNoMatch = msg1.includes("ODBC -2028") || msg1.toLowerCase().includes("no matching records found");
+      if (!isNoMatch) throw err1;
+
+      fallback = true;
+      const fallbackPayload = {
+        ...sapPayload,
+        Comments: `${buildComments({ requestNo, username, warehouse: warehouseCode, causa, motivo, comments })} [wh_fallback:1]`.slice(0, 254),
+        DocumentLines: cleanLines.map((ln) => ({
+          ItemCode: ln.ItemCode,
+          Quantity: ln.Quantity,
+        })),
+      };
+
+      created = await slFetch(`/${SAP_RETURN_ENTITY || "ReturnRequests"}`, {
+        method: "POST",
+        body: JSON.stringify(fallbackPayload),
+      });
+    }
+
+    await client.query(
+      `UPDATE return_requests
+       SET status=$1, sap_doc_entry=$2, sap_doc_num=$3, sap_payload=$4::jsonb, sap_response=$5::jsonb, raw_error=''
+       WHERE id=$6`,
+      [
+        fallback ? "CREATED_FALLBACK" : "CREATED",
+        created?.DocEntry || null,
+        created?.DocNum || null,
+        JSON.stringify(sapPayload),
+        JSON.stringify(created || {}),
+        requestId,
+      ]
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      message: fallback
+        ? "Solicitud de devolución creada (fallback sin WarehouseCode por -2028)"
+        : "Solicitud de devolución creada",
+      requestId,
+      requestNo,
+      sapEntity: SAP_RETURN_ENTITY || "ReturnRequests",
+      docEntry: created?.DocEntry || null,
+      docNum: created?.DocNum || null,
+      warehouse: warehouseCode,
+      fallback,
+    });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+
+    const msg = String(err?.message || err);
+    const hint = msg.toLowerCase().includes("unrecognized resource path")
+      ? `${msg}. Revisa SAP_RETURN_ENTITY. Para solicitud de devolución normalmente debe ser ReturnRequests.`
+      : msg;
+    return res.status(400).json({ ok: false, message: hint });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/requests/my", verifyUser, async (req, res) => {
+  try {
+    if (!hasDb()) return res.status(500).json({ ok: false, message: "DB no configurada" });
+
+    const r = await dbQuery(
+      `SELECT
+         id, request_no, created_at, warehouse_code, card_code, card_name,
+         causa, motivo, total_lines, total_qty,
+         status, sap_doc_entry, sap_doc_num
+       FROM return_requests
+       WHERE LOWER(created_by_username)=LOWER($1)
+       ORDER BY id DESC
+       LIMIT 100`,
+      [req.user?.username || ""]
+    );
+
+    return res.json({ ok: true, requests: r.rows || [] });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message || String(e) });
+  }
+});
+
+/* =========================================================
+   START
+========================================================= */
 (async () => {
   try {
     await ensureDb();
@@ -916,6 +1043,6 @@ process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
   }
 
   app.listen(Number(PORT), () => {
-    console.log(`DEVOLUCIONES API listening on :${PORT}`);
+    console.log(`SOLICITUD DEVOLUCION API listening on :${PORT}`);
   });
 })();
