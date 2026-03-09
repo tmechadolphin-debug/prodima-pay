@@ -304,43 +304,99 @@ app.get("/api/health", async (req, res) => {
 ========================================================= */
 let SL_COOKIE = "";
 let SL_COOKIE_AT = 0;
+let SL_LOGIN_PROMISE = null;
 
-async function slLogin() {
-  const url = `${SAP_BASE_URL.replace(/\/$/, "")}/Login`;
-  const body = {
-    CompanyDB: SAP_COMPANYDB,
-    UserName: SAP_USER,
-    Password: SAP_PASS,
-  };
-
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  const txt = await r.text();
-  let data = {};
-  try {
-    data = JSON.parse(txt);
-  } catch {}
-
-  if (!r.ok) {
-    throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
-  }
-
-  const setCookie = r.headers.get("set-cookie") || "";
-  const cookies = [];
-  for (const part of setCookie.split(",")) {
-    const s = part.trim();
-    if (s.startsWith("B1SESSION=") || s.startsWith("ROUTEID=")) cookies.push(s.split(";")[0]);
-  }
-  SL_COOKIE = cookies.join("; ");
-  SL_COOKIE_AT = Date.now();
-  return true;
+function clearSlSession() {
+  SL_COOKIE = "";
+  SL_COOKIE_AT = 0;
 }
 
-async function slFetch(path, options = {}) {
+function extractSapCookies(headers) {
+  let cookieHeaders = [];
+
+  if (typeof headers.getSetCookie === "function") {
+    cookieHeaders = headers.getSetCookie();
+  } else {
+    const single = headers.get("set-cookie") || "";
+    if (single) {
+      // separa cookies sin romper atributos con coma
+      cookieHeaders = single.split(/,(?=\s*[A-Za-z0-9_\-]+=)/);
+    }
+  }
+
+  const wanted = [];
+  for (const raw of cookieHeaders) {
+    const firstPart = String(raw || "").split(";")[0].trim();
+    if (/^(B1SESSION|ROUTEID)=/i.test(firstPart)) {
+      wanted.push(firstPart);
+    }
+  }
+
+  return wanted.join("; ");
+}
+
+async function slLogin(force = false) {
+  if (SL_LOGIN_PROMISE && !force) return SL_LOGIN_PROMISE;
+
+  SL_LOGIN_PROMISE = (async () => {
+    const url = `${SAP_BASE_URL.replace(/\/$/, "")}/Login`;
+    const body = {
+      CompanyDB: SAP_COMPANYDB,
+      UserName: SAP_USER,
+      Password: SAP_PASS,
+    };
+
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    const txt = await r.text();
+    let data = {};
+    try {
+      data = JSON.parse(txt);
+    } catch {}
+
+    if (!r.ok) {
+      throw new Error(`SAP login failed: HTTP ${r.status} ${data?.error?.message?.value || txt}`);
+    }
+
+    const cookie = extractSapCookies(r.headers);
+
+    if (!cookie || !/B1SESSION=/i.test(cookie)) {
+      throw new Error("SAP login failed: no se obtuvo cookie B1SESSION");
+    }
+
+    SL_COOKIE = cookie;
+    SL_COOKIE_AT = Date.now();
+    return true;
+  })();
+
+  try {
+    return await SL_LOGIN_PROMISE;
+  } finally {
+    SL_LOGIN_PROMISE = null;
+  }
+}
+
+function isSapNoMatchError(err) {
+  const msg = String(err?.message || err || "").toLowerCase();
+  return msg.includes("odbc -2028") || msg.includes("no matching records found");
+}
+
+function isSapAuthLikeError(err) {
+  const msg = String(err?.message || err || "").toLowerCase();
+  return (
+    msg.includes("sap error 401") ||
+    msg.includes("sap error 403") ||
+    msg.includes("invalid session") ||
+    msg.includes("session") ||
+    isSapNoMatchError(err)
+  );
+}
+
+async function slFetch(path, options = {}, allowAuthRetry = true) {
   if (missingSapEnv()) throw new Error("Missing SAP env");
 
   if (!SL_COOKIE || Date.now() - SL_COOKIE_AT > 25 * 60 * 1000) {
@@ -349,7 +405,6 @@ async function slFetch(path, options = {}) {
 
   const base = SAP_BASE_URL.replace(/\/$/, "");
   const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
-
   const method = String(options.method || "GET").toUpperCase();
 
   const r = await fetch(url, {
@@ -371,15 +426,31 @@ async function slFetch(path, options = {}) {
   }
 
   if (!r.ok) {
-    if (r.status === 401 || r.status === 403) {
-      SL_COOKIE = "";
-      await slLogin();
-      return slFetch(path, options);
+    const err = new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
+
+    if (allowAuthRetry && (r.status === 401 || r.status === 403)) {
+      clearSlSession();
+      await slLogin(true);
+      return slFetch(path, options, false);
     }
-    throw new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
+
+    throw err;
   }
 
   return data;
+}
+
+async function slFetchFreshSession(path, options = {}) {
+  try {
+    return await slFetch(path, options, true);
+  } catch (err) {
+    if (!isSapAuthLikeError(err)) throw err;
+
+    clearSlSession();
+    await slLogin(true);
+
+    return slFetch(path, options, false);
+  }
 }
 
 /* =========================================================
@@ -892,13 +963,19 @@ app.get("/api/sap/customer/:code", verifyUser, async (req, res) => {
 ========================================================= */
 app.post("/api/sap/quote", verifyUser, async (req, res) => {
   try {
-    if (missingSapEnv()) return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    if (missingSapEnv()) {
+      return res.status(400).json({ ok: false, message: "Faltan variables SAP" });
+    }
 
     const cardCode = String(req.body?.cardCode || "").trim();
     const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
 
-    if (!cardCode) return res.status(400).json({ ok: false, message: "cardCode requerido." });
-    if (!lines.length) return res.status(400).json({ ok: false, message: "lines requerido." });
+    if (!cardCode) {
+      return res.status(400).json({ ok: false, message: "cardCode requerido." });
+    }
+    if (!lines.length) {
+      return res.status(400).json({ ok: false, message: "lines requerido." });
+    }
 
     const warehouseCode = getWarehouseFromReq(req);
 
@@ -909,12 +986,18 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       }))
       .filter((x) => x.ItemCode && x.Quantity > 0);
 
-    if (!cleanLines.length)
+    if (!cleanLines.length) {
       return res.status(400).json({ ok: false, message: "No hay líneas válidas (qty>0)." });
+    }
 
     for (const ln of cleanLines) {
       assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
     }
+
+    // Validación rápida del cliente antes de crear
+    await slFetchFreshSession(
+      `/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`
+    );
 
     const DocumentLines = cleanLines.map((ln) => ({
       ItemCode: ln.ItemCode,
@@ -924,7 +1007,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
-
     const baseComments = [`[user:${creator}]`, `[wh:${warehouseCode}]`].join(" ");
 
     const payload = {
@@ -936,11 +1018,15 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       DocumentLines,
     };
 
-    try {
-      const created = await slFetch(`/Quotations`, {
+    async function createQuotation(body) {
+      return slFetchFreshSession(`/Quotations`, {
         method: "POST",
-        body: JSON.stringify(payload),
+        body: JSON.stringify(body),
       });
+    }
+
+    try {
+      const created = await createQuotation(payload);
 
       return res.json({
         ok: true,
@@ -953,10 +1039,10 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       });
     } catch (err1) {
       const msg1 = String(err1?.message || err1);
-      const isNoMatch =
-        msg1.includes("ODBC -2028") ||
-        msg1.toLowerCase().includes("no matching records found");
-      if (!isNoMatch) throw err1;
+
+      // Si SAP devuelve -2028, primero ya se intentó con sesión nueva por slFetchFreshSession.
+      // Ahora intentamos fallback sin WarehouseCode por línea.
+      if (!isSapNoMatchError(err1)) throw err1;
 
       const payloadFallback = {
         ...payload,
@@ -967,20 +1053,27 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         })),
       };
 
-      const created2 = await slFetch(`/Quotations`, {
-        method: "POST",
-        body: JSON.stringify(payloadFallback),
-      });
+      try {
+        const created2 = await createQuotation(payloadFallback);
 
-      return res.json({
-        ok: true,
-        message: "Cotización creada (fallback sin WarehouseCode por -2028)",
-        docEntry: created2.DocEntry,
-        docNum: created2.DocNum,
-        warehouse: warehouseCode,
-        bodega: warehouseCode,
-        fallback: true,
-      });
+        return res.json({
+          ok: true,
+          message: "Cotización creada (fallback sin WarehouseCode por -2028)",
+          docEntry: created2.DocEntry,
+          docNum: created2.DocNum,
+          warehouse: warehouseCode,
+          bodega: warehouseCode,
+          fallback: true,
+        });
+      } catch (err2) {
+        return res.status(500).json({
+          ok: false,
+          message:
+            `SAP error al crear cotización. ` +
+            `Se reintentó con sesión nueva y también fallback sin WarehouseCode. ` +
+            `Detalle final: ${String(err2?.message || err2)}`,
+        });
+      }
     }
   } catch (err) {
     const msg = String(err?.message || err);
@@ -988,7 +1081,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     return res.status(isAllow ? 400 : 500).json({ ok: false, message: msg });
   }
 });
-
 /* =========================================================
    ✅ START
 ========================================================= */
