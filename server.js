@@ -1384,7 +1384,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
     const Comments = truncate(
-  `${extraComments ? extraComments + " " : ""}[user:${creator}] [wh:${warehouseCode}]`,
+  `${extraComments ? extraComments + " " : ""}[user:${creator}] [wh:${warehouseCode}] [motivo:${truncate(motivo, 60)}] [causa:${truncate(causa, 60)}]`,
   240
 );
 
@@ -1394,12 +1394,6 @@ const payload = {
   DocDueDate: docDate,
   Comments,
   JournalMemo: "Solicitud devolución web",
-
-  U_Motivo: truncate(motivo, 100),
-  U_Causa: truncate(causa, 100),
-  U_UsuarioWeb: truncate(creator, 50),
-  U_BodegaWeb: truncate(warehouseCode, 20),
-
   DocumentLines,
 };
 
