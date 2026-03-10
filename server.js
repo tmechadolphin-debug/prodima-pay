@@ -33,6 +33,10 @@ const {
   SAP_WAREHOUSE = "300",
   SAP_PRICE_LIST = "Lista de Precios 99 2018",
   SAP_RETURN_ENTITY = "Returns",
+  SAP_RETURN_HEADER_MOTIVO_FIELD = "",
+  SAP_RETURN_HEADER_CAUSA_FIELD = "",
+  SAP_RETURN_LINE_MOTIVO_FIELD = "",
+  SAP_RETURN_LINE_CAUSA_FIELD = "",
 
   // Devoluciones / dimensiones
   SAP_DIM1_DEFAULT = "",
@@ -483,6 +487,13 @@ function getDim1ForWh(warehouse) {
     "01": SAP_DIM1_01,
   };
   return String(byWh[wh] || SAP_DIM1_DEFAULT || "").trim();
+}
+
+function applyIfPresent(obj, fieldName, value) {
+  const key = String(fieldName || "").trim();
+  if (!key) return obj;
+  obj[key] = value;
+  return obj;
 }
 
 /* =========================================================
@@ -1493,16 +1504,26 @@ async function createReturnRequestHandler(req, res) {
       DocDate: docDate,
       Comments: comments,
       JournalMemo: `Devolución web ${motivo}`,
-      DocumentLines: cleanLines.map((ln) => ({
-        ItemCode: ln.ItemCode,
-        ItemDescription: ln.ItemDescription,
-        Quantity: ln.Quantity,
-        UnitPrice: ln.Price,
-        Price: ln.Price,
-        WarehouseCode: warehouseCode,
-        CostingCode: dim1,
-      })),
+      DocumentLines: cleanLines.map((ln) => {
+        const line = {
+          ItemCode: ln.ItemCode,
+          ItemDescription: ln.ItemDescription,
+          Quantity: ln.Quantity,
+          UnitPrice: ln.Price,
+          Price: ln.Price,
+          WarehouseCode: warehouseCode,
+          CostingCode: dim1,
+          COGSCostingCode: dim1,
+        };
+
+        applyIfPresent(line, SAP_RETURN_LINE_MOTIVO_FIELD, motivo);
+        applyIfPresent(line, SAP_RETURN_LINE_CAUSA_FIELD, causa);
+        return line;
+      }),
     };
+
+    applyIfPresent(payload, SAP_RETURN_HEADER_MOTIVO_FIELD, motivo);
+    applyIfPresent(payload, SAP_RETURN_HEADER_CAUSA_FIELD, causa);
 
     const entity = `/${String(SAP_RETURN_ENTITY || "Returns").replace(/^\/+/, "")}`;
     const created = await slFetchFreshSession(entity, {
