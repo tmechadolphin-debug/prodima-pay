@@ -2724,14 +2724,23 @@ app.get("/api/health", async (req, res) => {
 app.get("/api/test/returnrequest/:docNum", async (req, res) => {
   try {
     const docNum = Number(req.params.docNum || 0);
-    if (!docNum) {
-      return res.status(400).json({ ok:false, message:"docNum inválido" });
+
+    if (!Number.isFinite(docNum) || docNum <= 0) {
+      return res.status(400).json({ ok: false, message: "docNum inválido" });
     }
 
-    const r = await slFetch(`/ReturnRequest?$filter=DocNum eq ${docNum}`);
-    return res.json({ ok:true, data:r });
+    const data = await slFetch(`/ReturnRequest?$filter=DocNum eq ${docNum}`);
+
+    return res.json({
+      ok: true,
+      docNum,
+      data
+    });
   } catch (e) {
-    return res.status(500).json({ ok:false, message:String(e.message || e) });
+    return res.status(500).json({
+      ok: false,
+      message: String(e?.message || e)
+    });
   }
 });
 
