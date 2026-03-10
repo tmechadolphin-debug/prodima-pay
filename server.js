@@ -1383,20 +1383,25 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
-    const baseComments = [`[user:${creator}]`, `[wh:${warehouseCode}]`].join(" ");
+    const Comments = truncate(
+  `${extraComments ? extraComments + " " : ""}[user:${creator}] [wh:${warehouseCode}]`,
+  240
+);
 
-    const payload = {
-      CardCode: cardCode,
-      DocDate: docDate,
-      DocDueDate: docDate,
-      Comments: baseComments,
-      JournalMemo: "Cotización web mercaderistas",
-      DocumentLines: cleanLines.map((ln) => ({
-        ItemCode: ln.ItemCode,
-        Quantity: ln.Quantity,
-        WarehouseCode: warehouseCode,
-      })),
-    };
+const payload = {
+  CardCode: cardCode,
+  DocDate: docDate,
+  DocDueDate: docDate,
+  Comments,
+  JournalMemo: "Solicitud devolución web",
+
+  U_Motivo: truncate(motivo, 100),
+  U_Causa: truncate(causa, 100),
+  U_UsuarioWeb: truncate(creator, 50),
+  U_BodegaWeb: truncate(warehouseCode, 20),
+
+  DocumentLines,
+};
 
     async function createQuotation(body) {
       return slFetchFreshSession(`/Quotations`, {
