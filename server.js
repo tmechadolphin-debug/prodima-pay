@@ -1383,19 +1383,20 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
-    const Comments = truncate(
-  `${extraComments ? extraComments + " " : ""}[user:${creator}] [wh:${warehouseCode}] [motivo:${truncate(motivo, 60)}] [causa:${truncate(causa, 60)}]`,
-  240
-);
+    const baseComments = [`[user:${creator}]`, `[wh:${warehouseCode}]`].join(" ");
 
-const payload = {
-  CardCode: cardCode,
-  DocDate: docDate,
-  DocDueDate: docDate,
-  Comments,
-  JournalMemo: "Solicitud devolución web",
-  DocumentLines,
-};
+    const payload = {
+      CardCode: cardCode,
+      DocDate: docDate,
+      DocDueDate: docDate,
+      Comments: baseComments,
+      JournalMemo: "Cotización web mercaderistas",
+      DocumentLines: cleanLines.map((ln) => ({
+        ItemCode: ln.ItemCode,
+        Quantity: ln.Quantity,
+        WarehouseCode: warehouseCode,
+      })),
+    };
 
     async function createQuotation(body) {
       return slFetchFreshSession(`/Quotations`, {
@@ -2719,29 +2720,6 @@ app.get("/api/health", async (req, res) => {
     message: "✅ PRODIMA MENSAJERÍA API activa",
     db: hasDb() ? "on" : "off",
   });
-});
-
-app.get("/api/test/returnrequest/:docNum", async (req, res) => {
-  try {
-    const docNum = Number(req.params.docNum || 0);
-
-    if (!Number.isFinite(docNum) || docNum <= 0) {
-      return res.status(400).json({ ok: false, message: "docNum inválido" });
-    }
-
-    const data = await slFetch(`/ReturnRequest?$filter=DocNum eq ${docNum}`);
-
-    return res.json({
-      ok: true,
-      docNum,
-      data
-    });
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      message: String(e?.message || e)
-    });
-  }
 });
 
 /* =========================
