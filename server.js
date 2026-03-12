@@ -3563,6 +3563,7 @@ app.get("/api/admin/messaging/requests", verifyAdmin, async (req, res) => {
         r.created_by_username,
         r.requester_name, r.requester_department,
         r.request_type, r.priority, r.status,
+        r.contact_person_phone, r.address_details,
         r.assigned_to_user_id, r.assigned_to_name,
         r.courier_comment,
         ${fmtTsSql("r.closed_at")} AS closed_at_local
@@ -3583,6 +3584,8 @@ app.get("/api/admin/messaging/requests", verifyAdmin, async (req, res) => {
       requestType: r.request_type,
       priority: r.priority,
       status: r.status,
+      contactPersonPhone: r.contact_person_phone || "",
+      addressDetails: r.address_details || "",
       assignedToUserId: r.assigned_to_user_id != null ? Number(r.assigned_to_user_id) : null,
       assignedToName: r.assigned_to_name || "",
       courierComment: r.courier_comment || "",
