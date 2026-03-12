@@ -939,6 +939,43 @@ async function upsertQuoteLineCache(row) {
   );
 }
 
+function hasNumericField(obj, fieldName) {
+  if (!obj || !fieldName) return false;
+  if (!Object.prototype.hasOwnProperty.call(obj, fieldName)) return false;
+  const raw = obj[fieldName];
+  if (raw === null || raw === undefined || raw === "") return false;
+  return Number.isFinite(Number(raw));
+}
+
+function getReliableQuoteOpenQty(line) {
+  for (const field of ["RemainingOpenQuantity", "OpenQty", "OpenQuantity"]) {
+    if (hasNumericField(line, field)) return Number(line[field]);
+  }
+  return null;
+}
+
+function isCancelledQuote(status, cancelStatus) {
+  const s = norm(status || "");
+  const c = norm(cancelStatus || "");
+  return c.includes("csyes") || c.includes("cancel") || s.includes("cancel");
+}
+
+function normalizeQuoteStatus(status, cancelStatus, opts = {}) {
+  if (isCancelledQuote(status, cancelStatus)) return "Cancelled";
+
+  const hasReliableOpenQty = !!opts.hasReliableOpenQty;
+  const totalOpenQty = Number(opts.totalOpenQty);
+  if (hasReliableOpenQty && Number.isFinite(totalOpenQty)) {
+    return totalOpenQty > 0 ? "Open" : "Close";
+  }
+
+  const s = norm(status || "");
+  if (!s) return "Open";
+  if (s.includes("close")) return "Close";
+  if (s.includes("open")) return "Open";
+  return String(status || "").trim() || "Open";
+}
+
 /* =========================================================
    Returns cache helpers
 ========================================================= */
@@ -2045,17 +2082,34 @@ app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
       const status = String(q.DocumentStatus || q.Status || qFull?.DocumentStatus || "");
       const cancelStatus = String(q.CancelStatus || q.cancelStatus || qFull?.CancelStatus || "");
       const docTotal = Number(q.DocTotal || qFull?.DocTotal || 0);
+      const cancelled = isCancelledQuote(status, cancelStatus);
 
       let deliveredTotal = 0;
+      let hasReliableOpenQty = false;
+      let totalOpenQty = 0;
       for (const ln of qLines) {
         const qty = Number(ln?.Quantity || 0);
-        const openQty = Number(ln?.RemainingOpenQuantity ?? ln?.OpenQty ?? ln?.OpenQuantity ?? 0);
+        const openQty = getReliableQuoteOpenQty(ln);
+        if (openQty !== null) {
+          hasReliableOpenQty = true;
+          totalOpenQty += Math.max(openQty, 0);
+        }
+
         const lineTotal = Number(ln?.LineTotal ?? 0);
-        let deliveredQty = qty > 0 ? Math.max(qty - openQty, 0) : 0;
+        let deliveredQty = 0;
+        if (!cancelled && qty > 0 && openQty !== null) {
+          deliveredQty = Math.max(qty - openQty, 0);
+        }
         if (!Number.isFinite(deliveredQty)) deliveredQty = 0;
+
         const lineDelivered = qty > 0 ? lineTotal * Math.min(deliveredQty / qty, 1) : 0;
         deliveredTotal += Number.isFinite(lineDelivered) ? lineDelivered : 0;
       }
+
+      const normalizedStatus = normalizeQuoteStatus(status, cancelStatus, {
+        hasReliableOpenQty,
+        totalOpenQty,
+      });
 
       await upsertQuoteCache({
         docNum,
@@ -2067,8 +2121,8 @@ app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
         usuario,
         warehouse,
         docTotal,
-        deliveredTotal,
-        status,
+        deliveredTotal: cancelled ? 0 : deliveredTotal,
+        status: normalizedStatus,
         cancelStatus,
         comments,
         groupName: "",
@@ -2079,8 +2133,8 @@ app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
           const itemCode = String(ln?.ItemCode || "").trim();
           if (!itemCode) continue;
           const qtyQuoted = Number(ln?.Quantity || 0);
-          const openQty = Number(ln?.RemainingOpenQuantity ?? ln?.OpenQty ?? ln?.OpenQuantity ?? 0);
-          const qtyDelivered = qtyQuoted > 0 ? Math.max(qtyQuoted - openQty, 0) : 0;
+          const openQty = getReliableQuoteOpenQty(ln);
+          const qtyDelivered = !cancelled && qtyQuoted > 0 && openQty !== null ? Math.max(qtyQuoted - openQty, 0) : 0;
           const dollarsQuoted = Number(ln?.LineTotal ?? 0);
           const dollarsDelivered = qtyQuoted > 0 ? dollarsQuoted * Math.min(qtyDelivered / qtyQuoted, 1) : 0;
           const itemDesc = String(ln?.ItemDescription || ln?.ItemName || "").trim();
@@ -2115,7 +2169,7 @@ app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
       saved,
       lastSyncAt: stamp,
       window: { fromDate, toDate },
-      note: "Sync guardado en DB. delivered_total y líneas se calculan desde OpenQty/RemainingOpenQuantity cuando SAP lo devuelve.",
+      note: "Sync guardado en DB. Las canceladas quedan fuera del histórico y el entregado solo se calcula cuando SAP devuelve OpenQty/RemainingOpenQuantity/OpenQuantity de forma confiable.",
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -2143,8 +2197,21 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
     const params = [];
     let p = 1;
 
+    const cancelledSql = `(
+      LOWER(COALESCE(q.cancel_status,'')) LIKE '%csyes%' OR
+      LOWER(COALESCE(q.cancel_status,'')) LIKE '%cancel%' OR
+      LOWER(COALESCE(q.status,'')) LIKE '%cancel%'
+    )`;
+    const estadoSql = `CASE
+      WHEN ${cancelledSql} THEN 'Cancelled'
+      WHEN LOWER(COALESCE(q.status,'')) LIKE '%close%' THEN 'Close'
+      WHEN LOWER(COALESCE(q.status,'')) LIKE '%open%' THEN 'Open'
+      ELSE COALESCE(NULLIF(q.status,''), 'Open')
+    END`;
+
     where.push(`q.doc_date BETWEEN $${p++} AND $${p++}`);
     params.push(from, to);
+    where.push(`NOT ${cancelledSql}`);
 
     if (onlyCreated) where.push(`LOWER(COALESCE(q.usuario,'')) IN (SELECT LOWER(username) FROM app_users WHERE is_active=TRUE)`);
     if (user) {
@@ -2156,12 +2223,7 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
       params.push(`%${client}%`, `%${client}%`);
     }
     if (openOnly) {
-      where.push(`LOWER(COALESCE(q.status,'')) LIKE '%open%'`);
-      where.push(`NOT (
-        LOWER(COALESCE(q.cancel_status,'')) LIKE '%csyes%' OR
-        LOWER(COALESCE(q.cancel_status,'')) LIKE '%cancel%' OR
-        LOWER(COALESCE(q.status,'')) LIKE '%cancel%'
-      )`);
+      where.push(`(${estadoSql}) = 'Open'`);
     }
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
@@ -2177,11 +2239,14 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
         q.card_name AS "cardName",
         q.usuario AS "usuario",
         q.warehouse AS "warehouse",
-        q.status AS "estado",
+        ${estadoSql} AS "estado",
         q.cancel_status AS "cancelStatus",
         q.comments AS "comments",
         q.doc_total::float AS "montoCotizacion",
-        q.delivered_total::float AS "montoEntregado"
+        CASE
+          WHEN ${cancelledSql} THEN 0::float
+          ELSE COALESCE(q.delivered_total, 0)::float
+        END AS "montoEntregado"
        FROM quotes_cache q
        ${whereSql}
        ORDER BY q.doc_date DESC, q.doc_num DESC
