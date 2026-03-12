@@ -1992,177 +1992,159 @@ app.patch("/api/admin/returns/:reqNum/status", verifyAdmin, async (req, res) => 
 /* =========================================================
    Admin cotizaciones DB / sync
 ========================================================= */
-function isCancelledLikeQuote(q) {
-  const cancelVal = q?.CancelStatus ?? q?.cancelStatus ?? q?.Cancelled ?? q?.cancelled ?? "";
-  const cancelRaw = String(cancelVal).trim().toLowerCase();
+function qcIsCancelledLike(row) {
+  const cancelStr = String(row?.CancelStatus ?? row?.cancelStatus ?? "").toLowerCase();
+  const statusStr = String(row?.DocumentStatus ?? row?.status ?? "").toLowerCase();
+  const commentsStr = String(row?.Comments ?? row?.comments ?? "").toLowerCase();
   return (
-    cancelVal === true ||
-    cancelRaw === "csyes" ||
-    cancelRaw === "yes" ||
-    cancelRaw === "true" ||
-    cancelRaw.includes("csyes") ||
-    cancelRaw.includes("cancel")
+    cancelStr.includes("csyes") ||
+    cancelStr.includes("cancel") ||
+    statusStr.includes("cancel") ||
+    commentsStr.includes("cancel")
   );
 }
 
-async function sapGetFirstByDocNum(entity, docNum, select = "") {
+function qcNormalizeStatus(doc, lines = []) {
+  if (qcIsCancelledLike(doc)) return "Cancelled";
+
+  const header = String(doc?.DocumentStatus ?? doc?.status ?? "").toLowerCase();
+  const lineStates = (Array.isArray(lines) ? lines : [])
+    .map((ln) => String(ln?.LineStatus ?? "").toLowerCase())
+    .filter(Boolean);
+
+  const allClosed = lineStates.length > 0 && lineStates.every((s) => s.includes("close"));
+  const anyOpen = lineStates.some((s) => s.includes("open"));
+
+  if (header.includes("close")) return "Close";
+  if (header.includes("open")) return allClosed && !anyOpen ? "Close" : "Open";
+  if (allClosed) return "Close";
+  if (anyOpen) return "Open";
+
+  const raw = String(doc?.DocumentStatus ?? doc?.status ?? "").trim();
+  return raw || "Open";
+}
+
+async function qcDeleteQuoteCacheDoc(docNum) {
   const n = Number(docNum || 0);
-  if (!Number.isFinite(n) || n <= 0) return null;
-
-  const parts = [];
-  if (String(select || "").trim()) parts.push(`$select=${encodeURIComponent(select)}`);
-  parts.push(`$filter=${encodeURIComponent(`DocNum eq ${n}`)}`);
-  parts.push(`$top=1`);
-
-  const r = await slFetchFreshSession(`/${entity}?${parts.join("&")}`);
-  const arr = Array.isArray(r?.value) ? r.value : [];
-  return arr[0] || null;
+  if (!n) return;
+  await dbQuery(`DELETE FROM quote_lines_cache WHERE doc_num=$1`, [n]);
+  await dbQuery(`DELETE FROM quotes_cache WHERE doc_num=$1`, [n]);
 }
 
-const QUOTE_TRACE_CACHE = new Map();
-const QUOTE_TRACE_TTL_MS = 2 * 60 * 60 * 1000;
+async function qcDeleteQuoteLinesOnly(docNum) {
+  const n = Number(docNum || 0);
+  if (!n) return;
+  await dbQuery(`DELETE FROM quote_lines_cache WHERE doc_num=$1`, [n]);
+}
 
-function quoteTraceCacheGet(key) {
-  const it = QUOTE_TRACE_CACHE.get(key);
-  if (!it) return null;
-  if (Date.now() - it.at > QUOTE_TRACE_TTL_MS) {
-    QUOTE_TRACE_CACHE.delete(key);
-    return null;
+async function qcSapGetFirstByDocNum(entity, docNum, select = "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments") {
+  const n = Number(docNum || 0);
+  if (!n) return null;
+  const raw = await slFetchFreshSession(
+    `/${entity}?$select=${select}&$filter=${encodeURIComponent(`DocNum eq ${n}`)}&$orderby=DocEntry desc&$top=1`
+  );
+  return Array.isArray(raw?.value) && raw.value.length ? raw.value[0] : null;
+}
+
+async function qcFindOrdersLinkedToQuote(quoteDocEntry, cardCode, from, toPlus1) {
+  const cc = String(cardCode || "").trim();
+  if (!quoteDocEntry || !cc) return [];
+  const raw = await slFetchFreshSession(
+    `/Orders?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
+      `&$filter=${encodeURIComponent(`CardCode eq '${cc.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`)}` +
+      `&$orderby=DocDate desc,DocEntry desc&$top=200`
+  );
+  const candidates = Array.isArray(raw?.value) ? raw.value : [];
+  const out = [];
+  for (const o of candidates) {
+    const od = await sapGetByDocEntry("Orders", o.DocEntry);
+    const lines = Array.isArray(od?.DocumentLines) ? od.DocumentLines : [];
+    const linked = lines.some((l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === Number(quoteDocEntry));
+    if (linked) out.push(od);
+    await sleep(8);
   }
-  return it.data;
-}
-function quoteTraceCacheSet(key, data) {
-  QUOTE_TRACE_CACHE.set(key, { at: Date.now(), data });
+  return out;
 }
 
-async function traceQuoteTotals(quoteDocNum, fromOverride, toOverride) {
-  const cacheKey = `Q:${quoteDocNum}:${fromOverride || ""}:${toOverride || ""}`;
-  const cached = quoteTraceCacheGet(cacheKey);
-  if (cached) return cached;
-
-  const quoteHead = await sapGetFirstByDocNum(
+async function qcTraceQuoteTotals(quoteDocNum, fromOverride, toOverride) {
+  const quoteHead = await qcSapGetFirstByDocNum(
     "Quotations",
     quoteDocNum,
     "DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments"
   );
-
-  if (!quoteHead?.DocEntry) {
-    const out = { ok: false, message: "Cotización no encontrada" };
-    quoteTraceCacheSet(cacheKey, out);
-    return out;
-  }
+  if (!quoteHead?.DocEntry) return { ok: false, totalEntregado: 0, totalCotizado: 0, pendiente: 0 };
 
   const quote = await sapGetByDocEntry("Quotations", quoteHead.DocEntry);
-  const quoteDocEntry = Number(quote?.DocEntry || 0);
-  const cardCode = String(quote?.CardCode || "").trim();
-  const quoteDate = String(quote?.DocDate || "").slice(0, 10);
+  const quoteDocEntry = Number(quote?.DocEntry || quoteHead.DocEntry || 0);
+  const cardCode = String(quote?.CardCode || quoteHead?.CardCode || "").trim();
+  const quoteDate = String(quote?.DocDate || quoteHead?.DocDate || "").slice(0, 10);
+  const totalCotizado = Number(quote?.DocTotal || quoteHead?.DocTotal || 0);
 
-  const from = isISO(fromOverride) ? String(fromOverride) : addDaysISO(quoteDate, -7);
-  const to = isISO(toOverride) ? String(toOverride) : addDaysISO(quoteDate, 30);
+  const from = /^\d{4}-\d{2}-\d{2}$/.test(String(fromOverride || "")) ? String(fromOverride) : addDaysISO(quoteDate, -30);
+  const to = /^\d{4}-\d{2}-\d{2}$/.test(String(toOverride || "")) ? String(toOverride) : addDaysISO(quoteDate, 60);
   const toPlus1 = addDaysISO(to, 1);
 
-  const ordersList = await slFetchFreshSession(
-    `/Orders?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
-      `&$filter=${encodeURIComponent(
-        `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
-      )}` +
-      `&$orderby=DocDate desc,DocEntry desc&$top=200`
-  );
-
-  const orderCandidates = Array.isArray(ordersList?.value) ? ordersList.value : [];
-  const orderDocEntrySet = new Set();
-
-  for (const o of orderCandidates) {
-    const od = await sapGetByDocEntry("Orders", o.DocEntry);
-    const lines = Array.isArray(od?.DocumentLines) ? od.DocumentLines : [];
-    const linked = lines.some((l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry);
-    if (linked) orderDocEntrySet.add(Number(od?.DocEntry || 0));
-    await sleep(10);
+  const orders = await qcFindOrdersLinkedToQuote(quoteDocEntry, cardCode, from, toPlus1);
+  if (!orders.length) {
+    return { ok: true, totalCotizado, totalEntregado: 0, pendiente: Number(totalCotizado.toFixed(2)) };
   }
 
+  const orderDocEntrySet = new Set(orders.map((x) => Number(x?.DocEntry || 0)).filter(Boolean));
   let totalEntregado = 0;
+  const seen = new Set();
 
-  if (orderDocEntrySet.size) {
-    const delList = await slFetchFreshSession(
-      `/DeliveryNotes?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
-        `&$filter=${encodeURIComponent(
-          `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
-        )}` +
-        `&$orderby=DocDate desc,DocEntry desc&$top=300`
-    );
+  const delRaw = await slFetchFreshSession(
+    `/DeliveryNotes?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,DocumentStatus,CancelStatus,Comments` +
+      `&$filter=${encodeURIComponent(`CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`)}` +
+      `&$orderby=DocDate desc,DocEntry desc&$top=300`
+  );
+  const delCandidates = Array.isArray(delRaw?.value) ? delRaw.value : [];
 
-    const delCandidates = Array.isArray(delList?.value) ? delList.value : [];
-    const seen = new Set();
-
-    for (const d of delCandidates) {
-      const dd = await sapGetByDocEntry("DeliveryNotes", d.DocEntry);
-      const de = Number(dd?.DocEntry || 0);
-      if (!de || seen.has(de)) continue;
-
-      const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
-      const linked = lines.some((l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry)));
-
-      if (linked) {
-        seen.add(de);
-        totalEntregado += Number(dd?.DocTotal || 0);
-      }
-
-      await sleep(10);
+  for (const d of delCandidates) {
+    const dd = await sapGetByDocEntry("DeliveryNotes", d.DocEntry);
+    const de = Number(dd?.DocEntry || 0);
+    if (!de || seen.has(de)) continue;
+    const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
+    const linked = lines.some((l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry)));
+    if (linked) {
+      seen.add(de);
+      totalEntregado += Number(dd?.DocTotal || 0);
     }
+    await sleep(8);
   }
 
-  const totalCotizado = Number(quote?.DocTotal || 0);
-  const pendiente = Number((totalCotizado - totalEntregado).toFixed(2));
-  const out = { ok: true, totalCotizado, totalEntregado, pendiente };
-  quoteTraceCacheSet(cacheKey, out);
-  return out;
+  return {
+    ok: true,
+    totalCotizado,
+    totalEntregado: Number(totalEntregado.toFixed(2)),
+    pendiente: Number((totalCotizado - totalEntregado).toFixed(2)),
+  };
 }
 
-async function traceQuoteLinesByItem(quoteDocNum, fromOverride, toOverride) {
+async function qcTraceQuoteLinesByItem(quoteDocNum, fromOverride, toOverride) {
   const out = new Map();
-
-  const quoteHead = await sapGetFirstByDocNum("Quotations", quoteDocNum, "DocEntry,DocNum,DocDate,CardCode");
+  const quoteHead = await qcSapGetFirstByDocNum("Quotations", quoteDocNum, "DocEntry,DocNum,DocDate,CardCode");
   if (!quoteHead?.DocEntry) return out;
 
   const quote = await sapGetByDocEntry("Quotations", quoteHead.DocEntry);
-  const quoteDocEntry = Number(quote?.DocEntry || 0);
-  const cardCode = String(quote?.CardCode || "").trim();
-  const quoteDate = String(quote?.DocDate || "").slice(0, 10);
+  const quoteDocEntry = Number(quote?.DocEntry || quoteHead.DocEntry || 0);
+  const cardCode = String(quote?.CardCode || quoteHead?.CardCode || "").trim();
+  const quoteDate = String(quote?.DocDate || quoteHead?.DocDate || "").slice(0, 10);
 
-  const from = isISO(fromOverride) ? String(fromOverride) : addDaysISO(quoteDate, -30);
-  const to = isISO(toOverride) ? String(toOverride) : addDaysISO(quoteDate, 60);
+  const from = /^\d{4}-\d{2}-\d{2}$/.test(String(fromOverride || "")) ? String(fromOverride) : addDaysISO(quoteDate, -30);
+  const to = /^\d{4}-\d{2}-\d{2}$/.test(String(toOverride || "")) ? String(toOverride) : addDaysISO(quoteDate, 60);
   const toPlus1 = addDaysISO(to, 1);
 
-  const ordersList = await slFetchFreshSession(
-    `/Orders?$select=DocEntry,DocNum,DocDate,CardCode` +
-      `&$filter=${encodeURIComponent(
-        `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
-      )}` +
-      `&$orderby=DocDate desc,DocEntry desc&$top=200`
-  );
-
-  const orderCandidates = Array.isArray(ordersList?.value) ? ordersList.value : [];
-  const orderDocEntrySet = new Set();
-
-  for (const o of orderCandidates) {
-    const od = await sapGetByDocEntry("Orders", o.DocEntry);
-    const lines = Array.isArray(od?.DocumentLines) ? od.DocumentLines : [];
-    const linked = lines.some((l) => Number(l?.BaseType) === 23 && Number(l?.BaseEntry) === quoteDocEntry);
-    if (linked) orderDocEntrySet.add(Number(od?.DocEntry || 0));
-    await sleep(10);
-  }
-
+  const orders = await qcFindOrdersLinkedToQuote(quoteDocEntry, cardCode, from, toPlus1);
+  const orderDocEntrySet = new Set(orders.map((x) => Number(x?.DocEntry || 0)).filter(Boolean));
   if (!orderDocEntrySet.size) return out;
 
-  const delList = await slFetchFreshSession(
+  const delRaw = await slFetchFreshSession(
     `/DeliveryNotes?$select=DocEntry,DocNum,DocDate,CardCode` +
-      `&$filter=${encodeURIComponent(
-        `CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`
-      )}` +
+      `&$filter=${encodeURIComponent(`CardCode eq '${cardCode.replace(/'/g, "''")}' and DocDate ge '${from}' and DocDate lt '${toPlus1}'`)}` +
       `&$orderby=DocDate desc,DocEntry desc&$top=300`
   );
-
-  const delCandidates = Array.isArray(delList?.value) ? delList.value : [];
+  const delCandidates = Array.isArray(delRaw?.value) ? delRaw.value : [];
   const seen = new Set();
 
   for (const d of delCandidates) {
@@ -2174,7 +2156,7 @@ async function traceQuoteLinesByItem(quoteDocNum, fromOverride, toOverride) {
     const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
     const linked = lines.some((l) => Number(l?.BaseType) === 17 && orderDocEntrySet.has(Number(l?.BaseEntry)));
     if (!linked) {
-      await sleep(10);
+      await sleep(8);
       continue;
     }
 
@@ -2194,43 +2176,10 @@ async function traceQuoteLinesByItem(quoteDocNum, fromOverride, toOverride) {
       out.set(itemCode, prev);
     }
 
-    await sleep(10);
+    await sleep(8);
   }
 
   return out;
-}
-
-async function deleteQuoteCacheDoc(docNum) {
-  const n = Number(docNum || 0);
-  if (!Number.isFinite(n) || n <= 0) return;
-  await dbQuery(`DELETE FROM quote_lines_cache WHERE doc_num=$1`, [n]);
-  await dbQuery(`DELETE FROM quotes_cache WHERE doc_num=$1`, [n]);
-}
-
-async function resetQuoteLinesCacheDoc(docNum) {
-  const n = Number(docNum || 0);
-  if (!Number.isFinite(n) || n <= 0) return;
-  await dbQuery(`DELETE FROM quote_lines_cache WHERE doc_num=$1`, [n]);
-}
-
-function normalizeQuoteStatus({ headerStatus, cancelStatus, qFull, deliveredTotal, docTotal }) {
-  if (isCancelledLikeQuote({ CancelStatus: cancelStatus, DocumentStatus: headerStatus })) return "Cancelled";
-
-  const rawHeader = String(headerStatus || qFull?.DocumentStatus || "").trim();
-  const header = rawHeader.toLowerCase();
-  const lines = Array.isArray(qFull?.DocumentLines) ? qFull.DocumentLines : [];
-  const lineStatuses = lines
-    .map((l) => String(l?.LineStatus || l?.DocumentStatus || "").trim().toLowerCase())
-    .filter(Boolean);
-
-  const allClosed = lineStatuses.length > 0 && lineStatuses.every((s) => s.includes("close"));
-  const anyOpen = lineStatuses.some((s) => s.includes("open"));
-
-  if (allClosed) return "Close";
-  if (header.includes("close")) return "Close";
-  if (Number(docTotal || 0) > 0 && Number(deliveredTotal || 0) >= Number(docTotal || 0) - 0.01) return "Close";
-  if (anyOpen || header.includes("open")) return "Open";
-  return rawHeader || "Open";
 }
 
 async function fetchQuotationHeadersPage(fromDate, toDate, top = 200, skip = 0) {
@@ -2241,63 +2190,57 @@ async function fetchQuotationHeadersPage(fromDate, toDate, top = 200, skip = 0) 
   const path =
     `/Quotations?$select=DocEntry,DocNum,DocDate,DocTime,CardCode,CardName,DocTotal,Comments,DocumentStatus,CancelStatus` +
     `&$filter=DocDate ge ${fromExpr} and DocDate lt ${toExpr}` +
-    `&$orderby=DocDate desc,DocEntry desc&$top=${top}&$skip=${skip}`;
+    `&$orderby=DocDate desc,DocNum desc&$top=${top}&$skip=${skip}`;
 
   const r = await slFetchFreshSession(path);
   return Array.isArray(r?.value) ? r.value : [];
 }
 
-app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
+
+async function handleAdminQuotesSync(req, res) {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
     if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const body = req.body || {};
-    const modeRaw = String(body?.mode || req.query?.mode || "days").trim().toLowerCase();
-    const mode = ["days", "hours", "minutes", "range", "today"].includes(modeRaw) ? modeRaw : "days";
-    const nRaw = Number(body?.n ?? req.query?.n ?? 30);
-    const nMax = mode === "days" ? 400 : mode === "hours" ? 72 : mode === "minutes" ? 1440 : 400;
-    const n = Math.max(1, Math.min(nMax, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 30));
-    const maxDocsRaw = Number(body?.maxDocs ?? req.query?.maxDocs ?? 600);
-    const maxDocs = Math.max(20, Math.min(2000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 600));
-    const maxTrace = Math.min(200, maxDocs);
-    const maxLinesCalc = Math.min(150, maxDocs);
-    const batchTop = Math.min(200, maxDocs);
-
-    let fromDate = "";
-    let toDate = "";
-
-    if (isISO(body?.fromDate || req.query?.fromDate) && isISO(body?.toDate || req.query?.toDate)) {
-      fromDate = String(body?.fromDate || req.query?.fromDate).slice(0, 10);
-      toDate = String(body?.toDate || req.query?.toDate).slice(0, 10);
-    } else if (mode === "today") {
-      fromDate = today;
-      toDate = today;
-    } else if (mode === "hours" || mode === "minutes") {
-      fromDate = addDaysISO(today, -2);
-      toDate = today;
-    } else {
-      fromDate = addDaysISO(today, -n);
-      toDate = today;
-    }
+    const mode = String(req.body?.mode || req.query?.mode || "days").trim().toLowerCase();
+    const nRaw = Number(req.body?.n || req.query?.n || 30);
+    const n = Math.max(1, Math.min(mode === "days" ? 400 : mode === "hours" ? 72 : 1440, Number.isFinite(nRaw) ? Math.trunc(nRaw) : 30));
+    const maxDocsRaw = Number(req.body?.maxDocs || req.query?.maxDocs || 600);
+    const maxDocs = Math.max(1, Math.min(2000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 600));
 
     const nowMs = nowInOffsetMs(TZ_OFFSET_MIN);
-    const winMs =
+    const fromMs =
       mode === "hours"
-        ? n * 60 * 60 * 1000
+        ? nowMs - n * 60 * 60 * 1000
         : mode === "minutes"
-        ? n * 60 * 1000
-        : n * 24 * 60 * 60 * 1000;
-    const fromMs = nowMs - winMs;
+        ? nowMs - n * 60 * 1000
+        : 0;
+
+    const monthStart = `${today.slice(0, 8)}01`;
+    const fromDate = isISO(req.body?.fromDate || req.query?.fromDate)
+      ? String(req.body?.fromDate || req.query?.fromDate)
+      : mode === "today"
+      ? today
+      : mode === "month"
+      ? monthStart
+      : mode === "hours" || mode === "minutes"
+      ? addDaysISO(today, -2)
+      : addDaysISO(today, -n);
+
+    const toDate = isISO(req.body?.toDate || req.query?.toDate)
+      ? String(req.body?.toDate || req.query?.toDate)
+      : today;
 
     let scanned = 0;
     let saved = 0;
+    let removed = 0;
     let skipSap = 0;
+    const batchTop = Math.min(200, maxDocs);
+    const maxTrace = Math.min(500, maxDocs);
+    const maxLinesCalc = Math.min(250, maxDocs);
 
-    for (let page = 0; page < 100; page++) {
-      if (saved >= maxDocs) break;
-
+    for (let page = 0; page < 80 && saved < maxDocs; page++) {
       const headers = await fetchQuotationHeadersPage(fromDate, toDate, batchTop, skipSap);
       if (!headers.length) break;
       skipSap += headers.length;
@@ -2307,48 +2250,60 @@ app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
         scanned++;
 
         const docNum = Number(q?.DocNum || 0);
-        const docDate = String(q?.DocDate || "").slice(0, 10);
         const docTime = Number(q?.DocTime || 0);
+        const docDate = String(q?.DocDate || "").slice(0, 10);
 
-        if (mode === "hours" || mode === "minutes") {
+        if ((mode === "hours" || mode === "minutes") && docDate) {
           const ms = docDateTimeToMs(docDate, docTime);
           if (ms && ms < fromMs) continue;
         }
 
-        if (isCancelledLikeQuote(q)) {
-          await deleteQuoteCacheDoc(docNum);
+        const qFull = await sapGetByDocEntry("Quotations", q.DocEntry);
+        const qLines = Array.isArray(qFull?.DocumentLines) ? qFull.DocumentLines : [];
+        const comments = String(qFull?.Comments || q?.Comments || "");
+        const cancelStatus = String(qFull?.CancelStatus || q?.CancelStatus || "");
+        const isCancelled = qcIsCancelledLike({
+          CancelStatus: cancelStatus,
+          DocumentStatus: qFull?.DocumentStatus || q?.DocumentStatus || "",
+          Comments: comments,
+        });
+
+        await qcDeleteQuoteLinesOnly(docNum);
+
+        if (isCancelled) {
+          await qcDeleteQuoteCacheDoc(docNum);
+          removed++;
           continue;
         }
 
-        const qFull = await sapGetByDocEntry("Quotations", q.DocEntry);
-        const qLines = Array.isArray(qFull?.DocumentLines) ? qFull.DocumentLines : [];
-        const comments = String(q?.Comments || qFull?.Comments || "");
-        const usuario = parseUserFromComments(comments);
-        const warehouse = parseWhFromComments(comments);
-        const cardCode = String(q?.CardCode || qFull?.CardCode || "");
-        const cardName = String(q?.CardName || qFull?.CardName || "");
-        const cancelStatus = String(q?.CancelStatus || q?.cancelStatus || qFull?.CancelStatus || "");
-        const docTotal = Number(q?.DocTotal || qFull?.DocTotal || 0);
+        const usuario = parseUserFromComments(comments) || "sin_user";
+        const warehouse = parseWhFromComments(comments) || "sin_wh";
+        const cardCode = String(qFull?.CardCode || q?.CardCode || "");
+        const cardName = String(qFull?.CardName || q?.CardName || "");
+        const docTotal = Number(qFull?.DocTotal || q?.DocTotal || 0);
+        const status = qcNormalizeStatus(qFull || q, qLines);
 
         let deliveredTotal = 0;
+        let deliveredMap = new Map();
+
         if (saved < maxTrace) {
           try {
-            const tr = await traceQuoteTotals(docNum, addDaysISO(docDate || today, -30), today);
+            const tr = await qcTraceQuoteTotals(docNum, addDaysISO(today, -45), today);
             if (tr?.ok) deliveredTotal = Number(tr.totalEntregado || 0);
           } catch {}
         }
 
-        const status = normalizeQuoteStatus({
-          headerStatus: String(q?.DocumentStatus || q?.Status || qFull?.DocumentStatus || ""),
-          cancelStatus,
-          qFull,
-          deliveredTotal,
-          docTotal,
-        });
+        if (saved < maxLinesCalc) {
+          try {
+            deliveredMap = await qcTraceQuoteLinesByItem(docNum, addDaysISO(today, -45), today);
+          } catch {
+            deliveredMap = new Map();
+          }
+        }
 
         await upsertQuoteCache({
           docNum,
-          docEntry: q.DocEntry,
+          docEntry: qFull?.DocEntry || q?.DocEntry || null,
           docDate,
           docTime,
           cardCode,
@@ -2363,55 +2318,37 @@ app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
           groupName: "",
         });
 
-        if (saved < maxLinesCalc) {
-          try {
-            await resetQuoteLinesCacheDoc(docNum);
+        const quotedMap = new Map();
+        for (const ln of qLines) {
+          const itemCode = String(ln?.ItemCode || "").trim();
+          if (!itemCode) continue;
+          const qtyQuoted = Number(ln?.Quantity || 0);
+          const dollarsQuoted = Number(ln?.LineTotal ?? 0);
+          const itemDesc = String(ln?.ItemDescription || ln?.ItemName || "").trim();
+          const prev = quotedMap.get(itemCode) || { qtyQuoted: 0, dollarsQuoted: 0, itemDesc: itemDesc || "" };
+          prev.qtyQuoted += Number.isFinite(qtyQuoted) ? qtyQuoted : 0;
+          prev.dollarsQuoted += Number.isFinite(dollarsQuoted) ? dollarsQuoted : 0;
+          if (!prev.itemDesc && itemDesc) prev.itemDesc = itemDesc;
+          quotedMap.set(itemCode, prev);
+        }
 
-            const deliveredMap = await traceQuoteLinesByItem(docNum, addDaysISO(docDate || today, -45), today);
-            const quotedMap = new Map();
-
-            for (const ln of qLines) {
-              const itemCode = String(ln?.ItemCode || "").trim();
-              if (!itemCode) continue;
-
-              const qtyQuoted = Number(ln?.Quantity || 0);
-              const dollarsQuoted = Number(ln?.LineTotal ?? 0);
-              const itemDesc = String(ln?.ItemDescription || ln?.ItemName || "").trim();
-
-              const prev = quotedMap.get(itemCode) || {
-                qtyQuoted: 0,
-                dollarsQuoted: 0,
-                itemDesc: itemDesc || "",
-              };
-
-              prev.qtyQuoted += Number.isFinite(qtyQuoted) ? qtyQuoted : 0;
-              prev.dollarsQuoted += Number.isFinite(dollarsQuoted) ? dollarsQuoted : 0;
-              if (!prev.itemDesc && itemDesc) prev.itemDesc = itemDesc;
-              quotedMap.set(itemCode, prev);
-            }
-
-            for (const [itemCode, qv] of quotedMap.entries()) {
-              const dv = deliveredMap.get(itemCode) || { qtyDelivered: 0, dollarsDelivered: 0 };
-
-              await upsertQuoteLineCache({
-                docNum,
-                docDate,
-                itemCode,
-                itemDesc: qv.itemDesc || "",
-                qtyQuoted: qv.qtyQuoted,
-                qtyDelivered: dv.qtyDelivered,
-                dollarsQuoted: qv.dollarsQuoted,
-                dollarsDelivered: dv.dollarsDelivered,
-              });
-            }
-          } catch {}
+        for (const [itemCode, qv] of quotedMap.entries()) {
+          const dv = deliveredMap.get(itemCode) || { qtyDelivered: 0, dollarsDelivered: 0 };
+          await upsertQuoteLineCache({
+            docNum,
+            docDate,
+            itemCode,
+            itemDesc: qv.itemDesc || "",
+            qtyQuoted: qv.qtyQuoted,
+            qtyDelivered: Number(dv.qtyDelivered || 0),
+            dollarsQuoted: qv.dollarsQuoted,
+            dollarsDelivered: Number(dv.dollarsDelivered || 0),
+          });
         }
 
         saved++;
         await sleep(10);
       }
-
-      if (headers.length < batchTop) break;
     }
 
     const stamp = isoDateTimeInOffset(TZ_OFFSET_MIN);
@@ -2424,16 +2361,25 @@ app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
       maxDocs,
       scanned,
       saved,
+      removed,
       lastSyncAt: stamp,
       window: { fromDate, toDate },
-      note: "Sync guardado en DB. El entregado se calcula solo desde documentos enlazados (pedido/entrega), se borran canceladas del caché y el estado se normaliza con el cierre real de líneas.",
+      note: "Historico lee quotes_cache. Este sync reemplaza las lineas cacheadas del documento, elimina canceladas y recalcula entregado desde Quote -> Order -> Delivery.",
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
+}
+
+app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
+  return handleAdminQuotesSync(req, res);
+});
+app.get("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
+  return handleAdminQuotesSync(req, res);
 });
 
 app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
+
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
 
@@ -2456,12 +2402,7 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
 
     where.push(`q.doc_date BETWEEN $${p++} AND $${p++}`);
     params.push(from, to);
-
-    where.push(`NOT (
-      LOWER(COALESCE(q.cancel_status,'')) LIKE '%csyes%' OR
-      LOWER(COALESCE(q.cancel_status,'')) LIKE '%cancel%' OR
-      LOWER(COALESCE(q.status,'')) LIKE '%cancel%'
-    )`);
+    where.push(`NOT (LOWER(COALESCE(q.cancel_status,'')) LIKE '%csyes%' OR LOWER(COALESCE(q.cancel_status,'')) LIKE '%cancel%' OR LOWER(COALESCE(q.status,'')) LIKE '%cancel%')`);
 
     if (onlyCreated) where.push(`LOWER(COALESCE(q.usuario,'')) IN (SELECT LOWER(username) FROM app_users WHERE is_active=TRUE)`);
     if (user) {
@@ -2474,6 +2415,11 @@ app.get("/api/admin/quotes/db", verifyAdmin, async (req, res) => {
     }
     if (openOnly) {
       where.push(`LOWER(COALESCE(q.status,'')) LIKE '%open%'`);
+      where.push(`NOT (
+        LOWER(COALESCE(q.cancel_status,'')) LIKE '%csyes%' OR
+        LOWER(COALESCE(q.cancel_status,'')) LIKE '%cancel%' OR
+        LOWER(COALESCE(q.status,'')) LIKE '%cancel%'
+      )`);
     }
 
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
@@ -2532,13 +2478,7 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
     const createdJoin = onlyCreated
       ? `AND LOWER(COALESCE(q.usuario,'')) IN (SELECT LOWER(username) FROM app_users WHERE is_active=TRUE)`
       : ``;
-
-    const notCancelledSql = `
-       AND NOT (
-         LOWER(COALESCE(q.cancel_status,'')) LIKE '%csyes%' OR
-         LOWER(COALESCE(q.cancel_status,'')) LIKE '%cancel%' OR
-         LOWER(COALESCE(q.status,'')) LIKE '%cancel%'
-       )`;
+    const notCancelledJoin = `AND NOT (LOWER(COALESCE(q.cancel_status,'')) LIKE '%csyes%' OR LOWER(COALESCE(q.cancel_status,'')) LIKE '%cancel%' OR LOWER(COALESCE(q.status,'')) LIKE '%cancel%')`;
 
     const totalsR = await dbQuery(
       `SELECT
@@ -2547,8 +2487,8 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
         COALESCE(SUM(q.delivered_total),0)::float AS entregado
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
-       ${notCancelledSql}
-       ${createdJoin}`,
+       ${createdJoin}
+       ${notCancelledJoin}`,
       [from, to]
     );
     const totals = totalsR.rows?.[0] || { quotes: 0, cotizado: 0, entregado: 0 };
@@ -2562,8 +2502,8 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
         COALESCE(SUM(q.delivered_total),0)::float AS entregado
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
-       ${notCancelledSql}
        ${createdJoin}
+       ${notCancelledJoin}
        GROUP BY 1
        ORDER BY cotizado DESC
        LIMIT 2000`,
@@ -2578,8 +2518,8 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
         COALESCE(SUM(q.delivered_total),0)::float AS entregado
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
-       ${notCancelledSql}
        ${createdJoin}
+       ${notCancelledJoin}
        GROUP BY 1
        ORDER BY cotizado DESC
        LIMIT 2000`,
@@ -2593,8 +2533,8 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
         COALESCE(SUM(q.doc_total),0)::float AS cotizado
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
-       ${notCancelledSql}
        ${createdJoin}
+       ${notCancelledJoin}
        GROUP BY 1
        ORDER BY cotizado DESC
        LIMIT 2000`,
@@ -2608,8 +2548,8 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
         COALESCE(SUM(q.doc_total),0)::float AS cotizado
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
-       ${notCancelledSql}
        ${createdJoin}
+       ${notCancelledJoin}
        GROUP BY 1
        ORDER BY cotizado DESC
        LIMIT 2000`,
