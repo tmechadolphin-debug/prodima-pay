@@ -960,19 +960,47 @@ function isCancelledQuote(status, cancelStatus) {
   return c.includes("csyes") || c.includes("cancel") || s.includes("cancel");
 }
 
+function hasQuoteLineTarget(line) {
+  if (!line || typeof line !== "object") return false;
+
+  const numericCandidates = ["TrgetEntry", "TargetEntry", "TargetDocEntry"];
+  for (const field of numericCandidates) {
+    if (!Object.prototype.hasOwnProperty.call(line, field)) continue;
+    const raw = line[field];
+    if (raw === null || raw === undefined || raw === "") continue;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return true;
+  }
+
+  const typeCandidates = ["TargetType", "TrgetType"];
+  for (const field of typeCandidates) {
+    if (!Object.prototype.hasOwnProperty.call(line, field)) continue;
+    const raw = String(line[field] ?? "").trim().toLowerCase();
+    if (!raw) continue;
+    if (!["-1", "0", "none", "null"].includes(raw)) return true;
+  }
+
+  return false;
+}
+
 function normalizeQuoteStatus(status, cancelStatus, opts = {}) {
   if (isCancelledQuote(status, cancelStatus)) return "Cancelled";
 
+  const s = norm(status || "");
   const hasReliableOpenQty = !!opts.hasReliableOpenQty;
   const totalOpenQty = Number(opts.totalOpenQty);
+  const allLinesClosed = !!opts.allLinesClosed;
+
+  if (s.includes("close")) return "Close";
+
+  if (allLinesClosed) return "Close";
+
   if (hasReliableOpenQty && Number.isFinite(totalOpenQty)) {
     return totalOpenQty > 0 ? "Open" : "Close";
   }
 
-  const s = norm(status || "");
-  if (!s) return "Open";
-  if (s.includes("close")) return "Close";
   if (s.includes("open")) return "Open";
+  if (!s) return "Open";
   return String(status || "").trim() || "Open";
 }
 
@@ -2087,9 +2115,16 @@ app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
       let deliveredTotal = 0;
       let hasReliableOpenQty = false;
       let totalOpenQty = 0;
+      let lineCount = 0;
+      let closedLineCount = 0;
       for (const ln of qLines) {
+        lineCount++;
         const qty = Number(ln?.Quantity || 0);
         const openQty = getReliableQuoteOpenQty(ln);
+        const hasTarget = hasQuoteLineTarget(ln);
+        const lineStatus = norm(ln?.LineStatus || "");
+        const lineClosed = lineStatus.includes("close");
+        if (lineClosed) closedLineCount++;
         if (openQty !== null) {
           hasReliableOpenQty = true;
           totalOpenQty += Math.max(openQty, 0);
@@ -2097,10 +2132,15 @@ app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
 
         const lineTotal = Number(ln?.LineTotal ?? 0);
         let deliveredQty = 0;
-        if (!cancelled && qty > 0 && openQty !== null) {
-          deliveredQty = Math.max(qty - openQty, 0);
+        if (!cancelled && qty > 0) {
+          if (hasTarget && openQty !== null) {
+            deliveredQty = Math.max(qty - openQty, 0);
+          } else if (hasTarget && lineClosed) {
+            deliveredQty = qty;
+          }
         }
         if (!Number.isFinite(deliveredQty)) deliveredQty = 0;
+        deliveredQty = Math.min(Math.max(deliveredQty, 0), Math.max(qty, 0));
 
         const lineDelivered = qty > 0 ? lineTotal * Math.min(deliveredQty / qty, 1) : 0;
         deliveredTotal += Number.isFinite(lineDelivered) ? lineDelivered : 0;
@@ -2109,6 +2149,7 @@ app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
       const normalizedStatus = normalizeQuoteStatus(status, cancelStatus, {
         hasReliableOpenQty,
         totalOpenQty,
+        allLinesClosed: lineCount > 0 && closedLineCount === lineCount,
       });
 
       await upsertQuoteCache({
@@ -2134,7 +2175,17 @@ app.post("/api/admin/quotes/sync", verifyAdmin, async (req, res) => {
           if (!itemCode) continue;
           const qtyQuoted = Number(ln?.Quantity || 0);
           const openQty = getReliableQuoteOpenQty(ln);
-          const qtyDelivered = !cancelled && qtyQuoted > 0 && openQty !== null ? Math.max(qtyQuoted - openQty, 0) : 0;
+          const hasTarget = hasQuoteLineTarget(ln);
+          const lineClosed = norm(ln?.LineStatus || "").includes("close");
+          let qtyDelivered = 0;
+          if (!cancelled && qtyQuoted > 0) {
+            if (hasTarget && openQty !== null) {
+              qtyDelivered = Math.max(qtyQuoted - openQty, 0);
+            } else if (hasTarget && lineClosed) {
+              qtyDelivered = qtyQuoted;
+            }
+          }
+          qtyDelivered = Math.min(Math.max(Number.isFinite(qtyDelivered) ? qtyDelivered : 0, 0), Math.max(qtyQuoted, 0));
           const dollarsQuoted = Number(ln?.LineTotal ?? 0);
           const dollarsDelivered = qtyQuoted > 0 ? dollarsQuoted * Math.min(qtyDelivered / qtyQuoted, 1) : 0;
           const itemDesc = String(ln?.ItemDescription || ln?.ItemName || "").trim();
