@@ -2968,8 +2968,7 @@ const DOCS_NOTIFY_TO = parseEmailList(
 
 function sanitizeAttachmentName(name, fallback = "archivo") {
   const raw = String(name || fallback || "archivo")
-    .replace(/[\/
-	]+/g, " ")
+    .replace(/[\/\r\n\t]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
   const clean = raw.replace(/[^A-Za-z0-9._()\- áéíóúÁÉÍÓÚñÑ]/g, "_");
