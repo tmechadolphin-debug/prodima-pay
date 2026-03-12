@@ -7,7 +7,7 @@ import XLSX from "xlsx";
 
 const { Pool } = pg;
 const app = express();
-app.use(express.json({ limit: "4mb" }));
+app.use(express.json({ limit: "20mb" }));
 const __extraBootTasks = [];
 
 /* =========================================================
@@ -1379,7 +1379,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     for (const ln of cleanLines) assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
 
-    await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`);
+    const bp = await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`);
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
@@ -1407,6 +1407,31 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     try {
       const created = await createQuotation(payload);
+
+      let mailResult = { ok: false, skipped: true, message: "" };
+      try {
+        mailResult = await sendDocumentEmailViaGAS({
+          event: "quote_created",
+          notifyTo: DOCS_NOTIFY_TO,
+          attachments: req.body?.attachments,
+          data: {
+            kind: "quote",
+            docNum: created.DocNum,
+            docEntry: created.DocEntry,
+            docDate,
+            warehouse: warehouseCode,
+            createdBy: creator,
+            cardCode,
+            cardName: String(bp?.CardName || ""),
+            comments: String(req.body?.comments || "").trim(),
+            lines: cleanLines.map((ln) => ({ itemCode: ln.ItemCode, qty: ln.Quantity })),
+          },
+        });
+      } catch (mailErr) {
+        mailResult = { ok: false, skipped: false, message: String(mailErr?.message || mailErr) };
+        console.error("quote email error:", mailResult.message);
+      }
+
       return res.json({
         ok: true,
         message: "Cotización creada",
@@ -1415,6 +1440,8 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         warehouse: warehouseCode,
         bodega: warehouseCode,
         fallback: false,
+        mailSent: !!mailResult?.ok,
+        mailMessage: mailResult?.message || "",
       });
     } catch (err1) {
       if (!isSapNoMatchError(err1)) throw err1;
@@ -1429,6 +1456,31 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       };
 
       const created2 = await createQuotation(payloadFallback);
+
+      let mailResult = { ok: false, skipped: true, message: "" };
+      try {
+        mailResult = await sendDocumentEmailViaGAS({
+          event: "quote_created",
+          notifyTo: DOCS_NOTIFY_TO,
+          attachments: req.body?.attachments,
+          data: {
+            kind: "quote",
+            docNum: created2.DocNum,
+            docEntry: created2.DocEntry,
+            docDate,
+            warehouse: warehouseCode,
+            createdBy: creator,
+            cardCode,
+            cardName: String(bp?.CardName || ""),
+            comments: String(req.body?.comments || "").trim(),
+            lines: cleanLines.map((ln) => ({ itemCode: ln.ItemCode, qty: ln.Quantity })),
+          },
+        });
+      } catch (mailErr) {
+        mailResult = { ok: false, skipped: false, message: String(mailErr?.message || mailErr) };
+        console.error("quote fallback email error:", mailResult.message);
+      }
+
       return res.json({
         ok: true,
         message: "Cotización creada (fallback sin WarehouseCode por -2028)",
@@ -1437,6 +1489,8 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         warehouse: warehouseCode,
         bodega: warehouseCode,
         fallback: true,
+        mailSent: !!mailResult?.ok,
+        mailMessage: mailResult?.message || "",
       });
     }
   } catch (err) {
@@ -1490,7 +1544,7 @@ async function createReturnRequestHandler(req, res) {
       });
     }
 
-    await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`);
+    const bp = await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`);
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
@@ -1567,6 +1621,39 @@ async function createReturnRequestHandler(req, res) {
       }
     }
 
+    let mailResult = { ok: false, skipped: true, message: "" };
+    try {
+      mailResult = await sendDocumentEmailViaGAS({
+        event: "return_created",
+        notifyTo: DOCS_NOTIFY_TO,
+        attachments: req.body?.attachments,
+        data: {
+          kind: "return",
+          reqNum,
+          reqEntry,
+          docDate,
+          warehouse: warehouseCode,
+          createdBy: creator,
+          cardCode,
+          cardName: String(bp?.CardName || cardName || ""),
+          motivo,
+          causa,
+          comments: extraComments,
+          totalQty,
+          totalAmount,
+          lines: cleanLines.map((ln) => ({
+            itemCode: ln.ItemCode,
+            itemDesc: ln.ItemDescription,
+            qty: ln.Quantity,
+            price: ln.Price,
+          })),
+        },
+      });
+    } catch (mailErr) {
+      mailResult = { ok: false, skipped: false, message: String(mailErr?.message || mailErr) };
+      console.error("return email error:", mailResult.message);
+    }
+
     return res.json({
       ok: true,
       message: "Solicitud de devolución creada",
@@ -1575,6 +1662,8 @@ async function createReturnRequestHandler(req, res) {
       warehouse: warehouseCode,
       bodega: warehouseCode,
       entity: String(SAP_RETURN_ENTITY || "Returns"),
+      mailSent: !!mailResult?.ok,
+      mailMessage: mailResult?.message || "",
     });
   } catch (err) {
     return res.status(500).json({ ok: false, message: String(err?.message || err) });
@@ -2890,6 +2979,92 @@ function parseEmailList(csv) {
     .split(",")
     .map((s) => s.trim().toLowerCase())
     .filter((x) => isEmail(x));
+}
+
+
+const DOCS_NOTIFY_TO = parseEmailList(
+  "facturacion@prodima.com.pa,adm-red@prodima.com.pa,ventasconsumidor@prodima.com.pa,liliana.vergara@prodima.com.pa"
+).join(",");
+
+function sanitizeAttachmentName(name, fallback = "archivo") {
+  const raw = String(name || fallback || "archivo")
+    .replace(/[\\/\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const clean = raw.replace(/[^A-Za-z0-9._()\- áéíóúÁÉÍÓÚñÑ]/g, "_");
+  return (clean || fallback || "archivo").slice(0, 120);
+}
+
+function normalizeIncomingAttachments(list) {
+  const allowed = new Set([
+    "application/pdf",
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+    "image/heic",
+    "image/heif",
+  ]);
+
+  const incoming = Array.isArray(list) ? list : [];
+  const out = [];
+  let totalBytes = 0;
+
+  for (const file of incoming.slice(0, 5)) {
+    const filename = sanitizeAttachmentName(file?.filename || file?.name || "archivo");
+    const mimeType = String(file?.mimeType || file?.type || "application/octet-stream").trim().toLowerCase();
+    const contentBase64 = String(file?.contentBase64 || file?.base64 || file?.content || "").trim();
+
+    if (!filename || !contentBase64) continue;
+    if (!allowed.has(mimeType)) continue;
+
+    let bytes = 0;
+    try {
+      bytes = Buffer.byteLength(contentBase64, "base64");
+    } catch {
+      continue;
+    }
+
+    if (!bytes || bytes > 8 * 1024 * 1024) continue;
+    if (totalBytes + bytes > 18 * 1024 * 1024) break;
+    totalBytes += bytes;
+
+    out.push({ filename, mimeType, contentBase64, size: bytes });
+  }
+
+  return out;
+}
+
+async function sendDocumentEmailViaGAS({ event, notifyTo, data, attachments }) {
+  if (!GAS_WEBHOOK_URL || !GAS_WEBHOOK_SECRET) {
+    return { ok: false, skipped: true, message: "GAS no configurado" };
+  }
+
+  const payload = {
+    secret: GAS_WEBHOOK_SECRET,
+    event,
+    requesterEmail: "",
+    notifyTo: notifyTo || DOCS_NOTIFY_TO,
+    data: data || {},
+    attachments: normalizeIncomingAttachments(attachments),
+  };
+
+  try {
+    const f = await _getFetch();
+    const resp = await f(GAS_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const text = await resp.text().catch(() => "");
+    if (!resp.ok) {
+      return { ok: false, skipped: false, message: text || `HTTP ${resp.status}` };
+    }
+    return { ok: true, skipped: false, message: text || "ok" };
+  } catch (err) {
+    return { ok: false, skipped: false, message: String(err?.message || err) };
+  }
 }
 
 // Fetch helper: Node 18+ tiene fetch; Node <18 usa node-fetch si lo instalas.
