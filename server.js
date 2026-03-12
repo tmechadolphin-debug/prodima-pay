@@ -1407,25 +1407,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     try {
       const created = await createQuotation(payload);
-
-      const mailResult = await sendDocumentEmailViaGAS({
-        event: "quote_created",
-        notifyTo: DOCS_NOTIFY_TO,
-        attachments: req.body?.attachments,
-        data: {
-          kind: "quote",
-          docNum: created.DocNum,
-          docEntry: created.DocEntry,
-          docDate,
-          warehouse: warehouseCode,
-          createdBy: creator,
-          cardCode,
-          cardName: String((await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardName`))?.CardName || ""),
-          comments: String(req.body?.comments || "").trim(),
-          lines: cleanLines.map((ln) => ({ itemCode: ln.ItemCode, qty: ln.Quantity })),
-        },
-      });
-
       return res.json({
         ok: true,
         message: "Cotización creada",
@@ -1434,8 +1415,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         warehouse: warehouseCode,
         bodega: warehouseCode,
         fallback: false,
-        mailSent: !!mailResult?.ok,
-        mailMessage: mailResult?.message || "",
       });
     } catch (err1) {
       if (!isSapNoMatchError(err1)) throw err1;
@@ -1450,26 +1429,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       };
 
       const created2 = await createQuotation(payloadFallback);
-
-      const mailResult = await sendDocumentEmailViaGAS({
-        event: "quote_created",
-        notifyTo: DOCS_NOTIFY_TO,
-        attachments: req.body?.attachments,
-        data: {
-          kind: "quote",
-          docNum: created2.DocNum,
-          docEntry: created2.DocEntry,
-          docDate,
-          warehouse: warehouseCode,
-          createdBy: creator,
-          cardCode,
-          cardName: String((await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardName`))?.CardName || ""),
-          comments: String(req.body?.comments || "").trim(),
-          fallback: true,
-          lines: cleanLines.map((ln) => ({ itemCode: ln.ItemCode, qty: ln.Quantity })),
-        },
-      });
-
       return res.json({
         ok: true,
         message: "Cotización creada (fallback sin WarehouseCode por -2028)",
@@ -1478,8 +1437,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         warehouse: warehouseCode,
         bodega: warehouseCode,
         fallback: true,
-        mailSent: !!mailResult?.ok,
-        mailMessage: mailResult?.message || "",
       });
     }
   } catch (err) {
@@ -1610,33 +1567,6 @@ async function createReturnRequestHandler(req, res) {
       }
     }
 
-    const mailResult = await sendDocumentEmailViaGAS({
-      event: "return_created",
-      notifyTo: DOCS_NOTIFY_TO,
-      attachments: req.body?.attachments,
-      data: {
-        kind: "return",
-        reqNum,
-        reqEntry,
-        docDate,
-        warehouse: warehouseCode,
-        createdBy: creator,
-        cardCode,
-        cardName,
-        motivo,
-        causa,
-        comments: extraComments,
-        totalQty,
-        totalAmount,
-        lines: cleanLines.map((ln) => ({
-          itemCode: ln.ItemCode,
-          itemDesc: ln.ItemDescription,
-          qty: ln.Quantity,
-          price: ln.Price,
-        })),
-      },
-    });
-
     return res.json({
       ok: true,
       message: "Solicitud de devolución creada",
@@ -1645,8 +1575,6 @@ async function createReturnRequestHandler(req, res) {
       warehouse: warehouseCode,
       bodega: warehouseCode,
       entity: String(SAP_RETURN_ENTITY || "Returns"),
-      mailSent: !!mailResult?.ok,
-      mailMessage: mailResult?.message || "",
     });
   } catch (err) {
     return res.status(500).json({ ok: false, message: String(err?.message || err) });
@@ -2713,7 +2641,7 @@ app.get("/api/admin/quotes/lines", verifyAdmin, async (req, res) => {
 
 const { Pool } = pg;
 
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 /* =========================
    ENV
@@ -2738,9 +2666,6 @@ const {
 
   // ✅ Supervisores
   SUPERVISOR_NOTIFY_TO = "logistica2@prodima.com.pa,melanie.choy@prodima.com.pa,malena.torrero@prodima.com.pa",
-
-  // ✅ Correos fijos para documentos con adjuntos
-  DOCS_NOTIFY_TO = "facturacion@prodima.com.pa,adm-red@prodima.com.pa,ventasconsumidor@prodima.com.pa,liliana.vergara@prodima.com.pa",
 
   // ✅ Auto-asignación a Victor
   AUTO_ASSIGN_ENABLED = "1",              // "1" = activo
@@ -3027,85 +2952,6 @@ async function notifyViaGAS({ event, requesterEmail, notifyTo, data }) {
     console.error("GAS notify error:", err?.message || err);
   }
 }
-
-function sanitizeAttachmentName(name) {
-  return String(name || "archivo")
-    .replace(/[\\/\r\n\t]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 180) || "archivo";
-}
-
-function normalizeIncomingAttachments(list) {
-  const allowed = new Set([
-    "application/pdf",
-    "image/jpeg",
-    "image/jpg",
-    "image/png",
-    "image/webp",
-    "image/heic",
-    "image/heif",
-  ]);
-
-  const incoming = Array.isArray(list) ? list : [];
-  const out = [];
-  let totalBytes = 0;
-
-  for (const file of incoming.slice(0, 5)) {
-    const name = sanitizeAttachmentName(file?.name || file?.filename || "archivo");
-    const mimeType = String(file?.mimeType || file?.type || "application/octet-stream").trim().toLowerCase();
-    const contentBase64 = String(file?.contentBase64 || file?.base64 || file?.content || "").trim();
-    if (!contentBase64) continue;
-    if (!allowed.has(mimeType)) continue;
-
-    let bytes = 0;
-    try {
-      bytes = Buffer.byteLength(contentBase64, "base64");
-    } catch {
-      continue;
-    }
-    if (!bytes || bytes > 8 * 1024 * 1024) continue;
-    if (totalBytes + bytes > 18 * 1024 * 1024) break;
-    totalBytes += bytes;
-
-    out.push({ name, mimeType, contentBase64, size: bytes });
-  }
-
-  return out;
-}
-
-async function sendDocumentEmailViaGAS({ event, notifyTo, data, attachments }) {
-  if (!GAS_WEBHOOK_URL || !GAS_WEBHOOK_SECRET) {
-    return { ok: false, skipped: true, message: "GAS no configurado" };
-  }
-
-  const payload = {
-    secret: GAS_WEBHOOK_SECRET,
-    event,
-    requesterEmail: "",
-    notifyTo: notifyTo || DOCS_NOTIFY_TO,
-    data: data || {},
-    attachments: normalizeIncomingAttachments(attachments),
-  };
-
-  try {
-    const f = await _getFetch();
-    const resp = await f(GAS_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    const text = await resp.text().catch(() => "");
-    if (!resp.ok) {
-      return { ok: false, skipped: false, message: text || `HTTP ${resp.status}` };
-    }
-    return { ok: true, skipped: false, message: text || "ok" };
-  } catch (err) {
-    return { ok: false, skipped: false, message: String(err?.message || err) };
-  }
-}
-
 
 /* =========================
    AUTO-ASIGNACIÓN: buscar mensajero "victor"
