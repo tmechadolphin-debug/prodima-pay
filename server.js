@@ -7,7 +7,7 @@ import XLSX from "xlsx";
 
 const { Pool } = pg;
 const app = express();
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "4mb" }));
 const __extraBootTasks = [];
 
 /* =========================================================
@@ -1379,7 +1379,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     for (const ln of cleanLines) assertItemAllowedOrThrow(warehouseCode, ln.ItemCode);
 
-    const bp = await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`);
+    await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`);
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
@@ -1407,6 +1407,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     try {
       const created = await createQuotation(payload);
+
       const mailResult = await sendDocumentEmailViaGAS({
         event: "quote_created",
         notifyTo: DOCS_NOTIFY_TO,
@@ -1419,7 +1420,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
           warehouse: warehouseCode,
           createdBy: creator,
           cardCode,
-          cardName: String(bp?.CardName || ""),
+          cardName: String((await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardName`))?.CardName || ""),
           comments: String(req.body?.comments || "").trim(),
           lines: cleanLines.map((ln) => ({ itemCode: ln.ItemCode, qty: ln.Quantity })),
         },
@@ -1449,6 +1450,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       };
 
       const created2 = await createQuotation(payloadFallback);
+
       const mailResult = await sendDocumentEmailViaGAS({
         event: "quote_created",
         notifyTo: DOCS_NOTIFY_TO,
@@ -1461,7 +1463,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
           warehouse: warehouseCode,
           createdBy: creator,
           cardCode,
-          cardName: String(bp?.CardName || ""),
+          cardName: String((await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardName`))?.CardName || ""),
           comments: String(req.body?.comments || "").trim(),
           fallback: true,
           lines: cleanLines.map((ln) => ({ itemCode: ln.ItemCode, qty: ln.Quantity })),
@@ -1531,7 +1533,7 @@ async function createReturnRequestHandler(req, res) {
       });
     }
 
-    const bp = await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`);
+    await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(cardCode)}')?$select=CardCode,CardName`);
 
     const docDate = getDateISOInOffset(TZ_OFFSET_MIN);
     const creator = req.user?.username || "unknown";
@@ -1620,7 +1622,7 @@ async function createReturnRequestHandler(req, res) {
         warehouse: warehouseCode,
         createdBy: creator,
         cardCode,
-        cardName: String(bp?.CardName || cardName || ""),
+        cardName,
         motivo,
         causa,
         comments: extraComments,
@@ -2711,7 +2713,7 @@ app.get("/api/admin/quotes/lines", verifyAdmin, async (req, res) => {
 
 const { Pool } = pg;
 
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "20mb" }));
 
 /* =========================
    ENV
@@ -2736,6 +2738,9 @@ const {
 
   // ✅ Supervisores
   SUPERVISOR_NOTIFY_TO = "logistica2@prodima.com.pa,melanie.choy@prodima.com.pa,malena.torrero@prodima.com.pa",
+
+  // ✅ Correos fijos para documentos con adjuntos
+  DOCS_NOTIFY_TO = "facturacion@prodima.com.pa,adm-red@prodima.com.pa,ventasconsumidor@prodima.com.pa,liliana.vergara@prodima.com.pa",
 
   // ✅ Auto-asignación a Victor
   AUTO_ASSIGN_ENABLED = "1",              // "1" = activo
@@ -2962,17 +2967,73 @@ function parseEmailList(csv) {
     .filter((x) => isEmail(x));
 }
 
-const DOCS_NOTIFY_TO = parseEmailList(
-  "facturacion@prodima.com.pa,adm-red@prodima.com.pa,ventasconsumidor@prodima.com.pa,liliana.vergara@prodima.com.pa"
-).join(",");
+// Fetch helper: Node 18+ tiene fetch; Node <18 usa node-fetch si lo instalas.
+async function _getFetch() {
+  if (typeof fetch !== "undefined") return fetch;
+  const mod = await import("node-fetch"); // npm i node-fetch
+  return mod.default;
+}
 
-function sanitizeAttachmentName(name, fallback = "archivo") {
-  const raw = String(name || fallback || "archivo")
-    .replace(/[\/\r\n\t]+/g, " ")
+async function getActiveCourierEmails() {
+  const r = await dbQuery(
+    `SELECT email
+     FROM msg_users
+     WHERE is_active=TRUE
+       AND role='courier'
+       AND COALESCE(email,'') <> ''`
+  );
+  return (r.rows || [])
+    .map((x) => String(x.email || "").trim().toLowerCase())
+    .filter((x) => isEmail(x));
+}
+
+async function buildNotifyRecipientsForCouriersAndSupervisors() {
+  const base = [];
+  if (COURIER_MAILBOX && isEmail(COURIER_MAILBOX)) base.push(String(COURIER_MAILBOX).trim().toLowerCase());
+
+  const supervisors = parseEmailList(SUPERVISOR_NOTIFY_TO);
+  const couriers = await getActiveCourierEmails();
+
+  const all = [...base, ...supervisors, ...couriers];
+  const uniq = [...new Set(all.map((x) => x.trim().toLowerCase()).filter(Boolean))];
+
+  return uniq.join(",");
+}
+
+async function notifyViaGAS({ event, requesterEmail, notifyTo, data }) {
+  if (!GAS_WEBHOOK_URL || !GAS_WEBHOOK_SECRET) return;
+
+  const payload = {
+    secret: GAS_WEBHOOK_SECRET,
+    event,
+    requesterEmail: requesterEmail || "",
+    notifyTo: notifyTo || "",
+    data: data || {},
+  };
+
+  try {
+    const f = await _getFetch();
+    const resp = await f(GAS_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      console.error("GAS notify failed:", resp.status, t);
+    }
+  } catch (err) {
+    console.error("GAS notify error:", err?.message || err);
+  }
+}
+
+function sanitizeAttachmentName(name) {
+  return String(name || "archivo")
+    .replace(/[\\/\r\n\t]+/g, " ")
     .replace(/\s+/g, " ")
-    .trim();
-  const clean = raw.replace(/[^A-Za-z0-9._()\- áéíóúÁÉÍÓÚñÑ]/g, "_");
-  return (clean || fallback || "archivo").slice(0, 120);
+    .trim()
+    .slice(0, 180) || "archivo";
 }
 
 function normalizeIncomingAttachments(list) {
@@ -3045,66 +3106,6 @@ async function sendDocumentEmailViaGAS({ event, notifyTo, data, attachments }) {
   }
 }
 
-// Fetch helper: Node 18+ tiene fetch; Node <18 usa node-fetch si lo instalas.
-async function _getFetch() {
-  if (typeof fetch !== "undefined") return fetch;
-  const mod = await import("node-fetch"); // npm i node-fetch
-  return mod.default;
-}
-
-async function getActiveCourierEmails() {
-  const r = await dbQuery(
-    `SELECT email
-     FROM msg_users
-     WHERE is_active=TRUE
-       AND role='courier'
-       AND COALESCE(email,'') <> ''`
-  );
-  return (r.rows || [])
-    .map((x) => String(x.email || "").trim().toLowerCase())
-    .filter((x) => isEmail(x));
-}
-
-async function buildNotifyRecipientsForCouriersAndSupervisors() {
-  const base = [];
-  if (COURIER_MAILBOX && isEmail(COURIER_MAILBOX)) base.push(String(COURIER_MAILBOX).trim().toLowerCase());
-
-  const supervisors = parseEmailList(SUPERVISOR_NOTIFY_TO);
-  const couriers = await getActiveCourierEmails();
-
-  const all = [...base, ...supervisors, ...couriers];
-  const uniq = [...new Set(all.map((x) => x.trim().toLowerCase()).filter(Boolean))];
-
-  return uniq.join(",");
-}
-
-async function notifyViaGAS({ event, requesterEmail, notifyTo, data }) {
-  if (!GAS_WEBHOOK_URL || !GAS_WEBHOOK_SECRET) return;
-
-  const payload = {
-    secret: GAS_WEBHOOK_SECRET,
-    event,
-    requesterEmail: requesterEmail || "",
-    notifyTo: notifyTo || "",
-    data: data || {},
-  };
-
-  try {
-    const f = await _getFetch();
-    const resp = await f(GAS_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    if (!resp.ok) {
-      const t = await resp.text().catch(() => "");
-      console.error("GAS notify failed:", resp.status, t);
-    }
-  } catch (err) {
-    console.error("GAS notify error:", err?.message || err);
-  }
-}
 
 /* =========================
    AUTO-ASIGNACIÓN: buscar mensajero "victor"
@@ -4023,7 +4024,7 @@ __extraBootTasks.push(async () => {
 
 const { Pool } = pg;
 
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "6mb" }));
 
 /* =========================================================
    ✅ ENV
@@ -5538,7 +5539,7 @@ __extraBootTasks.push(async () => {
 {
 const { Pool } = pg;
 
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "6mb" }));
 
 /* =========================================================
    ✅ ENV
