@@ -1370,12 +1370,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     const warehouseCode = getWarehouseFromReq(req);
     const cleanLines = lines
-      .map((l) => ({
-        ItemCode: String(l.itemCode || "").trim(),
-        ItemDescription: String(l.itemDesc || l.itemDescription || l.description || l.name || "").trim(),
-        Quantity: Number(l.qty || 0),
-        Price: Number(l.price || l.unitPrice || 0),
-      }))
+      .map((l) => ({ ItemCode: String(l.itemCode || "").trim(), Quantity: Number(l.qty || 0) }))
       .filter((x) => x.ItemCode && x.Quantity > 0);
 
     if (!cleanLines.length) {
@@ -1429,12 +1424,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
             cardCode,
             cardName: String(bp?.CardName || ""),
             comments: String(req.body?.comments || "").trim(),
-            lines: cleanLines.map((ln) => ({
-              itemCode: ln.ItemCode,
-              itemDesc: ln.ItemDescription,
-              qty: ln.Quantity,
-              price: ln.Price,
-            })),
+            lines: cleanLines.map((ln) => ({ itemCode: ln.ItemCode, qty: ln.Quantity })),
           },
         });
       } catch (mailErr) {
@@ -1483,12 +1473,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
             cardCode,
             cardName: String(bp?.CardName || ""),
             comments: String(req.body?.comments || "").trim(),
-            lines: cleanLines.map((ln) => ({
-              itemCode: ln.ItemCode,
-              itemDesc: ln.ItemDescription,
-              qty: ln.Quantity,
-              price: ln.Price,
-            })),
+            lines: cleanLines.map((ln) => ({ itemCode: ln.ItemCode, qty: ln.Quantity })),
           },
         });
       } catch (mailErr) {
@@ -2998,10 +2983,10 @@ function parseEmailList(csv) {
 
 
 globalThis.DOCS_NOTIFY_TO = parseEmailList(
-  "pe-impa@prodima.com.pa"
+  "facturacion@prodima.com.pa,adm-red@prodima.com.pa,ventasconsumidor@prodima.com.pa,drivera@prodimapanama.com,liliana.vergara@prodima.com.pa"
 ).join(",");
 const DOCS_NOTIFY_TO = globalThis.DOCS_NOTIFY_TO;
-console.log("BOOT", "DOCS_MAIL_V9_ADMRED_ONLY");
+console.log("BOOT", "DOCS_MAIL_V7_GLOBAL_HELPER");
 
 
 function sanitizeAttachmentName(name, fallback = "archivo") {
