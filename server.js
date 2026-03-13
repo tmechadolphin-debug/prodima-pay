@@ -1412,7 +1412,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       try {
         mailResult = await globalThis.sendDocumentEmailViaGAS({
           event: "quote_created",
-          notifyTo: DOCS_NOTIFY_TO,
+          notifyTo: globalThis.DOCS_NOTIFY_TO,
           attachments: req.body?.attachments,
           data: {
             kind: "quote",
@@ -1461,7 +1461,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
       try {
         mailResult = await globalThis.sendDocumentEmailViaGAS({
           event: "quote_created",
-          notifyTo: DOCS_NOTIFY_TO,
+          notifyTo: globalThis.DOCS_NOTIFY_TO,
           attachments: req.body?.attachments,
           data: {
             kind: "quote",
@@ -1625,7 +1625,7 @@ async function createReturnRequestHandler(req, res) {
     try {
       mailResult = await globalThis.sendDocumentEmailViaGAS({
         event: "return_created",
-        notifyTo: DOCS_NOTIFY_TO,
+        notifyTo: globalThis.DOCS_NOTIFY_TO,
         attachments: req.body?.attachments,
         data: {
           kind: "return",
@@ -2982,9 +2982,10 @@ function parseEmailList(csv) {
 }
 
 
-const DOCS_NOTIFY_TO = parseEmailList(
+globalThis.DOCS_NOTIFY_TO = parseEmailList(
   "facturacion@prodima.com.pa,adm-red@prodima.com.pa,ventasconsumidor@prodima.com.pa,liliana.vergara@prodima.com.pa"
 ).join(",");
+const DOCS_NOTIFY_TO = globalThis.DOCS_NOTIFY_TO;
 console.log("BOOT", "DOCS_MAIL_V7_GLOBAL_HELPER");
 
 
@@ -3046,7 +3047,7 @@ globalThis.sendDocumentEmailViaGAS = async function sendDocumentEmailViaGAS({ ev
     secret: GAS_WEBHOOK_SECRET,
     event,
     requesterEmail: "",
-    notifyTo: notifyTo || DOCS_NOTIFY_TO,
+    notifyTo: notifyTo || globalThis.DOCS_NOTIFY_TO,
     data: data || {},
     attachments: normalizeIncomingAttachments(attachments),
   };
