@@ -1,3 +1,6 @@
+
+const DOCS_MAIL_BUILD = "DOCS_MAIL_V6_2026-03-12";
+console.log("BOOT", DOCS_MAIL_BUILD);
 import express from "express";
 import pg from "pg";
 import bcrypt from "bcryptjs";
@@ -1410,7 +1413,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
       let mailResult = { ok: false, skipped: true, message: "" };
       try {
-        console.log("QUOTE MAIL CALL", { fallback: false, docNum: created?.DocNum || "", attachments: Array.isArray(req.body?.attachments) ? req.body.attachments.length : 0 });
         mailResult = await sendDocumentEmailViaGAS({
           event: "quote_created",
           notifyTo: DOCS_NOTIFY_TO,
@@ -1432,7 +1434,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         mailResult = { ok: false, skipped: false, message: String(mailErr?.message || mailErr) };
         console.error("quote email error:", mailResult.message);
       }
-      console.log("QUOTE MAIL RESULT", mailResult);
 
       return res.json({
         ok: true,
@@ -1461,7 +1462,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
       let mailResult = { ok: false, skipped: true, message: "" };
       try {
-        console.log("QUOTE MAIL CALL", { fallback: true, docNum: created2?.DocNum || "", attachments: Array.isArray(req.body?.attachments) ? req.body.attachments.length : 0 });
         mailResult = await sendDocumentEmailViaGAS({
           event: "quote_created",
           notifyTo: DOCS_NOTIFY_TO,
@@ -1483,7 +1483,6 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
         mailResult = { ok: false, skipped: false, message: String(mailErr?.message || mailErr) };
         console.error("quote fallback email error:", mailResult.message);
       }
-      console.log("QUOTE MAIL RESULT", mailResult);
 
       return res.json({
         ok: true,
@@ -1627,7 +1626,6 @@ async function createReturnRequestHandler(req, res) {
 
     let mailResult = { ok: false, skipped: true, message: "" };
     try {
-      console.log("RETURN MAIL CALL", { reqNum, attachments: Array.isArray(req.body?.attachments) ? req.body.attachments.length : 0 });
       mailResult = await sendDocumentEmailViaGAS({
         event: "return_created",
         notifyTo: DOCS_NOTIFY_TO,
@@ -1658,7 +1656,6 @@ async function createReturnRequestHandler(req, res) {
       mailResult = { ok: false, skipped: false, message: String(mailErr?.message || mailErr) };
       console.error("return email error:", mailResult.message);
     }
-    console.log("RETURN MAIL RESULT", mailResult);
 
     return res.json({
       ok: true,
@@ -1672,7 +1669,7 @@ async function createReturnRequestHandler(req, res) {
       mailMessage: mailResult?.message || "",
     });
   } catch (err) {
-    return res.status(500).json({ ok: false, message: String(err?.message || err) });
+    return res.status(500).json({ ok: false, message: String(err?.message || err) + " | " + DOCS_MAIL_BUILD });
   }
 }
 
@@ -2982,7 +2979,6 @@ function isEmail(s) {
 }
 function parseEmailList(csv) {
   return String(csv || "")
-    .replace(/;/g, ",")
     .split(",")
     .map((s) => s.trim().toLowerCase())
     .filter((x) => isEmail(x));
@@ -3044,54 +3040,33 @@ function normalizeIncomingAttachments(list) {
 
 async function sendDocumentEmailViaGAS({ event, notifyTo, data, attachments }) {
   if (!GAS_WEBHOOK_URL || !GAS_WEBHOOK_SECRET) {
-    console.warn("DOC GAS skipped: missing GAS_WEBHOOK_URL/GAS_WEBHOOK_SECRET");
     return { ok: false, skipped: true, message: "GAS no configurado" };
   }
 
-  const finalNotifyTo = parseEmailList(notifyTo || DOCS_NOTIFY_TO).join(",");
-  const finalAttachments = normalizeIncomingAttachments(attachments);
   const payload = {
     secret: GAS_WEBHOOK_SECRET,
     event,
     requesterEmail: "",
-    notifyTo: finalNotifyTo,
+    notifyTo: notifyTo || DOCS_NOTIFY_TO,
     data: data || {},
-    attachments: finalAttachments,
+    attachments: normalizeIncomingAttachments(attachments),
   };
-
-  console.log("DOC GAS START", {
-    event,
-    notifyTo: finalNotifyTo,
-    attachments: finalAttachments.length,
-    docNum: data?.docNum || data?.reqNum || "",
-    docEntry: data?.docEntry || data?.reqEntry || "",
-  });
 
   try {
     const f = await _getFetch();
     const resp = await f(GAS_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      redirect: "follow",
       body: JSON.stringify(payload),
     });
 
     const text = await resp.text().catch(() => "");
-    console.log("DOC GAS RESULT", {
-      event,
-      status: resp.status,
-      ok: resp.ok,
-      body: text,
-    });
-
     if (!resp.ok) {
       return { ok: false, skipped: false, message: text || `HTTP ${resp.status}` };
     }
-    return { ok: true, skipped: false, message: text || "ok" };
+    return { ok: true, skipped: false, message: (text || "ok") + " | " + DOCS_MAIL_BUILD };
   } catch (err) {
-    const message = String(err?.message || err);
-    console.error("DOC GAS ERROR", { event, message });
-    return { ok: false, skipped: false, message };
+    return { ok: false, skipped: false, message: String(err?.message || err) + " | " + DOCS_MAIL_BUILD };
   }
 }
 
