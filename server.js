@@ -2983,10 +2983,10 @@ function parseEmailList(csv) {
 
 
 globalThis.DOCS_NOTIFY_TO = parseEmailList(
-  "facturacion@prodima.com.pa,adm-red@prodima.com.pa,ventasconsumidor@prodima.com.pa,drivera@prodimapanama.com,liliana.vergara@prodima.com.pa"
+  "adm-red@prodima.com.pa"
 ).join(",");
 const DOCS_NOTIFY_TO = globalThis.DOCS_NOTIFY_TO;
-console.log("BOOT", "DOCS_MAIL_V7_GLOBAL_HELPER");
+console.log("BOOT", "DOCS_MAIL_V9_ADMRED_ONLY");
 
 
 function sanitizeAttachmentName(name, fallback = "archivo") {
