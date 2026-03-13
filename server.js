@@ -1,6 +1,3 @@
-
-const DOCS_MAIL_BUILD = "DOCS_MAIL_V6_2026-03-12";
-console.log("BOOT", DOCS_MAIL_BUILD);
 import express from "express";
 import pg from "pg";
 import bcrypt from "bcryptjs";
@@ -1413,7 +1410,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
       let mailResult = { ok: false, skipped: true, message: "" };
       try {
-        mailResult = await sendDocumentEmailViaGAS({
+        mailResult = await globalThis.sendDocumentEmailViaGAS({
           event: "quote_created",
           notifyTo: DOCS_NOTIFY_TO,
           attachments: req.body?.attachments,
@@ -1462,7 +1459,7 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
       let mailResult = { ok: false, skipped: true, message: "" };
       try {
-        mailResult = await sendDocumentEmailViaGAS({
+        mailResult = await globalThis.sendDocumentEmailViaGAS({
           event: "quote_created",
           notifyTo: DOCS_NOTIFY_TO,
           attachments: req.body?.attachments,
@@ -1626,7 +1623,7 @@ async function createReturnRequestHandler(req, res) {
 
     let mailResult = { ok: false, skipped: true, message: "" };
     try {
-      mailResult = await sendDocumentEmailViaGAS({
+      mailResult = await globalThis.sendDocumentEmailViaGAS({
         event: "return_created",
         notifyTo: DOCS_NOTIFY_TO,
         attachments: req.body?.attachments,
@@ -1669,7 +1666,7 @@ async function createReturnRequestHandler(req, res) {
       mailMessage: mailResult?.message || "",
     });
   } catch (err) {
-    return res.status(500).json({ ok: false, message: String(err?.message || err) + " | " + DOCS_MAIL_BUILD });
+    return res.status(500).json({ ok: false, message: String(err?.message || err) });
   }
 }
 
@@ -2988,6 +2985,8 @@ function parseEmailList(csv) {
 const DOCS_NOTIFY_TO = parseEmailList(
   "facturacion@prodima.com.pa,adm-red@prodima.com.pa,ventasconsumidor@prodima.com.pa,liliana.vergara@prodima.com.pa"
 ).join(",");
+console.log("BOOT", "DOCS_MAIL_V7_GLOBAL_HELPER");
+
 
 function sanitizeAttachmentName(name, fallback = "archivo") {
   const raw = String(name || fallback || "archivo")
@@ -3038,7 +3037,7 @@ function normalizeIncomingAttachments(list) {
   return out;
 }
 
-async function sendDocumentEmailViaGAS({ event, notifyTo, data, attachments }) {
+globalThis.sendDocumentEmailViaGAS = async function globalThis.sendDocumentEmailViaGAS({ event, notifyTo, data, attachments }) {
   if (!GAS_WEBHOOK_URL || !GAS_WEBHOOK_SECRET) {
     return { ok: false, skipped: true, message: "GAS no configurado" };
   }
@@ -3064,9 +3063,9 @@ async function sendDocumentEmailViaGAS({ event, notifyTo, data, attachments }) {
     if (!resp.ok) {
       return { ok: false, skipped: false, message: text || `HTTP ${resp.status}` };
     }
-    return { ok: true, skipped: false, message: (text || "ok") + " | " + DOCS_MAIL_BUILD };
+    return { ok: true, skipped: false, message: text || "ok" };
   } catch (err) {
-    return { ok: false, skipped: false, message: String(err?.message || err) + " | " + DOCS_MAIL_BUILD };
+    return { ok: false, skipped: false, message: String(err?.message || err) };
   }
 }
 
@@ -5544,7 +5543,7 @@ process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
   } catch (e) {
     console.error("DB init error:", e.message);
   }
-  app.listen(Number(PORT), () => console.log(`Server listening on :${PORT}`));
+  console.log(`SKIP duplicate listen on :${PORT}`);
 })();
 
 __extraBootTasks.push(async () => {
@@ -6483,7 +6482,7 @@ process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
   } catch (e) {
     console.error("DB init error:", e.message);
   }
-  app.listen(Number(PORT), () => console.log(`Server listening on :${PORT}`));
+  console.log(`SKIP duplicate listen on :${PORT}`);
 })();
 
 __extraBootTasks.push(async () => {
