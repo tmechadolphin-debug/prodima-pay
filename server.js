@@ -2983,7 +2983,7 @@ function parseEmailList(csv) {
 
 
 globalThis.DOCS_NOTIFY_TO = parseEmailList(
-  "adm-red@prodima.com.pa"
+  "pe-impa@prodima.com.pa"
 ).join(",");
 const DOCS_NOTIFY_TO = globalThis.DOCS_NOTIFY_TO;
 console.log("BOOT", "DOCS_MAIL_V9_ADMRED_ONLY");
