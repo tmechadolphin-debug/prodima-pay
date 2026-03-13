@@ -1370,7 +1370,12 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
 
     const warehouseCode = getWarehouseFromReq(req);
     const cleanLines = lines
-      .map((l) => ({ ItemCode: String(l.itemCode || "").trim(), Quantity: Number(l.qty || 0) }))
+      .map((l) => ({
+        ItemCode: String(l.itemCode || "").trim(),
+        ItemDescription: String(l.itemDesc || l.itemDescription || l.description || l.name || "").trim(),
+        Quantity: Number(l.qty || 0),
+        Price: Number(l.price || l.unitPrice || 0),
+      }))
       .filter((x) => x.ItemCode && x.Quantity > 0);
 
     if (!cleanLines.length) {
@@ -1424,7 +1429,12 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
             cardCode,
             cardName: String(bp?.CardName || ""),
             comments: String(req.body?.comments || "").trim(),
-            lines: cleanLines.map((ln) => ({ itemCode: ln.ItemCode, qty: ln.Quantity })),
+            lines: cleanLines.map((ln) => ({
+              itemCode: ln.ItemCode,
+              itemDesc: ln.ItemDescription,
+              qty: ln.Quantity,
+              price: ln.Price,
+            })),
           },
         });
       } catch (mailErr) {
@@ -1473,7 +1483,12 @@ app.post("/api/sap/quote", verifyUser, async (req, res) => {
             cardCode,
             cardName: String(bp?.CardName || ""),
             comments: String(req.body?.comments || "").trim(),
-            lines: cleanLines.map((ln) => ({ itemCode: ln.ItemCode, qty: ln.Quantity })),
+            lines: cleanLines.map((ln) => ({
+              itemCode: ln.ItemCode,
+              itemDesc: ln.ItemDescription,
+              qty: ln.Quantity,
+              price: ln.Price,
+            })),
           },
         });
       } catch (mailErr) {
