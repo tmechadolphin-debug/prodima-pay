@@ -3037,7 +3037,7 @@ function normalizeIncomingAttachments(list) {
   return out;
 }
 
-globalThis.sendDocumentEmailViaGAS = async function globalThis.sendDocumentEmailViaGAS({ event, notifyTo, data, attachments }) {
+globalThis.sendDocumentEmailViaGAS = async function sendDocumentEmailViaGAS({ event, notifyTo, data, attachments }) {
   if (!GAS_WEBHOOK_URL || !GAS_WEBHOOK_SECRET) {
     return { ok: false, skipped: true, message: "GAS no configurado" };
   }
