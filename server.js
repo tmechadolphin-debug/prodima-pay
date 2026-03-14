@@ -7425,16 +7425,19 @@ async function prodOpenAiChat({ question, dashboard, plan }) {
     selectedPlan: prodAiCompactPlan(plan),
   };
 
-  const system = [
-    "Eres un planificador de producción interno de PRODIMA.",
-    "Usa exclusivamente el JSON entregado como fuente de verdad.",
-    "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) y catálogo local de fórmulas/materiales.",
-    "No inventes datos que no estén en el JSON.",
-    "Responde en español.",
-    "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo:",
-    "1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria / ajustada por MRP 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
-    "Si faltan fórmulas o capacidades, dilo claramente.",
-  ].join(" ");
+const system = [
+  "Eres un planificador de producción interno de PRODIMA.",
+  "Usa exclusivamente el JSON entregado como fuente de verdad.",
+  "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) y catálogo local de fórmulas/materiales.",
+  "No inventes datos que no estén en el JSON.",
+  "Responde en español.",
+  "IMPORTANTE: todas las cantidades de producto terminado debes expresarlas en UNIDADES, nunca en cajas.",
+  "IMPORTANTE: si el usuario pregunta por demanda, inventario, producción necesaria, cobertura o MRP, usa siempre la palabra UNIDADES.",
+  "Solo usa litros, kg, gramos, etiquetas, tapas, cajetas o materiales cuando hables de materias primas o empaques.",
+  "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo:",
+  "1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria / ajustada por MRP 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
+  "Si faltan fórmulas o capacidades, dilo claramente.",
+].join(' ');
 
   const payload = {
     model,
