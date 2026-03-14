@@ -2998,7 +2998,7 @@ function parseEmailList(csv) {
 
 
 globalThis.DOCS_NOTIFY_TO = parseEmailList(
-  "adm-red@prodima.com.pa"
+  "pe-impa@prodima.com.pa"
 ).join(",");
 const DOCS_NOTIFY_TO = globalThis.DOCS_NOTIFY_TO;
 console.log("BOOT", "DOCS_MAIL_V11_BASE41_FAST_SEARCH");
@@ -5104,189 +5104,280 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
 });
 
 
-function aiCompactDashboard(data, opts = {}) {
-  const focusCard = String(opts.cardCode || "").trim();
-  const focusWh = String(opts.warehouse || "").trim();
 
-  const table = Array.isArray(data?.table) ? data.table : [];
-  const focused = table.filter((r) => {
-    if (focusCard && String(r.cardCode || "") !== focusCard) return false;
-    if (focusWh && String(r.warehouse || "") !== focusWh) return false;
-    return true;
-  });
-
-  const pick = (arr, n = 10) => (Array.isArray(arr) ? arr.slice(0, n) : []);
+/* =========================================================
+   🤖 IA · Estratificación (DB sincronizada)
+========================================================= */
+function aiCompactEstratDashboard(data, opts = {}) {
+  const items = Array.isArray(data?.items) ? data.items : [];
+  const groups = Array.isArray(data?.groupAgg) ? data.groupAgg : [];
+  const selectedItemCode = String(opts?.selectedItemCode || '').trim();
+  const selectedItem = selectedItemCode
+    ? items.find((x) => String(x?.itemCode || '') === selectedItemCode) || null
+    : null;
 
   return {
-    range: { from: data?.from, to: data?.to },
-    totals: data?.totals || {},
-    byMonth: pick(data?.byMonth, 12),
-    topCustomers: pick(data?.topCustomers, 10),
-    topWarehouses: pick(data?.topWarehouses, 10),
-    rows: pick((focused.length ? focused : table), focused.length ? 25 : 40).map((r) => ({
-      cardCode: r.cardCode,
-      cardName: r.cardName,
-      customer: r.customer,
-      warehouse: r.warehouse,
-      dollars: r.dollars,
-      grossProfit: r.grossProfit,
-      grossPct: r.grossPct,
-      invoices: r.invoices,
+    source: 'db',
+    from: data?.from || '',
+    to: data?.to || '',
+    area: data?.area || '__ALL__',
+    grupo: data?.grupo || '__ALL__',
+    search: data?.q || '',
+    totals: {
+      revenue: Number(data?.totals?.revenue || 0),
+      gp: Number(data?.totals?.gp || 0),
+      gpPct: Number(data?.totals?.gpPct || 0),
+      items: items.length,
+    },
+    topGroups: groups.slice(0, 8).map((g) => ({
+      grupo: String(g?.grupo || ''),
+      rankArea: Number(g?.rankArea || 0),
+      revenue: Number(g?.revenue || 0),
+      gp: Number(g?.gp || 0),
+      gpPct: Number(g?.gpPct || 0),
     })),
+    topItems: items.slice(0, 12).map((x) => ({
+      itemCode: String(x?.itemCode || ''),
+      itemDesc: String(x?.itemDesc || ''),
+      grupo: String(x?.grupo || ''),
+      revenue: Number(x?.revenue || 0),
+      gp: Number(x?.gp || 0),
+      gpPct: Number(x?.gpPct || 0),
+      totalLabel: String(x?.totalLabel || ''),
+      rankTotal: Number(x?.rankTotal || 0),
+      rankArea: Number(x?.rankArea || 0),
+      stock: Number(x?.stock || 0),
+      stockMin: Number(x?.stockMin || 0),
+      stockMax: Number(x?.stockMax || 0),
+    })),
+    selectedItem: selectedItem
+      ? {
+          itemCode: String(selectedItem?.itemCode || ''),
+          itemDesc: String(selectedItem?.itemDesc || ''),
+          grupo: String(selectedItem?.grupo || ''),
+          revenue: Number(selectedItem?.revenue || 0),
+          gp: Number(selectedItem?.gp || 0),
+          gpPct: Number(selectedItem?.gpPct || 0),
+          totalLabel: String(selectedItem?.totalLabel || ''),
+          rankTotal: Number(selectedItem?.rankTotal || 0),
+          rankArea: Number(selectedItem?.rankArea || 0),
+          stock: Number(selectedItem?.stock || 0),
+          stockMin: Number(selectedItem?.stockMin || 0),
+          stockMax: Number(selectedItem?.stockMax || 0),
+        }
+      : null,
   };
 }
 
-function aiCompactDetail(detail, customerLabel = "") {
-  if (!detail?.ok) return null;
-  const flatLines = [];
-  for (const inv of (detail.invoices || []).slice(0, 25)) {
-    for (const ln of (inv.lines || []).slice(0, 15)) {
-      flatLines.push({
-        docNum: inv.docNum,
-        docDate: inv.docDate,
-        itemCode: ln.itemCode,
-        itemDesc: ln.itemDesc,
-        quantity: ln.quantity,
-        dollars: ln.dollars,
-        grossProfit: ln.grossProfit,
-        grossPct: ln.grossPct,
-      });
-      if (flatLines.length >= 80) break;
-    }
-    if (flatLines.length >= 80) break;
+function aiCompactEstratDetail(detailRows, itemLabel = '', itemSummary = null) {
+  const rows = Array.isArray(detailRows) ? detailRows : [];
+  const totals = rows.reduce(
+    (acc, r) => {
+      acc.qty += Number(r?.quantity || 0);
+      acc.revenue += Number(r?.total || 0);
+      acc.gp += Number(r?.gp || 0);
+      return acc;
+    },
+    { qty: 0, revenue: 0, gp: 0 }
+  );
+
+  const byClient = new Map();
+  for (const r of rows) {
+    const key = `${String(r?.cardCode || '')}|${String(r?.cardName || '')}`;
+    const cur = byClient.get(key) || { cardCode: String(r?.cardCode || ''), cardName: String(r?.cardName || ''), revenue: 0, gp: 0 };
+    cur.revenue += Number(r?.total || 0);
+    cur.gp += Number(r?.gp || 0);
+    byClient.set(key, cur);
   }
+
+  const docs = rows.slice(0, 12).map((r) => ({
+    docType: String(r?.docType || ''),
+    docDate: String(r?.docDate || ''),
+    docNum: r?.docNum ?? null,
+    cardCode: String(r?.cardCode || ''),
+    cardName: String(r?.cardName || ''),
+    quantity: Number(r?.quantity || 0),
+    total: Number(r?.total || 0),
+    gp: Number(r?.gp || 0),
+  }));
+
   return {
-    customerLabel,
-    cardCode: detail.cardCode,
-    warehouse: detail.warehouse,
-    totals: detail.totals,
-    lines: flatLines,
+    label: itemLabel || itemSummary?.itemDesc || itemSummary?.itemCode || '',
+    itemSummary: itemSummary
+      ? {
+          itemCode: String(itemSummary?.itemCode || ''),
+          itemDesc: String(itemSummary?.itemDesc || ''),
+          grupo: String(itemSummary?.grupo || ''),
+          revenue: Number(itemSummary?.revenue || 0),
+          gp: Number(itemSummary?.gp || 0),
+          gpPct: Number(itemSummary?.gpPct || 0),
+          totalLabel: String(itemSummary?.totalLabel || ''),
+          rankTotal: Number(itemSummary?.rankTotal || 0),
+          rankArea: Number(itemSummary?.rankArea || 0),
+          stock: Number(itemSummary?.stock || 0),
+          stockMin: Number(itemSummary?.stockMin || 0),
+          stockMax: Number(itemSummary?.stockMax || 0),
+        }
+      : null,
+    docsCount: rows.length,
+    totals: {
+      qty: Number(totals.qty || 0),
+      revenue: Number(totals.revenue || 0),
+      gp: Number(totals.gp || 0),
+      gpPct: totals.revenue ? (totals.gp / totals.revenue) * 100 : 0,
+    },
+    topClients: Array.from(byClient.values())
+      .sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0))
+      .slice(0, 8)
+      .map((x) => ({
+        cardCode: x.cardCode,
+        cardName: x.cardName,
+        revenue: Number(x.revenue || 0),
+        gp: Number(x.gp || 0),
+      })),
+    recentDocs: docs,
   };
 }
 
 function extractResponseText(obj) {
-  if (!obj || typeof obj !== "object") return "";
-
-  if (typeof obj.output_text === "string" && obj.output_text.trim()) {
+  if (!obj || typeof obj !== 'object') return '';
+  if (typeof obj.output_text === 'string' && obj.output_text.trim()) {
     return obj.output_text.trim();
   }
-
   const parts = [];
-
   for (const item of Array.isArray(obj.output) ? obj.output : []) {
     if (item && Array.isArray(item.content)) {
       for (const c of item.content) {
-        if (c?.type === "output_text" && typeof c.text === "string" && c.text.trim()) {
-          parts.push(c.text.trim());
-        } else if (c?.type === "text" && typeof c.text === "string" && c.text.trim()) {
-          parts.push(c.text.trim());
-        } else if (c?.type === "summary_text" && typeof c.text === "string" && c.text.trim()) {
-          parts.push(c.text.trim());
-        } else if (c?.type === "reasoning_text" && typeof c.text === "string" && c.text.trim()) {
-          parts.push(c.text.trim());
-        } else if (typeof c?.text === "string" && c.text.trim()) {
-          parts.push(c.text.trim());
-        } else if (c?.text && typeof c.text?.value === "string" && c.text.value.trim()) {
-          parts.push(c.text.value.trim());
-        }
+        if (c?.type === 'output_text' && typeof c.text === 'string' && c.text.trim()) parts.push(c.text.trim());
+        else if (c?.type === 'text' && typeof c.text === 'string' && c.text.trim()) parts.push(c.text.trim());
+        else if (c?.type === 'summary_text' && typeof c.text === 'string' && c.text.trim()) parts.push(c.text.trim());
+        else if (typeof c?.text === 'string' && c.text.trim()) parts.push(c.text.trim());
+        else if (c?.text && typeof c.text?.value === 'string' && c.text.value.trim()) parts.push(c.text.value.trim());
       }
     }
-
-    if (typeof item?.text === "string" && item.text.trim()) {
-      parts.push(item.text.trim());
-    }
+    if (typeof item?.text === 'string' && item.text.trim()) parts.push(item.text.trim());
   }
-
-  return parts.join("\n\n").trim();
+  return parts.join('\n\n').trim();
 }
 
-async function openaiDbAnalystChat({ question, dashboard, detail = null, customerLabel = "" }) {
-  const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
-  const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
-  if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
+async function queryEstratItemDocsForAi({ itemCode, from, to, areaSel = '__ALL__', grupoSel = '__ALL__' }) {
+  const q1 = await dbQuery(
+    `
+    SELECT
+      s.doc_type,
+      s.doc_date,
+      s.doc_entry,
+      s.doc_num,
+      s.card_code,
+      s.card_name,
+      s.item_code,
+      s.item_desc,
+      s.quantity,
+      s.revenue,
+      s.gross_profit,
+      COALESCE(g.grupo, 'Sin grupo') AS grupo,
+      COALESCE(g.area, '') AS area
+    FROM sales_item_lines s
+    LEFT JOIN item_group_cache g ON g.item_code = s.item_code
+    WHERE s.item_code = $1
+      AND s.doc_date >= $2::date
+      AND s.doc_date <= $3::date
+    ORDER BY s.doc_date DESC, s.doc_entry DESC, s.line_num ASC
+    LIMIT 500
+    `,
+    [itemCode, from, to]
+  );
+
+  let rows = (q1.rows || []).map((r) => {
+    const grupoTxtRaw = String(r.grupo || 'Sin grupo');
+    const grupoTxt = normalizeGrupoFinal(grupoTxtRaw);
+    const areaDb = String(r.area || '');
+    const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || 'CONS';
+    return {
+      docType: String(r.doc_type || ''),
+      docDate: String(r.doc_date || '').slice(0, 10),
+      docEntry: Number(r.doc_entry || 0),
+      docNum: r.doc_num != null ? Number(r.doc_num) : null,
+      cardCode: String(r.card_code || ''),
+      cardName: String(r.card_name || ''),
+      itemCode: String(r.item_code || ''),
+      itemDesc: String(r.item_desc || ''),
+      quantity: Number(r.quantity || 0),
+      total: Number(r.revenue || 0),
+      gp: Number(r.gross_profit || 0),
+      area: areaFinal,
+      grupo: grupoTxt,
+    };
+  });
+
+  if (areaSel !== '__ALL__') rows = rows.filter((x) => String(x.area || '') === areaSel);
+  if (grupoSel !== '__ALL__') {
+    const gSelN = normGroupName(grupoSel);
+    rows = rows.filter((x) => normGroupName(x.grupo) === gSelN);
+  }
+  return rows;
+}
+
+async function openaiEstratificacionChat({ question, dashboard, itemSummary = null, detailRows = [], itemLabel = '' }) {
+  const apiKey = String(process.env.OPENAI_API_KEY || '').trim();
+  const model = String(process.env.OPENAI_MODEL || 'gpt-5-mini').trim();
+  if (!apiKey) throw new Error('OPENAI_API_KEY no configurada');
 
   const compact = {
-    dashboard: aiCompactDashboard(dashboard, {
-      cardCode: detail?.cardCode || "",
-      warehouse: detail?.warehouse || "",
-    }),
-    detail: detail ? aiCompactDetail(detail, customerLabel) : null,
+    dashboard: aiCompactEstratDashboard(dashboard, { selectedItemCode: itemSummary?.itemCode || '' }),
+    detail: itemSummary || detailRows.length ? aiCompactEstratDetail(detailRows, itemLabel, itemSummary) : null,
   };
 
   const system = [
-    "Eres un analista comercial interno de PRODIMA.",
-    "Usa exclusivamente el JSON entregado como fuente de verdad.",
-    "La fuente es la base de datos sincronizada del sistema, no SAP en vivo.",
-    "Si falta información, dilo claramente y no inventes.",
-    "Responde en español, claro y útil.",
-    "Prioriza métricas concretas, hallazgos accionables y cifras redondeadas."
-  ].join(" ");
+    'Eres un analista interno de inventario y rentabilidad para PRODIMA.',
+    'Usa exclusivamente el JSON entregado como fuente de verdad.',
+    'La fuente es la base de datos sincronizada del sistema, no SAP en vivo.',
+    'Responde en español, claro y útil.',
+    'Prioriza métricas concretas, hallazgos accionables, grupos, ABC, stock, revenue y margen.',
+    'Si falta información, dilo claramente y no inventes.'
+  ].join(' ');
 
   const payload = {
     model,
     input: [
-      { role: "system", content: [{ type: "input_text", text: system }] },
+      { role: 'system', content: [{ type: 'input_text', text: system }] },
       {
-        role: "user",
+        role: 'user',
         content: [
           {
-            type: "input_text",
-            text:
-              `Pregunta del usuario:
-${String(question || "").trim()}
-
-` +
-              `JSON de contexto:
-${JSON.stringify(compact)}`
-          }
-        ]
-      }
+            type: 'input_text',
+            text: `Pregunta del usuario:\n${String(question || '').trim()}\n\nJSON de contexto:\n${JSON.stringify(compact)}`,
+          },
+        ],
+      },
     ],
-    text: { format: { type: "text" } },
+    text: { format: { type: 'text' } },
     max_output_tokens: 700,
   };
 
-  console.log("AI CHAT REQUEST", {
-    model,
-    hasDetail: !!detail,
-    questionLen: String(question || "").length
-  });
-
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
+  console.log('AI ESTRAT REQUEST', { model, hasItem: !!itemSummary, docs: detailRows.length, qLen: String(question || '').length });
+  const resp = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
     headers: {
-      "Content-Type": "application/json",
+      'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify(payload),
   });
 
   const data = await resp.json().catch(() => ({}));
-
-  console.log("AI CHAT OPENAI STATUS", resp.status);
-  console.log("AI CHAT OPENAI DATA", JSON.stringify(data).slice(0, 3000));
+  console.log('AI ESTRAT STATUS', resp.status);
+  console.log('AI ESTRAT DATA', JSON.stringify(data).slice(0, 3000));
 
   if (!resp.ok) {
-    const msg =
-      data?.error?.message ||
-      data?.message ||
-      `OpenAI HTTP ${resp.status}`;
+    const msg = data?.error?.message || data?.message || `OpenAI HTTP ${resp.status}`;
     throw new Error(msg);
   }
 
   const answer = extractResponseText(data);
-
-  if (!answer) {
-    throw new Error("OpenAI respondió sin texto utilizable.");
-  }
-
-  return {
-    answer,
-    model,
-    raw: data,
-  };
+  if (!answer) throw new Error('OpenAI respondió sin texto utilizable.');
+  return { answer, model, raw: data };
 }
-
 
 /* =========================================================
    ✅ Health + Auth
@@ -5331,6 +5422,51 @@ app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) =>
 
     const data = await dashboardFromDb({ from, to, area, grupo, q });
     return safeJson(res, 200, data);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+
+
+app.post('/api/admin/estratificacion/ai-chat', verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: 'DB no configurada (DATABASE_URL)' });
+
+    const question = String(req.body?.question || '').trim();
+    if (!question) return safeJson(res, 400, { ok: false, message: 'Pregunta vacía' });
+
+    const fromQ = String(req.body?.from || '');
+    const toQ = String(req.body?.to || '');
+    const area = String(req.body?.area || '__ALL__');
+    const grupo = String(req.body?.grupo || '__ALL__');
+    const q = String(req.body?.q || '');
+    const itemCode = String(req.body?.itemCode || '').trim();
+    const itemLabel = String(req.body?.itemLabel || '').trim();
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = isISO(fromQ) ? fromQ : '2024-01-01';
+    const to = isISO(toQ) ? toQ : today;
+
+    const dashboard = await dashboardFromDb({ from, to, area, grupo, q });
+    let itemSummary = null;
+    let detailRows = [];
+
+    if (itemCode) {
+      itemSummary = (Array.isArray(dashboard?.items) ? dashboard.items : []).find(
+        (x) => String(x?.itemCode || '') === itemCode
+      ) || null;
+      detailRows = await queryEstratItemDocsForAi({ itemCode, from, to, areaSel: area, grupoSel: grupo });
+    }
+
+    const out = await openaiEstratificacionChat({ question, dashboard, itemSummary, detailRows, itemLabel });
+    return safeJson(res, 200, {
+      ok: true,
+      source: 'db',
+      answer: out.answer,
+      model: out.model,
+      focus: itemSummary ? { itemCode, itemLabel: itemLabel || itemSummary?.itemDesc || itemSummary?.itemCode || '' } : null,
+    });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -6438,189 +6574,280 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", limi
 }
 
 
-function aiCompactDashboard(data, opts = {}) {
-  const focusCard = String(opts.cardCode || "").trim();
-  const focusWh = String(opts.warehouse || "").trim();
 
-  const table = Array.isArray(data?.table) ? data.table : [];
-  const focused = table.filter((r) => {
-    if (focusCard && String(r.cardCode || "") !== focusCard) return false;
-    if (focusWh && String(r.warehouse || "") !== focusWh) return false;
-    return true;
-  });
-
-  const pick = (arr, n = 10) => (Array.isArray(arr) ? arr.slice(0, n) : []);
+/* =========================================================
+   🤖 IA · Estratificación (DB sincronizada)
+========================================================= */
+function aiCompactEstratDashboard(data, opts = {}) {
+  const items = Array.isArray(data?.items) ? data.items : [];
+  const groups = Array.isArray(data?.groupAgg) ? data.groupAgg : [];
+  const selectedItemCode = String(opts?.selectedItemCode || '').trim();
+  const selectedItem = selectedItemCode
+    ? items.find((x) => String(x?.itemCode || '') === selectedItemCode) || null
+    : null;
 
   return {
-    range: { from: data?.from, to: data?.to },
-    totals: data?.totals || {},
-    byMonth: pick(data?.byMonth, 12),
-    topCustomers: pick(data?.topCustomers, 10),
-    topWarehouses: pick(data?.topWarehouses, 10),
-    rows: pick((focused.length ? focused : table), focused.length ? 25 : 40).map((r) => ({
-      cardCode: r.cardCode,
-      cardName: r.cardName,
-      customer: r.customer,
-      warehouse: r.warehouse,
-      dollars: r.dollars,
-      grossProfit: r.grossProfit,
-      grossPct: r.grossPct,
-      invoices: r.invoices,
+    source: 'db',
+    from: data?.from || '',
+    to: data?.to || '',
+    area: data?.area || '__ALL__',
+    grupo: data?.grupo || '__ALL__',
+    search: data?.q || '',
+    totals: {
+      revenue: Number(data?.totals?.revenue || 0),
+      gp: Number(data?.totals?.gp || 0),
+      gpPct: Number(data?.totals?.gpPct || 0),
+      items: items.length,
+    },
+    topGroups: groups.slice(0, 8).map((g) => ({
+      grupo: String(g?.grupo || ''),
+      rankArea: Number(g?.rankArea || 0),
+      revenue: Number(g?.revenue || 0),
+      gp: Number(g?.gp || 0),
+      gpPct: Number(g?.gpPct || 0),
     })),
+    topItems: items.slice(0, 12).map((x) => ({
+      itemCode: String(x?.itemCode || ''),
+      itemDesc: String(x?.itemDesc || ''),
+      grupo: String(x?.grupo || ''),
+      revenue: Number(x?.revenue || 0),
+      gp: Number(x?.gp || 0),
+      gpPct: Number(x?.gpPct || 0),
+      totalLabel: String(x?.totalLabel || ''),
+      rankTotal: Number(x?.rankTotal || 0),
+      rankArea: Number(x?.rankArea || 0),
+      stock: Number(x?.stock || 0),
+      stockMin: Number(x?.stockMin || 0),
+      stockMax: Number(x?.stockMax || 0),
+    })),
+    selectedItem: selectedItem
+      ? {
+          itemCode: String(selectedItem?.itemCode || ''),
+          itemDesc: String(selectedItem?.itemDesc || ''),
+          grupo: String(selectedItem?.grupo || ''),
+          revenue: Number(selectedItem?.revenue || 0),
+          gp: Number(selectedItem?.gp || 0),
+          gpPct: Number(selectedItem?.gpPct || 0),
+          totalLabel: String(selectedItem?.totalLabel || ''),
+          rankTotal: Number(selectedItem?.rankTotal || 0),
+          rankArea: Number(selectedItem?.rankArea || 0),
+          stock: Number(selectedItem?.stock || 0),
+          stockMin: Number(selectedItem?.stockMin || 0),
+          stockMax: Number(selectedItem?.stockMax || 0),
+        }
+      : null,
   };
 }
 
-function aiCompactDetail(detail, customerLabel = "") {
-  if (!detail?.ok) return null;
-  const flatLines = [];
-  for (const inv of (detail.invoices || []).slice(0, 25)) {
-    for (const ln of (inv.lines || []).slice(0, 15)) {
-      flatLines.push({
-        docNum: inv.docNum,
-        docDate: inv.docDate,
-        itemCode: ln.itemCode,
-        itemDesc: ln.itemDesc,
-        quantity: ln.quantity,
-        dollars: ln.dollars,
-        grossProfit: ln.grossProfit,
-        grossPct: ln.grossPct,
-      });
-      if (flatLines.length >= 80) break;
-    }
-    if (flatLines.length >= 80) break;
+function aiCompactEstratDetail(detailRows, itemLabel = '', itemSummary = null) {
+  const rows = Array.isArray(detailRows) ? detailRows : [];
+  const totals = rows.reduce(
+    (acc, r) => {
+      acc.qty += Number(r?.quantity || 0);
+      acc.revenue += Number(r?.total || 0);
+      acc.gp += Number(r?.gp || 0);
+      return acc;
+    },
+    { qty: 0, revenue: 0, gp: 0 }
+  );
+
+  const byClient = new Map();
+  for (const r of rows) {
+    const key = `${String(r?.cardCode || '')}|${String(r?.cardName || '')}`;
+    const cur = byClient.get(key) || { cardCode: String(r?.cardCode || ''), cardName: String(r?.cardName || ''), revenue: 0, gp: 0 };
+    cur.revenue += Number(r?.total || 0);
+    cur.gp += Number(r?.gp || 0);
+    byClient.set(key, cur);
   }
+
+  const docs = rows.slice(0, 12).map((r) => ({
+    docType: String(r?.docType || ''),
+    docDate: String(r?.docDate || ''),
+    docNum: r?.docNum ?? null,
+    cardCode: String(r?.cardCode || ''),
+    cardName: String(r?.cardName || ''),
+    quantity: Number(r?.quantity || 0),
+    total: Number(r?.total || 0),
+    gp: Number(r?.gp || 0),
+  }));
+
   return {
-    customerLabel,
-    cardCode: detail.cardCode,
-    warehouse: detail.warehouse,
-    totals: detail.totals,
-    lines: flatLines,
+    label: itemLabel || itemSummary?.itemDesc || itemSummary?.itemCode || '',
+    itemSummary: itemSummary
+      ? {
+          itemCode: String(itemSummary?.itemCode || ''),
+          itemDesc: String(itemSummary?.itemDesc || ''),
+          grupo: String(itemSummary?.grupo || ''),
+          revenue: Number(itemSummary?.revenue || 0),
+          gp: Number(itemSummary?.gp || 0),
+          gpPct: Number(itemSummary?.gpPct || 0),
+          totalLabel: String(itemSummary?.totalLabel || ''),
+          rankTotal: Number(itemSummary?.rankTotal || 0),
+          rankArea: Number(itemSummary?.rankArea || 0),
+          stock: Number(itemSummary?.stock || 0),
+          stockMin: Number(itemSummary?.stockMin || 0),
+          stockMax: Number(itemSummary?.stockMax || 0),
+        }
+      : null,
+    docsCount: rows.length,
+    totals: {
+      qty: Number(totals.qty || 0),
+      revenue: Number(totals.revenue || 0),
+      gp: Number(totals.gp || 0),
+      gpPct: totals.revenue ? (totals.gp / totals.revenue) * 100 : 0,
+    },
+    topClients: Array.from(byClient.values())
+      .sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0))
+      .slice(0, 8)
+      .map((x) => ({
+        cardCode: x.cardCode,
+        cardName: x.cardName,
+        revenue: Number(x.revenue || 0),
+        gp: Number(x.gp || 0),
+      })),
+    recentDocs: docs,
   };
 }
 
 function extractResponseText(obj) {
-  if (!obj || typeof obj !== "object") return "";
-
-  if (typeof obj.output_text === "string" && obj.output_text.trim()) {
+  if (!obj || typeof obj !== 'object') return '';
+  if (typeof obj.output_text === 'string' && obj.output_text.trim()) {
     return obj.output_text.trim();
   }
-
   const parts = [];
-
   for (const item of Array.isArray(obj.output) ? obj.output : []) {
     if (item && Array.isArray(item.content)) {
       for (const c of item.content) {
-        if (c?.type === "output_text" && typeof c.text === "string" && c.text.trim()) {
-          parts.push(c.text.trim());
-        } else if (c?.type === "text" && typeof c.text === "string" && c.text.trim()) {
-          parts.push(c.text.trim());
-        } else if (c?.type === "summary_text" && typeof c.text === "string" && c.text.trim()) {
-          parts.push(c.text.trim());
-        } else if (c?.type === "reasoning_text" && typeof c.text === "string" && c.text.trim()) {
-          parts.push(c.text.trim());
-        } else if (typeof c?.text === "string" && c.text.trim()) {
-          parts.push(c.text.trim());
-        } else if (c?.text && typeof c.text?.value === "string" && c.text.value.trim()) {
-          parts.push(c.text.value.trim());
-        }
+        if (c?.type === 'output_text' && typeof c.text === 'string' && c.text.trim()) parts.push(c.text.trim());
+        else if (c?.type === 'text' && typeof c.text === 'string' && c.text.trim()) parts.push(c.text.trim());
+        else if (c?.type === 'summary_text' && typeof c.text === 'string' && c.text.trim()) parts.push(c.text.trim());
+        else if (typeof c?.text === 'string' && c.text.trim()) parts.push(c.text.trim());
+        else if (c?.text && typeof c.text?.value === 'string' && c.text.value.trim()) parts.push(c.text.value.trim());
       }
     }
-
-    if (typeof item?.text === "string" && item.text.trim()) {
-      parts.push(item.text.trim());
-    }
+    if (typeof item?.text === 'string' && item.text.trim()) parts.push(item.text.trim());
   }
-
-  return parts.join("\n\n").trim();
+  return parts.join('\n\n').trim();
 }
 
-async function openaiDbAnalystChat({ question, dashboard, detail = null, customerLabel = "" }) {
-  const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
-  const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
-  if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
+async function queryEstratItemDocsForAi({ itemCode, from, to, areaSel = '__ALL__', grupoSel = '__ALL__' }) {
+  const q1 = await dbQuery(
+    `
+    SELECT
+      s.doc_type,
+      s.doc_date,
+      s.doc_entry,
+      s.doc_num,
+      s.card_code,
+      s.card_name,
+      s.item_code,
+      s.item_desc,
+      s.quantity,
+      s.revenue,
+      s.gross_profit,
+      COALESCE(g.grupo, 'Sin grupo') AS grupo,
+      COALESCE(g.area, '') AS area
+    FROM sales_item_lines s
+    LEFT JOIN item_group_cache g ON g.item_code = s.item_code
+    WHERE s.item_code = $1
+      AND s.doc_date >= $2::date
+      AND s.doc_date <= $3::date
+    ORDER BY s.doc_date DESC, s.doc_entry DESC, s.line_num ASC
+    LIMIT 500
+    `,
+    [itemCode, from, to]
+  );
+
+  let rows = (q1.rows || []).map((r) => {
+    const grupoTxtRaw = String(r.grupo || 'Sin grupo');
+    const grupoTxt = normalizeGrupoFinal(grupoTxtRaw);
+    const areaDb = String(r.area || '');
+    const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || 'CONS';
+    return {
+      docType: String(r.doc_type || ''),
+      docDate: String(r.doc_date || '').slice(0, 10),
+      docEntry: Number(r.doc_entry || 0),
+      docNum: r.doc_num != null ? Number(r.doc_num) : null,
+      cardCode: String(r.card_code || ''),
+      cardName: String(r.card_name || ''),
+      itemCode: String(r.item_code || ''),
+      itemDesc: String(r.item_desc || ''),
+      quantity: Number(r.quantity || 0),
+      total: Number(r.revenue || 0),
+      gp: Number(r.gross_profit || 0),
+      area: areaFinal,
+      grupo: grupoTxt,
+    };
+  });
+
+  if (areaSel !== '__ALL__') rows = rows.filter((x) => String(x.area || '') === areaSel);
+  if (grupoSel !== '__ALL__') {
+    const gSelN = normGroupName(grupoSel);
+    rows = rows.filter((x) => normGroupName(x.grupo) === gSelN);
+  }
+  return rows;
+}
+
+async function openaiEstratificacionChat({ question, dashboard, itemSummary = null, detailRows = [], itemLabel = '' }) {
+  const apiKey = String(process.env.OPENAI_API_KEY || '').trim();
+  const model = String(process.env.OPENAI_MODEL || 'gpt-5-mini').trim();
+  if (!apiKey) throw new Error('OPENAI_API_KEY no configurada');
 
   const compact = {
-    dashboard: aiCompactDashboard(dashboard, {
-      cardCode: detail?.cardCode || "",
-      warehouse: detail?.warehouse || "",
-    }),
-    detail: detail ? aiCompactDetail(detail, customerLabel) : null,
+    dashboard: aiCompactEstratDashboard(dashboard, { selectedItemCode: itemSummary?.itemCode || '' }),
+    detail: itemSummary || detailRows.length ? aiCompactEstratDetail(detailRows, itemLabel, itemSummary) : null,
   };
 
   const system = [
-    "Eres un analista comercial interno de PRODIMA.",
-    "Usa exclusivamente el JSON entregado como fuente de verdad.",
-    "La fuente es la base de datos sincronizada del sistema, no SAP en vivo.",
-    "Si falta información, dilo claramente y no inventes.",
-    "Responde en español, claro y útil.",
-    "Prioriza métricas concretas, hallazgos accionables y cifras redondeadas."
-  ].join(" ");
+    'Eres un analista interno de inventario y rentabilidad para PRODIMA.',
+    'Usa exclusivamente el JSON entregado como fuente de verdad.',
+    'La fuente es la base de datos sincronizada del sistema, no SAP en vivo.',
+    'Responde en español, claro y útil.',
+    'Prioriza métricas concretas, hallazgos accionables, grupos, ABC, stock, revenue y margen.',
+    'Si falta información, dilo claramente y no inventes.'
+  ].join(' ');
 
   const payload = {
     model,
     input: [
-      { role: "system", content: [{ type: "input_text", text: system }] },
+      { role: 'system', content: [{ type: 'input_text', text: system }] },
       {
-        role: "user",
+        role: 'user',
         content: [
           {
-            type: "input_text",
-            text:
-              `Pregunta del usuario:
-${String(question || "").trim()}
-
-` +
-              `JSON de contexto:
-${JSON.stringify(compact)}`
-          }
-        ]
-      }
+            type: 'input_text',
+            text: `Pregunta del usuario:\n${String(question || '').trim()}\n\nJSON de contexto:\n${JSON.stringify(compact)}`,
+          },
+        ],
+      },
     ],
-    text: { format: { type: "text" } },
+    text: { format: { type: 'text' } },
     max_output_tokens: 700,
   };
 
-  console.log("AI CHAT REQUEST", {
-    model,
-    hasDetail: !!detail,
-    questionLen: String(question || "").length
-  });
-
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
+  console.log('AI ESTRAT REQUEST', { model, hasItem: !!itemSummary, docs: detailRows.length, qLen: String(question || '').length });
+  const resp = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
     headers: {
-      "Content-Type": "application/json",
+      'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify(payload),
   });
 
   const data = await resp.json().catch(() => ({}));
-
-  console.log("AI CHAT OPENAI STATUS", resp.status);
-  console.log("AI CHAT OPENAI DATA", JSON.stringify(data).slice(0, 3000));
+  console.log('AI ESTRAT STATUS', resp.status);
+  console.log('AI ESTRAT DATA', JSON.stringify(data).slice(0, 3000));
 
   if (!resp.ok) {
-    const msg =
-      data?.error?.message ||
-      data?.message ||
-      `OpenAI HTTP ${resp.status}`;
+    const msg = data?.error?.message || data?.message || `OpenAI HTTP ${resp.status}`;
     throw new Error(msg);
   }
 
   const answer = extractResponseText(data);
-
-  if (!answer) {
-    throw new Error("OpenAI respondió sin texto utilizable.");
-  }
-
-  return {
-    answer,
-    model,
-    raw: data,
-  };
+  if (!answer) throw new Error('OpenAI respondió sin texto utilizable.');
+  return { answer, model, raw: data };
 }
-
 
 /* =========================================================
    ✅ Health + Auth
@@ -6720,54 +6947,6 @@ app.get("/api/admin/invoices/top-products", verifyAdmin, async (req, res) => {
 /* =========================================================
    ✅ EXPORT EXCEL (SERVER-SIDE) — SOLO SE AGREGA ESTO
 ========================================================= */
-
-app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-
-    const question = String(req.body?.question || "").trim();
-    if (!question) return safeJson(res, 400, { ok: false, message: "question requerida" });
-
-    const fromQ = String(req.body?.from || req.query?.from || "");
-    const toQ = String(req.body?.to || req.query?.to || "");
-    const cardCode = String(req.body?.cardCode || "").trim();
-    const warehouse = String(req.body?.warehouse || "").trim();
-    const customerLabel = String(req.body?.customerLabel || "").trim();
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
-
-    const from = isISO(fromQ) ? fromQ : defaultFrom;
-    const to = isISO(toQ) ? toQ : today;
-
-    const dashboard = await dashboardFromDb(from, to);
-    let detail = null;
-
-    if (cardCode && warehouse) {
-      detail = await detailsFromDb({ from, to, cardCode, warehouse });
-    }
-
-    const out = await openaiDbAnalystChat({
-      question,
-      dashboard,
-      detail,
-      customerLabel,
-    });
-
-    return safeJson(res, 200, {
-      ok: true,
-      answer: out.answer || "No pude generar una respuesta.",
-      model: out.model,
-      source: "db",
-      range: { from, to },
-      focus: detail ? { cardCode, warehouse, customerLabel } : null,
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-
 app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
@@ -6947,6 +7126,5 @@ process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
   app.listen(Number(PORT), () => {
     console.log(`PRODIMA API UNIFICADA listening on :${PORT}`);
-    console.log("AI invoices chat enabled ✅");
   });
 })();
