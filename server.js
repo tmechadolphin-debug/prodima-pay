@@ -6769,7 +6769,7 @@ async function prodGetFullItem(code) {
   const itemCode = String(code || "").trim();
   if (!itemCode) return null;
   const safe = itemCode.replace(/'/g, "''");
-  return slFetch(`/Items('${safe}')`, { timeoutMs: 120000 });
+  return slFetch(`/Items('${safe}')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection`, { timeoutMs: 120000 });
 }
 
 async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
@@ -6788,12 +6788,13 @@ async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
 
   for (let i = 0; i < codes.length; i++) {
     try {
-      const it = await prodGetFullItem(codes[i]);
+      const itemCode = codes[i];
+      const it = await prodGetFullItem(itemCode);
+      const itemDesc = String(it?.ItemName || "").trim();
       const whRows = Array.isArray(it?.ItemWarehouseInfoCollection) ? it.ItemWarehouseInfoCollection : [];
-      for (const w of whRows) {
-        const wh = String(w?.WarehouseCode ?? w?.WhsCode ?? "").trim();
-        if (!PROD_FINISHED_WHS.includes(wh)) continue;
 
+      for (const wh of PROD_FINISHED_WHS) {
+        const w = whRows.find((x) => String(x?.WarehouseCode ?? x?.WhsCode ?? "").trim() === wh) || {};
         const stock = prodNum(w?.InStock ?? w?.OnHand ?? 0);
         const committed = prodNum(w?.Committed ?? w?.IsCommited ?? 0);
         const ordered = prodNum(w?.Ordered ?? w?.OnOrder ?? 0);
@@ -6815,7 +6816,7 @@ async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
             available=EXCLUDED.available,
             updated_at=NOW()
           `,
-          [String(it?.ItemCode || codes[i]), String(it?.ItemName || ""), wh, stock, stockMin, stockMax, committed, ordered, available]
+          [itemCode, itemDesc, wh, stock, stockMin, stockMax, committed, ordered, available]
         );
         saved++;
       }
