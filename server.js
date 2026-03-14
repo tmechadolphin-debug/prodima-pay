@@ -4,6 +4,8 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import XLSX from "xlsx";
+import fs from "fs";
+import path from "path";
 
 const { Pool } = pg;
 const app = express();
@@ -2998,7 +3000,7 @@ function parseEmailList(csv) {
 
 
 globalThis.DOCS_NOTIFY_TO = parseEmailList(
-  "pe-impa@prodima.com.pa"
+  "adm-red@prodima.com.pa"
 ).join(",");
 const DOCS_NOTIFY_TO = globalThis.DOCS_NOTIFY_TO;
 console.log("BOOT", "DOCS_MAIL_V11_BASE41_FAST_SEARCH");
@@ -5103,282 +5105,6 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
   }
 });
 
-
-
-/* =========================================================
-   🤖 IA · Estratificación (DB sincronizada)
-========================================================= */
-function aiCompactEstratDashboard(data, opts = {}) {
-  const items = Array.isArray(data?.items) ? data.items : [];
-  const groups = Array.isArray(data?.groupAgg) ? data.groupAgg : [];
-  const selectedItemCode = String(opts?.selectedItemCode || '').trim();
-  const selectedItem = selectedItemCode
-    ? items.find((x) => String(x?.itemCode || '') === selectedItemCode) || null
-    : null;
-
-  return {
-    source: 'db',
-    from: data?.from || '',
-    to: data?.to || '',
-    area: data?.area || '__ALL__',
-    grupo: data?.grupo || '__ALL__',
-    search: data?.q || '',
-    totals: {
-      revenue: Number(data?.totals?.revenue || 0),
-      gp: Number(data?.totals?.gp || 0),
-      gpPct: Number(data?.totals?.gpPct || 0),
-      items: items.length,
-    },
-    topGroups: groups.slice(0, 8).map((g) => ({
-      grupo: String(g?.grupo || ''),
-      rankArea: Number(g?.rankArea || 0),
-      revenue: Number(g?.revenue || 0),
-      gp: Number(g?.gp || 0),
-      gpPct: Number(g?.gpPct || 0),
-    })),
-    topItems: items.slice(0, 12).map((x) => ({
-      itemCode: String(x?.itemCode || ''),
-      itemDesc: String(x?.itemDesc || ''),
-      grupo: String(x?.grupo || ''),
-      revenue: Number(x?.revenue || 0),
-      gp: Number(x?.gp || 0),
-      gpPct: Number(x?.gpPct || 0),
-      totalLabel: String(x?.totalLabel || ''),
-      rankTotal: Number(x?.rankTotal || 0),
-      rankArea: Number(x?.rankArea || 0),
-      stock: Number(x?.stock || 0),
-      stockMin: Number(x?.stockMin || 0),
-      stockMax: Number(x?.stockMax || 0),
-    })),
-    selectedItem: selectedItem
-      ? {
-          itemCode: String(selectedItem?.itemCode || ''),
-          itemDesc: String(selectedItem?.itemDesc || ''),
-          grupo: String(selectedItem?.grupo || ''),
-          revenue: Number(selectedItem?.revenue || 0),
-          gp: Number(selectedItem?.gp || 0),
-          gpPct: Number(selectedItem?.gpPct || 0),
-          totalLabel: String(selectedItem?.totalLabel || ''),
-          rankTotal: Number(selectedItem?.rankTotal || 0),
-          rankArea: Number(selectedItem?.rankArea || 0),
-          stock: Number(selectedItem?.stock || 0),
-          stockMin: Number(selectedItem?.stockMin || 0),
-          stockMax: Number(selectedItem?.stockMax || 0),
-        }
-      : null,
-  };
-}
-
-function aiCompactEstratDetail(detailRows, itemLabel = '', itemSummary = null) {
-  const rows = Array.isArray(detailRows) ? detailRows : [];
-  const totals = rows.reduce(
-    (acc, r) => {
-      acc.qty += Number(r?.quantity || 0);
-      acc.revenue += Number(r?.total || 0);
-      acc.gp += Number(r?.gp || 0);
-      return acc;
-    },
-    { qty: 0, revenue: 0, gp: 0 }
-  );
-
-  const byClient = new Map();
-  for (const r of rows) {
-    const key = `${String(r?.cardCode || '')}|${String(r?.cardName || '')}`;
-    const cur = byClient.get(key) || { cardCode: String(r?.cardCode || ''), cardName: String(r?.cardName || ''), revenue: 0, gp: 0 };
-    cur.revenue += Number(r?.total || 0);
-    cur.gp += Number(r?.gp || 0);
-    byClient.set(key, cur);
-  }
-
-  const docs = rows.slice(0, 12).map((r) => ({
-    docType: String(r?.docType || ''),
-    docDate: String(r?.docDate || ''),
-    docNum: r?.docNum ?? null,
-    cardCode: String(r?.cardCode || ''),
-    cardName: String(r?.cardName || ''),
-    quantity: Number(r?.quantity || 0),
-    total: Number(r?.total || 0),
-    gp: Number(r?.gp || 0),
-  }));
-
-  return {
-    label: itemLabel || itemSummary?.itemDesc || itemSummary?.itemCode || '',
-    itemSummary: itemSummary
-      ? {
-          itemCode: String(itemSummary?.itemCode || ''),
-          itemDesc: String(itemSummary?.itemDesc || ''),
-          grupo: String(itemSummary?.grupo || ''),
-          revenue: Number(itemSummary?.revenue || 0),
-          gp: Number(itemSummary?.gp || 0),
-          gpPct: Number(itemSummary?.gpPct || 0),
-          totalLabel: String(itemSummary?.totalLabel || ''),
-          rankTotal: Number(itemSummary?.rankTotal || 0),
-          rankArea: Number(itemSummary?.rankArea || 0),
-          stock: Number(itemSummary?.stock || 0),
-          stockMin: Number(itemSummary?.stockMin || 0),
-          stockMax: Number(itemSummary?.stockMax || 0),
-        }
-      : null,
-    docsCount: rows.length,
-    totals: {
-      qty: Number(totals.qty || 0),
-      revenue: Number(totals.revenue || 0),
-      gp: Number(totals.gp || 0),
-      gpPct: totals.revenue ? (totals.gp / totals.revenue) * 100 : 0,
-    },
-    topClients: Array.from(byClient.values())
-      .sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0))
-      .slice(0, 8)
-      .map((x) => ({
-        cardCode: x.cardCode,
-        cardName: x.cardName,
-        revenue: Number(x.revenue || 0),
-        gp: Number(x.gp || 0),
-      })),
-    recentDocs: docs,
-  };
-}
-
-function extractResponseText(obj) {
-  if (!obj || typeof obj !== 'object') return '';
-  if (typeof obj.output_text === 'string' && obj.output_text.trim()) {
-    return obj.output_text.trim();
-  }
-  const parts = [];
-  for (const item of Array.isArray(obj.output) ? obj.output : []) {
-    if (item && Array.isArray(item.content)) {
-      for (const c of item.content) {
-        if (c?.type === 'output_text' && typeof c.text === 'string' && c.text.trim()) parts.push(c.text.trim());
-        else if (c?.type === 'text' && typeof c.text === 'string' && c.text.trim()) parts.push(c.text.trim());
-        else if (c?.type === 'summary_text' && typeof c.text === 'string' && c.text.trim()) parts.push(c.text.trim());
-        else if (typeof c?.text === 'string' && c.text.trim()) parts.push(c.text.trim());
-        else if (c?.text && typeof c.text?.value === 'string' && c.text.value.trim()) parts.push(c.text.value.trim());
-      }
-    }
-    if (typeof item?.text === 'string' && item.text.trim()) parts.push(item.text.trim());
-  }
-  return parts.join('\n\n').trim();
-}
-
-async function queryEstratItemDocsForAi({ itemCode, from, to, areaSel = '__ALL__', grupoSel = '__ALL__' }) {
-  const q1 = await dbQuery(
-    `
-    SELECT
-      s.doc_type,
-      s.doc_date,
-      s.doc_entry,
-      s.doc_num,
-      s.card_code,
-      s.card_name,
-      s.item_code,
-      s.item_desc,
-      s.quantity,
-      s.revenue,
-      s.gross_profit,
-      COALESCE(g.grupo, 'Sin grupo') AS grupo,
-      COALESCE(g.area, '') AS area
-    FROM sales_item_lines s
-    LEFT JOIN item_group_cache g ON g.item_code = s.item_code
-    WHERE s.item_code = $1
-      AND s.doc_date >= $2::date
-      AND s.doc_date <= $3::date
-    ORDER BY s.doc_date DESC, s.doc_entry DESC, s.line_num ASC
-    LIMIT 500
-    `,
-    [itemCode, from, to]
-  );
-
-  let rows = (q1.rows || []).map((r) => {
-    const grupoTxtRaw = String(r.grupo || 'Sin grupo');
-    const grupoTxt = normalizeGrupoFinal(grupoTxtRaw);
-    const areaDb = String(r.area || '');
-    const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || 'CONS';
-    return {
-      docType: String(r.doc_type || ''),
-      docDate: String(r.doc_date || '').slice(0, 10),
-      docEntry: Number(r.doc_entry || 0),
-      docNum: r.doc_num != null ? Number(r.doc_num) : null,
-      cardCode: String(r.card_code || ''),
-      cardName: String(r.card_name || ''),
-      itemCode: String(r.item_code || ''),
-      itemDesc: String(r.item_desc || ''),
-      quantity: Number(r.quantity || 0),
-      total: Number(r.revenue || 0),
-      gp: Number(r.gross_profit || 0),
-      area: areaFinal,
-      grupo: grupoTxt,
-    };
-  });
-
-  if (areaSel !== '__ALL__') rows = rows.filter((x) => String(x.area || '') === areaSel);
-  if (grupoSel !== '__ALL__') {
-    const gSelN = normGroupName(grupoSel);
-    rows = rows.filter((x) => normGroupName(x.grupo) === gSelN);
-  }
-  return rows;
-}
-
-async function openaiEstratificacionChat({ question, dashboard, itemSummary = null, detailRows = [], itemLabel = '' }) {
-  const apiKey = String(process.env.OPENAI_API_KEY || '').trim();
-  const model = String(process.env.OPENAI_MODEL || 'gpt-5-mini').trim();
-  if (!apiKey) throw new Error('OPENAI_API_KEY no configurada');
-
-  const compact = {
-    dashboard: aiCompactEstratDashboard(dashboard, { selectedItemCode: itemSummary?.itemCode || '' }),
-    detail: itemSummary || detailRows.length ? aiCompactEstratDetail(detailRows, itemLabel, itemSummary) : null,
-  };
-
-  const system = [
-    'Eres un analista interno de inventario y rentabilidad para PRODIMA.',
-    'Usa exclusivamente el JSON entregado como fuente de verdad.',
-    'La fuente es la base de datos sincronizada del sistema, no SAP en vivo.',
-    'Responde en español, claro y útil.',
-    'Prioriza métricas concretas, hallazgos accionables, grupos, ABC, stock, revenue y margen.',
-    'Si falta información, dilo claramente y no inventes.'
-  ].join(' ');
-
-  const payload = {
-    model,
-    input: [
-      { role: 'system', content: [{ type: 'input_text', text: system }] },
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'input_text',
-            text: `Pregunta del usuario:\n${String(question || '').trim()}\n\nJSON de contexto:\n${JSON.stringify(compact)}`,
-          },
-        ],
-      },
-    ],
-    text: { format: { type: 'text' } },
-    max_output_tokens: 700,
-  };
-
-  console.log('AI ESTRAT REQUEST', { model, hasItem: !!itemSummary, docs: detailRows.length, qLen: String(question || '').length });
-  const resp = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const data = await resp.json().catch(() => ({}));
-  console.log('AI ESTRAT STATUS', resp.status);
-  console.log('AI ESTRAT DATA', JSON.stringify(data).slice(0, 3000));
-
-  if (!resp.ok) {
-    const msg = data?.error?.message || data?.message || `OpenAI HTTP ${resp.status}`;
-    throw new Error(msg);
-  }
-
-  const answer = extractResponseText(data);
-  if (!answer) throw new Error('OpenAI respondió sin texto utilizable.');
-  return { answer, model, raw: data };
-}
-
 /* =========================================================
    ✅ Health + Auth
 ========================================================= */
@@ -5422,51 +5148,6 @@ app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) =>
 
     const data = await dashboardFromDb({ from, to, area, grupo, q });
     return safeJson(res, 200, data);
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-
-
-app.post('/api/admin/estratificacion/ai-chat', verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: 'DB no configurada (DATABASE_URL)' });
-
-    const question = String(req.body?.question || '').trim();
-    if (!question) return safeJson(res, 400, { ok: false, message: 'Pregunta vacía' });
-
-    const fromQ = String(req.body?.from || '');
-    const toQ = String(req.body?.to || '');
-    const area = String(req.body?.area || '__ALL__');
-    const grupo = String(req.body?.grupo || '__ALL__');
-    const q = String(req.body?.q || '');
-    const itemCode = String(req.body?.itemCode || '').trim();
-    const itemLabel = String(req.body?.itemLabel || '').trim();
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = isISO(fromQ) ? fromQ : '2024-01-01';
-    const to = isISO(toQ) ? toQ : today;
-
-    const dashboard = await dashboardFromDb({ from, to, area, grupo, q });
-    let itemSummary = null;
-    let detailRows = [];
-
-    if (itemCode) {
-      itemSummary = (Array.isArray(dashboard?.items) ? dashboard.items : []).find(
-        (x) => String(x?.itemCode || '') === itemCode
-      ) || null;
-      detailRows = await queryEstratItemDocsForAi({ itemCode, from, to, areaSel: area, grupoSel: grupo });
-    }
-
-    const out = await openaiEstratificacionChat({ question, dashboard, itemSummary, detailRows, itemLabel });
-    return safeJson(res, 200, {
-      ok: true,
-      source: 'db',
-      answer: out.answer,
-      model: out.model,
-      focus: itemSummary ? { itemCode, itemLabel: itemLabel || itemSummary?.itemDesc || itemSummary?.itemCode || '' } : null,
-    });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -6573,282 +6254,6 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", limi
   };
 }
 
-
-
-/* =========================================================
-   🤖 IA · Estratificación (DB sincronizada)
-========================================================= */
-function aiCompactEstratDashboard(data, opts = {}) {
-  const items = Array.isArray(data?.items) ? data.items : [];
-  const groups = Array.isArray(data?.groupAgg) ? data.groupAgg : [];
-  const selectedItemCode = String(opts?.selectedItemCode || '').trim();
-  const selectedItem = selectedItemCode
-    ? items.find((x) => String(x?.itemCode || '') === selectedItemCode) || null
-    : null;
-
-  return {
-    source: 'db',
-    from: data?.from || '',
-    to: data?.to || '',
-    area: data?.area || '__ALL__',
-    grupo: data?.grupo || '__ALL__',
-    search: data?.q || '',
-    totals: {
-      revenue: Number(data?.totals?.revenue || 0),
-      gp: Number(data?.totals?.gp || 0),
-      gpPct: Number(data?.totals?.gpPct || 0),
-      items: items.length,
-    },
-    topGroups: groups.slice(0, 8).map((g) => ({
-      grupo: String(g?.grupo || ''),
-      rankArea: Number(g?.rankArea || 0),
-      revenue: Number(g?.revenue || 0),
-      gp: Number(g?.gp || 0),
-      gpPct: Number(g?.gpPct || 0),
-    })),
-    topItems: items.slice(0, 12).map((x) => ({
-      itemCode: String(x?.itemCode || ''),
-      itemDesc: String(x?.itemDesc || ''),
-      grupo: String(x?.grupo || ''),
-      revenue: Number(x?.revenue || 0),
-      gp: Number(x?.gp || 0),
-      gpPct: Number(x?.gpPct || 0),
-      totalLabel: String(x?.totalLabel || ''),
-      rankTotal: Number(x?.rankTotal || 0),
-      rankArea: Number(x?.rankArea || 0),
-      stock: Number(x?.stock || 0),
-      stockMin: Number(x?.stockMin || 0),
-      stockMax: Number(x?.stockMax || 0),
-    })),
-    selectedItem: selectedItem
-      ? {
-          itemCode: String(selectedItem?.itemCode || ''),
-          itemDesc: String(selectedItem?.itemDesc || ''),
-          grupo: String(selectedItem?.grupo || ''),
-          revenue: Number(selectedItem?.revenue || 0),
-          gp: Number(selectedItem?.gp || 0),
-          gpPct: Number(selectedItem?.gpPct || 0),
-          totalLabel: String(selectedItem?.totalLabel || ''),
-          rankTotal: Number(selectedItem?.rankTotal || 0),
-          rankArea: Number(selectedItem?.rankArea || 0),
-          stock: Number(selectedItem?.stock || 0),
-          stockMin: Number(selectedItem?.stockMin || 0),
-          stockMax: Number(selectedItem?.stockMax || 0),
-        }
-      : null,
-  };
-}
-
-function aiCompactEstratDetail(detailRows, itemLabel = '', itemSummary = null) {
-  const rows = Array.isArray(detailRows) ? detailRows : [];
-  const totals = rows.reduce(
-    (acc, r) => {
-      acc.qty += Number(r?.quantity || 0);
-      acc.revenue += Number(r?.total || 0);
-      acc.gp += Number(r?.gp || 0);
-      return acc;
-    },
-    { qty: 0, revenue: 0, gp: 0 }
-  );
-
-  const byClient = new Map();
-  for (const r of rows) {
-    const key = `${String(r?.cardCode || '')}|${String(r?.cardName || '')}`;
-    const cur = byClient.get(key) || { cardCode: String(r?.cardCode || ''), cardName: String(r?.cardName || ''), revenue: 0, gp: 0 };
-    cur.revenue += Number(r?.total || 0);
-    cur.gp += Number(r?.gp || 0);
-    byClient.set(key, cur);
-  }
-
-  const docs = rows.slice(0, 12).map((r) => ({
-    docType: String(r?.docType || ''),
-    docDate: String(r?.docDate || ''),
-    docNum: r?.docNum ?? null,
-    cardCode: String(r?.cardCode || ''),
-    cardName: String(r?.cardName || ''),
-    quantity: Number(r?.quantity || 0),
-    total: Number(r?.total || 0),
-    gp: Number(r?.gp || 0),
-  }));
-
-  return {
-    label: itemLabel || itemSummary?.itemDesc || itemSummary?.itemCode || '',
-    itemSummary: itemSummary
-      ? {
-          itemCode: String(itemSummary?.itemCode || ''),
-          itemDesc: String(itemSummary?.itemDesc || ''),
-          grupo: String(itemSummary?.grupo || ''),
-          revenue: Number(itemSummary?.revenue || 0),
-          gp: Number(itemSummary?.gp || 0),
-          gpPct: Number(itemSummary?.gpPct || 0),
-          totalLabel: String(itemSummary?.totalLabel || ''),
-          rankTotal: Number(itemSummary?.rankTotal || 0),
-          rankArea: Number(itemSummary?.rankArea || 0),
-          stock: Number(itemSummary?.stock || 0),
-          stockMin: Number(itemSummary?.stockMin || 0),
-          stockMax: Number(itemSummary?.stockMax || 0),
-        }
-      : null,
-    docsCount: rows.length,
-    totals: {
-      qty: Number(totals.qty || 0),
-      revenue: Number(totals.revenue || 0),
-      gp: Number(totals.gp || 0),
-      gpPct: totals.revenue ? (totals.gp / totals.revenue) * 100 : 0,
-    },
-    topClients: Array.from(byClient.values())
-      .sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0))
-      .slice(0, 8)
-      .map((x) => ({
-        cardCode: x.cardCode,
-        cardName: x.cardName,
-        revenue: Number(x.revenue || 0),
-        gp: Number(x.gp || 0),
-      })),
-    recentDocs: docs,
-  };
-}
-
-function extractResponseText(obj) {
-  if (!obj || typeof obj !== 'object') return '';
-  if (typeof obj.output_text === 'string' && obj.output_text.trim()) {
-    return obj.output_text.trim();
-  }
-  const parts = [];
-  for (const item of Array.isArray(obj.output) ? obj.output : []) {
-    if (item && Array.isArray(item.content)) {
-      for (const c of item.content) {
-        if (c?.type === 'output_text' && typeof c.text === 'string' && c.text.trim()) parts.push(c.text.trim());
-        else if (c?.type === 'text' && typeof c.text === 'string' && c.text.trim()) parts.push(c.text.trim());
-        else if (c?.type === 'summary_text' && typeof c.text === 'string' && c.text.trim()) parts.push(c.text.trim());
-        else if (typeof c?.text === 'string' && c.text.trim()) parts.push(c.text.trim());
-        else if (c?.text && typeof c.text?.value === 'string' && c.text.value.trim()) parts.push(c.text.value.trim());
-      }
-    }
-    if (typeof item?.text === 'string' && item.text.trim()) parts.push(item.text.trim());
-  }
-  return parts.join('\n\n').trim();
-}
-
-async function queryEstratItemDocsForAi({ itemCode, from, to, areaSel = '__ALL__', grupoSel = '__ALL__' }) {
-  const q1 = await dbQuery(
-    `
-    SELECT
-      s.doc_type,
-      s.doc_date,
-      s.doc_entry,
-      s.doc_num,
-      s.card_code,
-      s.card_name,
-      s.item_code,
-      s.item_desc,
-      s.quantity,
-      s.revenue,
-      s.gross_profit,
-      COALESCE(g.grupo, 'Sin grupo') AS grupo,
-      COALESCE(g.area, '') AS area
-    FROM sales_item_lines s
-    LEFT JOIN item_group_cache g ON g.item_code = s.item_code
-    WHERE s.item_code = $1
-      AND s.doc_date >= $2::date
-      AND s.doc_date <= $3::date
-    ORDER BY s.doc_date DESC, s.doc_entry DESC, s.line_num ASC
-    LIMIT 500
-    `,
-    [itemCode, from, to]
-  );
-
-  let rows = (q1.rows || []).map((r) => {
-    const grupoTxtRaw = String(r.grupo || 'Sin grupo');
-    const grupoTxt = normalizeGrupoFinal(grupoTxtRaw);
-    const areaDb = String(r.area || '');
-    const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || 'CONS';
-    return {
-      docType: String(r.doc_type || ''),
-      docDate: String(r.doc_date || '').slice(0, 10),
-      docEntry: Number(r.doc_entry || 0),
-      docNum: r.doc_num != null ? Number(r.doc_num) : null,
-      cardCode: String(r.card_code || ''),
-      cardName: String(r.card_name || ''),
-      itemCode: String(r.item_code || ''),
-      itemDesc: String(r.item_desc || ''),
-      quantity: Number(r.quantity || 0),
-      total: Number(r.revenue || 0),
-      gp: Number(r.gross_profit || 0),
-      area: areaFinal,
-      grupo: grupoTxt,
-    };
-  });
-
-  if (areaSel !== '__ALL__') rows = rows.filter((x) => String(x.area || '') === areaSel);
-  if (grupoSel !== '__ALL__') {
-    const gSelN = normGroupName(grupoSel);
-    rows = rows.filter((x) => normGroupName(x.grupo) === gSelN);
-  }
-  return rows;
-}
-
-async function openaiEstratificacionChat({ question, dashboard, itemSummary = null, detailRows = [], itemLabel = '' }) {
-  const apiKey = String(process.env.OPENAI_API_KEY || '').trim();
-  const model = String(process.env.OPENAI_MODEL || 'gpt-5-mini').trim();
-  if (!apiKey) throw new Error('OPENAI_API_KEY no configurada');
-
-  const compact = {
-    dashboard: aiCompactEstratDashboard(dashboard, { selectedItemCode: itemSummary?.itemCode || '' }),
-    detail: itemSummary || detailRows.length ? aiCompactEstratDetail(detailRows, itemLabel, itemSummary) : null,
-  };
-
-  const system = [
-    'Eres un analista interno de inventario y rentabilidad para PRODIMA.',
-    'Usa exclusivamente el JSON entregado como fuente de verdad.',
-    'La fuente es la base de datos sincronizada del sistema, no SAP en vivo.',
-    'Responde en español, claro y útil.',
-    'Prioriza métricas concretas, hallazgos accionables, grupos, ABC, stock, revenue y margen.',
-    'Si falta información, dilo claramente y no inventes.'
-  ].join(' ');
-
-  const payload = {
-    model,
-    input: [
-      { role: 'system', content: [{ type: 'input_text', text: system }] },
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'input_text',
-            text: `Pregunta del usuario:\n${String(question || '').trim()}\n\nJSON de contexto:\n${JSON.stringify(compact)}`,
-          },
-        ],
-      },
-    ],
-    text: { format: { type: 'text' } },
-    max_output_tokens: 700,
-  };
-
-  console.log('AI ESTRAT REQUEST', { model, hasItem: !!itemSummary, docs: detailRows.length, qLen: String(question || '').length });
-  const resp = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const data = await resp.json().catch(() => ({}));
-  console.log('AI ESTRAT STATUS', resp.status);
-  console.log('AI ESTRAT DATA', JSON.stringify(data).slice(0, 3000));
-
-  if (!resp.ok) {
-    const msg = data?.error?.message || data?.message || `OpenAI HTTP ${resp.status}`;
-    throw new Error(msg);
-  }
-
-  const answer = extractResponseText(data);
-  if (!answer) throw new Error('OpenAI respondió sin texto utilizable.');
-  return { answer, model, raw: data };
-}
-
 /* =========================================================
    ✅ Health + Auth
 ========================================================= */
@@ -7106,6 +6511,989 @@ __extraBootTasks.push(async () => {
   }
 });
 }
+
+
+/* =========================================================
+   ✅ PRODUCCIÓN (DB + JSON local + IA)
+   Requiere:
+   /data/production/production_formula_catalog.json
+   /data/production/production_material_stock_catalog.json
+   /data/production/production_capacity_config.json
+========================================================= */
+
+const PROD_FINISHED_WHS = ["01", "200", "300", "500"];
+const PROD_DATA_DIR = process.env.PROD_DATA_DIR || path.join(process.cwd(), "data", "production");
+const PROD_FORMULA_JSON = process.env.PROD_FORMULA_JSON || path.join(PROD_DATA_DIR, "production_formula_catalog.json");
+const PROD_MATERIAL_JSON = process.env.PROD_MATERIAL_JSON || path.join(PROD_DATA_DIR, "production_material_stock_catalog.json");
+const PROD_CAPACITY_JSON = process.env.PROD_CAPACITY_JSON || path.join(PROD_DATA_DIR, "production_capacity_config.json");
+
+let __prodLocalCache = { loadedAt: 0, formulas: { products: {}, liquids: {} }, materials: { materials: {} }, capacity: {} };
+
+function prodNum(v, def = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+function prodRound(n, d = 2) {
+  const p = 10 ** d;
+  return Math.round(prodNum(n) * p) / p;
+}
+function prodNorm(s) {
+  return String(s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+function prodReadJsonSafe(fp, fallback) {
+  try {
+    if (!fs.existsSync(fp)) return fallback;
+    return JSON.parse(fs.readFileSync(fp, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+function loadProductionLocalData(force = false) {
+  const mtimes = [PROD_FORMULA_JSON, PROD_MATERIAL_JSON, PROD_CAPACITY_JSON]
+    .map((fp) => (fs.existsSync(fp) ? fs.statSync(fp).mtimeMs : 0))
+    .join("|");
+
+  if (!force && __prodLocalCache.loadedAt === mtimes) return __prodLocalCache;
+
+  const formulas = prodReadJsonSafe(PROD_FORMULA_JSON, { products: {}, liquids: {} });
+  const materials = prodReadJsonSafe(PROD_MATERIAL_JSON, { materials: {} });
+  const capacity = prodReadJsonSafe(PROD_CAPACITY_JSON, {
+    shiftHours: 8,
+    workdays: [1, 2, 3, 4, 5],
+    allowSaturday: true,
+    defaultRates: { SAUCES: 700, CLEANING: 650 },
+    itemRates: { "68328": 666.67 },
+    machineNames: { SAUCES: "Máquina de salsas", CLEANING: "Máquina de limpieza" },
+  });
+
+  __prodLocalCache = { loadedAt: mtimes, formulas, materials, capacity };
+  return __prodLocalCache;
+}
+
+function prodMachineFromAreaOrGroup(area, grupo, itemMeta = null) {
+  if (itemMeta?.machine) return itemMeta.machine;
+  const g = prodNorm(grupo);
+  const a = String(area || "").toUpperCase();
+  if (a === "RCI") return "CLEANING";
+  if (g.includes("sazon") || g.includes("vinagr") || g.includes("especial") || g.includes("gmt")) return "SAUCES";
+  return "CLEANING";
+}
+function prodApplyMrp(need, minOrder, multiple) {
+  let out = Math.max(0, prodNum(need));
+  const mn = Math.max(0, prodNum(minOrder));
+  const mul = Math.max(0, prodNum(multiple));
+
+  if (out <= 0) return 0;
+  if (mn > 0 && out < mn) out = mn;
+  if (mul > 1) out = Math.ceil(out / mul) * mul;
+  return Math.round(out);
+}
+function prodYm(d) {
+  const dt = d instanceof Date ? d : new Date(d);
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`;
+}
+function prodAddMonthsISO(iso, months) {
+  const [y, m, d] = String(iso || "").split("-").map(Number);
+  const dt = new Date(y || 2000, (m || 1) - 1, d || 1);
+  dt.setMonth(dt.getMonth() + Number(months || 0));
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+}
+function prodCountDays(startISO, endISO, dayNums = [1, 2, 3, 4, 5]) {
+  const set = new Set(dayNums.map(Number));
+  const a = new Date(startISO);
+  const b = new Date(endISO);
+  let n = 0;
+  for (let d = new Date(a); d <= b; d.setDate(d.getDate() + 1)) {
+    const wd = d.getDay(); // 0 Sun, 6 Sat
+    const map = wd === 0 ? 7 : wd; // 1 Mon ... 7 Sun
+    if (set.has(map)) n++;
+  }
+  return n;
+}
+function prodCountSaturdays(startISO, endISO) {
+  return prodCountDays(startISO, endISO, [6]);
+}
+function prodFormatMonthName(ym) {
+  const [y, m] = String(ym || "").split("-").map(Number);
+  const names = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
+  return `${names[(m || 1) - 1]} ${y || ""}`.trim();
+}
+function prodInferLitersPerUnit(desc) {
+  const d = prodNorm(desc);
+  const mm = d.match(/(\d+(?:\.\d+)?)\s*ml/);
+  if (mm) return prodRound(Number(mm[1]) / 1000, 6);
+  if (/5\s*5\s*oz|5\s*5\s*onz/.test(d)) return 0.165833;
+  if (/10\s*5\s*oz|10\s*5\s*onz/.test(d)) return 0.315417;
+  if (/20\s*oz|20\s*onz/.test(d)) return 0.591667;
+  if (/24\s*oz|24\s*onz/.test(d)) return 0.709765;
+  if (/29\s*oz|29\s*onz/.test(d)) return 0.87;
+  if (/32\s*oz|32\s*onz/.test(d)) return 0.94625;
+  if (/1\s*gal/.test(d)) return 3.785;
+  return 0;
+}
+
+async function ensureProductionDb() {
+  if (!hasDb()) return;
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_inv_wh_cache (
+      item_code TEXT NOT NULL,
+      item_desc TEXT NOT NULL DEFAULT '',
+      warehouse TEXT NOT NULL,
+      stock NUMERIC(18,4) NOT NULL DEFAULT 0,
+      stock_min NUMERIC(18,4) NOT NULL DEFAULT 0,
+      stock_max NUMERIC(18,4) NOT NULL DEFAULT 0,
+      committed NUMERIC(18,4) NOT NULL DEFAULT 0,
+      ordered NUMERIC(18,4) NOT NULL DEFAULT 0,
+      available NUMERIC(18,4) NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY(item_code, warehouse)
+    );
+  `);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_mrp_cache (
+      item_code TEXT PRIMARY KEY,
+      item_desc TEXT NOT NULL DEFAULT '',
+      procurement_method TEXT NOT NULL DEFAULT '',
+      lead_time_days NUMERIC(18,4) NOT NULL DEFAULT 0,
+      min_order_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      multiple_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      planning_system TEXT NOT NULL DEFAULT '',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_inv_wh_item ON production_inv_wh_cache(item_code);`);
+}
+__extraBootTasks.push(async () => {
+  try {
+    await ensureProductionDb();
+    loadProductionLocalData(true);
+  } catch (e) {
+    console.error("Producción init error:", e.message || String(e));
+  }
+});
+
+function prodExtractMrpFromItem(it) {
+  return {
+    itemCode: String(it?.ItemCode || "").trim(),
+    itemDesc: String(it?.ItemName || "").trim(),
+    procurementMethod: String(it?.ProcurementMethod || it?.IssueMethod || "").trim(),
+    planningSystem: String(it?.PlanningSystem || "").trim(),
+    leadTimeDays: prodNum(it?.LeadTime ?? it?.LeadTimeDays ?? it?.LeadTm ?? 0),
+    minOrderQty: prodNum(it?.MinimumOrderQuantity ?? it?.MinOrderQty ?? it?.MinOrdrQty ?? it?.MinInventory ?? 0),
+    multipleQty: prodNum(it?.OrderMultiple ?? it?.OrderMultipleQty ?? it?.OrdrMulti ?? it?.OrderIntervals ?? 0),
+  };
+}
+
+async function prodGetFullItem(code) {
+  const itemCode = String(code || "").trim();
+  if (!itemCode) return null;
+  const safe = itemCode.replace(/'/g, "''");
+  return slFetch(`/Items('${safe}')`, { timeoutMs: 120000 });
+}
+
+async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
+  const r = await dbQuery(
+    `
+    SELECT DISTINCT item_code
+    FROM sales_item_lines
+    WHERE doc_date >= $1::date AND doc_date <= $2::date
+      AND item_code <> ''
+    LIMIT $3
+    `,
+    [from, to, Math.max(100, Math.min(8000, Number(maxItems || 2500)))]
+  );
+  const codes = (r.rows || []).map((x) => String(x.item_code || "").trim()).filter(Boolean);
+  let saved = 0;
+
+  for (let i = 0; i < codes.length; i++) {
+    try {
+      const it = await prodGetFullItem(codes[i]);
+      const whRows = Array.isArray(it?.ItemWarehouseInfoCollection) ? it.ItemWarehouseInfoCollection : [];
+      for (const w of whRows) {
+        const wh = String(w?.WarehouseCode ?? w?.WhsCode ?? "").trim();
+        if (!PROD_FINISHED_WHS.includes(wh)) continue;
+
+        const stock = prodNum(w?.InStock ?? w?.OnHand ?? 0);
+        const committed = prodNum(w?.Committed ?? w?.IsCommited ?? 0);
+        const ordered = prodNum(w?.Ordered ?? w?.OnOrder ?? 0);
+        const stockMin = prodNum(w?.MinimalStock ?? w?.MinStock ?? 0);
+        const stockMax = prodNum(w?.MaximalStock ?? w?.MaxStock ?? 0);
+        const available = stock - committed + ordered;
+
+        await dbQuery(
+          `
+          INSERT INTO production_inv_wh_cache(item_code,item_desc,warehouse,stock,stock_min,stock_max,committed,ordered,available,updated_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+          ON CONFLICT(item_code,warehouse) DO UPDATE SET
+            item_desc=EXCLUDED.item_desc,
+            stock=EXCLUDED.stock,
+            stock_min=EXCLUDED.stock_min,
+            stock_max=EXCLUDED.stock_max,
+            committed=EXCLUDED.committed,
+            ordered=EXCLUDED.ordered,
+            available=EXCLUDED.available,
+            updated_at=NOW()
+          `,
+          [String(it?.ItemCode || codes[i]), String(it?.ItemName || ""), wh, stock, stockMin, stockMax, committed, ordered, available]
+        );
+        saved++;
+      }
+    } catch {}
+    if ((i + 1) % 20 === 0) await sleep(15);
+  }
+  return saved;
+}
+
+async function syncProductionMrp({ from, to, maxItems = 2500 }) {
+  const r = await dbQuery(
+    `
+    SELECT DISTINCT item_code
+    FROM sales_item_lines
+    WHERE doc_date >= $1::date AND doc_date <= $2::date
+      AND item_code <> ''
+    LIMIT $3
+    `,
+    [from, to, Math.max(100, Math.min(8000, Number(maxItems || 2500)))]
+  );
+  const codes = (r.rows || []).map((x) => String(x.item_code || "").trim()).filter(Boolean);
+  let saved = 0;
+
+  for (let i = 0; i < codes.length; i++) {
+    try {
+      const it = await prodGetFullItem(codes[i]);
+      const mrp = prodExtractMrpFromItem(it || {});
+      await dbQuery(
+        `
+        INSERT INTO production_mrp_cache(item_code,item_desc,procurement_method,lead_time_days,min_order_qty,multiple_qty,planning_system,updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,NOW())
+        ON CONFLICT(item_code) DO UPDATE SET
+          item_desc=EXCLUDED.item_desc,
+          procurement_method=EXCLUDED.procurement_method,
+          lead_time_days=EXCLUDED.lead_time_days,
+          min_order_qty=EXCLUDED.min_order_qty,
+          multiple_qty=EXCLUDED.multiple_qty,
+          planning_system=EXCLUDED.planning_system,
+          updated_at=NOW()
+        `,
+        [mrp.itemCode || codes[i], mrp.itemDesc || "", mrp.procurementMethod, mrp.leadTimeDays, mrp.minOrderQty, mrp.multipleQty, mrp.planningSystem]
+      );
+      saved++;
+    } catch {}
+    if ((i + 1) % 20 === 0) await sleep(15);
+  }
+  return saved;
+}
+
+async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 5, horizonMonths = 3 }) {
+  const rows = await dbQuery(
+    `
+    WITH sales AS (
+      SELECT
+        s.item_code,
+        MAX(NULLIF(s.item_desc,'')) AS item_desc,
+        COALESCE(SUM(s.revenue),0)::numeric(18,2) AS revenue,
+        COALESCE(SUM(s.gross_profit),0)::numeric(18,2) AS gp,
+        COALESCE(SUM(s.quantity),0)::numeric(18,4) AS qty,
+        MAX(NULLIF(s.area,'')) AS area_s,
+        MAX(NULLIF(s.item_group,'')) AS grupo_s
+      FROM sales_item_lines s
+      WHERE s.doc_date >= $1::date AND s.doc_date <= $2::date
+      GROUP BY s.item_code
+    ),
+    inv AS (
+      SELECT
+        item_code,
+        SUM(CASE WHEN warehouse='01'  THEN stock ELSE 0 END)::float AS wh_01,
+        SUM(CASE WHEN warehouse='200' THEN stock ELSE 0 END)::float AS wh_200,
+        SUM(CASE WHEN warehouse='300' THEN stock ELSE 0 END)::float AS wh_300,
+        SUM(CASE WHEN warehouse='500' THEN stock ELSE 0 END)::float AS wh_500,
+        SUM(stock)::float AS stock_total,
+        MAX(stock_min)::float AS stock_min,
+        MAX(stock_max)::float AS stock_max
+      FROM production_inv_wh_cache
+      GROUP BY item_code
+    )
+    SELECT
+      sales.item_code,
+      COALESCE(NULLIF(sales.item_desc,''), NULLIF(g.item_desc,''), '') AS item_desc,
+      COALESCE(NULLIF(sales.grupo_s,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo,
+      COALESCE(NULLIF(sales.area_s,''), NULLIF(g.area,''), '') AS area,
+      sales.revenue,
+      sales.gp,
+      sales.qty,
+      COALESCE(inv.wh_01,0) AS wh_01,
+      COALESCE(inv.wh_200,0) AS wh_200,
+      COALESCE(inv.wh_300,0) AS wh_300,
+      COALESCE(inv.wh_500,0) AS wh_500,
+      COALESCE(inv.stock_total,0) AS stock_total,
+      COALESCE(inv.stock_min,0) AS stock_min,
+      COALESCE(inv.stock_max,0) AS stock_max,
+      COALESCE(m.procurement_method,'') AS procurement_method,
+      COALESCE(m.lead_time_days,0) AS lead_time_days,
+      COALESCE(m.min_order_qty,0) AS min_order_qty,
+      COALESCE(m.multiple_qty,0) AS multiple_qty
+    FROM sales
+    LEFT JOIN item_group_cache g ON g.item_code = sales.item_code
+    LEFT JOIN inv ON inv.item_code = sales.item_code
+    LEFT JOIN production_mrp_cache m ON m.item_code = sales.item_code
+    ORDER BY sales.revenue DESC
+    `,
+    [from, to]
+  );
+
+  const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN));
+  const monthFrom = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(Math.max(1, Number(avgMonths || 5)) - 1));
+  const monthRows = await dbQuery(
+    `
+    SELECT
+      item_code,
+      to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym,
+      COALESCE(SUM(quantity),0)::numeric(18,4) AS qty
+    FROM sales_item_lines
+    WHERE doc_date >= $1::date AND doc_date <= $2::date
+    GROUP BY item_code, to_char(date_trunc('month', doc_date), 'YYYY-MM')
+    `,
+    [monthFrom, monthTo]
+  );
+  const monthly = new Map();
+  for (const r of monthRows.rows || []) {
+    const key = String(r.item_code || "");
+    if (!monthly.has(key)) monthly.set(key, new Map());
+    monthly.get(key).set(String(r.ym || ""), prodNum(r.qty));
+  }
+
+  let items = (rows.rows || []).map((r) => {
+    const rev = prodNum(r.revenue);
+    const gp = prodNum(r.gp);
+    const gpPct = rev > 0 ? (gp / rev) * 100 : 0;
+    const grupoTxt = normalizeGrupoFinal(String(r.grupo || "Sin grupo"));
+    const areaFinal = String(r.area || "") || inferAreaFromGroup(grupoTxt) || "CONS";
+    const monthsMap = monthly.get(String(r.item_code || "")) || new Map();
+
+    const avgMonthsSafe = Math.max(1, Number(avgMonths || 5));
+    const monthLabels = [];
+    let sumMonths = 0;
+    for (let i = avgMonthsSafe - 1; i >= 0; i--) {
+      const ym = prodYm(prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -i));
+      monthLabels.push(ym);
+      sumMonths += prodNum(monthsMap.get(ym));
+    }
+    const avgQty = sumMonths / avgMonthsSafe;
+    const projectedQty = avgQty * Math.max(1, Number(horizonMonths || 3));
+    const stockTotal = prodNum(r.stock_total);
+    const needed = Math.max(0, projectedQty - stockTotal);
+    const adjusted = prodApplyMrp(needed, r.min_order_qty, r.multiple_qty);
+
+    return {
+      itemCode: String(r.item_code || ""),
+      itemDesc: String(r.item_desc || ""),
+      grupo: grupoTxt,
+      area: areaFinal,
+      revenue: rev,
+      gp,
+      gpPct: prodRound(gpPct, 2),
+      soldQty: prodNum(r.qty),
+      avgMonthlyQty: prodRound(avgQty, 2),
+      projectedQty: prodRound(projectedQty, 2),
+      stockTotal,
+      wh01: prodNum(r.wh_01),
+      wh200: prodNum(r.wh_200),
+      wh300: prodNum(r.wh_300),
+      wh500: prodNum(r.wh_500),
+      stockMin: prodNum(r.stock_min),
+      stockMax: prodNum(r.stock_max),
+      procurementMethod: String(r.procurement_method || ""),
+      leadTimeDays: prodNum(r.lead_time_days),
+      minOrderQty: prodNum(r.min_order_qty),
+      multipleQty: prodNum(r.multiple_qty),
+      productionNeeded: prodRound(needed, 2),
+      productionAdjusted: adjusted,
+    };
+  });
+
+  const areaSel = String(area || "__ALL__");
+  const grupoSel = String(grupo || "__ALL__");
+  const qq = String(q || "").trim().toLowerCase();
+
+  let availableGroups = [];
+  if (areaSel === "CONS") availableGroups = Array.from(GROUPS_CONS);
+  else if (areaSel === "RCI") availableGroups = Array.from(GROUPS_RCI);
+  else availableGroups = Array.from(new Set([...GROUPS_CONS, ...GROUPS_RCI]));
+  availableGroups.sort((a, b) => a.localeCompare(b));
+
+  let universe = items.slice();
+  if (areaSel !== "__ALL__") universe = universe.filter((x) => x.area === areaSel);
+  if (grupoSel !== "__ALL__") universe = universe.filter((x) => normGroupName(x.grupo) === normGroupName(grupoSel));
+
+  const abcRev = abcByMetric(universe, "revenue");
+  const abcGP = abcByMetric(universe, "gp");
+  const abcQty = abcByMetric(universe, "avgMonthlyQty");
+
+  items = items.map((it, idx) => {
+    const a1 = abcRev.get(it.itemCode) || "D";
+    const a2 = abcGP.get(it.itemCode) || "D";
+    const a3 = abcQty.get(it.itemCode) || "D";
+    const total = totalFromLetters(a1, a2, a3);
+    const local = loadProductionLocalData();
+    const meta = local.formulas.products?.[it.itemCode] || null;
+    const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
+    const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
+    const hoursNeeded = rate > 0 ? it.productionAdjusted / rate : 0;
+
+    return {
+      ...it,
+      rankTotal: idx + 1,
+      abcRevenue: a1,
+      abcGP: a2,
+      abcDemand: a3,
+      totalLabel: total.label,
+      totalTagClass: total.cls,
+      totalScore: total.t,
+      machine,
+      unitsPerHour: rate,
+      hoursNeeded: prodRound(hoursNeeded, 2),
+      hasFormula: !!meta,
+      baseLiquidCode: meta?.baseLiquidCode || "",
+    };
+  });
+
+  if (areaSel !== "__ALL__") items = items.filter((x) => x.area === areaSel);
+  if (grupoSel !== "__ALL__") items = items.filter((x) => normGroupName(x.grupo) === normGroupName(grupoSel));
+  if (qq) items = items.filter((x) => x.itemCode.toLowerCase().includes(qq) || x.itemDesc.toLowerCase().includes(qq));
+
+  items.sort((a, b) => {
+    const d1 = (b.projectedQty || 0) - (a.projectedQty || 0);
+    if (d1) return d1;
+    const d2 = (b.productionNeeded || 0) - (a.productionNeeded || 0);
+    if (d2) return d2;
+    return (b.revenue || 0) - (a.revenue || 0);
+  });
+
+  const totals = items.reduce(
+    (acc, x) => {
+      acc.revenue += prodNum(x.revenue);
+      acc.projectedQty += prodNum(x.projectedQty);
+      acc.stockTotal += prodNum(x.stockTotal);
+      acc.productionNeeded += prodNum(x.productionNeeded);
+      acc.productionAdjusted += prodNum(x.productionAdjusted);
+      acc.hoursNeeded += prodNum(x.hoursNeeded);
+      if (x.productionNeeded > 0) acc.riskCount += 1;
+      if (x.totalLabel === "AB Crítico") acc.abCount += 1;
+      return acc;
+    },
+    { revenue: 0, projectedQty: 0, stockTotal: 0, productionNeeded: 0, productionAdjusted: 0, hoursNeeded: 0, riskCount: 0, abCount: 0 }
+  );
+
+  const machineAggMap = new Map();
+  for (const it of items) {
+    const cur = machineAggMap.get(it.machine) || { machine: it.machine, items: 0, productionAdjusted: 0, hoursNeeded: 0 };
+    cur.items += 1;
+    cur.productionAdjusted += prodNum(it.productionAdjusted);
+    cur.hoursNeeded += prodNum(it.hoursNeeded);
+    machineAggMap.set(it.machine, cur);
+  }
+
+  return {
+    ok: true,
+    from, to, area: areaSel, grupo: grupoSel, q: qq,
+    avgMonths: Math.max(1, Number(avgMonths || 5)),
+    horizonMonths: Math.max(1, Number(horizonMonths || 3)),
+    lastSyncAt: await getState("production_last_sync_at"),
+    availableGroups,
+    totals: {
+      revenue: prodRound(totals.revenue, 2),
+      projectedQty: prodRound(totals.projectedQty, 2),
+      stockTotal: prodRound(totals.stockTotal, 2),
+      productionNeeded: prodRound(totals.productionNeeded, 2),
+      productionAdjusted: prodRound(totals.productionAdjusted, 2),
+      hoursNeeded: prodRound(totals.hoursNeeded, 2),
+      riskCount: totals.riskCount,
+      abCount: totals.abCount,
+    },
+    machineAgg: Array.from(machineAggMap.values()).map((x) => ({ ...x, hoursNeeded: prodRound(x.hoursNeeded, 2) })),
+    items,
+    capacityConfig: loadProductionLocalData().capacity || {},
+  };
+}
+
+function prodMergeMaterial(map, code, description, qty, unit, type) {
+  if (!code) return;
+  const key = String(code).trim();
+  const cur = map.get(key) || { code: key, description: description || "", requiredQty: 0, unit: unit || "", componentType: type || "" };
+  cur.requiredQty += prodNum(qty);
+  if (!cur.description) cur.description = description || "";
+  if (!cur.unit) cur.unit = unit || "";
+  if (!cur.componentType) cur.componentType = type || "";
+  map.set(key, cur);
+}
+
+async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizonMonths = 3, shiftHours = 8 }) {
+  const code = String(itemCode || "").trim();
+  if (!code) throw new Error("Falta itemCode");
+
+  const local = loadProductionLocalData();
+  const meta = local.formulas.products?.[code] || local.formulas.products?.[String(code).replace(/^0+/, "")] || null;
+
+  const itemMaster = await dbQuery(
+    `
+    SELECT
+      COALESCE(MAX(NULLIF(s.item_desc,'')), MAX(NULLIF(g.item_desc,'')), '') AS item_desc,
+      COALESCE(MAX(NULLIF(g.grupo,'')), MAX(NULLIF(g.group_name,'')), MAX(NULLIF(s.item_group,'')), 'Sin grupo') AS grupo,
+      COALESCE(MAX(NULLIF(g.area,'')), MAX(NULLIF(s.area,'')), '') AS area
+    FROM sales_item_lines s
+    LEFT JOIN item_group_cache g ON g.item_code = s.item_code
+    WHERE s.item_code = $1
+    `,
+    [code]
+  );
+  const row0 = itemMaster.rows?.[0] || {};
+  const itemDesc = String(row0.item_desc || meta?.description || "");
+  const grupo = normalizeGrupoFinal(String(row0.grupo || ""));
+  const area = String(row0.area || "") || inferAreaFromGroup(grupo) || "";
+  const machine = prodMachineFromAreaOrGroup(area, grupo, meta);
+
+  const end = String(toDate || getDateISOInOffset(TZ_OFFSET_MIN));
+  const monthStart = `${String(end).slice(0, 7)}-01`;
+  const histFrom = prodAddMonthsISO(monthStart, -11);
+
+  const monthlyRows = await dbQuery(
+    `
+    SELECT to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym, COALESCE(SUM(quantity),0)::numeric(18,4) AS qty
+    FROM sales_item_lines
+    WHERE item_code = $1 AND doc_date >= $2::date AND doc_date <= $3::date
+    GROUP BY 1
+    ORDER BY 1
+    `,
+    [code, histFrom, end]
+  );
+  const monthMap = new Map((monthlyRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
+  const salesHistory = [];
+  for (let i = 11; i >= 0; i--) {
+    const ym = prodYm(prodAddMonthsISO(monthStart, -i));
+    salesHistory.push({ ym, label: prodFormatMonthName(ym), qty: prodRound(monthMap.get(ym) || 0, 2) });
+  }
+
+  let avgQty = 0;
+  for (let i = Math.max(1, Number(avgMonths || 5)) - 1; i >= 0; i--) {
+    const ym = prodYm(prodAddMonthsISO(monthStart, -i));
+    avgQty += prodNum(monthMap.get(ym) || 0);
+  }
+  avgQty = avgQty / Math.max(1, Number(avgMonths || 5));
+  const projectedQty = avgQty * Math.max(1, Number(horizonMonths || 3));
+
+  const invRows = await dbQuery(
+    `SELECT warehouse, stock, stock_min, stock_max, committed, ordered, available
+     FROM production_inv_wh_cache
+     WHERE item_code = $1`,
+    [code]
+  );
+  const byWh = { "01": 0, "200": 0, "300": 0, "500": 0 };
+  let stockTotal = 0;
+  let stockMin = 0;
+  let stockMax = 0;
+  for (const r of invRows.rows || []) {
+    const wh = String(r.warehouse || "").trim();
+    byWh[wh] = prodNum(r.stock);
+    stockTotal += prodNum(r.stock);
+    stockMin = Math.max(stockMin, prodNum(r.stock_min));
+    stockMax = Math.max(stockMax, prodNum(r.stock_max));
+  }
+
+  const mrpRows = await dbQuery(
+    `SELECT procurement_method, lead_time_days, min_order_qty, multiple_qty, planning_system
+     FROM production_mrp_cache WHERE item_code = $1 LIMIT 1`,
+    [code]
+  );
+  const mrp = mrpRows.rows?.[0] || {};
+  const productionNeeded = Math.max(0, projectedQty - stockTotal);
+  const productionAdjusted = prodApplyMrp(productionNeeded, mrp.min_order_qty, mrp.multiple_qty);
+
+  const litersPerUnit = prodNum(meta?.litersPerUnit || prodInferLitersPerUnit(itemDesc));
+  const baseLiquidCode = String(meta?.baseLiquidCode || "");
+  const baseLiquidFormula = meta?.baseLiquidFormula || (baseLiquidCode ? local.formulas.liquids?.[baseLiquidCode] : null);
+  const litersRequired = productionAdjusted * litersPerUnit;
+
+  const reqMap = new Map();
+  const topLevel = Array.isArray(meta?.components) ? meta.components : [];
+
+  for (const c of topLevel) {
+    const qty = prodNum(c.qtyPerUnit) * productionAdjusted;
+    if (String(c.componentType || "") === "LIQUID_BASE") continue;
+    prodMergeMaterial(reqMap, c.code, c.description, qty, c.unit, c.componentType);
+  }
+  if (baseLiquidFormula && Array.isArray(baseLiquidFormula.components)) {
+    for (const c of baseLiquidFormula.components) {
+      const qty = prodNum(c.qtyPerLiter) * litersRequired;
+      prodMergeMaterial(reqMap, c.code, c.description, qty, c.unit, "RAW_MATERIAL");
+    }
+  }
+
+  const requirements = Array.from(reqMap.values()).map((x) => {
+    const stockRec = local.materials?.materials?.[x.code] || null;
+    const stockQty = prodNum(stockRec?.stockQty);
+    const shortage = Math.max(0, x.requiredQty - stockQty);
+    const coverage = x.requiredQty > 0 ? stockQty / x.requiredQty : 0;
+    return {
+      ...x,
+      requiredQty: prodRound(x.requiredQty, 3),
+      stockQty: prodRound(stockQty, 3),
+      shortageQty: prodRound(shortage, 3),
+      coveragePct: prodRound(coverage * 100, 1),
+      supplier: String(stockRec?.supplier || ""),
+      cost: prodRound(stockRec?.cost, 4),
+      status: shortage > 0 ? "FALTANTE" : "OK",
+    };
+  });
+
+  const rawMaterials = requirements.filter((x) => x.componentType === "RAW_MATERIAL");
+  const packaging = requirements.filter((x) => x.componentType === "PACKAGING");
+  const bottlenecks = requirements
+    .filter((x) => x.shortageQty > 0)
+    .sort((a, b) => b.shortageQty - a.shortageQty)
+    .slice(0, 8);
+
+  const rate = prodNum(local.capacity?.itemRates?.[code] || local.capacity?.defaultRates?.[machine] || 0);
+  const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
+  const planStart = addDaysISO(end, 1);
+  const planEnd = addDaysISO(prodAddMonthsISO(planStart, Math.max(1, Number(horizonMonths || 3))), -1);
+  const businessDays = prodCountDays(planStart, planEnd, local.capacity?.workdays || [1, 2, 3, 4, 5]);
+  const saturdays = prodCountSaturdays(planStart, planEnd);
+  const shiftHoursSafe = prodNum(shiftHours || local.capacity?.shiftHours || 8, 8);
+  const singleCapHours = businessDays * shiftHoursSafe;
+  const saturdayCapHours = (businessDays + saturdays) * shiftHoursSafe;
+  const doubleShiftHours = businessDays * shiftHoursSafe * 2;
+
+  let laborRecommendation = "Capacidad normal";
+  if (hoursNeeded <= singleCapHours) laborRecommendation = "Con turno normal lunes a viernes alcanza";
+  else if (hoursNeeded <= saturdayCapHours) laborRecommendation = "Se recomienda agregar sábados";
+  else if (hoursNeeded <= doubleShiftHours) laborRecommendation = "Se recomienda doble turno";
+  else laborRecommendation = "Se recomienda doble turno + sábado o reprogramar";
+
+  const maxUnitsByMaterial = requirements
+    .filter((x) => x.requiredQty > 0)
+    .map((x) => {
+      const perUnit = productionAdjusted > 0 ? x.requiredQty / productionAdjusted : 0;
+      return perUnit > 0 ? prodNum(x.stockQty) / perUnit : Number.POSITIVE_INFINITY;
+    })
+    .filter((n) => Number.isFinite(n));
+  const maxUnitsToday = maxUnitsByMaterial.length ? Math.floor(Math.min(...maxUnitsByMaterial)) : 0;
+
+  return {
+    ok: true,
+    itemCode: code,
+    itemDesc,
+    grupo,
+    area,
+    machine,
+    abcHint: "",
+    period: { endDate: end, avgMonths: Math.max(1, Number(avgMonths || 5)), horizonMonths: Math.max(1, Number(horizonMonths || 3)), planStart, planEnd },
+    salesHistory,
+    avgMonthlyQty: prodRound(avgQty, 2),
+    projectedQty: prodRound(projectedQty, 2),
+    inventory: {
+      total: prodRound(stockTotal, 2),
+      byWarehouse: byWh,
+      stockMin: prodRound(stockMin, 2),
+      stockMax: prodRound(stockMax, 2),
+    },
+    mrp: {
+      procurementMethod: String(mrp.procurement_method || ""),
+      planningSystem: String(mrp.planning_system || ""),
+      leadTimeDays: prodNum(mrp.lead_time_days),
+      minOrderQty: prodNum(mrp.min_order_qty),
+      multipleQty: prodNum(mrp.multiple_qty),
+    },
+    production: {
+      litersPerUnit: prodRound(litersPerUnit, 6),
+      baseLiquidCode,
+      litersRequired: prodRound(litersRequired, 3),
+      neededQty: prodRound(productionNeeded, 2),
+      adjustedQty: prodRound(productionAdjusted, 2),
+      maxUnitsToday,
+    },
+    capacity: {
+      unitsPerHour: prodRound(rate, 2),
+      hoursNeeded: prodRound(hoursNeeded, 2),
+      shiftHours: shiftHoursSafe,
+      businessDays,
+      saturdays,
+      singleCapHours: prodRound(singleCapHours, 2),
+      saturdayCapHours: prodRound(saturdayCapHours, 2),
+      doubleShiftHours: prodRound(doubleShiftHours, 2),
+      laborRecommendation,
+      machineLabel: local.capacity?.machineNames?.[machine] || machine,
+    },
+    requirements: {
+      all: requirements,
+      rawMaterials,
+      packaging,
+      bottlenecks,
+    },
+    meta: meta || null,
+    source: "base de datos sincronizada + catálogo local de fórmulas",
+  };
+}
+
+function prodAiCompactDashboard(data) {
+  const topItems = (data?.items || []).slice(0, 25).map((x) => ({
+    itemCode: x.itemCode,
+    itemDesc: x.itemDesc,
+    grupo: x.grupo,
+    totalLabel: x.totalLabel,
+    avgMonthlyQty: x.avgMonthlyQty,
+    projectedQty: x.projectedQty,
+    stockTotal: x.stockTotal,
+    productionNeeded: x.productionNeeded,
+    productionAdjusted: x.productionAdjusted,
+    machine: x.machine,
+    hoursNeeded: x.hoursNeeded,
+    leadTimeDays: x.leadTimeDays,
+  }));
+  return {
+    filters: {
+      from: data?.from || "",
+      to: data?.to || "",
+      area: data?.area || "__ALL__",
+      grupo: data?.grupo || "__ALL__",
+      avgMonths: data?.avgMonths || 5,
+      horizonMonths: data?.horizonMonths || 3,
+    },
+    totals: data?.totals || {},
+    machineAgg: data?.machineAgg || [],
+    topItems,
+  };
+}
+function prodAiCompactPlan(plan) {
+  if (!plan) return null;
+  return {
+    itemCode: plan.itemCode,
+    itemDesc: plan.itemDesc,
+    grupo: plan.grupo,
+    area: plan.area,
+    machine: plan.machine,
+    period: plan.period,
+    avgMonthlyQty: plan.avgMonthlyQty,
+    projectedQty: plan.projectedQty,
+    inventory: plan.inventory,
+    mrp: plan.mrp,
+    production: plan.production,
+    capacity: plan.capacity,
+    requirements: {
+      bottlenecks: plan.requirements?.bottlenecks || [],
+      rawTop: (plan.requirements?.rawMaterials || []).slice(0, 20),
+      packagingTop: (plan.requirements?.packaging || []).slice(0, 20),
+    },
+  };
+}
+function prodExtractResponseText(obj) {
+  if (!obj || typeof obj !== "object") return "";
+  if (typeof obj.output_text === "string" && obj.output_text.trim()) return obj.output_text.trim();
+
+  const out = [];
+  for (const item of Array.isArray(obj.output) ? obj.output : []) {
+    if (Array.isArray(item.content)) {
+      for (const c of item.content) {
+        if (typeof c?.text === "string" && c.text.trim()) out.push(c.text.trim());
+        else if (typeof c?.text?.value === "string" && c.text.value.trim()) out.push(c.text.value.trim());
+      }
+    }
+  }
+  return out.join("\n\n").trim();
+}
+async function prodOpenAiChat({ question, dashboard, plan }) {
+  const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+  const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
+  if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
+
+  const input = {
+    dashboard: prodAiCompactDashboard(dashboard),
+    selectedPlan: prodAiCompactPlan(plan),
+  };
+
+  const system = [
+    "Eres un planificador de producción interno de PRODIMA.",
+    "Usa exclusivamente el JSON entregado como fuente de verdad.",
+    "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) y catálogo local de fórmulas/materiales.",
+    "No inventes datos que no estén en el JSON.",
+    "Responde en español.",
+    "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo:",
+    "1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria / ajustada por MRP 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
+    "Si faltan fórmulas o capacidades, dilo claramente.",
+  ].join(" ");
+
+  const payload = {
+    model,
+    input: [
+      { role: "system", content: [{ type: "input_text", text: system }] },
+      {
+        role: "user",
+        content: [{ type: "input_text", text: `Pregunta:\n${String(question || "").trim()}\n\nContexto JSON:\n${JSON.stringify(input)}` }],
+      },
+    ],
+    text: { format: { type: "text" } },
+    max_output_tokens: 900,
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify(payload),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(data?.error?.message || data?.message || `OpenAI HTTP ${resp.status}`);
+  }
+  const answer = prodExtractResponseText(data);
+  if (!answer) throw new Error("OpenAI respondió sin texto utilizable.");
+  return { answer, model };
+}
+
+app.get("/api/admin/production/dashboard", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = String(req.query?.from || "2025-01-01");
+    const to = String(req.query?.to || today);
+    const area = String(req.query?.area || "__ALL__");
+    const grupo = String(req.query?.grupo || "__ALL__");
+    const q = String(req.query?.q || "");
+    const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, 5)));
+    const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 3)));
+
+    const out = await productionDashboardFromDb({ from, to, area, grupo, q, avgMonths, horizonMonths });
+    return safeJson(res, 200, out);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+    const itemCode = String(req.query?.itemCode || "").trim();
+    if (!itemCode) return safeJson(res, 400, { ok: false, message: "Falta itemCode" });
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const toDate = String(req.query?.toDate || today);
+    const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, 5)));
+    const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 3)));
+    const shiftHours = Math.max(1, Math.min(24, prodNum(req.query?.shiftHours, 8)));
+
+    const plan = await productionBuildItemPlan({ itemCode, toDate, avgMonths, horizonMonths, shiftHours });
+
+    const dash = await productionDashboardFromDb({
+      from: "2025-01-01",
+      to: today,
+      area: "__ALL__",
+      grupo: "__ALL__",
+      q: itemCode,
+      avgMonths,
+      horizonMonths,
+    });
+    const row = (dash.items || []).find((x) => String(x.itemCode || "") === itemCode);
+    if (row) plan.abcHint = row.totalLabel || "";
+
+    return safeJson(res, 200, plan);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post("/api/admin/production/ai-chat", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+    const question = String(req.body?.question || "").trim();
+    if (!question) return safeJson(res, 400, { ok: false, message: "Falta question" });
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = String(req.body?.from || "2025-01-01");
+    const to = String(req.body?.to || today);
+    const area = String(req.body?.area || "__ALL__");
+    const grupo = String(req.body?.grupo || "__ALL__");
+    const q = String(req.body?.q || "");
+    const avgMonths = Math.max(1, Math.min(12, prodNum(req.body?.avgMonths, 5)));
+    const horizonMonths = Math.max(1, Math.min(12, prodNum(req.body?.horizonMonths, 3)));
+    const shiftHours = Math.max(1, Math.min(24, prodNum(req.body?.shiftHours, 8)));
+    const itemCode = String(req.body?.itemCode || "").trim();
+
+    const dashboard = await productionDashboardFromDb({ from, to, area, grupo, q, avgMonths, horizonMonths });
+    const plan = itemCode ? await productionBuildItemPlan({ itemCode, toDate: to, avgMonths, horizonMonths, shiftHours }) : null;
+    if (plan && dashboard?.items?.length) {
+      const row = dashboard.items.find((x) => String(x.itemCode || "") === itemCode);
+      if (row) plan.abcHint = row.totalLabel || "";
+    }
+
+    const out = await prodOpenAiChat({ question, dashboard, plan });
+    return safeJson(res, 200, { ok: true, answer: out.answer, model: out.model, source: "base de datos sincronizada + catálogo local" });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+async function handleProductionSync(req, res) {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const mode = String(req.body?.mode || req.query?.mode || "range");
+    let from = String(req.body?.from || req.query?.from || "2025-01-01");
+    let to = String(req.body?.to || req.query?.to || today);
+
+    if (mode === "recent") {
+      const days = Math.max(1, Math.min(120, prodNum(req.body?.days || req.query?.days, 30)));
+      from = addDaysISO(today, -days);
+      to = today;
+    }
+
+    const maxDocs = Math.max(50, Math.min(20000, prodNum(req.body?.maxDocs || req.query?.maxDocs, 4000)));
+
+    const salesSaved = await syncSales({ from, to, maxDocs });
+    const groupsSaved = await syncItemGroupsForSalesItems({ from, to, maxItems: 3000 });
+    const invSaved = await syncInventoryForSalesItems({ from, to, maxItems: 3000 });
+    const invWhSaved = await syncProductionInventoryWh({ from, to, maxItems: 3000 });
+    const mrpSaved = await syncProductionMrp({ from, to, maxItems: 3000 });
+
+    await setState("production_last_sync_at", new Date().toISOString());
+
+    return safeJson(res, 200, {
+      ok: true,
+      from, to, maxDocs,
+      salesSaved, groupsSaved, invSaved, invWhSaved, mrpSaved,
+      formulasLoaded: Object.keys(loadProductionLocalData().formulas?.products || {}).length,
+      materialsLoaded: Object.keys(loadProductionLocalData().materials?.materials || {}).length,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+}
+app.get("/api/admin/production/sync", verifyAdmin, handleProductionSync);
+app.post("/api/admin/production/sync", verifyAdmin, handleProductionSync);
+
+app.get("/api/admin/production/health", verifyAdmin, async (_req, res) => {
+  try {
+    const local = loadProductionLocalData();
+    return safeJson(res, 200, {
+      ok: true,
+      formulasLoaded: Object.keys(local.formulas?.products || {}).length,
+      materialsLoaded: Object.keys(local.materials?.materials || {}).length,
+      capacityLoaded: Object.keys(local.capacity || {}).length,
+      lastSyncAt: await getState("production_last_sync_at"),
+      dataDir: PROD_DATA_DIR,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
 
 /* =========================================================
    Start
