@@ -6769,7 +6769,37 @@ async function prodGetFullItem(code) {
   const itemCode = String(code || "").trim();
   if (!itemCode) return null;
   const safe = itemCode.replace(/'/g, "''");
-  return slFetch(`/Items('${safe}')?$select=ItemCode,ItemName,ItemWarehouseInfoCollection`, { timeoutMs: 120000 });
+
+  let item = null;
+  try {
+    item = await slFetch(
+      `/Items('${safe}')?$select=ItemCode,ItemName,ItemsGroupCode,SalesUnit,InventoryItem,Valid,FrozenFor,ProcurementMethod,PlanningSystem,LeadTime,LeadTimeDays,MinimumOrderQuantity,MinOrderQty,OrderMultiple,OrderMultipleQty,MinInventory`,
+      { timeoutMs: 120000 }
+    );
+  } catch (e1) {
+    try {
+      item = await slFetch(`/Items('${safe}')`, { timeoutMs: 120000 });
+    } catch (e2) {
+      item = { ItemCode: itemCode, ItemName: "", ItemWarehouseInfoCollection: [] };
+    }
+  }
+
+  if (!Array.isArray(item?.ItemWarehouseInfoCollection) || !item.ItemWarehouseInfoCollection.length) {
+    try {
+      const whInfo = await slFetch(
+        `/Items('${safe}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,OnHand,Committed,IsCommited,Ordered,OnOrder,MinimalStock,MinStock,MaximalStock,MaxStock`,
+        { timeoutMs: 120000 }
+      );
+      if (Array.isArray(whInfo?.value)) item.ItemWarehouseInfoCollection = whInfo.value;
+      else if (Array.isArray(whInfo)) item.ItemWarehouseInfoCollection = whInfo;
+    } catch (e3) {
+      item.ItemWarehouseInfoCollection = Array.isArray(item?.ItemWarehouseInfoCollection)
+        ? item.ItemWarehouseInfoCollection
+        : [];
+    }
+  }
+
+  return item;
 }
 
 async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
@@ -6785,6 +6815,7 @@ async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
   );
   const codes = (r.rows || []).map((x) => String(x.item_code || "").trim()).filter(Boolean);
   let saved = 0;
+  const errors = [];
 
   for (let i = 0; i < codes.length; i++) {
     try {
@@ -6820,10 +6851,12 @@ async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
         );
         saved++;
       }
-    } catch {}
+    } catch (e) {
+      if (errors.length < 10) errors.push({ itemCode: codes[i], message: e.message || String(e) });
+    }
     if ((i + 1) % 20 === 0) await sleep(15);
   }
-  return saved;
+  return { saved, errors, items: codes.length };
 }
 
 async function syncProductionMrp({ from, to, maxItems = 2500 }) {
@@ -7531,11 +7564,41 @@ async function handleProductionSync(req, res) {
 
     const maxDocs = Math.max(50, Math.min(20000, prodNum(req.body?.maxDocs || req.query?.maxDocs, 4000)));
 
+    const syncErrors = [];
+
     const salesSaved = await globalThis.syncSales({ from, to, maxDocs });
-    const groupsSaved = await syncItemGroupsForSalesItems({ from, to, maxItems: 3000 });
-    const invSaved = await syncInventoryForSalesItems({ from, to, maxItems: 3000 });
-    const invWhSaved = await syncProductionInventoryWh({ from, to, maxItems: 3000 });
-    const mrpSaved = await syncProductionMrp({ from, to, maxItems: 3000 });
+
+    let groupsSaved = 0;
+    try {
+      groupsSaved = await syncItemGroupsForSalesItems({ from, to, maxItems: 3000 });
+    } catch (e) {
+      syncErrors.push({ step: "item_groups", message: e.message || String(e) });
+    }
+
+    let invSaved = 0;
+    try {
+      invSaved = await syncInventoryForSalesItems({ from, to, maxItems: 3000 });
+    } catch (e) {
+      syncErrors.push({ step: "inventory_total", message: e.message || String(e) });
+    }
+
+    let invWhSaved = 0;
+    let invWhErrors = [];
+    try {
+      const invWh = await syncProductionInventoryWh({ from, to, maxItems: 3000 });
+      invWhSaved = Number(invWh?.saved || 0);
+      invWhErrors = Array.isArray(invWh?.errors) ? invWh.errors : [];
+      if (invWhErrors.length) syncErrors.push({ step: "inventory_wh", message: `items con error: ${invWhErrors.length}`, sample: invWhErrors.slice(0, 5) });
+    } catch (e) {
+      syncErrors.push({ step: "inventory_wh", message: e.message || String(e) });
+    }
+
+    let mrpSaved = 0;
+    try {
+      mrpSaved = await syncProductionMrp({ from, to, maxItems: 3000 });
+    } catch (e) {
+      syncErrors.push({ step: "mrp", message: e.message || String(e) });
+    }
 
     await setState("production_last_sync_at", new Date().toISOString());
 
@@ -7543,6 +7606,7 @@ async function handleProductionSync(req, res) {
       ok: true,
       from, to, maxDocs,
       salesSaved, groupsSaved, invSaved, invWhSaved, mrpSaved,
+      syncErrors,
       formulasLoaded: Object.keys(loadProductionLocalData().formulas?.products || {}).length,
       materialsLoaded: Object.keys(loadProductionLocalData().materials?.materials || {}).length,
     });
