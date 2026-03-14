@@ -5103,6 +5103,148 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
   }
 });
 
+
+function aiCompactDashboard(data, opts = {}) {
+  const focusCard = String(opts.cardCode || "").trim();
+  const focusWh = String(opts.warehouse || "").trim();
+
+  const table = Array.isArray(data?.table) ? data.table : [];
+  const focused = table.filter((r) => {
+    if (focusCard && String(r.cardCode || "") !== focusCard) return false;
+    if (focusWh && String(r.warehouse || "") !== focusWh) return false;
+    return true;
+  });
+
+  const pick = (arr, n = 10) => (Array.isArray(arr) ? arr.slice(0, n) : []);
+
+  return {
+    range: { from: data?.from, to: data?.to },
+    totals: data?.totals || {},
+    byMonth: pick(data?.byMonth, 12),
+    topCustomers: pick(data?.topCustomers, 10),
+    topWarehouses: pick(data?.topWarehouses, 10),
+    rows: pick((focused.length ? focused : table), focused.length ? 25 : 40).map((r) => ({
+      cardCode: r.cardCode,
+      cardName: r.cardName,
+      customer: r.customer,
+      warehouse: r.warehouse,
+      dollars: r.dollars,
+      grossProfit: r.grossProfit,
+      grossPct: r.grossPct,
+      invoices: r.invoices,
+    })),
+  };
+}
+
+function aiCompactDetail(detail, customerLabel = "") {
+  if (!detail?.ok) return null;
+  const flatLines = [];
+  for (const inv of (detail.invoices || []).slice(0, 25)) {
+    for (const ln of (inv.lines || []).slice(0, 15)) {
+      flatLines.push({
+        docNum: inv.docNum,
+        docDate: inv.docDate,
+        itemCode: ln.itemCode,
+        itemDesc: ln.itemDesc,
+        quantity: ln.quantity,
+        dollars: ln.dollars,
+        grossProfit: ln.grossProfit,
+        grossPct: ln.grossPct,
+      });
+      if (flatLines.length >= 80) break;
+    }
+    if (flatLines.length >= 80) break;
+  }
+  return {
+    customerLabel,
+    cardCode: detail.cardCode,
+    warehouse: detail.warehouse,
+    totals: detail.totals,
+    lines: flatLines,
+  };
+}
+
+function extractResponseText(obj) {
+  if (!obj) return "";
+  if (typeof obj.output_text === "string" && obj.output_text.trim()) return obj.output_text.trim();
+
+  const parts = [];
+  for (const item of (obj.output || [])) {
+    for (const c of (item.content || [])) {
+      if (c?.type === "output_text" && c?.text) parts.push(String(c.text));
+      if (c?.type === "text" && c?.text) parts.push(String(c.text));
+    }
+  }
+  return parts.join("\n").trim();
+}
+
+async function openaiDbAnalystChat({ question, dashboard, detail = null, customerLabel = "" }) {
+  const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+  const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
+  if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
+
+  const compact = {
+    dashboard: aiCompactDashboard(dashboard, {
+      cardCode: detail?.cardCode || "",
+      warehouse: detail?.warehouse || "",
+    }),
+    detail: detail ? aiCompactDetail(detail, customerLabel) : null,
+  };
+
+  const system = [
+    "Eres un analista comercial interno de PRODIMA.",
+    "Usa exclusivamente el JSON entregado como fuente de verdad.",
+    "La fuente es la base de datos sincronizada del sistema, no SAP en vivo.",
+    "Si falta información, dilo claramente y no inventes.",
+    "Responde en español, claro y útil.",
+    "Prioriza métricas concretas, hallazgos accionables y cifras redondeadas."
+  ].join(" ");
+
+  const payload = {
+    model,
+    input: [
+      { role: "system", content: [{ type: "input_text", text: system }] },
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text:
+              `Pregunta del usuario:\n${String(question || "").trim()}\n\n` +
+              `JSON de contexto:\n${JSON.stringify(compact)}`
+          }
+        ]
+      }
+    ],
+    max_output_tokens: 700,
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const msg =
+      data?.error?.message ||
+      data?.message ||
+      `OpenAI HTTP ${resp.status}`;
+    throw new Error(msg);
+  }
+
+  return {
+    answer: extractResponseText(data),
+    model,
+    raw: data,
+  };
+}
+
+
 /* =========================================================
    ✅ Health + Auth
 ========================================================= */
@@ -6252,6 +6394,148 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", limi
   };
 }
 
+
+function aiCompactDashboard(data, opts = {}) {
+  const focusCard = String(opts.cardCode || "").trim();
+  const focusWh = String(opts.warehouse || "").trim();
+
+  const table = Array.isArray(data?.table) ? data.table : [];
+  const focused = table.filter((r) => {
+    if (focusCard && String(r.cardCode || "") !== focusCard) return false;
+    if (focusWh && String(r.warehouse || "") !== focusWh) return false;
+    return true;
+  });
+
+  const pick = (arr, n = 10) => (Array.isArray(arr) ? arr.slice(0, n) : []);
+
+  return {
+    range: { from: data?.from, to: data?.to },
+    totals: data?.totals || {},
+    byMonth: pick(data?.byMonth, 12),
+    topCustomers: pick(data?.topCustomers, 10),
+    topWarehouses: pick(data?.topWarehouses, 10),
+    rows: pick((focused.length ? focused : table), focused.length ? 25 : 40).map((r) => ({
+      cardCode: r.cardCode,
+      cardName: r.cardName,
+      customer: r.customer,
+      warehouse: r.warehouse,
+      dollars: r.dollars,
+      grossProfit: r.grossProfit,
+      grossPct: r.grossPct,
+      invoices: r.invoices,
+    })),
+  };
+}
+
+function aiCompactDetail(detail, customerLabel = "") {
+  if (!detail?.ok) return null;
+  const flatLines = [];
+  for (const inv of (detail.invoices || []).slice(0, 25)) {
+    for (const ln of (inv.lines || []).slice(0, 15)) {
+      flatLines.push({
+        docNum: inv.docNum,
+        docDate: inv.docDate,
+        itemCode: ln.itemCode,
+        itemDesc: ln.itemDesc,
+        quantity: ln.quantity,
+        dollars: ln.dollars,
+        grossProfit: ln.grossProfit,
+        grossPct: ln.grossPct,
+      });
+      if (flatLines.length >= 80) break;
+    }
+    if (flatLines.length >= 80) break;
+  }
+  return {
+    customerLabel,
+    cardCode: detail.cardCode,
+    warehouse: detail.warehouse,
+    totals: detail.totals,
+    lines: flatLines,
+  };
+}
+
+function extractResponseText(obj) {
+  if (!obj) return "";
+  if (typeof obj.output_text === "string" && obj.output_text.trim()) return obj.output_text.trim();
+
+  const parts = [];
+  for (const item of (obj.output || [])) {
+    for (const c of (item.content || [])) {
+      if (c?.type === "output_text" && c?.text) parts.push(String(c.text));
+      if (c?.type === "text" && c?.text) parts.push(String(c.text));
+    }
+  }
+  return parts.join("\n").trim();
+}
+
+async function openaiDbAnalystChat({ question, dashboard, detail = null, customerLabel = "" }) {
+  const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+  const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
+  if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
+
+  const compact = {
+    dashboard: aiCompactDashboard(dashboard, {
+      cardCode: detail?.cardCode || "",
+      warehouse: detail?.warehouse || "",
+    }),
+    detail: detail ? aiCompactDetail(detail, customerLabel) : null,
+  };
+
+  const system = [
+    "Eres un analista comercial interno de PRODIMA.",
+    "Usa exclusivamente el JSON entregado como fuente de verdad.",
+    "La fuente es la base de datos sincronizada del sistema, no SAP en vivo.",
+    "Si falta información, dilo claramente y no inventes.",
+    "Responde en español, claro y útil.",
+    "Prioriza métricas concretas, hallazgos accionables y cifras redondeadas."
+  ].join(" ");
+
+  const payload = {
+    model,
+    input: [
+      { role: "system", content: [{ type: "input_text", text: system }] },
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text:
+              `Pregunta del usuario:\n${String(question || "").trim()}\n\n` +
+              `JSON de contexto:\n${JSON.stringify(compact)}`
+          }
+        ]
+      }
+    ],
+    max_output_tokens: 700,
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const msg =
+      data?.error?.message ||
+      data?.message ||
+      `OpenAI HTTP ${resp.status}`;
+    throw new Error(msg);
+  }
+
+  return {
+    answer: extractResponseText(data),
+    model,
+    raw: data,
+  };
+}
+
+
 /* =========================================================
    ✅ Health + Auth
 ========================================================= */
@@ -6350,6 +6634,54 @@ app.get("/api/admin/invoices/top-products", verifyAdmin, async (req, res) => {
 /* =========================================================
    ✅ EXPORT EXCEL (SERVER-SIDE) — SOLO SE AGREGA ESTO
 ========================================================= */
+
+app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+
+    const question = String(req.body?.question || "").trim();
+    if (!question) return safeJson(res, 400, { ok: false, message: "question requerida" });
+
+    const fromQ = String(req.body?.from || req.query?.from || "");
+    const toQ = String(req.body?.to || req.query?.to || "");
+    const cardCode = String(req.body?.cardCode || "").trim();
+    const warehouse = String(req.body?.warehouse || "").trim();
+    const customerLabel = String(req.body?.customerLabel || "").trim();
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const defaultFrom = addDaysISO(today, -30);
+
+    const from = isISO(fromQ) ? fromQ : defaultFrom;
+    const to = isISO(toQ) ? toQ : today;
+
+    const dashboard = await dashboardFromDb(from, to);
+    let detail = null;
+
+    if (cardCode && warehouse) {
+      detail = await detailsFromDb({ from, to, cardCode, warehouse });
+    }
+
+    const out = await openaiDbAnalystChat({
+      question,
+      dashboard,
+      detail,
+      customerLabel,
+    });
+
+    return safeJson(res, 200, {
+      ok: true,
+      answer: out.answer || "No pude generar una respuesta.",
+      model: out.model,
+      source: "db",
+      range: { from, to },
+      focus: detail ? { cardCode, warehouse, customerLabel } : null,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+
 app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
@@ -6529,5 +6861,6 @@ process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
   app.listen(Number(PORT), () => {
     console.log(`PRODIMA API UNIFICADA listening on :${PORT}`);
+    console.log("AI invoices chat enabled ✅");
   });
 })();
