@@ -2998,7 +2998,7 @@ function parseEmailList(csv) {
 
 
 globalThis.DOCS_NOTIFY_TO = parseEmailList(
-  "pe-impa@prodima.com.pa"
+  "adm-red@prodima.com.pa"
 ).join(",");
 const DOCS_NOTIFY_TO = globalThis.DOCS_NOTIFY_TO;
 console.log("BOOT", "DOCS_MAIL_V11_BASE41_FAST_SEARCH");
@@ -5197,9 +5197,7 @@ function extractResponseText(obj) {
     }
   }
 
-  return parts.join("
-
-").trim();
+  return parts.join("\n\n").trim();
 }
 
 async function openaiDbAnalystChat({ question, dashboard, detail = null, customerLabel = "" }) {
@@ -6533,9 +6531,7 @@ function extractResponseText(obj) {
     }
   }
 
-  return parts.join("
-
-").trim();
+  return parts.join("\n\n").trim();
 }
 
 async function openaiDbAnalystChat({ question, dashboard, detail = null, customerLabel = "" }) {
