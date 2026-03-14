@@ -4170,7 +4170,7 @@ function guessCanonicalGroupName(groupNameRaw) {
   return "";
 }
 
-function normalizeGrupoFinal(grupoRaw) {
+globalThis.normalizeGrupoFinal = function globalThis.normalizeGrupoFinal(grupoRaw) {
   const raw = String(grupoRaw || "").trim();
   if (!raw) return "Sin grupo";
 
@@ -4583,7 +4583,7 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
   return inserted;
 }
 
-async function syncSales({ from, to, maxDocs = 2500 }) {
+globalThis.syncSales = async function globalThis.syncSales({ from, to, maxDocs = 2500 }) {
   let saved = 0;
 
   const invHeaders = await scanDocHeaders("Invoices", { from, to, maxDocs });
@@ -4759,7 +4759,7 @@ async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
       const groupNameRaw = String(sap.groupName || "").trim();
 
       // ✅ FIX: normaliza (canon + heurística) para evitar "Sin grupo"
-      const grupo = normalizeGrupoFinal(groupNameRaw || "");
+      const grupo = globalThis.normalizeGrupoFinal(groupNameRaw || "");
       const area = inferAreaFromGroup(grupo) || inferAreaFromGroup(groupNameRaw) || "";
 
       const itemDesc = (String(sap.itemName || "").trim() || descFromSales || "");
@@ -4873,7 +4873,7 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     const pct = rev > 0 ? (gp / rev) * 100 : 0;
 
     const grupoTxtRaw = String(r.grupo || "Sin grupo");
-    const grupoTxt = normalizeGrupoFinal(grupoTxtRaw);
+    const grupoTxt = globalThis.normalizeGrupoFinal(grupoTxtRaw);
 
     const areaDb = String(r.area || "");
     const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || "CONS";
@@ -5071,7 +5071,7 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
 
     let rows = (q1.rows || []).map((r) => {
       const grupoTxtRaw = String(r.grupo || "Sin grupo");
-      const grupoTxt = normalizeGrupoFinal(grupoTxtRaw);
+      const grupoTxt = globalThis.normalizeGrupoFinal(grupoTxtRaw);
 
       const areaDb = String(r.area || "");
       const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || "CONS";
@@ -5187,7 +5187,7 @@ app.get("/api/admin/estratificacion/sync", verifyAdmin, async (req, res) => {
     }
 
     // ventas netas
-    const salesSaved = await syncSales({ from, to, maxDocs });
+    const salesSaved = await globalThis.syncSales({ from, to, maxDocs });
 
     // grupos + inventario para items del rango
     const groupsSaved = await syncItemGroupsForSalesItems({ from, to, maxItems: 2500 });
@@ -6874,7 +6874,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const rev = prodNum(r.revenue);
     const gp = prodNum(r.gp);
     const gpPct = rev > 0 ? (gp / rev) * 100 : 0;
-    const grupoTxt = normalizeGrupoFinal(String(r.grupo || "Sin grupo"));
+    const grupoTxt = globalThis.normalizeGrupoFinal(String(r.grupo || "Sin grupo"));
     const areaFinal = String(r.area || "") || inferAreaFromGroup(grupoTxt) || "CONS";
     const monthsMap = monthly.get(String(r.item_code || "")) || new Map();
 
@@ -7056,7 +7056,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   );
   const row0 = itemMaster.rows?.[0] || {};
   const itemDesc = String(row0.item_desc || meta?.description || "");
-  const grupo = normalizeGrupoFinal(String(row0.grupo || ""));
+  const grupo = globalThis.normalizeGrupoFinal(String(row0.grupo || ""));
   const area = String(row0.area || "") || inferAreaFromGroup(grupo) || "";
   const machine = prodMachineFromAreaOrGroup(area, grupo, meta);
 
@@ -7457,7 +7457,7 @@ async function handleProductionSync(req, res) {
 
     const maxDocs = Math.max(50, Math.min(20000, prodNum(req.body?.maxDocs || req.query?.maxDocs, 4000)));
 
-    const salesSaved = await syncSales({ from, to, maxDocs });
+    const salesSaved = await globalThis.syncSales({ from, to, maxDocs });
     const groupsSaved = await syncItemGroupsForSalesItems({ from, to, maxItems: 3000 });
     const invSaved = await syncInventoryForSalesItems({ from, to, maxItems: 3000 });
     const invWhSaved = await syncProductionInventoryWh({ from, to, maxItems: 3000 });
