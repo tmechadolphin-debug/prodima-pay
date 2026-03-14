@@ -5165,17 +5165,42 @@ function aiCompactDetail(detail, customerLabel = "") {
 }
 
 function extractResponseText(obj) {
-  if (!obj) return "";
-  if (typeof obj.output_text === "string" && obj.output_text.trim()) return obj.output_text.trim();
+  if (!obj || typeof obj !== "object") return "";
+
+  // Algunos SDKs exponen esto, pero en fetch REST normalmente no viene
+  if (typeof obj.output_text === "string" && obj.output_text.trim()) {
+    return obj.output_text.trim();
+  }
 
   const parts = [];
-  for (const item of (obj.output || [])) {
-    for (const c of (item.content || [])) {
-      if (c?.type === "output_text" && c?.text) parts.push(String(c.text));
-      if (c?.type === "text" && c?.text) parts.push(String(c.text));
+
+  for (const item of Array.isArray(obj.output) ? obj.output : []) {
+    // Caso normal de Responses API: output message -> content -> output_text
+    if (item && Array.isArray(item.content)) {
+      for (const c of item.content) {
+        if (c?.type === "output_text" && typeof c.text === "string" && c.text.trim()) {
+          parts.push(c.text.trim());
+        } else if (c?.type === "text" && typeof c.text === "string" && c.text.trim()) {
+          parts.push(c.text.trim());
+        } else if (c?.type === "summary_text" && typeof c.text === "string" && c.text.trim()) {
+          parts.push(c.text.trim());
+        } else if (c?.type === "reasoning_text" && typeof c.text === "string" && c.text.trim()) {
+          parts.push(c.text.trim());
+        } else if (typeof c?.text === "string" && c.text.trim()) {
+          parts.push(c.text.trim());
+        } else if (c?.text && typeof c.text?.value === "string" && c.text.value.trim()) {
+          parts.push(c.text.value.trim());
+        }
+      }
+    }
+
+    // Por si el texto viniera en otro formato inesperado
+    if (typeof item?.text === "string" && item.text.trim()) {
+      parts.push(item.text.trim());
     }
   }
-  return parts.join("\n").trim();
+
+  return parts.join("\n\n").trim();
 }
 
 async function openaiDbAnalystChat({ question, dashboard, detail = null, customerLabel = "" }) {
@@ -5216,8 +5241,15 @@ async function openaiDbAnalystChat({ question, dashboard, detail = null, custome
         ]
       }
     ],
+    text: { format: { type: "text" } },
     max_output_tokens: 700,
   };
+
+  console.log("AI CHAT REQUEST", {
+    model,
+    hasDetail: !!detail,
+    questionLen: String(question || "").length
+  });
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -5229,6 +5261,10 @@ async function openaiDbAnalystChat({ question, dashboard, detail = null, custome
   });
 
   const data = await resp.json().catch(() => ({}));
+
+  console.log("AI CHAT OPENAI STATUS", resp.status);
+  console.log("AI CHAT OPENAI DATA", JSON.stringify(data).slice(0, 3000));
+
   if (!resp.ok) {
     const msg =
       data?.error?.message ||
@@ -5237,8 +5273,14 @@ async function openaiDbAnalystChat({ question, dashboard, detail = null, custome
     throw new Error(msg);
   }
 
+  const answer = extractResponseText(data);
+
+  if (!answer) {
+    throw new Error("OpenAI respondió sin texto utilizable.");
+  }
+
   return {
-    answer: extractResponseText(data),
+    answer,
     model,
     raw: data,
   };
