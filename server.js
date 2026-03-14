@@ -4170,7 +4170,7 @@ function guessCanonicalGroupName(groupNameRaw) {
   return "";
 }
 
-globalThis.normalizeGrupoFinal = function globalThis.normalizeGrupoFinal(grupoRaw) {
+globalThis.normalizeGrupoFinal = function normalizeGrupoFinal(grupoRaw) {
   const raw = String(grupoRaw || "").trim();
   if (!raw) return "Sin grupo";
 
@@ -4583,7 +4583,7 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
   return inserted;
 }
 
-globalThis.syncSales = async function globalThis.syncSales({ from, to, maxDocs = 2500 }) {
+globalThis.syncSales = async function syncSales({ from, to, maxDocs = 2500 }) {
   let saved = 0;
 
   const invHeaders = await scanDocHeaders("Invoices", { from, to, maxDocs });
