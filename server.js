@@ -6522,6 +6522,79 @@ __extraBootTasks.push(async () => {
 ========================================================= */
 
 const PROD_FINISHED_WHS = ["01", "200", "300", "500"];
+
+// Producción: helpers autosuficientes para no depender del scope de otros módulos
+const PROD_GROUPS_CONS = (globalThis.GROUPS_CONS && globalThis.GROUPS_CONS.size ? globalThis.GROUPS_CONS : new Set([)
+  "Ambientador", "Cuidado de la ropa", "Lejías", "Desinfectante", "Limpieza cocina", "Limpieza Piso",
+  "Limpieza Vidrios", "Limpieza General", "Limpieza de baño", "Quita grasa", "Lustramuebles",
+  "Insecticida", "Detergente", "Desengrasante", "Suavizante", "Limpiador de baños"
+]));
+const PROD_GROUPS_RCI = (globalThis.GROUPS_RCI && globalThis.GROUPS_RCI.size ? globalThis.GROUPS_RCI : new Set([)
+  "Salsas", "Vinagres", "Consumidor", "Institucional", "Mayonesas", "Aderezos", "Bebidas", "Condimentos"
+]));
+const PROD_GROUPS_CONS_N = new Set(Array.from(PROD_GROUPS_CONS).map((s) => String(s||"").normalize("NFD").replace(/[̀-ͯ]/g, "").trim().toLowerCase()));
+const PROD_GROUPS_RCI_N = new Set(Array.from(PROD_GROUPS_RCI).map((s) => String(s||"").normalize("NFD").replace(/[̀-ͯ]/g, "").trim().toLowerCase()));
+
+function prodNormGroupName(v) {
+  return String(v || "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function prodNormalizeGrupoFinal(grupoRaw) {
+  const canon = String(grupoRaw || "").trim() || "Sin grupo";
+  const canonN = prodNormGroupName(canon);
+  if (PROD_GROUPS_CONS_N.has(canonN) || PROD_GROUPS_RCI_N.has(canonN)) return canon;
+  if (!canonN) return "Sin grupo";
+  if (/(ambient|ropa|lej|desinfect|cocina|piso|vidrio|bano|grasa|mueble|insect|deterg|suav|limpiador)/i.test(canonN)) return "Limpieza General";
+  if (/(salsa|vinagre|mayonesa|aderezo|condiment|consumidor|institucional)/i.test(canonN)) return "Salsas";
+  return canon;
+}
+
+function prodInferAreaFromGroup(groupName) {
+  const g = prodNormGroupName(groupName);
+  if (PROD_GROUPS_RCI_N.has(g)) return "RCI";
+  if (PROD_GROUPS_CONS_N.has(g)) return "CONS";
+  if (/(salsa|vinagre|mayonesa|aderezo|condiment|consumidor|institucional)/i.test(g)) return "RCI";
+  if (/(ambient|ropa|lej|desinfect|cocina|piso|vidrio|bano|grasa|mueble|insect|deterg|suav|limpiador)/i.test(g)) return "CONS";
+  return "";
+}
+
+function prodAbcByMetric(rows, metricKey) {
+  const arr = (Array.isArray(rows) ? rows : [])
+    .map((r) => ({ key: r.itemCode, v: Math.max(0, Number((r && r[metricKey]) || 0)) }))
+    .sort((a, b) => b.v - a.v);
+  const total = arr.reduce((a, x) => a + x.v, 0) || 0;
+  let acc = 0;
+  const out = new Map();
+  for (const x of arr) {
+    acc += x.v;
+    const share = total > 0 ? acc / total : 1;
+    const letter = share <= 0.8 ? "A" : share <= 0.95 ? "B" : share <= 0.99 ? "C" : "D";
+    out.set(x.key, letter);
+  }
+  return out;
+}
+
+function prodLetterScore(l) {
+  const L = String(l || "").toUpperCase();
+  if (L === "A") return 4;
+  if (L === "B") return 3;
+  if (L === "C") return 2;
+  return 1;
+}
+
+function prodTotalFromLetters(a1, a2, a3) {
+  const avg = (prodLetterScore(a1) + prodLetterScore(a2) + prodLetterScore(a3)) / 3;
+  const t = Math.round(avg * 10) / 10;
+  if (t >= 3.5) return { label: "AB Crítico", cls: "bad", t };
+  if (t >= 2.0) return { label: "C Importante", cls: "warn", t };
+  return { label: "D", cls: "ok", t };
+}
+
 const PROD_DATA_DIR = process.env.PROD_DATA_DIR || path.join(process.cwd(), "data", "production");
 const PROD_FORMULA_JSON = process.env.PROD_FORMULA_JSON || path.join(PROD_DATA_DIR, "production_formula_catalog.json");
 const PROD_MATERIAL_JSON = process.env.PROD_MATERIAL_JSON || path.join(PROD_DATA_DIR, "production_material_stock_catalog.json");
@@ -6874,8 +6947,8 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const rev = prodNum(r.revenue);
     const gp = prodNum(r.gp);
     const gpPct = rev > 0 ? (gp / rev) * 100 : 0;
-    const grupoTxt = globalThis.normalizeGrupoFinal(String(r.grupo || "Sin grupo"));
-    const areaFinal = String(r.area || "") || globalThis.inferAreaFromGroup(grupoTxt) || "CONS";
+    const grupoTxt = prodNormalizeGrupoFinal(String(r.grupo || "Sin grupo"));
+    const areaFinal = String(r.area || "") || prodInferAreaFromGroup(grupoTxt) || "CONS";
     const monthsMap = monthly.get(String(r.item_code || "")) || new Map();
 
     const avgMonthsSafe = Math.max(1, Number(avgMonths || 5));
@@ -6924,24 +6997,24 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
   const qq = String(q || "").trim().toLowerCase();
 
   let availableGroups = [];
-  if (areaSel === "CONS") availableGroups = Array.from(globalThis.GROUPS_CONS);
-  else if (areaSel === "RCI") availableGroups = Array.from(globalThis.GROUPS_RCI);
-  else availableGroups = Array.from(new Set([...globalThis.GROUPS_CONS, ...globalThis.GROUPS_RCI]));
+  if (areaSel === "CONS") availableGroups = Array.from(PROD_GROUPS_CONS);
+  else if (areaSel === "RCI") availableGroups = Array.from(PROD_GROUPS_RCI);
+  else availableGroups = Array.from(new Set([...PROD_GROUPS_CONS, ...PROD_GROUPS_RCI]));
   availableGroups.sort((a, b) => a.localeCompare(b));
 
   let universe = items.slice();
   if (areaSel !== "__ALL__") universe = universe.filter((x) => x.area === areaSel);
-  if (grupoSel !== "__ALL__") universe = universe.filter((x) => normGroupName(x.grupo) === normGroupName(grupoSel));
+  if (grupoSel !== "__ALL__") universe = universe.filter((x) => prodNormGroupName(x.grupo) === prodNormGroupName(grupoSel));
 
-  const abcRev = abcByMetric(universe, "revenue");
-  const abcGP = abcByMetric(universe, "gp");
-  const abcQty = abcByMetric(universe, "avgMonthlyQty");
+  const abcRev = prodAbcByMetric(universe, "revenue");
+  const abcGP = prodAbcByMetric(universe, "gp");
+  const abcQty = prodAbcByMetric(universe, "avgMonthlyQty");
 
   items = items.map((it, idx) => {
     const a1 = abcRev.get(it.itemCode) || "D";
     const a2 = abcGP.get(it.itemCode) || "D";
     const a3 = abcQty.get(it.itemCode) || "D";
-    const total = totalFromLetters(a1, a2, a3);
+    const total = prodTotalFromLetters(a1, a2, a3);
     const local = loadProductionLocalData();
     const meta = local.formulas.products?.[it.itemCode] || null;
     const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
@@ -6966,7 +7039,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
   });
 
   if (areaSel !== "__ALL__") items = items.filter((x) => x.area === areaSel);
-  if (grupoSel !== "__ALL__") items = items.filter((x) => normGroupName(x.grupo) === normGroupName(grupoSel));
+  if (grupoSel !== "__ALL__") items = items.filter((x) => prodNormGroupName(x.grupo) === prodNormGroupName(grupoSel));
   if (qq) items = items.filter((x) => x.itemCode.toLowerCase().includes(qq) || x.itemDesc.toLowerCase().includes(qq));
 
   items.sort((a, b) => {
@@ -7056,8 +7129,8 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   );
   const row0 = itemMaster.rows?.[0] || {};
   const itemDesc = String(row0.item_desc || meta?.description || "");
-  const grupo = globalThis.normalizeGrupoFinal(String(row0.grupo || ""));
-  const area = String(row0.area || "") || globalThis.inferAreaFromGroup(grupo) || "";
+  const grupo = prodNormalizeGrupoFinal(String(row0.grupo || ""));
+  const area = String(row0.area || "") || prodInferAreaFromGroup(grupo) || "";
   const machine = prodMachineFromAreaOrGroup(area, grupo, meta);
 
   const end = String(toDate || getDateISOInOffset(TZ_OFFSET_MIN));
