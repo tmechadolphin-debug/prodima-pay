@@ -6524,12 +6524,12 @@ __extraBootTasks.push(async () => {
 const PROD_FINISHED_WHS = ["01", "200", "300", "500"];
 
 // Producción: helpers autosuficientes para no depender del scope de otros módulos
-const PROD_GROUPS_CONS = (globalThis.GROUPS_CONS && globalThis.GROUPS_CONS.size ? globalThis.GROUPS_CONS : new Set([)
+const PROD_GROUPS_CONS = (globalThis.GROUPS_CONS && globalThis.GROUPS_CONS.size ? globalThis.GROUPS_CONS : new Set([
   "Ambientador", "Cuidado de la ropa", "Lejías", "Desinfectante", "Limpieza cocina", "Limpieza Piso",
   "Limpieza Vidrios", "Limpieza General", "Limpieza de baño", "Quita grasa", "Lustramuebles",
   "Insecticida", "Detergente", "Desengrasante", "Suavizante", "Limpiador de baños"
 ]));
-const PROD_GROUPS_RCI = (globalThis.GROUPS_RCI && globalThis.GROUPS_RCI.size ? globalThis.GROUPS_RCI : new Set([)
+const PROD_GROUPS_RCI = (globalThis.GROUPS_RCI && globalThis.GROUPS_RCI.size ? globalThis.GROUPS_RCI : new Set([
   "Salsas", "Vinagres", "Consumidor", "Institucional", "Mayonesas", "Aderezos", "Bebidas", "Condimentos"
 ]));
 const PROD_GROUPS_CONS_N = new Set(Array.from(PROD_GROUPS_CONS).map((s) => String(s||"").normalize("NFD").replace(/[̀-ͯ]/g, "").trim().toLowerCase()));
