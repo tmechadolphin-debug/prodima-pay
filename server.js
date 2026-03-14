@@ -4090,7 +4090,7 @@ const {
 /* =========================================================
    ✅ GRUPOS (TU REGLA DE NEGOCIO)
 ========================================================= */
-const GROUPS_CONS = new Set([
+globalThis.GROUPS_CONS = new Set([
   "Prod. De Limpieza",
   "Cuidado De La Ropa",
   "Sazonadores",
@@ -4099,7 +4099,7 @@ const GROUPS_CONS = new Set([
   "Especialidades y GMT",
 ]);
 
-const GROUPS_RCI = new Set([
+globalThis.GROUPS_RCI = new Set([
   "Equip. Y Acces. Agua",
   "Químicos Piscina",
   "Servicios",
@@ -4120,11 +4120,11 @@ function normGroupName(s) {
     .toUpperCase();
 }
 
-const GROUPS_CONS_N = new Set(Array.from(GROUPS_CONS).map(normGroupName));
-const GROUPS_RCI_N = new Set(Array.from(GROUPS_RCI).map(normGroupName));
+globalThis.GROUPS_CONS_N = new Set(Array.from(globalThis.GROUPS_CONS).map(normGroupName));
+globalThis.GROUPS_RCI_N = new Set(Array.from(globalThis.GROUPS_RCI).map(normGroupName));
 
 const CANON_GROUP = new Map(
-  [...Array.from(GROUPS_CONS), ...Array.from(GROUPS_RCI)].map((g) => [normGroupName(g), g])
+  [...Array.from(globalThis.GROUPS_CONS), ...Array.from(globalThis.GROUPS_RCI)].map((g) => [normGroupName(g), g])
 );
 
 function canonicalGroupName(groupName) {
@@ -4178,7 +4178,7 @@ globalThis.normalizeGrupoFinal = function normalizeGrupoFinal(grupoRaw) {
   const canonN = normGroupName(canon);
 
   // si ya está en tus listas, perfecto
-  if (GROUPS_CONS_N.has(canonN) || GROUPS_RCI_N.has(canonN)) return canon;
+  if (globalThis.GROUPS_CONS_N.has(canonN) || globalThis.GROUPS_RCI_N.has(canonN)) return canon;
 
   // si no, prueba heurística
   const guessed = guessCanonicalGroupName(raw);
@@ -4190,8 +4190,8 @@ globalThis.normalizeGrupoFinal = function normalizeGrupoFinal(grupoRaw) {
 globalThis.inferAreaFromGroup = function inferAreaFromGroup(groupName) {
   const g = normGroupName(groupName);
   if (!g) return "";
-  if (GROUPS_CONS_N.has(g)) return "CONS";
-  if (GROUPS_RCI_N.has(g)) return "RCI";
+  if (globalThis.GROUPS_CONS_N.has(g)) return "CONS";
+  if (globalThis.GROUPS_RCI_N.has(g)) return "RCI";
   return "";
 }
 
@@ -4901,9 +4901,9 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
 
   // availableGroups (según filtro área)
   let availableGroups = [];
-  if (areaSel === "CONS") availableGroups = Array.from(GROUPS_CONS);
-  else if (areaSel === "RCI") availableGroups = Array.from(GROUPS_RCI);
-  else availableGroups = Array.from(new Set([...GROUPS_CONS, ...GROUPS_RCI]));
+  if (areaSel === "CONS") availableGroups = Array.from(globalThis.GROUPS_CONS);
+  else if (areaSel === "RCI") availableGroups = Array.from(globalThis.GROUPS_RCI);
+  else availableGroups = Array.from(new Set([...globalThis.GROUPS_CONS, ...globalThis.GROUPS_RCI]));
   availableGroups.sort((a, b) => a.localeCompare(b));
 
   /* =========================
@@ -6924,9 +6924,9 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
   const qq = String(q || "").trim().toLowerCase();
 
   let availableGroups = [];
-  if (areaSel === "CONS") availableGroups = Array.from(GROUPS_CONS);
-  else if (areaSel === "RCI") availableGroups = Array.from(GROUPS_RCI);
-  else availableGroups = Array.from(new Set([...GROUPS_CONS, ...GROUPS_RCI]));
+  if (areaSel === "CONS") availableGroups = Array.from(globalThis.GROUPS_CONS);
+  else if (areaSel === "RCI") availableGroups = Array.from(globalThis.GROUPS_RCI);
+  else availableGroups = Array.from(new Set([...globalThis.GROUPS_CONS, ...globalThis.GROUPS_RCI]));
   availableGroups.sort((a, b) => a.localeCompare(b));
 
   let universe = items.slice();
