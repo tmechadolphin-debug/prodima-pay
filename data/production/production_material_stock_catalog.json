@@ -1,0 +1,1973 @@
+{
+  "materials": {
+    "CLAVMOLGRA": {
+      "code": "CLAVMOLGRA",
+      "description": "CLAVITO DE OLOR MOLIDO GRAJASA",
+      "stockQty": 2.075,
+      "cost": 17.0,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FBCHINAB": {
+      "code": "FBCHINAB",
+      "description": "Base Salsa China 25 kg (MP00117)",
+      "stockQty": 300.0,
+      "cost": 6.25,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FBINGLESA": {
+      "code": "FBINGLESA",
+      "description": "Base Inglesa Sansae Baltimore (Sacos de 25.5 Kg)",
+      "stockQty": 3182.4,
+      "cost": 6.17,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FBRECAO": {
+      "code": "FBRECAO",
+      "description": "Base Salsa De Cocina Recao Balt. (Sacos de 22.5 Kg)",
+      "stockQty": 671.86,
+      "cost": 8.99,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FBSALSAOSC": {
+      "code": "FBSALSAOSC",
+      "description": "Base de Salsa Oscura Baltimore (Sacos de 25 Kg)",
+      "stockQty": 1539.7,
+      "cost": 6.2,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FGLUSOD": {
+      "code": "FGLUSOD",
+      "description": "Glutamato De Sodio (Ajinomoto) saco/50 lbs",
+      "stockQty": 84200.0,
+      "cost": 0.0,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FVAIPOL": {
+      "code": "FVAIPOL",
+      "description": "Vainilla Polvo",
+      "stockQty": 47.9,
+      "cost": 31.04,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "KCARPOL": {
+      "code": "KCARPOL",
+      "description": "Caramel Color AP680. 20 kg/ cs",
+      "stockQty": 0.0,
+      "cost": 3.8,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "KCARPOLDA": {
+      "code": "KCARPOLDA",
+      "description": "Colorante Caramelo en Polvo Saco de (22.68 kg)",
+      "stockQty": 87.64,
+      "cost": 10.25,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "PIMMOLGRA": {
+      "code": "PIMMOLGRA",
+      "description": "PIMIENTA MOLIDA GRAJASA",
+      "stockQty": 7.544,
+      "cost": 4.3,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QALETILP": {
+      "code": "QALETILP",
+      "description": "Alcohol Etilico Puro",
+      "stockQty": 121.133,
+      "cost": 1.74,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QAZUCAR": {
+      "code": "QAZUCAR",
+      "description": "Azucar blanca Refinada",
+      "stockQty": 647.08,
+      "cost": 1.19,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QBENZSOD": {
+      "code": "QBENZSOD",
+      "description": "Benzoato De Sodio Americano  (grado alimenticio). 25kg",
+      "stockQty": 52216.2,
+      "cost": 0.0,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "qmetabisulf": {
+      "code": "qmetabisulf",
+      "description": "Metabisulfito de Sodio ( Grado Alimento)",
+      "stockQty": 28700.0,
+      "cost": 0.0,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QSAL": {
+      "code": "QSAL",
+      "description": "Sal (Sacos de 25 Kg cu)",
+      "stockQty": 7204.4,
+      "cost": 0.35,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QSORBAT": {
+      "code": "QSORBAT",
+      "description": "Sorbato De Potasio (grado alimenticio) 25 Kg",
+      "stockQty": 45000.0,
+      "cost": 0.0,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QVIN10": {
+      "code": "QVIN10",
+      "description": "Vinagre Al 10%",
+      "stockQty": 6217.93,
+      "cost": 0.55,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QVINMANZANA": {
+      "code": "QVINMANZANA",
+      "description": "Vinagre de sidra de Manzana 10%",
+      "stockQty": 56.7812,
+      "cost": 1.47,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "Número de artículo": {
+      "code": "Número de artículo",
+      "description": "Descripción",
+      "stockQty": 0,
+      "cost": 0,
+      "supplier": "nan",
+      "sheet": "ME al 24-jul"
+    },
+    "QACCITRI": {
+      "code": "QACCITRI",
+      "description": "Acido Citrico (25 Kg./ Saco)",
+      "stockQty": 9441.726337,
+      "cost": 1.31,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QACISOCIA": {
+      "code": "QACISOCIA",
+      "description": "Acido Isocianurico",
+      "stockQty": 310.605,
+      "cost": 1.48,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QACMURIA": {
+      "code": "QACMURIA",
+      "description": "Acido Clorhidrico (Muriatico) \"B10\"",
+      "stockQty": 149.58,
+      "cost": 0.6,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QBTC2125L": {
+      "code": "QBTC2125L",
+      "description": "Btc 2125 Liquido/Maquat MQ 2525 M-80 (425 lb # DRUMS)",
+      "stockQty": 1506.5,
+      "cost": 8.22,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QSODASH": {
+      "code": "QSODASH",
+      "description": "Soda Ash 25 Kg \"B10\"",
+      "stockQty": 151.69,
+      "cost": 0.61,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QTRIPFOS": {
+      "code": "QTRIPFOS",
+      "description": "Tripolifosfato De Sodio",
+      "stockQty": 136.185359,
+      "cost": 0.83,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "VITEC4000": {
+      "code": "VITEC4000",
+      "description": "Vitec® 4000/d, antiscalant, 500 pound pail (cubo de 500lbs)",
+      "stockQty": 1050.9436,
+      "cost": 4.5,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "VITEC7000": {
+      "code": "VITEC7000",
+      "description": "Vitec® 7000/d, antiscalant, 500 pound pail (cubo de 500lbs)",
+      "stockQty": 707.278211,
+      "cost": 3.28,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FEFLORFANTA": {
+      "code": "FEFLORFANTA",
+      "description": "Esencia Flores de Fantasia 89658P",
+      "stockQty": 48.549,
+      "cost": 22.05,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FEGRAPEFRUIT": {
+      "code": "FEGRAPEFRUIT",
+      "description": "Esencia Grapefruit 88029P",
+      "stockQty": 25.934,
+      "cost": 48.12,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FELAVANDASUR": {
+      "code": "FELAVANDASUR",
+      "description": "Fragancia Lavanda Sur LD 80225P",
+      "stockQty": 37.86,
+      "cost": 13.07,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FEPINOCAD": {
+      "code": "FEPINOCAD",
+      "description": "Esencia Pino Canadiense 86319P",
+      "stockQty": 106.82,
+      "cost": 31.67,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FETIFFOSI": {
+      "code": "FETIFFOSI",
+      "description": "Esencia Tiffosi Lj-S",
+      "stockQty": 54.5,
+      "cost": 13.96,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "KAAA": {
+      "code": "KAAA",
+      "description": "Colorante Amarillo AA (Amarillo Huevo)",
+      "stockQty": 1691.372,
+      "cost": 0.01,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "KREDBRIG": {
+      "code": "KREDBRIG",
+      "description": "Colorante Bright Red Ls-783",
+      "stockQty": 3843.714,
+      "cost": 0.07,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "KRFRAMB": {
+      "code": "KRFRAMB",
+      "description": "Colorante Rojo Frambuesa",
+      "stockQty": 1340.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "KZ": {
+      "code": "KZ",
+      "description": "Colorante Azul Iragon",
+      "stockQty": 8543.0,
+      "cost": 0.04,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "KZ508": {
+      "code": "KZ508",
+      "description": "Colorante Azul 508// Turquoise",
+      "stockQty": 2701.0,
+      "cost": 0.12,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "KZBLUEBRI": {
+      "code": "KZBLUEBRI",
+      "description": "Colorante Bright Blue Ls-740",
+      "stockQty": 0.0,
+      "cost": 0.12,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QALIPA": {
+      "code": "QALIPA",
+      "description": "Alcohol Isopropilico \"B10\"",
+      "stockQty": 1384.467704,
+      "cost": 2.38,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QAMONIA": {
+      "code": "QAMONIA",
+      "description": "Amoniaco Gas \"B10\"",
+      "stockQty": 157.502426,
+      "cost": 6.92,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QAMONIALIQ": {
+      "code": "QAMONIALIQ",
+      "description": "Amoniaco Liquido \"B10\"",
+      "stockQty": 6.5,
+      "cost": 1.14,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QAMON-LO": {
+      "code": "QAMON-LO",
+      "description": "Ammonix Lo / Macat AO-12 (440 # DRUM)",
+      "stockQty": 409.38,
+      "cost": 3.57,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QBUTCEL": {
+      "code": "QBUTCEL",
+      "description": "Butyl Cellosolve",
+      "stockQty": 779.18,
+      "cost": 2.5,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QCLORUBEN": {
+      "code": "QCLORUBEN",
+      "description": "cloruro de benzalconio",
+      "stockQty": 79.93,
+      "cost": 2.95,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QETHOXYBE7": {
+      "code": "QETHOXYBE7",
+      "description": "Ethoxy-Brite EB .FAE7 (DEHYDOL LS7TH)",
+      "stockQty": 779.660954,
+      "cost": 2.99,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QHIPOCLOR/MP": {
+      "code": "QHIPOCLOR/MP",
+      "description": "Hipoclorito de Sodio 12% Materia Prima. 208.175 LT",
+      "stockQty": 2930.7775,
+      "cost": 0.55,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QLYTRON": {
+      "code": "QLYTRON",
+      "description": "Lytron",
+      "stockQty": 120.86,
+      "cost": 2.45,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QMETSOD": {
+      "code": "QMETSOD",
+      "description": "Metasilicato De Sodio Kg",
+      "stockQty": 278.97025,
+      "cost": 0.79,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QSODAC": {
+      "code": "QSODAC",
+      "description": "Soda Caustica (saco/25 kg) \"B10\"",
+      "stockQty": 7791.24,
+      "cost": 0.92,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "6009.2": {
+      "code": "6009.2",
+      "description": "Acido sulfurico 0.12N 1Qt.",
+      "stockQty": 0.0,
+      "cost": 2.73,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FEBLUEDR": {
+      "code": "FEBLUEDR",
+      "description": "Fragancia Blue Dreams LCV TME12-02075",
+      "stockQty": 0.0,
+      "cost": 31.54,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FECUNITA": {
+      "code": "FECUNITA",
+      "description": "Esencia Cunita 176100",
+      "stockQty": 269.32,
+      "cost": 30.0,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FEDAVINYA": {
+      "code": "FEDAVINYA",
+      "description": "Fragancia Davynya TD 248.129B",
+      "stockQty": 368.3,
+      "cost": 21.16,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FEFAIRYDUST": {
+      "code": "FEFAIRYDUST",
+      "description": "FAIRY DUST MEX-EC0257312",
+      "stockQty": 60.17,
+      "cost": 33.05,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FEFRESYCHOCO": {
+      "code": "FEFRESYCHOCO",
+      "description": "Fragancia Fresas y Chocolate MEX-EC0370393/01",
+      "stockQty": 320.851,
+      "cost": 24.12,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FELAVANDAMIC": {
+      "code": "FELAVANDAMIC",
+      "description": "Fragancia Micro Lavanda 54.700.0054",
+      "stockQty": 4.12,
+      "cost": 27.57,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FEMANECAPS": {
+      "code": "FEMANECAPS",
+      "description": "Fragancia Sunny Pop Manencaps MEX-EC0219518",
+      "stockQty": 191.6,
+      "cost": 23.51,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FEPETALH": {
+      "code": "FEPETALH",
+      "description": "PETAL HUG 31B11483",
+      "stockQty": 271.02,
+      "cost": 17.36,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FESENSACION": {
+      "code": "FESENSACION",
+      "description": "Fragancia Sensaciones 53.095.0203",
+      "stockQty": 80.32,
+      "cost": 15.8,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FESOFTVANIL": {
+      "code": "FESOFTVANIL",
+      "description": "Soft Vanilla P0271943",
+      "stockQty": 232.9,
+      "cost": 14.12,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "FESPRINGV": {
+      "code": "FESPRINGV",
+      "description": "Esencia Spring Valley Plus  49851P",
+      "stockQty": 0.0,
+      "cost": 8.38,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "KAY20455": {
+      "code": "KAY20455",
+      "description": "Colorante Yellow 20455  Gr.",
+      "stockQty": 1312.0,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "KRESDSCA": {
+      "code": "KRESDSCA",
+      "description": "Colorante Scarlet Red Ls-779",
+      "stockQty": 0.0,
+      "cost": 0.0,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "KRROD": {
+      "code": "KRROD",
+      "description": "Colorante Rodamine (Rhodamine B)",
+      "stockQty": 135.0,
+      "cost": 0.2,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "KZCOL": {
+      "code": "KZCOL",
+      "description": "Colorante Azul RVA 009 (bolsa de 1/2 kg)",
+      "stockQty": 6365.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QFORMAL": {
+      "code": "QFORMAL",
+      "description": "Formaldehido (Carboya de 34 kg)",
+      "stockQty": 13960.0,
+      "cost": 0.0,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QPOIZ88": {
+      "code": "QPOIZ88",
+      "description": "Espesante Visco Brite 1588 (200 Kg)",
+      "stockQty": 373.0,
+      "cost": 4.56,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "QTETRANYL": {
+      "code": "QTETRANYL",
+      "description": "Stepantex THD-88E (Drum/180 kg)",
+      "stockQty": 10320.534456,
+      "cost": 3.32,
+      "supplier": "",
+      "sheet": "MP al 24-jul"
+    },
+    "TAAT": {
+      "code": "TAAT",
+      "description": "Atomizador Ajustable Transparente 28-400 \"INSP LAB\"",
+      "stockQty": 34983066.0,
+      "cost": 0.0,
+      "supplier": "GUALA",
+      "sheet": "ME al 24-jul"
+    },
+    "TATBAÑO": {
+      "code": "TATBAÑO",
+      "description": "Atomizador ajustable para MCl. Baño Morado",
+      "stockQty": 365.0,
+      "cost": 0.2,
+      "supplier": "GUALA",
+      "sheet": "ME al 24-jul"
+    },
+    "TRO24-410FLIPT": {
+      "code": "TRO24-410FLIPT",
+      "description": "TRO24-410FLIPT",
+      "stockQty": 225719.0,
+      "cost": 0.03,
+      "supplier": "PLASTICOS UNIDOS",
+      "sheet": "ME al 24-jul"
+    },
+    "TRO24FLIPTENV": {
+      "code": "TRO24FLIPTENV",
+      "description": "Tapa 25 mm Flip Top Envasa Negra",
+      "stockQty": 52348.0,
+      "cost": 0.03,
+      "supplier": "-",
+      "sheet": "ME al 24-jul"
+    },
+    "TRO28": {
+      "code": "TRO28",
+      "description": "Tapa 28-400 P.Liner Pp. \"INSP LAB\"",
+      "stockQty": 10771.0,
+      "cost": 0.02,
+      "supplier": "PLASTICOS UNIDOS",
+      "sheet": "ME al 24-jul"
+    },
+    "TRO28-410FLIPT": {
+      "code": "TRO28-410FLIPT",
+      "description": "Tapa 28-410 FLIP TOP",
+      "stockQty": 100329.0,
+      "cost": 0.04,
+      "supplier": "PLASTICOS UNIDOS",
+      "sheet": "ME al 24-jul"
+    },
+    "TRO28Venteo": {
+      "code": "TRO28Venteo",
+      "description": "Tapa 28-400 liner con venteo",
+      "stockQty": 5.067372,
+      "cost": 107.28,
+      "supplier": "SELIG",
+      "sheet": "ME al 24-jul"
+    },
+    "TRO28VIN": {
+      "code": "TRO28VIN",
+      "description": "Tapa rosca con anillo para Vinagre",
+      "stockQty": 192881.0,
+      "cost": 0.01,
+      "supplier": "RAVI CENTROAMERICA, S.A. DE C.V",
+      "sheet": "ME al 24-jul"
+    },
+    "TRO38": {
+      "code": "TRO38",
+      "description": "Tapa 38-400 P.Blanca",
+      "stockQty": 6692.0,
+      "cost": 0.04,
+      "supplier": "MEGAPET",
+      "sheet": "ME al 24-jul"
+    },
+    "TRO58-400": {
+      "code": "TRO58-400",
+      "description": "Tapa Rosca De Potasa",
+      "stockQty": 5490.0,
+      "cost": 0.06,
+      "supplier": "PLASTICOS UNIDOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EM7270": {
+      "code": "EM7270",
+      "description": "Etiqueta manga de Potasa 240 gr.",
+      "stockQty": 27063.0,
+      "cost": 0.06,
+      "supplier": "H&M",
+      "sheet": "ME al 24-jul"
+    },
+    "EMDUOSALSAS10.5": {
+      "code": "EMDUOSALSAS10.5",
+      "description": "Manga para Duopack de Salsas de 10.5 onzas",
+      "stockQty": 11251.0,
+      "cost": 0.18,
+      "supplier": "H&M",
+      "sheet": "ME al 24-jul"
+    },
+    "EMTRIORECAO": {
+      "code": "EMTRIORECAO",
+      "description": "Manga para Trio Recao de 5.5 onzas",
+      "stockQty": 10715.0,
+      "cost": 0.12,
+      "supplier": "H&M",
+      "sheet": "ME al 24-jul"
+    },
+    "EMTRIOSALSAS": {
+      "code": "EMTRIOSALSAS",
+      "description": "Manga para Triopack Salsas 5.5",
+      "stockQty": 20684.0,
+      "cost": 0.15,
+      "supplier": "H&M",
+      "sheet": "ME al 24-jul"
+    },
+    "SNT.CHINA.CONC": {
+      "code": "SNT.CHINA.CONC",
+      "description": "Sello termo para S.China Concentrada 57x65",
+      "stockQty": 1745.6,
+      "cost": 0.03,
+      "supplier": "H&M",
+      "sheet": "ME al 24-jul"
+    },
+    "SNT.CHINA.LS": {
+      "code": "SNT.CHINA.LS",
+      "description": "Sello termo en rollo para S.China Low Sodium 57x65",
+      "stockQty": 29936.72,
+      "cost": 0.03,
+      "supplier": "H&M",
+      "sheet": "ME al 24-jul"
+    },
+    "SNT.CONDI": {
+      "code": "SNT.CONDI",
+      "description": "Sello termo en rollo para S.Condimentada 57x65",
+      "stockQty": 831.0375,
+      "cost": 0.03,
+      "supplier": "H&M",
+      "sheet": "ME al 24-jul"
+    },
+    "SNT.INGLESA": {
+      "code": "SNT.INGLESA",
+      "description": "Sello Termo para S.Inglesa 57x65",
+      "stockQty": 34421.0,
+      "cost": 0.03,
+      "supplier": "H&M",
+      "sheet": "ME al 24-jul"
+    },
+    "SNT.RECAO": {
+      "code": "SNT.RECAO",
+      "description": "Sello Termo en rollo para Recao Criollo 57x65 mm",
+      "stockQty": 65156.768956,
+      "cost": 0.03,
+      "supplier": "H&M",
+      "sheet": "ME al 24-jul"
+    },
+    "SNT56.5x65": {
+      "code": "SNT56.5x65",
+      "description": "Sello Termo Amarillo letra S Generico rollo para Salsas",
+      "stockQty": 15495.0,
+      "cost": 0.02,
+      "supplier": "H&M",
+      "sheet": "ME al 24-jul"
+    },
+    "SNT56.5x65REY": {
+      "code": "SNT56.5x65REY",
+      "description": "Sello Termo Blanco en rollo 57x65 para Maquila",
+      "stockQty": 10603.2,
+      "cost": 0.03,
+      "supplier": "H&M",
+      "sheet": "ME al 24-jul"
+    },
+    "EC105AD": {
+      "code": "EC105AD",
+      "description": "Etiq. Salsa China Low Sodium 5.5 onz. ADHESIVA",
+      "stockQty": 17159.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC110AD": {
+      "code": "EC110AD",
+      "description": "Etiq. Salsa China Low Sodium 10.5 onz. ADHESIVA",
+      "stockQty": 12339.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC124AD": {
+      "code": "EC124AD",
+      "description": "Etiq. Salsa China Low Sodium 24 onz ADHESIVA",
+      "stockQty": 21814.0,
+      "cost": 0.04,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC1908": {
+      "code": "EC1908",
+      "description": "Etiq. Vinagre Blanco Sansae de 8 onzas",
+      "stockQty": 35626.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC1916": {
+      "code": "EC1916",
+      "description": "Etiq. Vinagre Blanco Sansae de 16 onzas",
+      "stockQty": 44694.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC1932": {
+      "code": "EC1932",
+      "description": "Etiq. Vinagre Blanco Sansae de 32 onzas",
+      "stockQty": 43156.0,
+      "cost": 0.04,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC1991": {
+      "code": "EC1991",
+      "description": "Etiq. Vinagre Blanco Sansae (1 galón)",
+      "stockQty": 17574.0,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC2016": {
+      "code": "EC2016",
+      "description": "Etiq. Vinagre de Sidra de Manzana de 16 onzas",
+      "stockQty": 35172.333333,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC2032": {
+      "code": "EC2032",
+      "description": "Etiq. de Vinagre de Sidra de Manzana de 32 onzas",
+      "stockQty": 35954.0,
+      "cost": 0.04,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC205AD": {
+      "code": "EC205AD",
+      "description": "Etiq. Salsa China Conc. 5.5 onz. ADHESIVA",
+      "stockQty": 36804.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC210AD": {
+      "code": "EC210AD",
+      "description": "Etiq. Salsa China Conc. 10.5 onz. ADHESIVA",
+      "stockQty": 28352.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC224AD": {
+      "code": "EC224AD",
+      "description": "Etiqueta Salsa China Conc. 24 onz. ADHESIVA",
+      "stockQty": 16993.0,
+      "cost": 0.04,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC224AD.PSMART": {
+      "code": "EC224AD.PSMART",
+      "description": "Etiq. S.China Conc.24 onz. p/Tetrapack PSmart.Con c/barras",
+      "stockQty": 29579.0,
+      "cost": 0.04,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC305AD": {
+      "code": "EC305AD",
+      "description": "Etiq. Salsa Inglesa 5.5 onz. ADHESIVA",
+      "stockQty": 44370.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC310AD": {
+      "code": "EC310AD",
+      "description": "Etiq. Salsa Inglesa 10.5 onz. ADHESIVA",
+      "stockQty": 38994.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC324AD": {
+      "code": "EC324AD",
+      "description": "Etiq. Salsa Inglesa 24 onz. ADHESIVA",
+      "stockQty": 22144.0,
+      "cost": 0.04,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC324AD.PSMART": {
+      "code": "EC324AD.PSMART",
+      "description": "Etiq. S.Inglesa24 onz.p/tetrapackPSMART.Sin C/barras",
+      "stockQty": 51884.0,
+      "cost": 0.04,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC405AD": {
+      "code": "EC405AD",
+      "description": "Etiq. Salsa Condimentada 5.5 onz. ADHESIVA",
+      "stockQty": 2519.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC410AD": {
+      "code": "EC410AD",
+      "description": "Etiq. Salsa Condimentada 10.5 onz. ADHESIVA",
+      "stockQty": 17292.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC424AD": {
+      "code": "EC424AD",
+      "description": "Etiq. Salsa Condimentada 24 onz. ADHESIVA",
+      "stockQty": 23225.0,
+      "cost": 0.04,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC424AD.PSMART": {
+      "code": "EC424AD.PSMART",
+      "description": "Etiq. S.Condimentada24onz p/tetrapackPSMART.Sin C/barras",
+      "stockQty": 26571.0,
+      "cost": 0.04,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC505AD": {
+      "code": "EC505AD",
+      "description": "Etiq. Vainilla 5.5 onz. ADHESIVA",
+      "stockQty": 23199.5,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC510AD": {
+      "code": "EC510AD",
+      "description": "ET  VAINILLA 10.5 Oz",
+      "stockQty": 13296.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC605AD": {
+      "code": "EC605AD",
+      "description": "Etiq. Recao Criollo 5.5 onz. ADHESIVA",
+      "stockQty": 34847.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC610AD": {
+      "code": "EC610AD",
+      "description": "Etiq. Recao Criollo 10.5 onzas ADHESIVA",
+      "stockQty": 19210.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC624AD": {
+      "code": "EC624AD",
+      "description": "Etiq. Recao Criollo 24 onz. ADHESIVA",
+      "stockQty": 23028.0,
+      "cost": 0.04,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC624AD.PSMART": {
+      "code": "EC624AD.PSMART",
+      "description": "Etiq.Recao Criollo24 onz p/tetrapack PSMART Sin c/barras",
+      "stockQty": 15662.0,
+      "cost": 0.04,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC6539": {
+      "code": "EC6539",
+      "description": "Et Adh. Esponja Con Paño 8x12 6539 (156937)",
+      "stockQty": 1920.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC6540": {
+      "code": "EC6540",
+      "description": "Et Adh. Abrasivo Triple  4x3x6 6540 (156938)",
+      "stockQty": 16598.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EC6541": {
+      "code": "EC6541",
+      "description": "Et Adh. Esponja y Paño 6541  (156936)",
+      "stockQty": 26174.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ECM0205": {
+      "code": "ECM0205",
+      "description": "Etiq. Salsa Sansae Mini China Concentrada. 48/5.5 oz",
+      "stockQty": 2582.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ECM0305": {
+      "code": "ECM0305",
+      "description": "Etiq. Salsa Sansae Mini Inglesa 48/5.5 oz",
+      "stockQty": 47780.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ECM0405": {
+      "code": "ECM0405",
+      "description": "Etiq. Salsa Sansae Mini Condimentada 48/5.5 oz",
+      "stockQty": 21411.5,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ECS7270AD": {
+      "code": "ECS7270AD",
+      "description": "Etiq. Splash Potasa",
+      "stockQty": 4206.999168,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF5020": {
+      "code": "EF5020",
+      "description": "Et. Fr. AD. Amoniaco de 20 onzas",
+      "stockQty": 4617.0,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF5029": {
+      "code": "EF5029",
+      "description": "Et. Fr. AD. Amoniaco de 29 onzas",
+      "stockQty": 11218.0,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF5091": {
+      "code": "EF5091",
+      "description": "Et Adh.  Amoniaco 128 Oz/1 Gal.",
+      "stockQty": 1423.0,
+      "cost": 0.06,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF5124AD": {
+      "code": "EF5124AD",
+      "description": "Etiquetas Frente adhesivas Multi Cleaner Limpiador 20 oz",
+      "stockQty": 12169.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF5132AD": {
+      "code": "EF5132AD",
+      "description": "Etiq.Frente adhesiva Multi Cleaner limpiador Todo Uso 29 oz .",
+      "stockQty": 12094.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF5216": {
+      "code": "EF5216",
+      "description": "Etiqueta de Pinoclin de 16 onzas 470 ml \"INSP LAB\"",
+      "stockQty": 2858.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF5224AD": {
+      "code": "EF5224AD",
+      "description": "Etiq. AD. Pinoclin 20 onz.-585 ml \"INSP LAB\"",
+      "stockQty": 7329.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF5232AD": {
+      "code": "EF5232AD",
+      "description": "Etiq. AD. Pinoclin 29 onz.-870 ml \"INSP LAB\"",
+      "stockQty": 5701.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF5264": {
+      "code": "EF5264",
+      "description": "Et Adh.  Fr Pinoclin     66 Oz",
+      "stockQty": 5071.0,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF5291": {
+      "code": "EF5291",
+      "description": "Et Adh.  Fr Pinoclin 128 Oz/1gal.",
+      "stockQty": 5683.0,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF6216AT": {
+      "code": "EF6216AT",
+      "description": "Etiqueta Frente W. Cleaner 16 onz 470 ml Atomizador.(6214)",
+      "stockQty": 18630.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF6216RE": {
+      "code": "EF6216RE",
+      "description": "Etiqueta Respaldo W. Cleaner 16 onz. 470 ml Repuesto (6215)",
+      "stockQty": 5116.0,
+      "cost": 0.02,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF6224AT": {
+      "code": "EF6224AT",
+      "description": "CB 025433062241 Etiq. AD. W.CLeaner 20 onz.-585 ml.AT.",
+      "stockQty": 15649.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF6224RE": {
+      "code": "EF6224RE",
+      "description": "CB 025433062258Etiq. AD. W.Cleaner 20 onz.-585 ml.Rep.",
+      "stockQty": 8986.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF6232AT": {
+      "code": "EF6232AT",
+      "description": "025433062340-Etiq. Ad. W.Cleaner 29 onz.-870 ml.AT.",
+      "stockQty": 14324.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF6232RE": {
+      "code": "EF6232RE",
+      "description": "CB 025433062357 Etiq. AD. Frente.  W.Cleaner 29 onz.-870 ml.Rep.",
+      "stockQty": 13904.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF6264": {
+      "code": "EF6264",
+      "description": "Et Fr Windo Cleaner 66  / ½ GALON",
+      "stockQty": 4377.0,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF6291PS": {
+      "code": "EF6291PS",
+      "description": "Et Adh.  Fr Windo Cleaner 1 Gal. PRICESMART",
+      "stockQty": 12695.0,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF6824FTE": {
+      "code": "EF6824FTE",
+      "description": "Etiq. AD. Frente MCL. Bano 20 onz.",
+      "stockQty": 23484.5,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF6832FTE": {
+      "code": "EF6832FTE",
+      "description": "Etiq. AD. Frente MCL. Bano 29 onz.",
+      "stockQty": 22222.0,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF7020FTE": {
+      "code": "EF7020FTE",
+      "description": "Et. Frente Mcl. Cocina 585 ml ( 20 onz.) \"INSP LAB\"",
+      "stockQty": 22764.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF7029FTE": {
+      "code": "EF7029FTE",
+      "description": "Et. Frente Mcl. Cocina 870 ml. ( 29 onz. ) \"INSP LAB\"",
+      "stockQty": 11258.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "EF7302": {
+      "code": "EF7302",
+      "description": "Etiq. Generica Quimico",
+      "stockQty": 0.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ER5124AD": {
+      "code": "ER5124AD",
+      "description": "CB 025433051245 Etiq. adhesivas Multi Cleaner limpiador Respaldo 20 oz AT",
+      "stockQty": 10662.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ER5125AD": {
+      "code": "ER5125AD",
+      "description": "025433051252-Etiq. Adhesivas Multi Cleaner limpiador 20 oz Respaldo REP",
+      "stockQty": 9042.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ER5132AD": {
+      "code": "ER5132AD",
+      "description": "025433051320 -Etiq. adhesivas Multi Cleaner limpiador 29 oz respaldo AT",
+      "stockQty": 21025.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ER5133AD": {
+      "code": "ER5133AD",
+      "description": "025433051337 Etiq. adhesivas Multi Cleaner limpiador 29 oz respaldo REP",
+      "stockQty": 9974.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ER6824AT": {
+      "code": "ER6824AT",
+      "description": "CB 025433068243Etiq. AD. MCL. Bano 20 onz. AT.",
+      "stockQty": 69964.0,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ER6824RE": {
+      "code": "ER6824RE",
+      "description": "CB. 025433068250.Etiq. AD. MCL. Bano 20 onz. Rep.",
+      "stockQty": 19619.5,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ER6832AT": {
+      "code": "ER6832AT",
+      "description": "02543068328 Etiq. AD. MCL. Bano 29 onz. AT",
+      "stockQty": 44214.0,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ER6832RE": {
+      "code": "ER6832RE",
+      "description": "CB 025433068359Etiq. AD. MCl. Bano 29 onz. Rep.",
+      "stockQty": 12702.0,
+      "cost": 0.05,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ER7020AT": {
+      "code": "ER7020AT",
+      "description": "025433070208 Etiq. MCL. Cocina 20 onz-585 ml.At. \"INSP LAB\"",
+      "stockQty": 16452.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ER7020RE": {
+      "code": "ER7020RE",
+      "description": "CB 025433070215 Etiq. MCL. Cocina 20 onz-585ml.Rep. \"INSP LAB\"",
+      "stockQty": 20450.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ER7029AT": {
+      "code": "ER7029AT",
+      "description": "CB 025433070291 Etiq. MCL. Cocina 29 onz-870ml.AT \"INSP LAB\"",
+      "stockQty": 14238.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "ER7029RE": {
+      "code": "ER7029RE",
+      "description": "CB 025433070307 Etiq. MCL. Cocina 29 onz-870ml.Rep. \"INSP LAB\"",
+      "stockQty": 10528.0,
+      "cost": 0.03,
+      "supplier": "",
+      "sheet": "Hoja3"
+    },
+    "BOLPASTILLA": {
+      "code": "BOLPASTILLA",
+      "description": "Bolsas de plastico para pastillas de 16 cm x 12 cm adhesivas",
+      "stockQty": 2747.0,
+      "cost": 0.05,
+      "supplier": "DE TODO AQUÍ",
+      "sheet": "ME al 24-jul"
+    },
+    "EAD6332": {
+      "code": "EAD6332",
+      "description": "Et. Adh. Alka Plus   5 lbs.(025433063323)",
+      "stockQty": 7885.0,
+      "cost": 0.05,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EAOB-01": {
+      "code": "EAOB-01",
+      "description": "Etiq. Plateada Pequeña Ocean Blue",
+      "stockQty": 0.0,
+      "cost": 0.02,
+      "supplier": "NO PEDIR",
+      "sheet": "ME al 24-jul"
+    },
+    "EAOB-02": {
+      "code": "EAOB-02",
+      "description": "Etiq. Plateada Grande Ocean Blue",
+      "stockQty": 0.0,
+      "cost": 0.09,
+      "supplier": "NO PEDIR",
+      "sheet": "ME al 24-jul"
+    },
+    "EF05908": {
+      "code": "EF05908",
+      "description": "Et. Adh Pastillas de doble accion para piscinas 5/1 (025433059081)",
+      "stockQty": 850.0,
+      "cost": 0.05,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF05909": {
+      "code": "EF05909",
+      "description": "Et. Adh Pastillas Multifunction para piscinas 5/1 025433059098",
+      "stockQty": 3528.67,
+      "cost": 0.06,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF1075": {
+      "code": "EF1075",
+      "description": "Et Adh. Ph Plus  5 Lbs (025433063224)",
+      "stockQty": 1080.0,
+      "cost": 0.05,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF1080": {
+      "code": "EF1080",
+      "description": "Et Adh. Ph Plus   10 Lbss",
+      "stockQty": 0.0,
+      "cost": 0.06,
+      "supplier": "NO PEDIR",
+      "sheet": "ME al 24-jul"
+    },
+    "EF1562": {
+      "code": "EF1562",
+      "description": "Et Adh. Cloro Granular 65% 35 Lbss.",
+      "stockQty": 41.0,
+      "cost": 0.88,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF1567": {
+      "code": "EF1567",
+      "description": "Et Adh. Cloro Granular   7 Lbs 025433064245",
+      "stockQty": 2101.0,
+      "cost": 0.04,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF1570.3": {
+      "code": "EF1570.3",
+      "description": "Etiqueta Adh. Pastilla Tricloro 200  10 Unids. (025433066140)",
+      "stockQty": 727.0,
+      "cost": 0.07,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF1570-I": {
+      "code": "EF1570-I",
+      "description": "Et. Adh Pastillas TCCA Individuales",
+      "stockQty": 6976.0,
+      "cost": 0.03,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF1578": {
+      "code": "EF1578",
+      "description": "Et Adh. Pool Floc  10 Lbss (025433063149)",
+      "stockQty": 964.0,
+      "cost": 0.08,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF1585": {
+      "code": "EF1585",
+      "description": "Et Adh. T/Diatomacea  5 Lbs (025433057322)",
+      "stockQty": 532.0,
+      "cost": 0.05,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF1587": {
+      "code": "EF1587",
+      "description": "Et Adh. Estabilizador   7 Lbs",
+      "stockQty": 725.0,
+      "cost": 0.05,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF2278": {
+      "code": "EF2278",
+      "description": "Et Adh. Algicide 12% 1 Gal (025433064146)",
+      "stockQty": 945.0,
+      "cost": 0.05,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF2278.2": {
+      "code": "EF2278.2",
+      "description": "Ef Adh. Algicide 12%  32 Oz (025433064320)",
+      "stockQty": 1505.0,
+      "cost": 0.06,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF2280": {
+      "code": "EF2280",
+      "description": "Et Adh. Algicide 20%  1 Gal (025433066324)",
+      "stockQty": 3167.0,
+      "cost": 0.06,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF2280.2": {
+      "code": "EF2280.2",
+      "description": "Et Adh.  Algicide 20% 32 Onz (025433053324)",
+      "stockQty": 1669.0,
+      "cost": 0.05,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF2281.5": {
+      "code": "EF2281.5",
+      "description": "Et Adh. Algicida Concentrado 32 Oz.(025433061084)",
+      "stockQty": 558.76,
+      "cost": 0.05,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF4061": {
+      "code": "EF4061",
+      "description": "Et Adh. Ph Minus-A.M.  1 Gal (025433058244)",
+      "stockQty": 1286.0,
+      "cost": 0.06,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF4062.45": {
+      "code": "EF4062.45",
+      "description": "Et Adh. Acido Citrico Liquido  1 Gal. a 50%",
+      "stockQty": 6073.25,
+      "cost": 0.04,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EF6422": {
+      "code": "EF6422",
+      "description": "Etiq. Autoad.Cloro Granular 0.5 KG",
+      "stockQty": 0.0,
+      "cost": 0.1,
+      "supplier": "NO PEDIR",
+      "sheet": "ME al 24-jul"
+    },
+    "EF6426": {
+      "code": "EF6426",
+      "description": "Et. adh Cloro Granular 45 KG.",
+      "stockQty": 0.0,
+      "cost": 0.04,
+      "supplier": "NO PEDIR",
+      "sheet": "ME al 24-jul"
+    },
+    "EF7300": {
+      "code": "EF7300",
+      "description": "Etiq. Generica Ocean Blue",
+      "stockQty": 934.67,
+      "cost": 0.06,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EFCLAR1578": {
+      "code": "EFCLAR1578",
+      "description": "Et. Adh Clarificador 32 oz (025433015780)",
+      "stockQty": 900.69,
+      "cost": 0.05,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "EFCLAR1578.10": {
+      "code": "EFCLAR1578.10",
+      "description": "Et. Adh Clarificador 1 Gal.",
+      "stockQty": 3500.0,
+      "cost": 0.05,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "ERTVO": {
+      "code": "ERTVO",
+      "description": "Et Adh.  Reactivos",
+      "stockQty": 1757.0,
+      "cost": 0.02,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "ET6429": {
+      "code": "ET6429",
+      "description": "Et Adh. Cloro Granular Multifunction Ocean Blue 7 Lbs (025433064290)",
+      "stockQty": 2067.0,
+      "cost": 0.08,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "ET6430": {
+      "code": "ET6430",
+      "description": "Et Adh. Cloro Granular Multifunction Ocean Blue 50 Kg (025433064306)",
+      "stockQty": 0.0,
+      "cost": 0.13,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "ET6431": {
+      "code": "ET6431",
+      "description": "Et Adh. Cloro Granular Multifunction Ocean Blue 35 lbs",
+      "stockQty": 899.0,
+      "cost": 0.07,
+      "supplier": "DOCUMENTOS MODERNOS",
+      "sheet": "ME al 24-jul"
+    },
+    "BOL23X32P": {
+      "code": "BOL23X32P",
+      "description": "Bolsa 23 X 32 Calibre 5",
+      "stockQty": 3203.0,
+      "cost": 0.39,
+      "supplier": "INDUSPLAST",
+      "sheet": "ME al 24-jul"
+    },
+    "BOLPEESPO": {
+      "code": "BOLPEESPO",
+      "description": "Bolsa De Esponjas 18x26 Pe Cal. 2",
+      "stockQty": 5446.375,
+      "cost": 0.11,
+      "supplier": "INDUSPLAST",
+      "sheet": "ME al 24-jul"
+    },
+    "BOLPISCIN": {
+      "code": "BOLPISCIN",
+      "description": "Bolsa  11 X 22 Pe Cal. 6",
+      "stockQty": 3830.0,
+      "cost": 0.16,
+      "supplier": "INDUSPLAST",
+      "sheet": "ME al 24-jul"
+    },
+    "CI16AT": {
+      "code": "CI16AT",
+      "description": "Cajeta para 16 onzas 470 ml.  AT. Todo uso 12/16 oz ECSA 0050 \"INSP LAB\"",
+      "stockQty": 2341.0,
+      "cost": 0.81,
+      "supplier": "ECSA",
+      "sheet": "ME al 24-jul"
+    },
+    "CI20": {
+      "code": "CI20",
+      "description": "Cajeta para Mcl. Baño de 20 onzas. M-29455A. ECSA#0049-0",
+      "stockQty": 6782.5,
+      "cost": 1.5,
+      "supplier": "PROPACK",
+      "sheet": "ME al 24-jul"
+    },
+    "CI240GRCOMP": {
+      "code": "CI240GRCOMP",
+      "description": "Cajeta/International/240gr.Potasa  ECSA#0045-0",
+      "stockQty": 3560.0,
+      "cost": 0.63,
+      "supplier": "ECSA",
+      "sheet": "ME al 24-jul"
+    },
+    "CI29": {
+      "code": "CI29",
+      "description": "Cajeta para MCl. Baño de 29 onzas #2007-0052-0",
+      "stockQty": 5024.865,
+      "cost": 1.09,
+      "supplier": "PROPACK",
+      "sheet": "ME al 24-jul"
+    },
+    "CI585AT": {
+      "code": "CI585AT",
+      "description": "Cajeta para botella 585ml Atom. \"INSP LAB\"",
+      "stockQty": 1185.75,
+      "cost": 0.53,
+      "supplier": "PROPACK",
+      "sheet": "ME al 24-jul"
+    },
+    "CI66COMP": {
+      "code": "CI66COMP",
+      "description": "Cajeta/International/66 Oz  ECSA 0034-0",
+      "stockQty": 2610.0,
+      "cost": 1.02,
+      "supplier": "ECSA",
+      "sheet": "ME al 24-jul"
+    },
+    "CI66JICOMP": {
+      "code": "CI66JICOMP",
+      "description": "Cajeta/International/66 Oz/Jigger ECSA#0011-0 (1 PAD 173H)",
+      "stockQty": 38.0,
+      "cost": 1.12,
+      "supplier": "ECSA",
+      "sheet": "ME al 24-jul"
+    },
+    "CI870AT": {
+      "code": "CI870AT",
+      "description": "Cajeta para botella 870ml Atom. \"INSP LAB\"",
+      "stockQty": 2444.0,
+      "cost": 0.87,
+      "supplier": "PROPACK",
+      "sheet": "ME al 24-jul"
+    },
+    "CIREFIL": {
+      "code": "CIREFIL",
+      "description": "ECSA#2007-058 Cajeta con division para Refil 450ml, 800 ml, 3.1 lt",
+      "stockQty": 3568.0,
+      "cost": 0.95,
+      "supplier": "ECSA",
+      "sheet": "ME al 24-jul"
+    },
+    "CS10.5": {
+      "code": "CS10.5",
+      "description": "Cajeta Salsa 10.5 Oz. ECSA#0048-0",
+      "stockQty": 325.0,
+      "cost": 0.63,
+      "supplier": "ECSA",
+      "sheet": "ME al 24-jul"
+    },
+    "CS24": {
+      "code": "CS24",
+      "description": "Cajeta para botella de salsa de 24 onzas/ ECSA#0004-0",
+      "stockQty": 6748.333514,
+      "cost": 0.67,
+      "supplier": "ECSA",
+      "sheet": "ME al 24-jul"
+    },
+    "CS5.5": {
+      "code": "CS5.5",
+      "description": "Cajeta Salsa 5.5 Oz. ECSA#0006-0",
+      "stockQty": 3677.0,
+      "cost": 0.75,
+      "supplier": "ECSA",
+      "sheet": "ME al 24-jul"
+    },
+    "CSGAL": {
+      "code": "CSGAL",
+      "description": "Cajeta Galón 32x32x32",
+      "stockQty": 3645.0,
+      "cost": 0.74,
+      "supplier": "ECSA",
+      "sheet": "ME al 24-jul"
+    },
+    "CSTETRA": {
+      "code": "CSTETRA",
+      "description": "Bandeja corrugada para COD. 0498/ 960F. 46x40.375x3",
+      "stockQty": 809.0,
+      "cost": 2.07,
+      "supplier": "ECSA",
+      "sheet": "ME al 24-jul"
+    },
+    "CV16": {
+      "code": "CV16",
+      "description": "Corrugado para Vinagre de 16 onzas-ECSA#0057",
+      "stockQty": 3614.0,
+      "cost": 0.93,
+      "supplier": "ECSA",
+      "sheet": "ME al 24-jul"
+    },
+    "CV32": {
+      "code": "CV32",
+      "description": "Corrugado para Vinagre de 32 onzas #0053-0 M32458",
+      "stockQty": 298.0,
+      "cost": 0.84,
+      "supplier": "ECSA",
+      "sheet": "ME al 24-jul"
+    },
+    "CV8": {
+      "code": "CV8",
+      "description": "Corrugado para Vinagre de 8 onzas #0054-0 - M32460",
+      "stockQty": 2618.0,
+      "cost": 0.37,
+      "supplier": "ECSA",
+      "sheet": "ME al 24-jul"
+    },
+    "DIVCORCI585AT": {
+      "code": "DIVCORCI585AT",
+      "description": "DIVISION CORTA CAJA CI585AT",
+      "stockQty": 3.0,
+      "cost": 108.66,
+      "supplier": "nan",
+      "sheet": "ME al 24-jul"
+    },
+    "DIVLARCI585AT": {
+      "code": "DIVLARCI585AT",
+      "description": "DIVISION LARGA CAJA CI585AT",
+      "stockQty": 3.0,
+      "cost": 71.46,
+      "supplier": "nan",
+      "sheet": "ME al 24-jul"
+    },
+    "BC1GAL": {
+      "code": "BC1GAL",
+      "description": "Botella de 1 galón Redondo Semitransparente con Plug",
+      "stockQty": 4357.0,
+      "cost": 0.4,
+      "supplier": "MEGAPET",
+      "sheet": "ME al 24-jul"
+    },
+    "BCARB5": {
+      "code": "BCARB5",
+      "description": "Carboya 5 Gal. Con Tapa",
+      "stockQty": 464.0,
+      "cost": 3.63,
+      "supplier": "ENVASA",
+      "sheet": "ME al 24-jul"
+    },
+    "BCB5GALPE": {
+      "code": "BCB5GALPE",
+      "description": "Botella Cilíndrica blanca de 5 galones (cubo + asa + tapa )",
+      "stockQty": 211.0,
+      "cost": 4.65,
+      "supplier": "MONOTEK",
+      "sheet": "ME al 24-jul"
+    },
+    "BCB8PE": {
+      "code": "BCB8PE",
+      "description": "Botella Cilíndrica Blanca  PE 8 oz 1/24 ud. P/Potasa",
+      "stockQty": 255.0,
+      "cost": 0.2,
+      "supplier": "ALBASA",
+      "sheet": "ME al 24-jul"
+    },
+    "BCLITRO": {
+      "code": "BCLITRO",
+      "description": "Bot/ Cil Litro Pe Natural",
+      "stockQty": 8197.0,
+      "cost": 0.5,
+      "supplier": "MEGAPET",
+      "sheet": "ME al 24-jul"
+    },
+    "BCPI64PE": {
+      "code": "BCPI64PE",
+      "description": "Bot/Cubo/Pintura/1 Galon",
+      "stockQty": 2373.0,
+      "cost": 1.25,
+      "supplier": "MONOTEK",
+      "sheet": "ME al 24-jul"
+    },
+    "BOB20ENV": {
+      "code": "BOB20ENV",
+      "description": "Botella Ovalada 20 onzas",
+      "stockQty": 45732.0,
+      "cost": 0.32,
+      "supplier": "ENVASA",
+      "sheet": "ME al 24-jul"
+    },
+    "BOB29ENV": {
+      "code": "BOB29ENV",
+      "description": "Botella ovalada blanca de 29 onzas",
+      "stockQty": 24108.0,
+      "cost": 0.31,
+      "supplier": "ENVASA",
+      "sheet": "ME al 24-jul"
+    },
+    "BPET470N": {
+      "code": "BPET470N",
+      "description": "Botella PET 470 ml 16 onzas Natural (Rociador) \"INSP LAB\"",
+      "stockQty": 23432.0,
+      "cost": 0.22,
+      "supplier": "PET PANAMA",
+      "sheet": "ME al 24-jul"
+    },
+    "BPET585NA": {
+      "code": "BPET585NA",
+      "description": "Botella PET 585 ml Natural.Atom.ENVASA \"INSP LAB\"",
+      "stockQty": 20331.0,
+      "cost": 0.31,
+      "supplier": "ENVASA",
+      "sheet": "ME al 24-jul"
+    },
+    "BPET870NA": {
+      "code": "BPET870NA",
+      "description": "Botella PET 870ml Natural.Atom.ENVASA \"INSP LAB\"",
+      "stockQty": 6504.0,
+      "cost": 0.35,
+      "supplier": "ENVASA",
+      "sheet": "ME al 24-jul"
+    },
+    "BPETN32CANE": {
+      "code": "BPETN32CANE",
+      "description": "Botella tipo M 32 oz PETnatural con tapas para Canecas",
+      "stockQty": 1225.0,
+      "cost": 0.4,
+      "supplier": "PLASTICOS UNIDOS",
+      "sheet": "ME al 24-jul"
+    },
+    "BS10.5": {
+      "code": "BS10.5",
+      "description": "Botella Salsa 10.5 oz PET",
+      "stockQty": 117232.0,
+      "cost": 0.12,
+      "supplier": "PLASTIGLAS",
+      "sheet": "ME al 24-jul"
+    },
+    "BS24PET": {
+      "code": "BS24PET",
+      "description": "Botella Salsa 24 Oz PET",
+      "stockQty": 29906.0,
+      "cost": 0.12,
+      "supplier": "PLASTIGLAS",
+      "sheet": "ME al 24-jul"
+    },
+    "BS5.5": {
+      "code": "BS5.5",
+      "description": "Bot Salsa 5.5Oz. PET",
+      "stockQty": 128932.0,
+      "cost": 0.1,
+      "supplier": "PLASTIGLAS",
+      "sheet": "ME al 24-jul"
+    },
+    "BS5.5ENV": {
+      "code": "BS5.5ENV",
+      "description": "Bot Salsa 5.5 Oz. Envasa",
+      "stockQty": 28832.0,
+      "cost": 0.13,
+      "supplier": "ENVASA",
+      "sheet": "ME al 24-jul"
+    },
+    "BV16": {
+      "code": "BV16",
+      "description": "Botella para Vinagre de 16 onzas",
+      "stockQty": 2555.0,
+      "cost": 0.09,
+      "supplier": "ARCOM",
+      "sheet": "ME al 24-jul"
+    },
+    "BV32": {
+      "code": "BV32",
+      "description": "Botella para Vinagre de 32 onzas",
+      "stockQty": 6641.0,
+      "cost": 0.12,
+      "supplier": "ARCOM",
+      "sheet": "ME al 24-jul"
+    },
+    "BV8": {
+      "code": "BV8",
+      "description": "Botella para Vinagre de 8 onzas",
+      "stockQty": 10907.0,
+      "cost": 0.09,
+      "supplier": "ARCOM",
+      "sheet": "ME al 24-jul"
+    },
+    "BD500GRBICAR": {
+      "code": "BD500GRBICAR",
+      "description": "Bolsa Multi Cleaner Bicarbonato de 500 gr ZIPPER",
+      "stockQty": 1000.0,
+      "cost": 0.25,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BD500MLMCB": {
+      "code": "BD500MLMCB",
+      "description": "Bolsa Multi Cleaner Bano de 500 ml. sin tapa.",
+      "stockQty": 10955.0,
+      "cost": 0.35,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BD500MLMCC": {
+      "code": "BD500MLMCC",
+      "description": "Bolsa Multi Cleaner Cocina de 500 ml. sin tapa \"INSP LAB\"",
+      "stockQty": 26742.0,
+      "cost": 0.33,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BD500MLMCTD": {
+      "code": "BD500MLMCTD",
+      "description": "Bolsa Multi Cleaner Todo Uso de 500 ml. sin tapa.",
+      "stockQty": 10456.0,
+      "cost": 0.24,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BD500MLPINO": {
+      "code": "BD500MLPINO",
+      "description": "Bolsa Pinoclin de 500 ml. sin tapa \"INSP LAB\"",
+      "stockQty": 3084.0,
+      "cost": 0.26,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BD500MLWINDO": {
+      "code": "BD500MLWINDO",
+      "description": "Bolsa Windo Cleaner de 500 ml. sin tapa.",
+      "stockQty": 11548.0,
+      "cost": 0.24,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BDP3.1LITBLOSSOM": {
+      "code": "BDP3.1LITBLOSSOM",
+      "description": "Bolsa Doy Pack Refil Blossom 3.1 litros",
+      "stockQty": 2387.0,
+      "cost": 0.37,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BDP3LITREFIL": {
+      "code": "BDP3LITREFIL",
+      "description": "Bolsa de Refil Primaveral de 3.1 litros",
+      "stockQty": 1472.0,
+      "cost": 0.37,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BDP450MLLAV": {
+      "code": "BDP450MLLAV",
+      "description": "Bolsa Refil Lavanda de 450 ml",
+      "stockQty": 4320.0,
+      "cost": 0.15,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BDP450MLPRIM": {
+      "code": "BDP450MLPRIM",
+      "description": "Bolsa Refil Primaveral 450 ml.",
+      "stockQty": 7826.0,
+      "cost": 0.17,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BDP800MLBEBE": {
+      "code": "BDP800MLBEBE",
+      "description": "Bolsa Refil Bebe de 800 ml. Con tapa.",
+      "stockQty": 27463.0,
+      "cost": 0.23,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BDP800MLCPETAL": {
+      "code": "BDP800MLCPETAL",
+      "description": "Bolsa Refil Caricias de Petalo de 800 ml. Con tapa",
+      "stockQty": 17531.0,
+      "cost": 0.23,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BDP800MLDVAINIL": {
+      "code": "BDP800MLDVAINIL",
+      "description": "Bolsa Refil Delicada Vainilla de 800 ml. Con tapa",
+      "stockQty": 13910.0,
+      "cost": 0.24,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BDP800MLFCHOCO": {
+      "code": "BDP800MLFCHOCO",
+      "description": "Bolsa Refil Fresa Chocolate de 800 ml. Con tapa",
+      "stockQty": 5469.0,
+      "cost": 0.23,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BDP800MLLAV": {
+      "code": "BDP800MLLAV",
+      "description": "Bolsa Refil Lavanda de 800 ml. con tapa.",
+      "stockQty": 21707.0,
+      "cost": 0.23,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    },
+    "BDP800MLPRIM": {
+      "code": "BDP800MLPRIM",
+      "description": "Bolsa Refil Primaveral de 800 ml. Con tapa.",
+      "stockQty": 23753.0,
+      "cost": 0.23,
+      "supplier": "H & M",
+      "sheet": "ME al 24-jul"
+    }
+  },
+  "generatedFrom": "uploaded xls"
+}
