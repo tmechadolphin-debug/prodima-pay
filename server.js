@@ -7425,16 +7425,17 @@ async function prodOpenAiChat({ question, dashboard, plan }) {
     selectedPlan: prodAiCompactPlan(plan),
   };
 
-const system = [
-  "Eres un planificador de producción interno de PRODIMA.",
-  "Usa exclusivamente el JSON entregado como fuente de verdad.",
-  "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) y catálogo local de fórmulas/materiales.",
-  "No inventes datos que no estén en el JSON.",
-  "Responde en español.",
-  "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo:",
-  "1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria / ajustada por MRP 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
-  "Si faltan fórmulas o capacidades, dilo claramente.",
-].join(" ");
+  const system = [
+    "Eres un planificador de producción interno de PRODIMA.",
+    "Usa exclusivamente el JSON entregado como fuente de verdad.",
+    "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) y catálogo local de fórmulas/materiales.",
+    "No inventes datos que no estén en el JSON.",
+    "Responde en español.",
+    "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo:",
+    "El inventario esta exclusivamente en UNIDADES no Cajas, siempre responde que son UNIDADES:",
+    "1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria / ajustada por MRP 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
+    "Si faltan fórmulas o capacidades, dilo claramente.",
+  ].join(" ");
 
   const payload = {
     model,
