@@ -7380,6 +7380,19 @@ function prodAiCompactDashboard(data) {
 }
 function prodAiCompactPlan(plan) {
   if (!plan) return null;
+
+  const rawMaterials = Array.isArray(plan.requirements?.rawMaterials)
+    ? plan.requirements.rawMaterials
+    : [];
+
+  const packaging = Array.isArray(plan.requirements?.packaging)
+    ? plan.requirements.packaging
+    : [];
+
+  const bottlenecks = Array.isArray(plan.requirements?.bottlenecks)
+    ? plan.requirements.bottlenecks
+    : [];
+
   return {
     itemCode: plan.itemCode,
     itemDesc: plan.itemDesc,
@@ -7387,17 +7400,36 @@ function prodAiCompactPlan(plan) {
     area: plan.area,
     machine: plan.machine,
     period: plan.period,
+
     avgMonthlyQty: plan.avgMonthlyQty,
     projectedQty: plan.projectedQty,
+
     inventory: plan.inventory,
     mrp: plan.mrp,
     production: plan.production,
     capacity: plan.capacity,
-    requirements: {
-      bottlenecks: plan.requirements?.bottlenecks || [],
-      rawTop: (plan.requirements?.rawMaterials || []).slice(0, 20),
-      packagingTop: (plan.requirements?.packaging || []).slice(0, 20),
+
+    formula: {
+      litersPerUnit: plan.production?.litersPerUnit || 0,
+      baseLiquidCode: plan.production?.baseLiquidCode || "",
+      litersRequired: plan.production?.litersRequired || 0,
+      neededQty: plan.production?.neededQty || 0,
+      adjustedQty: plan.production?.adjustedQty || 0
     },
+
+    requirements: {
+      hasRawMaterials: rawMaterials.length > 0,
+      hasPackaging: packaging.length > 0,
+      hasBottlenecks: bottlenecks.length > 0,
+
+      rawMaterialsCount: rawMaterials.length,
+      packagingCount: packaging.length,
+      bottlenecksCount: bottlenecks.length,
+
+      rawMaterials,
+      packaging,
+      bottlenecks
+    }
   };
 }
 function prodExtractResponseText(obj) {
@@ -7425,17 +7457,20 @@ async function prodOpenAiChat({ question, dashboard, plan }) {
     selectedPlan: prodAiCompactPlan(plan),
   };
 
-  const system = [
-    "Eres un planificador de producción interno de PRODIMA.",
-    "Usa exclusivamente el JSON entregado como fuente de verdad.",
-    "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) y catálogo local de fórmulas/materiales.",
-    "No inventes datos que no estén en el JSON.",
-    "Responde en español.",
-    "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo:",
-    "El inventario esta exclusivamente en UNIDADES no Cajas, siempre responde que son UNIDADES:",
-    "1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria / ajustada por MRP 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
-    "Si faltan fórmulas o capacidades, dilo claramente.",
-  ].join(" ");
+const system = [
+  "Eres un planificador de producción interno de PRODIMA.",
+  "Usa exclusivamente el JSON entregado como fuente de verdad.",
+  "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) y catálogo local de fórmulas/materiales.",
+  "No inventes datos que no estén en el JSON.",
+  "Responde en español.",
+  "IMPORTANTE: las cantidades de producto terminado siempre se expresan en UNIDADES, nunca en cajas.",
+  "IMPORTANTE: si el JSON trae requirements.rawMaterials, requirements.packaging o requirements.bottlenecks, debes analizarlos y mencionarlos explícitamente.",
+  "IMPORTANTE: no digas que faltan materias primas, empaques o cuellos de botella si esos arreglos existen en el JSON y tienen elementos.",
+  "IMPORTANTE: usa formula.litersPerUnit, formula.baseLiquidCode y formula.litersRequired cuando existan.",
+  "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo:",
+  "1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria / ajustada por MRP 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
+  "Si realmente falta información en el JSON, dilo claramente.",
+].join(' ');
 
   const payload = {
     model,
