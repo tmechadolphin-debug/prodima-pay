@@ -4187,7 +4187,7 @@ globalThis.normalizeGrupoFinal = function normalizeGrupoFinal(grupoRaw) {
   return canon || "Sin grupo";
 }
 
-function inferAreaFromGroup(groupName) {
+globalThis.inferAreaFromGroup = function inferAreaFromGroup(groupName) {
   const g = normGroupName(groupName);
   if (!g) return "";
   if (GROUPS_CONS_N.has(g)) return "CONS";
@@ -4760,7 +4760,7 @@ async function syncItemGroupsForSalesItems({ from, to, maxItems = 1500 }) {
 
       // ✅ FIX: normaliza (canon + heurística) para evitar "Sin grupo"
       const grupo = globalThis.normalizeGrupoFinal(groupNameRaw || "");
-      const area = inferAreaFromGroup(grupo) || inferAreaFromGroup(groupNameRaw) || "";
+      const area = globalThis.inferAreaFromGroup(grupo) || globalThis.inferAreaFromGroup(groupNameRaw) || "";
 
       const itemDesc = (String(sap.itemName || "").trim() || descFromSales || "");
 
@@ -4876,7 +4876,7 @@ async function dashboardFromDb({ from, to, area, grupo, q }) {
     const grupoTxt = globalThis.normalizeGrupoFinal(grupoTxtRaw);
 
     const areaDb = String(r.area || "");
-    const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || "CONS";
+    const areaFinal = areaDb || globalThis.inferAreaFromGroup(grupoTxt) || globalThis.inferAreaFromGroup(grupoTxtRaw) || "CONS";
 
     return {
       itemCode: String(r.item_code || ""),
@@ -5074,7 +5074,7 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
       const grupoTxt = globalThis.normalizeGrupoFinal(grupoTxtRaw);
 
       const areaDb = String(r.area || "");
-      const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || "CONS";
+      const areaFinal = areaDb || globalThis.inferAreaFromGroup(grupoTxt) || globalThis.inferAreaFromGroup(grupoTxtRaw) || "CONS";
 
       return {
         docType: String(r.doc_type || ""),
@@ -6875,7 +6875,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const gp = prodNum(r.gp);
     const gpPct = rev > 0 ? (gp / rev) * 100 : 0;
     const grupoTxt = globalThis.normalizeGrupoFinal(String(r.grupo || "Sin grupo"));
-    const areaFinal = String(r.area || "") || inferAreaFromGroup(grupoTxt) || "CONS";
+    const areaFinal = String(r.area || "") || globalThis.inferAreaFromGroup(grupoTxt) || "CONS";
     const monthsMap = monthly.get(String(r.item_code || "")) || new Map();
 
     const avgMonthsSafe = Math.max(1, Number(avgMonths || 5));
@@ -7057,7 +7057,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const row0 = itemMaster.rows?.[0] || {};
   const itemDesc = String(row0.item_desc || meta?.description || "");
   const grupo = globalThis.normalizeGrupoFinal(String(row0.grupo || ""));
-  const area = String(row0.area || "") || inferAreaFromGroup(grupo) || "";
+  const area = String(row0.area || "") || globalThis.inferAreaFromGroup(grupo) || "";
   const machine = prodMachineFromAreaOrGroup(area, grupo, meta);
 
   const end = String(toDate || getDateISOInOffset(TZ_OFFSET_MIN));
