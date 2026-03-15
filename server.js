@@ -4487,6 +4487,69 @@ function pickGrossProfit(ln) {
   return 0;
 }
 
+const SALES_UOM_FACTOR_CACHE = new Map();
+
+async function getSalesLineQtyFactor(itemCode, line) {
+  const directCandidates = [
+    line?.NumPerMsr,
+    line?.ItemsPerUnit,
+    line?.UnitsOfMeasurement,
+    line?.UnitsOfMeasurment,
+    line?.UomFactor,
+  ];
+
+  for (const c of directCandidates) {
+    const n = Number(c);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+
+  const code = String(itemCode || "").trim();
+  if (!code) return 1;
+
+  const uomEntry = Number(line?.UoMEntry ?? line?.UomEntry ?? NaN);
+  const cacheKey = `${code}::${Number.isFinite(uomEntry) ? uomEntry : "default"}`;
+  if (SALES_UOM_FACTOR_CACHE.has(cacheKey)) {
+    return SALES_UOM_FACTOR_CACHE.get(cacheKey);
+  }
+
+  let factor = 1;
+
+  try {
+    const itemFull = await slFetch(
+      `/Items('${encodeURIComponent(code)}')` +
+        `?$select=ItemCode,SalesItemsPerUnit` +
+        `&$expand=ItemUnitOfMeasurementCollection($select=UoMEntry,BaseQuantity,AlternateQuantity,UoMType)`,
+      { timeoutMs: 120000 }
+    );
+
+    if (Number.isFinite(uomEntry) && uomEntry > 0) {
+      const coll = Array.isArray(itemFull?.ItemUnitOfMeasurementCollection)
+        ? itemFull.ItemUnitOfMeasurementCollection
+        : [];
+
+      const row = coll.find((x) => Number(x?.UoMEntry) === uomEntry);
+      const base = Number(row?.BaseQuantity ?? NaN);
+      const alt = Number(row?.AlternateQuantity ?? NaN);
+
+      if (Number.isFinite(base) && base > 0 && Number.isFinite(alt) && alt > 0) {
+        factor = base / alt;
+      } else if (Number.isFinite(base) && base > 0) {
+        factor = base;
+      }
+    }
+
+    if (!(Number.isFinite(factor) && factor > 0)) {
+      factor = Number(getSalesUomFactor(itemFull) || 1);
+    }
+  } catch {}
+
+  if (!(Number.isFinite(factor) && factor > 0)) factor = 1;
+
+  SALES_UOM_FACTOR_CACHE.set(cacheKey, factor);
+  return factor;
+}
+
+
 async function scanDocHeaders(entity, { from, to, maxDocs = 2500 }) {
   const toPlus1 = addDaysISO(to, 1);
   const batchTop = 200;
@@ -4549,8 +4612,10 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
     const qtyRaw = Number(ln?.Quantity || 0);
     const revRaw = Number(ln?.LineTotal || 0);
     const gpRaw = Number(pickGrossProfit(ln) || 0);
+    const qtyFactor = await getSalesLineQtyFactor(itemCode, ln);
 
-    const qty = Math.abs(qtyRaw) * sign;
+    // ✅ FIX PRODUCCIÓN: guardar siempre en UNIDADES (no cajas)
+    const qty = Math.abs(qtyRaw) * qtyFactor * sign;
     const rev = Math.abs(revRaw) * sign;
     const gp = Math.abs(gpRaw) * sign;
 
@@ -8068,6 +8133,7 @@ function prodAiCompactDashboard(data) {
     topItems,
   };
 }
+
 function prodAiCompactPlan(plan) {
   if (!plan) return null;
 
@@ -8089,8 +8155,10 @@ function prodAiCompactPlan(plan) {
     grupo: plan.grupo,
     area: plan.area,
     machine: plan.machine,
+    abcHint: plan.abcHint || "",
     period: plan.period,
 
+    salesHistory: Array.isArray(plan.salesHistory) ? plan.salesHistory.slice(-12) : [],
     avgMonthlyQty: plan.avgMonthlyQty,
     projectedQty: plan.projectedQty,
 
@@ -8130,8 +8198,13 @@ function prodExtractResponseText(obj) {
   for (const item of Array.isArray(obj.output) ? obj.output : []) {
     if (Array.isArray(item.content)) {
       for (const c of item.content) {
-        if (typeof c?.text === "string" && c.text.trim()) out.push(c.text.trim());
-        else if (typeof c?.text?.value === "string" && c.text.value.trim()) out.push(c.text.value.trim());
+        if ((c?.type === "output_text" || c?.type === "text") && typeof c?.text === "string" && c.text.trim()) {
+          out.push(c.text.trim());
+        } else if (typeof c?.text?.value === "string" && c.text.value.trim()) {
+          out.push(c.text.value.trim());
+        } else if (c?.type === "refusal" && typeof c?.refusal === "string" && c.refusal.trim()) {
+          out.push(`El modelo rechazó responder: ${c.refusal.trim()}`);
+        }
       }
     }
   }
@@ -8147,20 +8220,40 @@ async function prodOpenAiChat({ question, dashboard, plan }) {
     selectedPlan: prodAiCompactPlan(plan),
   };
 
-const system = [
-  "Eres un planificador de producción interno de PRODIMA.",
-  "Usa exclusivamente el JSON entregado como fuente de verdad.",
-  "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) y catálogo local de fórmulas/materiales.",
-  "No inventes datos que no estén en el JSON.",
-  "Responde en español.",
-  "IMPORTANTE: las cantidades de producto terminado siempre se expresan en UNIDADES, nunca en cajas.",
-  "IMPORTANTE: si el JSON trae requirements.rawMaterials, requirements.packaging o requirements.bottlenecks, debes analizarlos y mencionarlos explícitamente.",
-  "IMPORTANTE: no digas que faltan materias primas, empaques o cuellos de botella si esos arreglos existen en el JSON y tienen elementos.",
-  "IMPORTANTE: usa formula.litersPerUnit, formula.baseLiquidCode y formula.litersRequired cuando existan.",
-  "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo:",
-  "1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria / ajustada por MRP 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
-  "Si realmente falta información en el JSON, dilo claramente.",
-].join(' ');
+  const system = [
+    "Eres un analista senior de producción, MRP y abastecimiento interno de PRODIMA.",
+    "Tu trabajo es analizar demanda, inventario terminado, materiales, empaques, capacidad y turnos para convertir los datos del sistema en un plan de acción claro.",
+    "Usa exclusivamente la información entregada por el sistema como fuente de verdad. No menciones formatos internos ni digas que estás usando JSON.",
+    "La fuente combina base de datos sincronizada del sistema y catálogo local de fórmulas, materiales, empaques y capacidades.",
+    "No inventes datos, no supongas fórmulas inexistentes y no afirmes faltantes o coberturas si el dato no aparece.",
+    "Responde siempre en español, con tono profesional, ejecutivo y accionable.",
+    "IMPORTANTE: las cantidades de producto terminado se expresan en UNIDADES, nunca en cajas.",
+    "IMPORTANTE: no confundas revenue en dólares con demanda en unidades.",
+    "IMPORTANTE: el inventario terminado relevante está en las bodegas 01, 200, 300 y 500.",
+    "IMPORTANTE: diferencia claramente entre producción necesaria y producción ajustada por MRP.",
+    "Si hay selectedPlan, úsalo como la fuente principal para responder; si no, usa el dashboard.",
+    "Cuando exista selectedPlan, analiza obligatoriamente: 1) historial de ventas mensual 2) promedio mensual usado 3) demanda proyectada 4) stock total y stock por bodega 5) mínimo, máximo, múltiplo y lead time 6) producción necesaria y ajustada 7) materias primas 8) empaques 9) cuellos de botella 10) capacidad y turnos.",
+    "Cuando existan materias primas, menciona código, descripción, requerido, stock, faltante y cobertura.",
+    "Cuando existan empaques, menciona código, descripción, requerido, stock, faltante y cobertura.",
+    "Cuando existan cuellos de botella, identifícalos como restricciones críticas y ordénalos por impacto.",
+    "Evalúa si el stock actual cubre la demanda proyectada del horizonte indicado y si también cubre la producción ajustada por MRP.",
+    "Evalúa si la capacidad en horas de la máquina alcanza con lunes a viernes, si requiere sábado, si requiere doble turno o si requiere reprogramación.",
+    "Cuando hables de capacidad, usa unitsPerHour, hoursNeeded, businessDays, saturdays, singleCapHours, saturdayCapHours y doubleShiftHours cuando existan.",
+    "Si el usuario pregunta qué producir, prioriza por riesgo operativo, faltante contra demanda, clase ABC, horas requeridas, cobertura de materiales y urgencia comercial.",
+    "Si el usuario pregunta si alcanza el stock, responde directo con el cálculo y explica el faltante o sobrante en unidades.",
+    "Si el usuario pregunta por materiales, separa materias primas de empaques y especifica faltantes exactos.",
+    "Si el usuario pregunta por turnos, concluye claramente si alcanza con turno normal, si conviene sábado, si conviene doble turno o si conviene reprogramar.",
+    "Si el usuario pide un análisis amplio, usa esta estructura: Resumen ejecutivo, Demanda y proyección, Inventario y cobertura, Producción requerida, Materias primas, Empaques, Cuellos de botella, Capacidad y turnos, Recomendación final.",
+    "Si la información es parcial, dilo claramente y distingue entre dato observado e hipótesis operativa.",
+    "No des respuestas genéricas. Siempre que sea posible, menciona código, descripción, cantidades, bodegas, faltantes, cobertura, horas y recomendación puntual.",
+    "Cierra con acciones concretas, por ejemplo: producir ahora, validar stock, comprar materiales, revisar empaque, mover inventario entre bodegas, agregar sábado o doble turno."
+  ].join(' ');
+
+  const reasoning = model.startsWith("gpt-5.1") || model.startsWith("gpt-5.2")
+    ? { effort: "none" }
+    : model.startsWith("gpt-5")
+      ? { effort: "minimal" }
+      : undefined;
 
   const payload = {
     model,
@@ -8168,11 +8261,12 @@ const system = [
       { role: "system", content: [{ type: "input_text", text: system }] },
       {
         role: "user",
-        content: [{ type: "input_text", text: `Pregunta:\n${String(question || "").trim()}\n\nContexto JSON:\n${JSON.stringify(input)}` }],
+        content: [{ type: "input_text", text: `Pregunta:\n${String(question || "").trim()}\n\nContexto del sistema:\n${JSON.stringify(input)}` }],
       },
     ],
     text: { format: { type: "text" } },
-    max_output_tokens: 900,
+    max_output_tokens: 1800,
+    ...(reasoning ? { reasoning } : {}),
   };
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
