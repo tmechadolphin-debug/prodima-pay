@@ -6108,7 +6108,7 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "
       warehouse: String(x.warehouse_code || ""),
       itemCode: String(x.item_code || ""),
       itemDesc: String(x.item_desc || ""),
-      quantity: num(x.quantity, 4),
+      quantity: estratAiNum(x.quantity, 4),
       dollars: money2(x.line_total),
       grossProfit: money2(x.gross_profit),
       grupo,
@@ -8558,6 +8558,14 @@ async function estratLoadItemDocsForAi({ itemCode, from, to, area = "__ALL__", g
   return rows;
 }
 
+function estratAiNum(x, d = 0) {
+  const n = Number(x || 0);
+  return Number.isFinite(n) ? Number(n.toFixed(d)) : 0;
+}
+function estratAiMoney2(x) {
+  return estratAiNum(x, 2);
+}
+
 function estratCompactItemDetail(rows, itemLabel = "") {
   const safeRows = Array.isArray(rows) ? rows : [];
   const totals = safeRows.reduce(
@@ -8607,10 +8615,10 @@ function estratCompactItemDetail(rows, itemLabel = "") {
       .sort((a, b) => String(a.month).localeCompare(String(b.month)))
       .map((x) => ({
         month: x.month,
-        quantity: num(x.quantity, 4),
-        revenue: money2(x.revenue),
-        gp: money2(x.gp),
-        gpPct: x.revenue ? num((x.gp / x.revenue) * 100, 2) : 0,
+        quantity: estratAiNum(x.quantity, 4),
+        revenue: estratAiMoney2(x.revenue),
+        gp: estratAiMoney2(x.gp),
+        gpPct: x.revenue ? estratAiNum((x.gp / x.revenue) * 100, 2) : 0,
         docs: x.docs,
       })),
     topCustomers: Array.from(customerAgg.values())
@@ -8620,10 +8628,10 @@ function estratCompactItemDetail(rows, itemLabel = "") {
         cardCode: x.cardCode,
         cardName: x.cardName,
         customer: x.customer,
-        quantity: num(x.quantity, 4),
-        revenue: money2(x.revenue),
-        gp: money2(x.gp),
-        gpPct: x.revenue ? num((x.gp / x.revenue) * 100, 2) : 0,
+        quantity: estratAiNum(x.quantity, 4),
+        revenue: estratAiMoney2(x.revenue),
+        gp: estratAiMoney2(x.gp),
+        gpPct: x.revenue ? estratAiNum((x.gp / x.revenue) * 100, 2) : 0,
         docs: x.docs,
       })),
     recentDocs: safeRows.slice(0, 80).map((x) => ({
