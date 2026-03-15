@@ -3000,7 +3000,7 @@ function parseEmailList(csv) {
 
 
 globalThis.DOCS_NOTIFY_TO = parseEmailList(
-  "pe-impa@prodima.com.pa"
+  "adm-red@prodima.com.pa"
 ).join(",");
 const DOCS_NOTIFY_TO = globalThis.DOCS_NOTIFY_TO;
 console.log("BOOT", "DOCS_MAIL_V11_BASE41_FAST_SEARCH");
@@ -4831,7 +4831,7 @@ function totalFromLetters(a1, a2, a3) {
    ✅ Dashboard (DB) con universo ABC como Excel + orden
    ✅ FIX: normaliza grupos (canon + heurística) en lectura también
 ========================================================= */
-async function dashboardFromDb({ from, to, area, grupo, q }) {
+async function dashboardFromDbEstratificacion({ from, to, area, grupo, q }) {
   const salesAgg = await dbQuery(
     `
     WITH s AS (
@@ -5146,7 +5146,7 @@ app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) =>
     const from = isISO(fromQ) ? fromQ : "2024-01-01";
     const to = isISO(toQ) ? toQ : today;
 
-    const data = await dashboardFromDb({ from, to, area, grupo, q });
+    const data = await dashboardFromDbEstratificacion({ from, to, area, grupo, q });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -6137,7 +6137,7 @@ function availableGroupsForArea(area) {
 /* =========================================================
    ✅ Dashboard from DB (neto)
 ========================================================= */
-async function dashboardFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", q = "" }) {
+async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo = "__ALL__", q = "" }) {
   const baseRows = await fetchInvoiceRows({ from, to, q });
   const rows = applyAreaGroupFilters(baseRows, { area, grupo });
 
@@ -6565,7 +6565,7 @@ app.get("/api/admin/invoices/dashboard", verifyAdmin, async (req, res) => {
     const grupo = String(req.query?.grupo || "__ALL__");
     const q = String(req.query?.q || "");
 
-    const data = await dashboardFromDb({ from, to, area, grupo, q });
+    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
     data.lastSyncAt = await getState("last_sync_at");
     return safeJson(res, 200, data);
   } catch (e) {
@@ -6627,7 +6627,7 @@ app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
     const grupo = String(req.query?.grupo || "__ALL__");
     const q = String(req.query?.q || "");
 
-    const data = await dashboardFromDb({ from, to, area, grupo, q });
+    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
 
     const wb = XLSX.utils.book_new();
     const rows = (data.table || []).map((r) => ({
@@ -6725,7 +6725,7 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
     const from = isISO(fromQ) ? fromQ : defaultFrom;
     const to = isISO(toQ) ? toQ : today;
 
-    const dashboard = await dashboardFromDb({ from, to, area, grupo, q: "" });
+    const dashboard = await dashboardFromDbAdminClientes({ from, to, area, grupo, q: "" });
     let detail = null;
     if (cardCode && warehouse) {
       detail = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
