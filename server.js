@@ -4487,69 +4487,6 @@ function pickGrossProfit(ln) {
   return 0;
 }
 
-const SALES_UOM_FACTOR_CACHE = new Map();
-
-async function getSalesLineQtyFactor(itemCode, line) {
-  const directCandidates = [
-    line?.NumPerMsr,
-    line?.ItemsPerUnit,
-    line?.UnitsOfMeasurement,
-    line?.UnitsOfMeasurment,
-    line?.UomFactor,
-  ];
-
-  for (const c of directCandidates) {
-    const n = Number(c);
-    if (Number.isFinite(n) && n > 0) return n;
-  }
-
-  const code = String(itemCode || "").trim();
-  if (!code) return 1;
-
-  const uomEntry = Number(line?.UoMEntry ?? line?.UomEntry ?? NaN);
-  const cacheKey = `${code}::${Number.isFinite(uomEntry) ? uomEntry : "default"}`;
-  if (SALES_UOM_FACTOR_CACHE.has(cacheKey)) {
-    return SALES_UOM_FACTOR_CACHE.get(cacheKey);
-  }
-
-  let factor = 1;
-
-  try {
-    const itemFull = await slFetch(
-      `/Items('${encodeURIComponent(code)}')` +
-        `?$select=ItemCode,SalesItemsPerUnit` +
-        `&$expand=ItemUnitOfMeasurementCollection($select=UoMEntry,BaseQuantity,AlternateQuantity,UoMType)`,
-      { timeoutMs: 120000 }
-    );
-
-    if (Number.isFinite(uomEntry) && uomEntry > 0) {
-      const coll = Array.isArray(itemFull?.ItemUnitOfMeasurementCollection)
-        ? itemFull.ItemUnitOfMeasurementCollection
-        : [];
-
-      const row = coll.find((x) => Number(x?.UoMEntry) === uomEntry);
-      const base = Number(row?.BaseQuantity ?? NaN);
-      const alt = Number(row?.AlternateQuantity ?? NaN);
-
-      if (Number.isFinite(base) && base > 0 && Number.isFinite(alt) && alt > 0) {
-        factor = base / alt;
-      } else if (Number.isFinite(base) && base > 0) {
-        factor = base;
-      }
-    }
-
-    if (!(Number.isFinite(factor) && factor > 0)) {
-      factor = Number(getSalesUomFactor(itemFull) || 1);
-    }
-  } catch {}
-
-  if (!(Number.isFinite(factor) && factor > 0)) factor = 1;
-
-  SALES_UOM_FACTOR_CACHE.set(cacheKey, factor);
-  return factor;
-}
-
-
 async function scanDocHeaders(entity, { from, to, maxDocs = 2500 }) {
   const toPlus1 = addDaysISO(to, 1);
   const batchTop = 200;
@@ -4612,10 +4549,8 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
     const qtyRaw = Number(ln?.Quantity || 0);
     const revRaw = Number(ln?.LineTotal || 0);
     const gpRaw = Number(pickGrossProfit(ln) || 0);
-    const qtyFactor = await getSalesLineQtyFactor(itemCode, ln);
 
-    // ✅ FIX PRODUCCIÓN: guardar siempre en UNIDADES (no cajas)
-    const qty = Math.abs(qtyRaw) * qtyFactor * sign;
+    const qty = Math.abs(qtyRaw) * sign;
     const rev = Math.abs(revRaw) * sign;
     const gp = Math.abs(gpRaw) * sign;
 
@@ -8133,7 +8068,6 @@ function prodAiCompactDashboard(data) {
     topItems,
   };
 }
-
 function prodAiCompactPlan(plan) {
   if (!plan) return null;
 
@@ -8155,10 +8089,8 @@ function prodAiCompactPlan(plan) {
     grupo: plan.grupo,
     area: plan.area,
     machine: plan.machine,
-    abcHint: plan.abcHint || "",
     period: plan.period,
 
-    salesHistory: Array.isArray(plan.salesHistory) ? plan.salesHistory.slice(-12) : [],
     avgMonthlyQty: plan.avgMonthlyQty,
     projectedQty: plan.projectedQty,
 
@@ -8198,13 +8130,8 @@ function prodExtractResponseText(obj) {
   for (const item of Array.isArray(obj.output) ? obj.output : []) {
     if (Array.isArray(item.content)) {
       for (const c of item.content) {
-        if ((c?.type === "output_text" || c?.type === "text") && typeof c?.text === "string" && c.text.trim()) {
-          out.push(c.text.trim());
-        } else if (typeof c?.text?.value === "string" && c.text.value.trim()) {
-          out.push(c.text.value.trim());
-        } else if (c?.type === "refusal" && typeof c?.refusal === "string" && c.refusal.trim()) {
-          out.push(`El modelo rechazó responder: ${c.refusal.trim()}`);
-        }
+        if (typeof c?.text === "string" && c.text.trim()) out.push(c.text.trim());
+        else if (typeof c?.text?.value === "string" && c.text.value.trim()) out.push(c.text.value.trim());
       }
     }
   }
@@ -8220,40 +8147,20 @@ async function prodOpenAiChat({ question, dashboard, plan }) {
     selectedPlan: prodAiCompactPlan(plan),
   };
 
-  const system = [
-    "Eres un analista senior de producción, MRP y abastecimiento interno de PRODIMA.",
-    "Tu trabajo es analizar demanda, inventario terminado, materiales, empaques, capacidad y turnos para convertir los datos del sistema en un plan de acción claro.",
-    "Usa exclusivamente la información entregada por el sistema como fuente de verdad. No menciones formatos internos ni digas que estás usando JSON.",
-    "La fuente combina base de datos sincronizada del sistema y catálogo local de fórmulas, materiales, empaques y capacidades.",
-    "No inventes datos, no supongas fórmulas inexistentes y no afirmes faltantes o coberturas si el dato no aparece.",
-    "Responde siempre en español, con tono profesional, ejecutivo y accionable.",
-    "IMPORTANTE: las cantidades de producto terminado se expresan en UNIDADES, nunca en cajas.",
-    "IMPORTANTE: no confundas revenue en dólares con demanda en unidades.",
-    "IMPORTANTE: el inventario terminado relevante está en las bodegas 01, 200, 300 y 500.",
-    "IMPORTANTE: diferencia claramente entre producción necesaria y producción ajustada por MRP.",
-    "Si hay selectedPlan, úsalo como la fuente principal para responder; si no, usa el dashboard.",
-    "Cuando exista selectedPlan, analiza obligatoriamente: 1) historial de ventas mensual 2) promedio mensual usado 3) demanda proyectada 4) stock total y stock por bodega 5) mínimo, máximo, múltiplo y lead time 6) producción necesaria y ajustada 7) materias primas 8) empaques 9) cuellos de botella 10) capacidad y turnos.",
-    "Cuando existan materias primas, menciona código, descripción, requerido, stock, faltante y cobertura.",
-    "Cuando existan empaques, menciona código, descripción, requerido, stock, faltante y cobertura.",
-    "Cuando existan cuellos de botella, identifícalos como restricciones críticas y ordénalos por impacto.",
-    "Evalúa si el stock actual cubre la demanda proyectada del horizonte indicado y si también cubre la producción ajustada por MRP.",
-    "Evalúa si la capacidad en horas de la máquina alcanza con lunes a viernes, si requiere sábado, si requiere doble turno o si requiere reprogramación.",
-    "Cuando hables de capacidad, usa unitsPerHour, hoursNeeded, businessDays, saturdays, singleCapHours, saturdayCapHours y doubleShiftHours cuando existan.",
-    "Si el usuario pregunta qué producir, prioriza por riesgo operativo, faltante contra demanda, clase ABC, horas requeridas, cobertura de materiales y urgencia comercial.",
-    "Si el usuario pregunta si alcanza el stock, responde directo con el cálculo y explica el faltante o sobrante en unidades.",
-    "Si el usuario pregunta por materiales, separa materias primas de empaques y especifica faltantes exactos.",
-    "Si el usuario pregunta por turnos, concluye claramente si alcanza con turno normal, si conviene sábado, si conviene doble turno o si conviene reprogramar.",
-    "Si el usuario pide un análisis amplio, usa esta estructura: Resumen ejecutivo, Demanda y proyección, Inventario y cobertura, Producción requerida, Materias primas, Empaques, Cuellos de botella, Capacidad y turnos, Recomendación final.",
-    "Si la información es parcial, dilo claramente y distingue entre dato observado e hipótesis operativa.",
-    "No des respuestas genéricas. Siempre que sea posible, menciona código, descripción, cantidades, bodegas, faltantes, cobertura, horas y recomendación puntual.",
-    "Cierra con acciones concretas, por ejemplo: producir ahora, validar stock, comprar materiales, revisar empaque, mover inventario entre bodegas, agregar sábado o doble turno."
-  ].join(' ');
-
-  const reasoning = model.startsWith("gpt-5.1") || model.startsWith("gpt-5.2")
-    ? { effort: "none" }
-    : model.startsWith("gpt-5")
-      ? { effort: "minimal" }
-      : undefined;
+const system = [
+  "Eres un planificador de producción interno de PRODIMA.",
+  "Usa exclusivamente el JSON entregado como fuente de verdad.",
+  "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) y catálogo local de fórmulas/materiales.",
+  "No inventes datos que no estén en el JSON.",
+  "Responde en español.",
+  "IMPORTANTE: las cantidades de producto terminado siempre se expresan en UNIDADES, nunca en cajas.",
+  "IMPORTANTE: si el JSON trae requirements.rawMaterials, requirements.packaging o requirements.bottlenecks, debes analizarlos y mencionarlos explícitamente.",
+  "IMPORTANTE: no digas que faltan materias primas, empaques o cuellos de botella si esos arreglos existen en el JSON y tienen elementos.",
+  "IMPORTANTE: usa formula.litersPerUnit, formula.baseLiquidCode y formula.litersRequired cuando existan.",
+  "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo:",
+  "1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria / ajustada por MRP 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
+  "Si realmente falta información en el JSON, dilo claramente.",
+].join(' ');
 
   const payload = {
     model,
@@ -8261,12 +8168,11 @@ async function prodOpenAiChat({ question, dashboard, plan }) {
       { role: "system", content: [{ type: "input_text", text: system }] },
       {
         role: "user",
-        content: [{ type: "input_text", text: `Pregunta:\n${String(question || "").trim()}\n\nContexto del sistema:\n${JSON.stringify(input)}` }],
+        content: [{ type: "input_text", text: `Pregunta:\n${String(question || "").trim()}\n\nContexto JSON:\n${JSON.stringify(input)}` }],
       },
     ],
     text: { format: { type: "text" } },
-    max_output_tokens: 1800,
-    ...(reasoning ? { reasoning } : {}),
+    max_output_tokens: 900,
   };
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
@@ -8452,6 +8358,435 @@ app.get("/api/admin/production/health", verifyAdmin, async (_req, res) => {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
 });
+
+/* =========================================================
+   IA — Estratificación (restaurada + super prompt)
+========================================================= */
+
+function estratCompactDashboard(data) {
+  const items = Array.isArray(data?.items) ? data.items : [];
+  const groupAgg = Array.isArray(data?.groupAgg) ? data.groupAgg : [];
+
+  const counts = items.reduce(
+    (acc, x) => {
+      const lab = String(x.totalLabel || "Sin clasificar");
+      acc.totalItems += 1;
+      acc.byClass[lab] = (acc.byClass[lab] || 0) + 1;
+      if (Number(x.stock || 0) < Number(x.stockMin || 0)) acc.stockBelowMin += 1;
+      if (Number(x.stockMax || 0) > 0 && Number(x.stock || 0) >= Number(x.stockMax || 0)) acc.stockAtOrOverMax += 1;
+      if (Number(x.stock || 0) <= 0) acc.stockZeroOrNegative += 1;
+      return acc;
+    },
+    { totalItems: 0, stockBelowMin: 0, stockAtOrOverMax: 0, stockZeroOrNegative: 0, byClass: {} }
+  );
+
+  const topByRevenue = items.slice(0, 25).map((x) => ({
+    rankTotal: x.rankTotal,
+    rankArea: x.rankArea,
+    itemCode: x.itemCode,
+    itemDesc: x.itemDesc,
+    area: x.area,
+    grupo: x.grupo,
+    revenue: x.revenue,
+    gp: x.gp,
+    gpPct: x.gpPct,
+    totalLabel: x.totalLabel,
+    abcRevenue: x.abcRevenue,
+    abcGP: x.abcGP,
+    abcGPPct: x.abcGPPct,
+    stock: x.stock,
+    stockMin: x.stockMin,
+    stockMax: x.stockMax,
+    available: x.available,
+    committed: x.committed,
+    ordered: x.ordered,
+  }));
+
+  const belowMin = items
+    .filter((x) => Number(x.stock || 0) < Number(x.stockMin || 0))
+    .slice(0, 25)
+    .map((x) => ({
+      itemCode: x.itemCode,
+      itemDesc: x.itemDesc,
+      area: x.area,
+      grupo: x.grupo,
+      totalLabel: x.totalLabel,
+      revenue: x.revenue,
+      gp: x.gp,
+      gpPct: x.gpPct,
+      stock: x.stock,
+      stockMin: x.stockMin,
+      stockMax: x.stockMax,
+      available: x.available,
+      committed: x.committed,
+      ordered: x.ordered,
+      faltanteVsMin: num(Number(x.stockMin || 0) - Number(x.stock || 0), 2),
+    }));
+
+  const atOrOverMax = items
+    .filter((x) => Number(x.stockMax || 0) > 0 && Number(x.stock || 0) >= Number(x.stockMax || 0))
+    .slice(0, 25)
+    .map((x) => ({
+      itemCode: x.itemCode,
+      itemDesc: x.itemDesc,
+      area: x.area,
+      grupo: x.grupo,
+      totalLabel: x.totalLabel,
+      revenue: x.revenue,
+      gp: x.gp,
+      gpPct: x.gpPct,
+      stock: x.stock,
+      stockMin: x.stockMin,
+      stockMax: x.stockMax,
+      available: x.available,
+      committed: x.committed,
+      ordered: x.ordered,
+      excesoVsMax: num(Number(x.stock || 0) - Number(x.stockMax || 0), 2),
+    }));
+
+  const highestMargin = [...items]
+    .filter((x) => Number(x.revenue || 0) > 0)
+    .sort((a, b) => Number(b.gpPct || 0) - Number(a.gpPct || 0))
+    .slice(0, 20)
+    .map((x) => ({
+      itemCode: x.itemCode,
+      itemDesc: x.itemDesc,
+      area: x.area,
+      grupo: x.grupo,
+      revenue: x.revenue,
+      gp: x.gp,
+      gpPct: x.gpPct,
+      totalLabel: x.totalLabel,
+    }));
+
+  const lowestMargin = [...items]
+    .filter((x) => Number(x.revenue || 0) > 0)
+    .sort((a, b) => Number(a.gpPct || 0) - Number(b.gpPct || 0))
+    .slice(0, 20)
+    .map((x) => ({
+      itemCode: x.itemCode,
+      itemDesc: x.itemDesc,
+      area: x.area,
+      grupo: x.grupo,
+      revenue: x.revenue,
+      gp: x.gp,
+      gpPct: x.gpPct,
+      totalLabel: x.totalLabel,
+    }));
+
+  return {
+    range: { from: data?.from, to: data?.to },
+    filters: {
+      area: data?.area,
+      grupo: data?.grupo,
+      q: data?.q || "",
+    },
+    totals: data?.totals || {},
+    counts,
+    topGroupsByRevenue: groupAgg.slice(0, 15).map((g) => ({
+      grupo: g.grupo,
+      revenue: g.revenue,
+      gp: g.gp,
+      gpPct: g.gpPct,
+    })),
+    topItemsByRevenue: topByRevenue,
+    itemsBelowMin: belowMin,
+    itemsAtOrOverMax: atOrOverMax,
+    topItemsByMarginPct: highestMargin,
+    lowestItemsByMarginPct: lowestMargin,
+  };
+}
+
+async function estratLoadItemDocsForAi({ itemCode, from, to, area = "__ALL__", grupo = "__ALL__" }) {
+  if (!itemCode) return [];
+  const q1 = await dbQuery(
+    `
+    SELECT
+      s.doc_type,
+      s.doc_date::text AS doc_date,
+      s.doc_entry,
+      s.doc_num,
+      s.card_code,
+      s.card_name,
+      s.item_code,
+      s.item_desc,
+      s.quantity,
+      s.revenue,
+      s.gross_profit,
+      COALESCE(NULLIF(s.area,''), NULLIF(g.area,''), '') AS area,
+      COALESCE(NULLIF(s.item_group,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo
+    FROM sales_item_lines s
+    LEFT JOIN item_group_cache g ON g.item_code = s.item_code
+    WHERE s.item_code = $1
+      AND s.doc_date >= $2::date
+      AND s.doc_date <= $3::date
+    ORDER BY s.doc_date DESC, s.doc_entry DESC, s.line_num ASC
+    LIMIT 400
+    `,
+    [itemCode, from, to]
+  );
+
+  let rows = (q1.rows || []).map((r) => {
+    const grupoTxtRaw = String(r.grupo || "Sin grupo");
+    const grupoTxt = normalizeGrupoFinal(grupoTxtRaw);
+    const areaDb = String(r.area || "");
+    const areaFinal = areaDb || inferAreaFromGroup(grupoTxt) || inferAreaFromGroup(grupoTxtRaw) || "CONS";
+    return {
+      docType: String(r.doc_type || ""),
+      docDate: String(r.doc_date || "").slice(0, 10),
+      docEntry: Number(r.doc_entry || 0),
+      docNum: r.doc_num != null ? Number(r.doc_num) : null,
+      cardCode: String(r.card_code || ""),
+      cardName: String(r.card_name || ""),
+      itemCode: String(r.item_code || ""),
+      itemDesc: String(r.item_desc || ""),
+      quantity: Number(r.quantity || 0),
+      total: Number(r.revenue || 0),
+      gp: Number(r.gross_profit || 0),
+      area: areaFinal,
+      grupo: grupoTxt,
+    };
+  });
+
+  if (area !== "__ALL__") rows = rows.filter((x) => String(x.area || "") === area);
+  if (grupo !== "__ALL__") {
+    const gSelN = normGroupName(grupo);
+    rows = rows.filter((x) => normGroupName(x.grupo) === gSelN);
+  }
+  return rows;
+}
+
+function estratCompactItemDetail(rows, itemLabel = "") {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const totals = safeRows.reduce(
+    (acc, x) => {
+      acc.docs += 1;
+      acc.quantity += Number(x.quantity || 0);
+      acc.revenue += Number(x.total || 0);
+      acc.gp += Number(x.gp || 0);
+      return acc;
+    },
+    { docs: 0, quantity: 0, revenue: 0, gp: 0 }
+  );
+  const gpPct = totals.revenue > 0 ? Number(((totals.gp / totals.revenue) * 100).toFixed(2)) : 0;
+
+  const customerAgg = new Map();
+  const monthAgg = new Map();
+  for (const x of safeRows) {
+    const custKey = `${x.cardCode}||${x.cardName}`;
+    const c = customerAgg.get(custKey) || {
+      cardCode: x.cardCode,
+      cardName: x.cardName,
+      customer: `${x.cardCode} · ${x.cardName}`,
+      quantity: 0,
+      revenue: 0,
+      gp: 0,
+      docs: 0,
+    };
+    c.quantity += Number(x.quantity || 0);
+    c.revenue += Number(x.total || 0);
+    c.gp += Number(x.gp || 0);
+    c.docs += 1;
+    customerAgg.set(custKey, c);
+
+    const m = String(x.docDate || "").slice(0, 7);
+    const mo = monthAgg.get(m) || { month: m, quantity: 0, revenue: 0, gp: 0, docs: 0 };
+    mo.quantity += Number(x.quantity || 0);
+    mo.revenue += Number(x.total || 0);
+    mo.gp += Number(x.gp || 0);
+    mo.docs += 1;
+    monthAgg.set(m, mo);
+  }
+
+  return {
+    itemLabel,
+    totals: { ...totals, gpPct },
+    byMonth: Array.from(monthAgg.values())
+      .sort((a, b) => String(a.month).localeCompare(String(b.month)))
+      .map((x) => ({
+        month: x.month,
+        quantity: num(x.quantity, 4),
+        revenue: money2(x.revenue),
+        gp: money2(x.gp),
+        gpPct: x.revenue ? num((x.gp / x.revenue) * 100, 2) : 0,
+        docs: x.docs,
+      })),
+    topCustomers: Array.from(customerAgg.values())
+      .sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0))
+      .slice(0, 20)
+      .map((x) => ({
+        cardCode: x.cardCode,
+        cardName: x.cardName,
+        customer: x.customer,
+        quantity: num(x.quantity, 4),
+        revenue: money2(x.revenue),
+        gp: money2(x.gp),
+        gpPct: x.revenue ? num((x.gp / x.revenue) * 100, 2) : 0,
+        docs: x.docs,
+      })),
+    recentDocs: safeRows.slice(0, 80).map((x) => ({
+      docType: x.docType,
+      docDate: x.docDate,
+      docNum: x.docNum,
+      cardCode: x.cardCode,
+      cardName: x.cardName,
+      quantity: x.quantity,
+      total: x.total,
+      gp: x.gp,
+      gpPct: x.total ? Number(((Number(x.gp || 0) / Number(x.total || 0)) * 100).toFixed(2)) : 0,
+      grupo: x.grupo,
+      area: x.area,
+    })),
+  };
+}
+
+async function openaiEstratificacionChat({ question, dashboard, itemRows = [], itemLabel = "" }) {
+  const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+  const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
+  if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
+
+  const compact = {
+    dashboard: estratCompactDashboard(dashboard),
+    selectedItem: itemRows.length ? estratCompactItemDetail(itemRows, itemLabel) : null,
+  };
+
+  const system = [
+    "Eres un analista comercial interno senior de PRODIMA especializado en estratificación de productos, rentabilidad, clasificación ABC, niveles de inventario y riesgo comercial.",
+    "Usa exclusivamente la información entregada por el sistema como fuente de verdad. No menciones formatos internos ni digas que estás usando JSON.",
+    "La fuente es la base de datos sincronizada del sistema, no SAP en vivo.",
+    "Respeta estrictamente los filtros activos de fecha, área, grupo, búsqueda y artículo seleccionado cuando existan.",
+    "No inventes datos, no asumas ventas, stock ni márgenes que no estén presentes en el contexto.",
+    "Responde siempre en español, con lenguaje claro, ejecutivo, útil y orientado a decisiones.",
+    "Prioriza hallazgos concretos sobre revenue, margen bruto, % margen, clasificación ABC, ranking, concentración, stock, mínimos, máximos, disponible, comprometido y ordenado.",
+    "Cuando hables de stock, distingue con precisión si el artículo está por debajo del mínimo, dentro de rango, en máximo o por encima del máximo.",
+    "Cuando hables de clasificación, explica tanto la clasificación total como ABC de revenue, GP y GP%.",
+    "Si el usuario pregunta por artículos críticos, prioriza artículos A o AB, especialmente los que estén bajo mínimo o con alta participación de ventas.",
+    "Si el usuario pregunta por oportunidades, identifica artículos con buen margen, artículos con stock alto y baja venta, y artículos con potencial de mejora.",
+    "Si hay un artículo seleccionado, analízalo primero. Luego compáralo contra el contexto general solo si eso agrega valor.",
+    "Si hay datos del artículo por cliente o por mes, menciona qué clientes lo compran más, cómo se comporta en el tiempo y si su margen cambia.",
+    "Cuando compares artículos, usa métricas concretas: revenue, GP, GP%, stock, disponible, comprometido, ordenado y clasificación.",
+    "Si detectas riesgo, explica por qué: por ejemplo alto revenue con stock bajo, margen bajo, sobrestock, dependencia de un grupo o concentración excesiva.",
+    "Si detectas sobrestock, menciona el exceso frente al máximo cuando esté disponible.",
+    "Si detectas faltante, menciona el faltante frente al mínimo cuando esté disponible.",
+    "Cuando el usuario pida resumen, responde con estructura: resumen ejecutivo, hallazgos clave, riesgos, oportunidades y acciones sugeridas.",
+    "Cuando el usuario pida un artículo específico, responde con estructura: resumen del artículo, desempeño comercial, margen, clientes, comportamiento mensual, stock y recomendación.",
+    "No des respuestas genéricas. Siempre que sea posible menciona códigos, descripciones, grupos, área, montos, porcentajes y niveles de stock concretos.",
+    "Si no hay suficiente detalle para concluir una causa, dilo claramente y plantea la causa como hipótesis basada en los datos visibles.",
+    "Tu objetivo es ayudar a ventas, gerencia y planificación a decidir qué artículos proteger, impulsar, revisar o depurar."
+  ].join(" ");
+
+  const reasoning = model.startsWith("gpt-5.1") || model.startsWith("gpt-5.2")
+    ? { effort: "none" }
+    : model.startsWith("gpt-5")
+      ? { effort: "minimal" }
+      : undefined;
+
+  const payload = {
+    model,
+    input: [
+      { role: "system", content: [{ type: "input_text", text: system }] },
+      {
+        role: "user",
+        content: [{
+          type: "input_text",
+          text:
+            `Pregunta del usuario:\n${String(question || "").trim()}\n\n` +
+            `Contexto del sistema:\n${JSON.stringify(compact)}`
+        }]
+      }
+    ],
+    text: { format: { type: "text" } },
+    max_output_tokens: 2200,
+    ...(reasoning ? { reasoning } : {}),
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(
+      data?.error?.message ||
+      data?.message ||
+      `OpenAI HTTP ${resp.status}`
+    );
+  }
+
+  const answer = extractResponseText(data);
+  if (!answer) {
+    console.error("OpenAI empty output [estratificacion]", {
+      model,
+      status: data?.status || null,
+      incomplete_details: data?.incomplete_details || null,
+      output_types: Array.isArray(data?.output) ? data.output.map((x) => x?.type) : [],
+      usage: data?.usage || null,
+    });
+
+    throw new Error(
+      data?.incomplete_details?.reason
+        ? `OpenAI devolvió salida vacía (${data.incomplete_details.reason})`
+        : "OpenAI devolvió salida vacía"
+    );
+  }
+
+  return {
+    answer,
+    model,
+    raw: data,
+  };
+}
+
+app.post("/api/admin/estratificacion/ai-chat", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+
+    const question = String(req.body?.question || "").trim();
+    if (!question) return safeJson(res, 400, { ok: false, message: "question requerida" });
+
+    const fromQ = String(req.body?.from || "");
+    const toQ = String(req.body?.to || "");
+    const area = String(req.body?.area || "__ALL__");
+    const grupo = String(req.body?.grupo || "__ALL__");
+    const q = String(req.body?.q || "");
+    const itemCode = String(req.body?.itemCode || "").trim();
+    const itemLabel = String(req.body?.itemLabel || "").trim();
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = isISO(fromQ) ? fromQ : "2025-01-01";
+    const to = isISO(toQ) ? toQ : today;
+
+    const dashboard = await dashboardFromDbEstratificacion({ from, to, area, grupo, q });
+    const itemRows = itemCode
+      ? await estratLoadItemDocsForAi({ itemCode, from, to, area, grupo })
+      : [];
+
+    const out = await openaiEstratificacionChat({
+      question,
+      dashboard,
+      itemRows,
+      itemLabel: itemLabel || itemCode,
+    });
+
+    return safeJson(res, 200, {
+      ok: true,
+      answer: out.answer,
+      model: out.model,
+      source: "db",
+      range: { from, to },
+      filters: { area, grupo, q },
+      focus: itemCode ? { itemCode, itemLabel: itemLabel || itemCode } : null,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 
 /* =========================================================
    Start
