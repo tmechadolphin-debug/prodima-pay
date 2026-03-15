@@ -8422,7 +8422,7 @@ function estratCompactDashboard(data) {
       available: x.available,
       committed: x.committed,
       ordered: x.ordered,
-      faltanteVsMin: num(Number(x.stockMin || 0) - Number(x.stock || 0), 2),
+      faltanteVsMin: estratAiNum(Number(x.stockMin || 0) - Number(x.stock || 0), 2),
     }));
 
   const atOrOverMax = items
@@ -8443,7 +8443,7 @@ function estratCompactDashboard(data) {
       available: x.available,
       committed: x.committed,
       ordered: x.ordered,
-      excesoVsMax: num(Number(x.stock || 0) - Number(x.stockMax || 0), 2),
+      excesoVsMax: estratAiNum(Number(x.stock || 0) - Number(x.stockMax || 0), 2),
     }));
 
   const highestMargin = [...items]
