@@ -5860,7 +5860,7 @@ async function scanInvoicesHeaders({ f, t, maxDocs = 3000 }) {
 
   for (let page = 0; page < 300; page++) {
     const raw = await slFetch(
-      `/Invoices?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName` +
+      `/Invoices?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,Canceled` +
         `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
         `&$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skipSap}`,
       { timeoutMs: 60000 }
@@ -5871,6 +5871,8 @@ async function scanInvoicesHeaders({ f, t, maxDocs = 3000 }) {
     skipSap += rows.length;
 
     for (const r of rows) {
+      if (String(r.Canceled || "N").toUpperCase() === "Y") continue;
+
       out.push({
         DocEntry: Number(r.DocEntry),
         DocNum: Number(r.DocNum),
@@ -5879,9 +5881,11 @@ async function scanInvoicesHeaders({ f, t, maxDocs = 3000 }) {
         CardCode: String(r.CardCode || ""),
         CardName: String(r.CardName || ""),
       });
+
       if (out.length >= maxDocs) return out;
     }
   }
+
   return out;
 }
 
@@ -5904,6 +5908,8 @@ function pickGrossProfit(ln) {
 }
 
 async function upsertLinesToDb(invHeader, docFull) {
+  if (String(docFull?.Canceled || "N").toUpperCase() === "Y") return 0;
+
   const lines = Array.isArray(docFull?.DocumentLines) ? docFull.DocumentLines : [];
   if (!lines.length) return 0;
 
@@ -5928,7 +5934,11 @@ async function upsertLinesToDb(invHeader, docFull) {
     const itemDesc = String(ln.ItemDescription || ln.ItemName || "").trim();
     const gp = pickGrossProfit(ln);
 
-    params.push(docEntry, lineNum, docNum, docDate, cardCode, cardName, wh, itemCode, itemDesc, qty, lt, gp);
+    params.push(
+      docEntry, lineNum, docNum, docDate, cardCode, cardName,
+      wh, itemCode, itemDesc, qty, lt, gp
+    );
+
     values.push(
       `($${p++},$${p++},$${p++},$${p++}::date,$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`
     );
@@ -5936,8 +5946,7 @@ async function upsertLinesToDb(invHeader, docFull) {
 
   if (!values.length) return 0;
 
-  await dbQuery(
-    `
+  await dbQuery(`
     INSERT INTO fact_invoice_lines
       (doc_entry,line_num,doc_num,doc_date,card_code,card_name,warehouse_code,item_code,item_desc,quantity,line_total,gross_profit)
     VALUES ${values.join(",")}
@@ -5954,9 +5963,7 @@ async function upsertLinesToDb(invHeader, docFull) {
       line_total=EXCLUDED.line_total,
       gross_profit=EXCLUDED.gross_profit,
       updated_at=NOW()
-    `,
-    params
-  );
+  `, params);
 
   return values.length;
 }
