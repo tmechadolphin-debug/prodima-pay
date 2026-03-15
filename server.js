@@ -6403,160 +6403,56 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
   };
 }
 
-/* =========================================================
-   ✅ IA (admin-clientes)
-========================================================= */
-function aiCompactDashboard(dashboard, focus = {}) {
-  const table = Array.isArray(dashboard?.table) ? dashboard.table.slice(0, 25) : [];
-  const byMonth = Array.isArray(dashboard?.byMonth) ? dashboard.byMonth : [];
-  const topWh = Array.isArray(dashboard?.topWarehouses) ? dashboard.topWarehouses.slice(0, 10) : [];
-  const topCust = Array.isArray(dashboard?.topCustomers) ? dashboard.topCustomers.slice(0, 10) : [];
+app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
 
-  return {
-    range: { from: dashboard?.from || "", to: dashboard?.to || "" },
-    filters: { area: dashboard?.area || "__ALL__", grupo: dashboard?.grupo || "__ALL__" },
-    totals: dashboard?.totals || {},
-    byMonth,
-    topWarehouses: topWh,
-    topCustomers: topCust,
-    table,
-    focus,
-  };
-}
-function aiCompactDetail(detail, customerLabel = "") {
-  const docs = Array.isArray(detail?.invoices) ? detail.invoices.slice(0, 15) : [];
-  return {
-    label: customerLabel,
-    cardCode: detail?.cardCode || "",
-    warehouse: detail?.warehouse || "",
-    filters: { area: detail?.area || "__ALL__", grupo: detail?.grupo || "__ALL__" },
-    totals: detail?.totals || {},
-    documents: docs.map((d) => ({
-      docType: d.docType,
-      docTypeLabel: d.docTypeLabel,
-      docNum: d.docNum,
-      docDate: d.docDate,
-      totals: d.totals,
-      lines: Array.isArray(d.lines) ? d.lines.slice(0, 20) : [],
-    })),
-  };
-}
-function extractResponseText(obj) {
-  if (!obj) return "";
-  if (typeof obj.output_text === "string" && obj.output_text.trim()) return obj.output_text.trim();
+    const question = String(req.body?.question || "").trim();
+    if (!question) return safeJson(res, 400, { ok: false, message: "question requerida" });
 
-  const parts = [];
-  for (const item of (obj.output || [])) {
-    if (item?.type && item.type !== "message") continue;
-    for (const c of (item.content || [])) {
-      if ((c?.type === "output_text" || c?.type === "text") && c?.text) {
-        parts.push(String(c.text));
-      }
-      if (c?.type === "refusal" && c?.refusal) {
-        parts.push(`El modelo rechazó responder: ${String(c.refusal)}`);
-      }
+    const fromQ = String(req.body?.from || req.query?.from || "");
+    const toQ = String(req.body?.to || req.query?.to || "");
+    const cardCode = String(req.body?.cardCode || "").trim();
+    const warehouse = String(req.body?.warehouse || "").trim();
+    const customerLabel = String(req.body?.customerLabel || "").trim();
+    const area = String(req.body?.area || req.query?.area || "__ALL__");
+    const grupo = String(req.body?.grupo || req.query?.grupo || "__ALL__");
+    const q = String(req.body?.q || req.query?.q || "").trim();
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const defaultFrom = addDaysISO(today, -30);
+    const from = isISO(fromQ) ? fromQ : defaultFrom;
+    const to = isISO(toQ) ? toQ : today;
+
+    const dashboard = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
+    const analytics = await buildAdminClientesAiAnalytics({ from, to, area, grupo, q });
+
+    let detail = null;
+    if (cardCode && warehouse) {
+      detail = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
     }
-  }
-  return parts.join("\n").trim();
-}
-async function openaiDbAnalystChat({ question, dashboard, detail = null, customerLabel = "" }) {
-  const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
-  const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
-  if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
 
-  const compact = {
-    dashboard: aiCompactDashboard(dashboard, {
-      cardCode: detail?.cardCode || "",
-      warehouse: detail?.warehouse || "",
-    }),
-    detail: detail ? aiCompactDetail(detail, customerLabel) : null,
-  };
-
-  const system = [
-[
-  "Eres un analista comercial interno senior de PRODIMA, experto en ventas, clientes, portafolio, variaciones mensuales, rentabilidad y hallazgos accionables.",
-  "Usa exclusivamente la información entregada por el sistema como fuente de verdad. No menciones al usuario el formato interno de los datos ni digas que estás usando JSON.",
-  "La fuente es la base de datos sincronizada del sistema, no SAP en vivo. Si algo no aparece en los datos entregados, indícalo con claridad sin inventar.",
-  "Las ventas del módulo están neteadas: facturas menos notas de crédito.",
-  "Respeta estrictamente los filtros activos de fecha, área, grupo, cliente, bodega y cualquier otro filtro aplicado. No analices fuera del alcance del filtro.",
-  "Responde siempre en español, con lenguaje profesional, claro, útil y orientado al negocio.",
-  "Prioriza cifras concretas, comparaciones, tendencias, cambios relevantes, causas probables y acciones recomendadas.",
-  "Cuando el usuario pida resumen, análisis, hallazgos o comparaciones, analiza variaciones entre periodos dentro del rango disponible y explica qué subió, qué bajó, qué se mantuvo y qué cambió en mezcla de clientes, artículos y bodegas.",
-  "Identifica clientes que cayeron en ventas, clientes que crecieron, clientes que dejaron de comprar, clientes nuevos y clientes intermitentes.",
-  "Detecta específicamente clientes que compraron en un mes y en otro no, indicando el mes en que compraron, el mes en que no compraron, el monto involucrado si está disponible y los artículos relacionados cuando existan en los datos.",
-  "Cuando sea posible, señala qué cliente cayó total o parcialmente, cuánto cayó en dólares y porcentaje, y qué artículos explican la caída.",
-  "Cuando detectes una caída, revisa si se debe a menor volumen, menor frecuencia de compra, ausencia total del cliente, menor surtido, caída de uno o varios artículos clave, cambio de bodega o aumento de notas de crédito.",
-  "Detecta artículos que dejaron de venderse, artículos nuevos, artículos que crecieron, artículos que cayeron y artículos comprados por un cliente en un periodo pero ausentes en otro.",
-  "Si el usuario pregunta por clientes que no compraron, identifica cuáles compraron en un mes anterior pero no aparecen en el mes actual dentro del rango analizado.",
-  'Si el usuario pregunta "qué cliente cayó", responde con ranking de mayores caídas y explica por qué, incluyendo cliente, monto, porcentaje y artículos asociados.',
-  'Si el usuario pregunta "qué cliente compró en un mes sí y en otro no", compara mes contra mes y entrega una lista clara con cliente, mes con compra, mes sin compra y artículos vinculados si están disponibles.',
-  'Si el usuario pregunta "qué artículos fueron", menciona los códigos y descripciones de los artículos relevantes, junto con sus montos, participación o variación cuando sea posible.',
-  "Analiza también concentración: qué clientes explican la mayor parte de la venta, cuáles concentran la caída, cuáles sostienen el crecimiento y cuáles tienen alta dependencia de pocos artículos.",
-  "Analiza rentabilidad además de ventas: señala clientes o artículos con buena venta pero bajo margen, o menor venta pero alto margen, si la información está disponible.",
-  "Cuando compares meses, usa una estructura clara: resumen ejecutivo, hallazgos clave, clientes que cayeron, clientes que crecieron, clientes que desaparecieron, artículos relevantes, posibles causas y acciones sugeridas.",
-  "Cuando haya suficientes datos, entrega hallazgos accionables como: recuperar cliente caído, revisar surtido, validar inventario, revisar precio, revisar frecuencia de visita, revisar nota de crédito, revisar bodega o revisar comportamiento de un artículo clave.",
-  "No des respuestas genéricas. Siempre que sea posible, cita nombres de clientes, códigos, artículos, montos, porcentajes, meses y diferencias concretas.",
-  "Si no existe base suficiente para afirmar una causa, dilo como posibilidad o hipótesis y aclara que se infiere de los datos observados.",
-  "Si el usuario hace una pregunta puntual, responde directo primero y luego agrega hallazgos adicionales útiles.",
-  "Si el usuario pide resumen general, entrega primero un resumen ejecutivo breve y luego el detalle analítico.",
-  "Evita repetir cifras innecesariamente. Ordena la información de mayor impacto a menor impacto.",
-  "Redondea montos y porcentajes de forma amigable, pero conserva precisión suficiente para decisiones comerciales.",
-  "Tu objetivo es ayudar a gerencia comercial, ventas y planificación a entender qué pasó, quién cayó, quién compró, quién dejó de comprar, qué artículos explican el cambio y qué acciones conviene tomar."
-]
-  ].join(" ");
-
-  const reasoning = model.startsWith("gpt-5.1") || model.startsWith("gpt-5.2")
-    ? { effort: "none" }
-    : model.startsWith("gpt-5")
-      ? { effort: "minimal" }
-      : undefined;
-
-  const payload = {
-    model,
-    input: [
-      { role: "system", content: [{ type: "input_text", text: system }] },
-      {
-        role: "user",
-        content: [{
-          type: "input_text",
-          text:
-            `Pregunta del usuario:\n${String(question || "").trim()}\n\n` +
-            `JSON de contexto:\n${JSON.stringify(compact)}`
-        }]
-      }
-    ],
-    text: { format: { type: "text" } },
-    max_output_tokens: 1800,
-    ...(reasoning ? { reasoning } : {}),
-  };
-
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    throw new Error(data?.error?.message || data?.message || `OpenAI HTTP ${resp.status}`);
-  }
-
-  const answer = extractResponseText(data);
-  if (!answer) {
-    console.error("OpenAI empty output", {
-      model,
-      status: data?.status || null,
-      incomplete_details: data?.incomplete_details || null,
-      output_types: Array.isArray(data?.output) ? data.output.map((x) => x?.type) : [],
+    const out = await openaiDbAnalystChat({
+      question,
+      dashboard,
+      analytics,
+      detail,
+      customerLabel,
     });
-    throw new Error("OpenAI devolvió salida vacía");
-  }
-  return { answer, model };
-}
 
+    return safeJson(res, 200, {
+      ok: true,
+      answer: out.answer,
+      model: out.model,
+      source: "db",
+      range: { from, to },
+      filters: { area, grupo, q },
+      focus: detail ? { cardCode, warehouse, customerLabel } : null,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
 /* =========================================================
    ✅ Health + Auth
 ========================================================= */
