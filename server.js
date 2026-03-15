@@ -5132,6 +5132,8 @@ app.post("/api/admin/login", async (req, res) => {
 /* =========================================================
    ✅ Dashboard endpoint
 ========================================================= */
+globalThis.dashboardFromDbEstratificacion = dashboardFromDbEstratificacion;
+
 app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
@@ -8744,13 +8746,18 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
 
 
 async function loadEstratificacionDashboardForAi(args) {
-  if (typeof dashboardFromDbEstratificacion === "function") {
-    return await dashboardFromDbEstratificacion(args);
+  const fn =
+    (typeof globalThis.dashboardFromDbEstratificacion === "function" && globalThis.dashboardFromDbEstratificacion) ||
+    (typeof dashboardFromDbEstratificacion === "function" && dashboardFromDbEstratificacion) ||
+    (typeof globalThis.dashboardFromDb === "function" && globalThis.dashboardFromDb) ||
+    (typeof dashboardFromDb === "function" && dashboardFromDb) ||
+    null;
+
+  if (!fn) {
+    throw new Error("No existe función de dashboard para Estratificación");
   }
-  if (typeof dashboardFromDb === "function") {
-    return await dashboardFromDb(args);
-  }
-  throw new Error("No existe función de dashboard para Estratificación");
+
+  return await fn(args);
 }
 
 app.post("/api/admin/estratificacion/ai-chat", verifyAdmin, async (req, res) => {
