@@ -6808,8 +6808,7 @@ function extractResponseText(obj) {
       }
     }
   }
-  return parts.join("
-").trim();
+  return parts.join("\n").trim();
 }
 
 async function openaiDbAnalystChat({ question, dashboard, analytics = null, detail = null, customerLabel = "" }) {
