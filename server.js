@@ -3000,7 +3000,7 @@ function parseEmailList(csv) {
 
 
 globalThis.DOCS_NOTIFY_TO = parseEmailList(
-  "pe-impa@prodima.com.pa"
+  "adm-red@prodima.com.pa"
 ).join(",");
 const DOCS_NOTIFY_TO = globalThis.DOCS_NOTIFY_TO;
 console.log("BOOT", "DOCS_MAIL_V11_BASE41_FAST_SEARCH");
@@ -6403,56 +6403,513 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
   };
 }
 
-app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
 
-    const question = String(req.body?.question || "").trim();
-    if (!question) return safeJson(res, 400, { ok: false, message: "question requerida" });
+/* =========================================================
+   ✅ IA (admin-clientes) — contexto rico para análisis mensual
+========================================================= */
+function aiPctDelta(base, next) {
+  const a = Number(base || 0);
+  const b = Number(next || 0);
+  if (a === 0 && b === 0) return 0;
+  if (a === 0 && b !== 0) return 100;
+  return num(((b - a) / a) * 100, 2);
+}
 
-    const fromQ = String(req.body?.from || req.query?.from || "");
-    const toQ = String(req.body?.to || req.query?.to || "");
-    const cardCode = String(req.body?.cardCode || "").trim();
-    const warehouse = String(req.body?.warehouse || "").trim();
-    const customerLabel = String(req.body?.customerLabel || "").trim();
-    const area = String(req.body?.area || req.query?.area || "__ALL__");
-    const grupo = String(req.body?.grupo || req.query?.grupo || "__ALL__");
-    const q = String(req.body?.q || req.query?.q || "").trim();
+function aiStatusFirstVsLast(firstSales, lastSales) {
+  const a = Number(firstSales || 0);
+  const b = Number(lastSales || 0);
 
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
-    const from = isISO(fromQ) ? fromQ : defaultFrom;
-    const to = isISO(toQ) ? toQ : today;
+  if (a > 0 && b === 0) return "compró en el primer mes y no compró en el último";
+  if (a === 0 && b > 0) return "no compró en el primer mes y sí compró en el último";
+  if (a > 0 && b > a) return "creció entre el primer y el último mes";
+  if (a > 0 && b < a) return "cayó entre el primer y el último mes";
+  if (a === 0 && b === 0) return "sin venta en ambos extremos del rango";
+  return "comportamiento estable";
+}
 
-    const dashboard = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
-    const analytics = await buildAdminClientesAiAnalytics({ from, to, area, grupo, q });
+function aiBucketTopItems(bucketMap, limit = 8) {
+  return Array.from(bucketMap.values())
+    .map((x) => ({
+      itemCode: x.itemCode,
+      itemDesc: x.itemDesc,
+      qty: num(x.qty, 4),
+      dollars: money2(x.dollars),
+      grossProfit: money2(x.grossProfit),
+      grossPct: x.dollars !== 0 ? num((x.grossProfit / x.dollars) * 100, 2) : 0,
+      area: x.area,
+      grupo: x.grupo,
+    }))
+    .sort((a, b) => Math.abs(Number(b.dollars || 0)) - Math.abs(Number(a.dollars || 0)))
+    .slice(0, Math.max(1, Math.min(50, Number(limit || 8))));
+}
 
-    let detail = null;
-    if (cardCode && warehouse) {
-      detail = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
+function aiTopChangedItems(sourceBucket, targetBucket, mode = "lost", limit = 8) {
+  const src = sourceBucket instanceof Map ? sourceBucket : new Map();
+  const trg = targetBucket instanceof Map ? targetBucket : new Map();
+  const out = [];
+
+  if (mode === "lost") {
+    for (const item of src.values()) {
+      const trgItem = trg.get(item.itemCode);
+      const trgDol = Number(trgItem?.dollars || 0);
+      if (Math.abs(Number(item.dollars || 0)) > 0.0001 && Math.abs(trgDol) <= 0.0001) {
+        out.push({
+          itemCode: item.itemCode,
+          itemDesc: item.itemDesc,
+          qty: num(item.qty, 4),
+          dollars: money2(item.dollars),
+          grossProfit: money2(item.grossProfit),
+          area: item.area,
+          grupo: item.grupo,
+        });
+      }
+    }
+  } else {
+    for (const item of trg.values()) {
+      const srcItem = src.get(item.itemCode);
+      const srcDol = Number(srcItem?.dollars || 0);
+      if (Math.abs(Number(item.dollars || 0)) > 0.0001 && Math.abs(srcDol) <= 0.0001) {
+        out.push({
+          itemCode: item.itemCode,
+          itemDesc: item.itemDesc,
+          qty: num(item.qty, 4),
+          dollars: money2(item.dollars),
+          grossProfit: money2(item.grossProfit),
+          area: item.area,
+          grupo: item.grupo,
+        });
+      }
+    }
+  }
+
+  return out
+    .sort((a, b) => Math.abs(Number(b.dollars || 0)) - Math.abs(Number(a.dollars || 0)))
+    .slice(0, Math.max(1, Math.min(50, Number(limit || 8))));
+}
+
+async function buildAdminClientesAiAnalytics({ from, to, area = "__ALL__", grupo = "__ALL__", q = "" }) {
+  let rows = await fetchInvoiceRows({ from, to, q });
+  rows = applyAreaGroupFilters(rows, { area, grupo });
+
+  const months = Array.from(
+    new Set(
+      rows
+        .map((r) => String(r.docDate || "").slice(0, 7))
+        .filter(Boolean)
+    )
+  ).sort((a, b) => a.localeCompare(b));
+
+  const firstMonth = months[0] || "";
+  const lastMonth = months[months.length - 1] || "";
+
+  const customerMonthMap = new Map();
+  const customerProfileMap = new Map();
+  const customerMonthItemBuckets = new Map();
+  const monthTotalsMap = new Map();
+
+  for (const r of rows) {
+    const month = String(r.docDate || "").slice(0, 7);
+    if (!month) continue;
+
+    const docKey = `${r.docType}:${r.docEntry}`;
+    const customerKey = `${r.cardCode}||${r.cardName}`;
+    const cmKey = `${month}||${r.cardCode}||${r.cardName}`;
+
+    {
+      const cur = monthTotalsMap.get(month) || {
+        month,
+        dollars: 0,
+        grossProfit: 0,
+        invoicesSet: new Set(),
+        creditNotesSet: new Set(),
+      };
+      cur.dollars += Number(r.dollars || 0);
+      cur.grossProfit += Number(r.grossProfit || 0);
+      if (r.docType === "CRN") cur.creditNotesSet.add(docKey);
+      else cur.invoicesSet.add(docKey);
+      monthTotalsMap.set(month, cur);
     }
 
-    const out = await openaiDbAnalystChat({
-      question,
+    {
+      const cur = customerMonthMap.get(cmKey) || {
+        month,
+        cardCode: r.cardCode,
+        cardName: r.cardName,
+        customer: `${r.cardCode} · ${r.cardName}`,
+        dollars: 0,
+        grossProfit: 0,
+        qty: 0,
+        invoicesSet: new Set(),
+        creditNotesSet: new Set(),
+        warehousesMap: new Map(),
+      };
+
+      cur.dollars += Number(r.dollars || 0);
+      cur.grossProfit += Number(r.grossProfit || 0);
+      cur.qty += Number(r.quantity || 0);
+
+      if (r.docType === "CRN") cur.creditNotesSet.add(docKey);
+      else cur.invoicesSet.add(docKey);
+
+      const wh = String(r.warehouse || "SIN_WH");
+      const whCur = cur.warehousesMap.get(wh) || { warehouse: wh, dollars: 0 };
+      whCur.dollars += Number(r.dollars || 0);
+      cur.warehousesMap.set(wh, whCur);
+
+      customerMonthMap.set(cmKey, cur);
+    }
+
+    {
+      const cur = customerProfileMap.get(customerKey) || {
+        cardCode: r.cardCode,
+        cardName: r.cardName,
+        customer: `${r.cardCode} · ${r.cardName}`,
+        totalSales: 0,
+        totalGP: 0,
+        monthsActive: new Set(),
+        salesByMonth: {},
+        gpByMonth: {},
+        topWarehousesMap: new Map(),
+      };
+
+      cur.totalSales += Number(r.dollars || 0);
+      cur.totalGP += Number(r.grossProfit || 0);
+      cur.monthsActive.add(month);
+      cur.salesByMonth[month] = Number(cur.salesByMonth[month] || 0) + Number(r.dollars || 0);
+      cur.gpByMonth[month] = Number(cur.gpByMonth[month] || 0) + Number(r.grossProfit || 0);
+
+      const wh = String(r.warehouse || "SIN_WH");
+      const whCur = cur.topWarehousesMap.get(wh) || { warehouse: wh, dollars: 0 };
+      whCur.dollars += Number(r.dollars || 0);
+      cur.topWarehousesMap.set(wh, whCur);
+
+      customerProfileMap.set(customerKey, cur);
+    }
+
+    {
+      const bucket = customerMonthItemBuckets.get(cmKey) || new Map();
+      const itemKey = String(r.itemCode || "").trim() || `SIN_ITEM__${String(r.itemDesc || "").trim()}`;
+
+      const cur = bucket.get(itemKey) || {
+        itemCode: String(r.itemCode || ""),
+        itemDesc: String(r.itemDesc || ""),
+        qty: 0,
+        dollars: 0,
+        grossProfit: 0,
+        area: r.area,
+        grupo: r.grupo,
+      };
+
+      cur.qty += Number(r.quantity || 0);
+      cur.dollars += Number(r.dollars || 0);
+      cur.grossProfit += Number(r.grossProfit || 0);
+
+      bucket.set(itemKey, cur);
+      customerMonthItemBuckets.set(cmKey, bucket);
+    }
+  }
+
+  const rangeMonthSummary = Array.from(monthTotalsMap.values())
+    .map((x) => {
+      const dol = money2(x.dollars);
+      const gp = money2(x.grossProfit);
+      return {
+        month: x.month,
+        invoices: x.invoicesSet.size,
+        creditNotes: x.creditNotesSet.size,
+        dollars: dol,
+        grossProfit: gp,
+        grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
+      };
+    })
+    .sort((a, b) => String(a.month).localeCompare(String(b.month)));
+
+  const customerMonthly = Array.from(customerMonthMap.values())
+    .map((x) => {
+      const dol = money2(x.dollars);
+      const gp = money2(x.grossProfit);
+      const topWarehouses = Array.from(x.warehousesMap.values())
+        .map((w) => ({ warehouse: w.warehouse, dollars: money2(w.dollars) }))
+        .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0))
+        .slice(0, 5);
+
+      return {
+        month: x.month,
+        cardCode: x.cardCode,
+        cardName: x.cardName,
+        customer: x.customer,
+        qty: num(x.qty, 4),
+        dollars: dol,
+        grossProfit: gp,
+        grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
+        invoices: x.invoicesSet.size,
+        creditNotes: x.creditNotesSet.size,
+        topWarehouses,
+      };
+    })
+    .sort((a, b) => {
+      if (String(a.month) !== String(b.month)) return String(a.month).localeCompare(String(b.month));
+      return Number(b.dollars || 0) - Number(a.dollars || 0);
+    })
+    .slice(0, 300);
+
+  const customerMonthTopItems = Array.from(customerMonthItemBuckets.entries())
+    .map(([cmKey, bucket]) => {
+      const [month, cardCode, cardName] = cmKey.split("||");
+      return {
+        month,
+        cardCode,
+        cardName,
+        customer: `${cardCode} · ${cardName}`,
+        topItems: aiBucketTopItems(bucket, 10),
+      };
+    })
+    .sort((a, b) => {
+      if (String(a.month) !== String(b.month)) return String(a.month).localeCompare(String(b.month));
+      const aTop = Number(a.topItems?.[0]?.dollars || 0);
+      const bTop = Number(b.topItems?.[0]?.dollars || 0);
+      return Math.abs(bTop) - Math.abs(aTop);
+    })
+    .slice(0, 180);
+
+  const customerComparisons = Array.from(customerProfileMap.values())
+    .map((x) => {
+      const salesByMonth = {};
+      const gpByMonth = {};
+
+      for (const m of months) {
+        salesByMonth[m] = money2(x.salesByMonth[m] || 0);
+        gpByMonth[m] = money2(x.gpByMonth[m] || 0);
+      }
+
+      const salesFirst = money2(x.salesByMonth[firstMonth] || 0);
+      const salesLast = money2(x.salesByMonth[lastMonth] || 0);
+
+      const firstBucket = customerMonthItemBuckets.get(`${firstMonth}||${x.cardCode}||${x.cardName}`) || new Map();
+      const lastBucket = customerMonthItemBuckets.get(`${lastMonth}||${x.cardCode}||${x.cardName}`) || new Map();
+
+      const topWarehouses = Array.from(x.topWarehousesMap.values())
+        .map((w) => ({ warehouse: w.warehouse, dollars: money2(w.dollars) }))
+        .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0))
+        .slice(0, 5);
+
+      return {
+        cardCode: x.cardCode,
+        cardName: x.cardName,
+        customer: x.customer,
+        totalSales: money2(x.totalSales),
+        totalGrossProfit: money2(x.totalGP),
+        totalGrossPct: x.totalSales !== 0 ? num((x.totalGP / x.totalSales) * 100, 2) : 0,
+        monthsActive: Array.from(x.monthsActive.values()).sort((a, b) => a.localeCompare(b)),
+        missingMonthsWithinRange: months.filter((m) => Math.abs(Number(x.salesByMonth[m] || 0)) <= 0.0001),
+        salesByMonth,
+        gpByMonth,
+        firstMonth,
+        lastMonth,
+        salesFirstMonth: salesFirst,
+        salesLastMonth: salesLast,
+        deltaFirstVsLast: money2(salesLast - salesFirst),
+        deltaPctFirstVsLast: aiPctDelta(salesFirst, salesLast),
+        statusFirstVsLast: aiStatusFirstVsLast(salesFirst, salesLast),
+        topLostItemsFirstVsLast: aiTopChangedItems(firstBucket, lastBucket, "lost", 10),
+        topGainedItemsFirstVsLast: aiTopChangedItems(firstBucket, lastBucket, "gained", 10),
+        topWarehouses,
+      };
+    })
+    .sort((a, b) => {
+      const absA = Math.abs(Number(a.deltaFirstVsLast || 0));
+      const absB = Math.abs(Number(b.deltaFirstVsLast || 0));
+      if (absB !== absA) return absB - absA;
+      return Number(b.totalSales || 0) - Number(a.totalSales || 0);
+    })
+    .slice(0, 150);
+
+  return {
+    range: { from, to },
+    filters: { area, grupo, q },
+    months,
+    firstMonth,
+    lastMonth,
+    rangeMonthSummary,
+    customerMonthly,
+    customerMonthTopItems,
+    customerComparisons,
+  };
+}
+
+function aiCompactDashboard(dashboard, analytics = {}, focus = {}) {
+  const table = Array.isArray(dashboard?.table) ? dashboard.table.slice(0, 25) : [];
+  const byMonth = Array.isArray(dashboard?.byMonth) ? dashboard.byMonth : [];
+  const topWh = Array.isArray(dashboard?.topWarehouses) ? dashboard.topWarehouses.slice(0, 10) : [];
+  const topCust = Array.isArray(dashboard?.topCustomers) ? dashboard.topCustomers.slice(0, 15) : [];
+
+  const customerMonthly = Array.isArray(analytics?.customerMonthly) ? analytics.customerMonthly.slice(0, 220) : [];
+  const customerMonthTopItems = Array.isArray(analytics?.customerMonthTopItems) ? analytics.customerMonthTopItems.slice(0, 120) : [];
+  const customerComparisons = Array.isArray(analytics?.customerComparisons) ? analytics.customerComparisons.slice(0, 120) : [];
+  const rangeMonthSummary = Array.isArray(analytics?.rangeMonthSummary) ? analytics.rangeMonthSummary : [];
+
+  return {
+    range: { from: dashboard?.from || "", to: dashboard?.to || "" },
+    filters: {
+      area: dashboard?.area || "__ALL__",
+      grupo: dashboard?.grupo || "__ALL__",
+      q: analytics?.filters?.q || "",
+    },
+    totals: dashboard?.totals || {},
+    byMonth,
+    topWarehouses: topWh,
+    topCustomers: topCust,
+    table,
+    analytics: {
+      months: Array.isArray(analytics?.months) ? analytics.months : [],
+      firstMonth: analytics?.firstMonth || "",
+      lastMonth: analytics?.lastMonth || "",
+      rangeMonthSummary,
+      customerMonthly,
+      customerComparisons,
+      customerMonthTopItems,
+    },
+    focus,
+  };
+}
+
+function aiCompactDetail(detail, customerLabel = "") {
+  const docs = Array.isArray(detail?.invoices) ? detail.invoices.slice(0, 15) : [];
+  return {
+    label: customerLabel,
+    cardCode: detail?.cardCode || "",
+    warehouse: detail?.warehouse || "",
+    filters: { area: detail?.area || "__ALL__", grupo: detail?.grupo || "__ALL__" },
+    totals: detail?.totals || {},
+    documents: docs.map((d) => ({
+      docType: d.docType,
+      docTypeLabel: d.docTypeLabel,
+      docNum: d.docNum,
+      docDate: d.docDate,
+      totals: d.totals,
+      lines: Array.isArray(d.lines) ? d.lines.slice(0, 25) : [],
+    })),
+  };
+}
+
+function extractResponseText(obj) {
+  if (!obj) return "";
+  if (typeof obj.output_text === "string" && obj.output_text.trim()) return obj.output_text.trim();
+
+  const parts = [];
+  for (const item of (obj.output || [])) {
+    if (item?.type && item.type !== "message") continue;
+    for (const c of (item.content || [])) {
+      if ((c?.type === "output_text" || c?.type === "text") && c?.text) {
+        parts.push(String(c.text));
+      }
+      if (c?.type === "refusal" && c?.refusal) {
+        parts.push(`El modelo rechazó responder: ${String(c.refusal)}`);
+      }
+    }
+  }
+  return parts.join("
+").trim();
+}
+
+async function openaiDbAnalystChat({ question, dashboard, analytics = null, detail = null, customerLabel = "" }) {
+  const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+  const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
+  if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
+
+  const compact = {
+    dashboard: aiCompactDashboard(
       dashboard,
       analytics,
-      detail,
-      customerLabel,
-    });
+      {
+        cardCode: detail?.cardCode || "",
+        warehouse: detail?.warehouse || "",
+      }
+    ),
+    detail: detail ? aiCompactDetail(detail, customerLabel) : null,
+  };
 
-    return safeJson(res, 200, {
-      ok: true,
-      answer: out.answer,
-      model: out.model,
-      source: "db",
-      range: { from, to },
-      filters: { area, grupo, q },
-      focus: detail ? { cardCode, warehouse, customerLabel } : null,
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
+  const system = [
+    "Eres un analista comercial interno senior de PRODIMA, experto en ventas, clientes, portafolio, variaciones mensuales, rentabilidad y hallazgos accionables.",
+    "Usa exclusivamente la información entregada por el sistema como fuente de verdad. No menciones formatos internos ni digas que estás usando JSON.",
+    "La fuente es la base de datos sincronizada del sistema, no SAP en vivo.",
+    "Las ventas del módulo están neteadas: facturas menos notas de crédito.",
+    "Respeta estrictamente los filtros activos de fecha, área, grupo, búsqueda, cliente, bodega y cualquier otro filtro entregado en el contexto.",
+    "Responde siempre en español, con tono profesional, claro, ejecutivo y útil.",
+    "Prioriza cifras concretas, comparaciones, tendencias, hallazgos accionables y posibles causas basadas en datos.",
+    "Cuando existan datos por cliente y mes, identifica clientes que cayeron, crecieron, dejaron de comprar, compraron en un mes y en otro no, clientes nuevos y clientes intermitentes.",
+    "Cuando existan datos por cliente, artículo y mes, explica qué artículos provocaron la caída, crecimiento o ausencia de compra de cada cliente.",
+    "Si el usuario pregunta qué cliente cayó, responde con ranking de mayores caídas, monto, porcentaje, meses comparados y artículos asociados cuando existan.",
+    "Si el usuario pregunta qué cliente compró en un mes sí y en otro no, usa el detalle cliente-mes y responde con una lista directa de clientes ausentes o intermitentes entre esos meses.",
+    "Si el usuario pregunta qué artículos fueron, menciona códigos, descripciones, montos, cantidades y variaciones cuando existan.",
+    "Si la información permite comparar el primer y el último mes del rango, usa también esa comparación para detectar clientes perdidos, recuperados, artículos perdidos y artículos ganados.",
+    "Cuando compares meses, indica cliente, mes inicial, mes final, venta inicial, venta final, variación en dólares, variación porcentual y los artículos relacionados cuando existan.",
+    "No des respuestas genéricas. Siempre que sea posible menciona nombres de clientes, códigos, artículos, montos, porcentajes, bodegas y meses concretos.",
+    "Si no existe base suficiente para afirmar una causa, preséntala como hipótesis inferida de los datos observados.",
+    "Si el usuario hace una pregunta puntual, responde directo primero. Luego agrega hallazgos adicionales útiles.",
+    "Si el usuario pide un análisis amplio, usa esta estructura: resumen ejecutivo, clientes que cayeron, clientes que crecieron, clientes que dejaron de comprar, artículos relacionados, posibles causas y acciones sugeridas.",
+    "Evita repetir cifras innecesariamente. Ordena de mayor impacto a menor impacto.",
+    "Tu objetivo es ayudar a gerencia comercial y ventas a entender qué pasó, quién cayó, quién dejó de comprar, qué artículos explican el cambio y qué acciones conviene tomar."
+  ].join(" ");
+
+  const reasoning = model.startsWith("gpt-5.1") || model.startsWith("gpt-5.2")
+    ? { effort: "none" }
+    : model.startsWith("gpt-5")
+      ? { effort: "minimal" }
+      : undefined;
+
+  const payload = {
+    model,
+    input: [
+      { role: "system", content: [{ type: "input_text", text: system }] },
+      {
+        role: "user",
+        content: [{
+          type: "input_text",
+          text:
+            `Pregunta del usuario:
+${String(question || "").trim()}
+
+` +
+            `Contexto del sistema:
+${JSON.stringify(compact)}`
+        }]
+      }
+    ],
+    text: { format: { type: "text" } },
+    max_output_tokens: 2200,
+    ...(reasoning ? { reasoning } : {}),
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(data?.error?.message || data?.message || `OpenAI HTTP ${resp.status}`);
   }
-});
+
+  const answer = extractResponseText(data);
+  if (!answer) {
+    console.error("OpenAI empty output", {
+      model,
+      status: data?.status || null,
+      incomplete_details: data?.incomplete_details || null,
+      output_types: Array.isArray(data?.output) ? data.output.map((x) => x?.type) : [],
+    });
+    throw new Error("OpenAI devolvió salida vacía");
+  }
+
+  return { answer, model };
+}
+
+
 /* =========================================================
    ✅ Health + Auth
 ========================================================= */
@@ -6631,6 +7088,7 @@ app.get("/api/admin/invoices/details/export", verifyAdmin, async (req, res) => {
   }
 });
 
+
 app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
@@ -6645,13 +7103,16 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
     const customerLabel = String(req.body?.customerLabel || "").trim();
     const area = String(req.body?.area || req.query?.area || "__ALL__");
     const grupo = String(req.body?.grupo || req.query?.grupo || "__ALL__");
+    const q = String(req.body?.q || req.query?.q || "").trim();
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const defaultFrom = addDaysISO(today, -30);
     const from = isISO(fromQ) ? fromQ : defaultFrom;
     const to = isISO(toQ) ? toQ : today;
 
-    const dashboard = await dashboardFromDbAdminClientes({ from, to, area, grupo, q: "" });
+    const dashboard = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
+    const analytics = await buildAdminClientesAiAnalytics({ from, to, area, grupo, q });
+
     let detail = null;
     if (cardCode && warehouse) {
       detail = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
@@ -6660,6 +7121,7 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
     const out = await openaiDbAnalystChat({
       question,
       dashboard,
+      analytics,
       detail,
       customerLabel,
     });
@@ -6670,13 +7132,14 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
       model: out.model,
       source: "db",
       range: { from, to },
-      filters: { area, grupo },
+      filters: { area, grupo, q },
       focus: detail ? { cardCode, warehouse, customerLabel } : null,
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
+
 
 app.post("/api/admin/invoices/sync", verifyAdmin, async (req, res) => {
   try {
