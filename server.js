@@ -8742,6 +8742,17 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
   };
 }
 
+
+async function loadEstratificacionDashboardForAi(args) {
+  if (typeof dashboardFromDbEstratificacion === "function") {
+    return await dashboardFromDbEstratificacion(args);
+  }
+  if (typeof dashboardFromDb === "function") {
+    return await dashboardFromDb(args);
+  }
+  throw new Error("No existe función de dashboard para Estratificación");
+}
+
 app.post("/api/admin/estratificacion/ai-chat", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
@@ -8761,7 +8772,7 @@ app.post("/api/admin/estratificacion/ai-chat", verifyAdmin, async (req, res) => 
     const from = isISO(fromQ) ? fromQ : "2025-01-01";
     const to = isISO(toQ) ? toQ : today;
 
-    const dashboard = await dashboardFromDbEstratificacion({ from, to, area, grupo, q });
+    const dashboard = await loadEstratificacionDashboardForAi({ from, to, area, grupo, q });
     const itemRows = itemCode
       ? await estratLoadItemDocsForAi({ itemCode, from, to, area, grupo })
       : [];
