@@ -6896,7 +6896,7 @@ ${JSON.stringify(compact)}`
     throw new Error(data?.error?.message || data?.message || `OpenAI HTTP ${resp.status}`);
   }
 
-  const answer = estratExtractResponseText(data);
+  const answer = extractResponseText(data);
   if (!answer) {
     console.error("OpenAI empty output", {
       model,
@@ -8865,7 +8865,7 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
     );
   }
 
-  const answer = estratExtractResponseText(data);
+  const answer = extractResponseText(data);
   if (!answer) {
     console.error("OpenAI empty output [estratificacion]", {
       model,
