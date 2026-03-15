@@ -8655,9 +8655,146 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
   const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
   if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
 
+  const safeNum = (x, d = 0) => {
+    const n = Number(x || 0);
+    return Number.isFinite(n) ? Number(n.toFixed(d)) : 0;
+  };
+  const safeMoney = (x) => safeNum(x, 2);
+
+  const items = Array.isArray(dashboard?.items) ? dashboard.items : [];
+  const groupAgg = Array.isArray(dashboard?.groupAgg) ? dashboard.groupAgg : [];
+
+  const compactDashboard = {
+    range: { from: dashboard?.from || "", to: dashboard?.to || "" },
+    filters: {
+      area: dashboard?.area || "__ALL__",
+      grupo: dashboard?.grupo || "__ALL__",
+      q: dashboard?.q || ""
+    },
+    totals: dashboard?.totals || {},
+    summary: {
+      totalItems: items.length,
+      stockBelowMin: items.filter((x) => Number(x.stock || 0) < Number(x.stockMin || 0)).length,
+      stockAtOrOverMax: items.filter((x) => Number(x.stockMax || 0) > 0 && Number(x.stock || 0) >= Number(x.stockMax || 0)).length,
+      stockZeroOrNegative: items.filter((x) => Number(x.stock || 0) <= 0).length
+    },
+    topGroups: groupAgg.slice(0, 20).map((x) => ({
+      area: x.area,
+      grupo: x.grupo,
+      items: Number(x.items || 0),
+      revenue: safeMoney(x.revenue),
+      gp: safeMoney(x.gp),
+      gpPct: safeNum(x.gpPct, 2),
+      shareRevenue: safeNum(x.shareRevenue, 2),
+      shareGP: safeNum(x.shareGP, 2),
+      label: x.label
+    })),
+    topItems: items.slice(0, 40).map((x) => ({
+      rankTotal: Number(x.rankTotal || 0),
+      rankArea: Number(x.rankArea || 0),
+      itemCode: x.itemCode,
+      itemDesc: x.itemDesc,
+      area: x.area,
+      grupo: x.grupo,
+      revenue: safeMoney(x.revenue),
+      gp: safeMoney(x.gp),
+      gpPct: safeNum(x.gpPct, 2),
+      totalLabel: x.totalLabel,
+      abcRevenue: x.abcRevenue,
+      abcGP: x.abcGP,
+      abcGPPct: x.abcGPPct,
+      stock: safeNum(x.stock, 2),
+      stockMin: safeNum(x.stockMin, 2),
+      stockMax: safeNum(x.stockMax, 2),
+      available: safeNum(x.available, 2),
+      committed: safeNum(x.committed, 2),
+      ordered: safeNum(x.ordered, 2),
+      faltanteVsMin: safeNum(Number(x.stockMin || 0) - Number(x.stock || 0), 2),
+      excesoVsMax: safeNum(Number(x.stock || 0) - Number(x.stockMax || 0), 2),
+    })),
+  };
+
+  const selectedItem = itemRows.length ? (() => {
+    const rows = Array.isArray(itemRows) ? itemRows : [];
+    const byCustomer = new Map();
+    const byMonth = new Map();
+    let totQty = 0, totRev = 0, totGp = 0;
+    let area = "", grupo = "", itemCode = "", itemDesc = "";
+
+    for (const r of rows) {
+      const qty = Number(r.quantity || 0);
+      const rev = Number(r.revenue || 0);
+      const gp = Number(r.gp || 0);
+      const month = String(r.docDate || "").slice(0, 7);
+      const ckey = `${r.cardCode || ""}||${r.cardName || ""}`;
+
+      itemCode = itemCode || String(r.itemCode || "");
+      itemDesc = itemDesc || String(r.itemDesc || "");
+      area = area || String(r.area || "");
+      grupo = grupo || String(r.grupo || "");
+
+      totQty += qty; totRev += rev; totGp += gp;
+
+      const c = byCustomer.get(ckey) || {
+        cardCode: String(r.cardCode || ""),
+        cardName: String(r.cardName || ""),
+        quantity: 0,
+        revenue: 0,
+        gp: 0
+      };
+      c.quantity += qty; c.revenue += rev; c.gp += gp;
+      byCustomer.set(ckey, c);
+
+      if (month) {
+        const m = byMonth.get(month) || { month, quantity: 0, revenue: 0, gp: 0 };
+        m.quantity += qty; m.revenue += rev; m.gp += gp;
+        byMonth.set(month, m);
+      }
+    }
+
+    return {
+      label: itemLabel || itemCode || itemDesc || "",
+      itemCode,
+      itemDesc,
+      area,
+      grupo,
+      totals: {
+        quantity: safeNum(totQty, 4),
+        revenue: safeMoney(totRev),
+        gp: safeMoney(totGp),
+        gpPct: totRev ? safeNum((totGp / totRev) * 100, 2) : 0
+      },
+      topCustomers: Array.from(byCustomer.values()).map((x) => ({
+        cardCode: x.cardCode,
+        cardName: x.cardName,
+        quantity: safeNum(x.quantity, 4),
+        revenue: safeMoney(x.revenue),
+        gp: safeMoney(x.gp),
+        gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
+      })).sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0)).slice(0, 20),
+      byMonth: Array.from(byMonth.values()).map((x) => ({
+        month: x.month,
+        quantity: safeNum(x.quantity, 4),
+        revenue: safeMoney(x.revenue),
+        gp: safeMoney(x.gp),
+        gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
+      })).sort((a, b) => String(a.month).localeCompare(String(b.month))).slice(0, 24),
+      rawRows: rows.slice(0, 120).map((r) => ({
+        docDate: r.docDate,
+        cardCode: r.cardCode,
+        cardName: r.cardName,
+        quantity: safeNum(r.quantity, 4),
+        revenue: safeMoney(r.revenue),
+        gp: safeMoney(r.gp),
+        area: r.area,
+        grupo: r.grupo
+      }))
+    };
+  })() : null;
+
   const compact = {
-    dashboard: estratCompactDashboard(dashboard),
-    selectedItem: itemRows.length ? estratCompactItemDetail(itemRows, itemLabel) : null,
+    dashboard: compactDashboard,
+    selectedItem
   };
 
   const system = [
@@ -8751,7 +8888,6 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
     raw: data,
   };
 }
-
 
 async function loadEstratificacionDashboardForAi(args) {
   const fn =
