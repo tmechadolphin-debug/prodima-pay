@@ -5860,9 +5860,9 @@ async function scanInvoicesHeaders({ f, t, maxDocs = 3000 }) {
 
   for (let page = 0; page < 300; page++) {
     const raw = await slFetch(
-      `/Invoices?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,Canceled` +
-        `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
-        `&$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skipSap}`,
+      `/Invoices?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,CancelStatus` +
+      `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
+      `&$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skipSap}`,
       { timeoutMs: 60000 }
     );
 
@@ -5871,7 +5871,12 @@ async function scanInvoicesHeaders({ f, t, maxDocs = 3000 }) {
     skipSap += rows.length;
 
     for (const r of rows) {
-      if (String(r.Canceled || "N").toUpperCase() === "Y") continue;
+      const cs = String(r.CancelStatus ?? "").trim();
+
+      // excluye canceladas y documentos de cancelación
+      if (cs === "csYes" || cs === "csCancellation" || cs === "0" || cs === "2") {
+        continue;
+      }
 
       out.push({
         DocEntry: Number(r.DocEntry),
