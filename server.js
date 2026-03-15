@@ -8650,6 +8650,37 @@ function estratCompactItemDetail(rows, itemLabel = "") {
   };
 }
 
+function estratExtractResponseText(obj) {
+  if (!obj || typeof obj !== "object") return "";
+  if (typeof obj.output_text === "string" && obj.output_text.trim()) return obj.output_text.trim();
+
+  const out = [];
+  for (const item of Array.isArray(obj.output) ? obj.output : []) {
+    if (item?.type && item.type !== "message") continue;
+    if (!Array.isArray(item.content)) continue;
+
+    for (const c of item.content) {
+      if (typeof c?.text === "string" && c.text.trim()) {
+        out.push(c.text.trim());
+        continue;
+      }
+      if (typeof c?.text?.value === "string" && c.text.value.trim()) {
+        out.push(c.text.value.trim());
+        continue;
+      }
+      if (typeof c?.output_text === "string" && c.output_text.trim()) {
+        out.push(c.output_text.trim());
+        continue;
+      }
+      if (c?.type === "refusal" && c?.refusal) {
+        out.push(`El modelo rechazó responder: ${String(c.refusal).trim()}`);
+      }
+    }
+  }
+
+  return out.join("\n\n").trim();
+}
+
 async function openaiEstratificacionChat({ question, dashboard, itemRows = [], itemLabel = "" }) {
   const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
   const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
@@ -8865,7 +8896,7 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
     );
   }
 
-  const answer = extractResponseText(data);
+  const answer = estratExtractResponseText(data);
   if (!answer) {
     console.error("OpenAI empty output [estratificacion]", {
       model,
