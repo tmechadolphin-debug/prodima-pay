@@ -5598,7 +5598,6 @@ const {
   SAP_USER = "",
   SAP_PASS = "",
 
-  // CORS_ORIGIN=https://prodima.com.pa,https://www.prodima.com.pa
   CORS_ORIGIN = "",
 } = process.env;
 
@@ -5687,6 +5686,39 @@ function getDateISOInOffset(offsetMin = 0) {
   const dd = String(d.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${dd}`;
 }
+function num(x, d = 0) {
+  const n = Number(x || 0);
+  return Number.isFinite(n) ? Number(n.toFixed(d)) : 0;
+}
+function money2(x) {
+  return num(x, 2);
+}
+function canonicalInvoiceGroup(raw) {
+  if (typeof globalThis.normalizeGrupoFinal === "function") {
+    return globalThis.normalizeGrupoFinal(raw);
+  }
+  return String(raw || "").trim() || "Sin grupo";
+}
+function inferInvoiceArea(grupo, areaDb = "") {
+  const a = String(areaDb || "").trim().toUpperCase();
+  if (a === "CONS" || a === "RCI") return a;
+  if (typeof globalThis.inferAreaFromGroup === "function") {
+    return globalThis.inferAreaFromGroup(grupo) || "";
+  }
+  return "";
+}
+const GROUPS_CONS_LIST = Array.from(globalThis.GROUPS_CONS || []);
+const GROUPS_RCI_LIST = Array.from(globalThis.GROUPS_RCI || []);
+function getAllowedGroupsByArea(area) {
+  const a = String(area || "__ALL__").trim().toUpperCase();
+  if (a === "CONS") return GROUPS_CONS_LIST.slice();
+  if (a === "RCI") return GROUPS_RCI_LIST.slice();
+  return Array.from(new Set([...GROUPS_CONS_LIST, ...GROUPS_RCI_LIST]));
+}
+function signedDocEntry(docType, docEntry) {
+  const de = Math.abs(Number(docEntry || 0));
+  return String(docType || "INV").toUpperCase() === "CRN" ? -de : de;
+}
 
 /* =========================================================
    ✅ Postgres (Supabase)
@@ -5710,6 +5742,7 @@ async function ensureDb() {
     CREATE TABLE IF NOT EXISTS fact_invoice_lines (
       doc_entry      INTEGER NOT NULL,
       line_num       INTEGER NOT NULL,
+      doc_type       TEXT    NOT NULL DEFAULT 'INV',
       doc_num        INTEGER NOT NULL,
       doc_date       DATE    NOT NULL,
       card_code      TEXT    NOT NULL,
@@ -5725,7 +5758,7 @@ async function ensureDb() {
     );
   `);
 
-  // migrations safe
+  await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS doc_type TEXT NOT NULL DEFAULT 'INV';`);
   await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS item_code TEXT NOT NULL DEFAULT '';`);
   await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS item_desc TEXT NOT NULL DEFAULT '';`);
   await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS quantity NUMERIC(18,4) NOT NULL DEFAULT 0;`);
@@ -5735,6 +5768,7 @@ async function ensureDb() {
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_wh ON fact_invoice_lines(warehouse_code);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_card ON fact_invoice_lines(card_code);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_item ON fact_invoice_lines(item_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_type ON fact_invoice_lines(doc_type);`);
 
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS sync_state (
@@ -5850,19 +5884,19 @@ async function slFetch(path, options = {}) {
 }
 
 /* =========================================================
-   ✅ SAP: scan invoice headers
+   ✅ SAP: scan invoices + credit notes
 ========================================================= */
-async function scanInvoicesHeaders({ f, t, maxDocs = 3000 }) {
+async function scanDocHeaders(entity, { f, t, maxDocs = 3000 }) {
   const toPlus1 = addDaysISO(t, 1);
   const batchTop = 200;
   let skipSap = 0;
   const out = [];
 
-  for (let page = 0; page < 300; page++) {
+  for (let page = 0; page < 500; page++) {
     const raw = await slFetch(
-      `/Invoices?$select=DocEntry,DocNum,DocDate,DocTotal,CardCode,CardName,CancelStatus` +
-      `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
-      `&$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skipSap}`,
+      `/${entity}?$select=DocEntry,DocNum,DocDate,CardCode,CardName` +
+        `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
+        `&$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skipSap}`,
       { timeoutMs: 60000 }
     );
 
@@ -5871,37 +5905,27 @@ async function scanInvoicesHeaders({ f, t, maxDocs = 3000 }) {
     skipSap += rows.length;
 
     for (const r of rows) {
-      const cs = String(r.CancelStatus ?? "").trim();
-
-      // excluye canceladas y documentos de cancelación
-      if (cs === "csYes" || cs === "csCancellation" || cs === "0" || cs === "2") {
-        continue;
-      }
-
       out.push({
         DocEntry: Number(r.DocEntry),
         DocNum: Number(r.DocNum),
         DocDate: String(r.DocDate || "").slice(0, 10),
-        DocTotal: Number(r.DocTotal || 0),
         CardCode: String(r.CardCode || ""),
         CardName: String(r.CardName || ""),
       });
-
       if (out.length >= maxDocs) return out;
     }
   }
 
   return out;
 }
-
-async function getInvoiceDoc(docEntry) {
+async function getSapDocument(entity, docEntry) {
   const de = Number(docEntry);
   if (!Number.isFinite(de) || de <= 0) return null;
-  return slFetch(`/Invoices(${de})`, { timeoutMs: 90000 });
+  return slFetch(`/${entity}(${de})`, { timeoutMs: 90000 });
 }
 
 /* =========================================================
-   ✅ Sync: upsert invoice lines
+   ✅ Sync: upsert net invoice lines
 ========================================================= */
 function pickGrossProfit(ln) {
   const candidates = [ln?.GrossProfit, ln?.GrossProfitTotal, ln?.GrossProfitFC, ln?.GrossProfitSC];
@@ -5912,17 +5936,15 @@ function pickGrossProfit(ln) {
   return 0;
 }
 
-async function upsertLinesToDb(invHeader, docFull) {
-  if (String(docFull?.Canceled || "N").toUpperCase() === "Y") return 0;
-
+async function upsertLinesToDb(docType, sign, header, docFull) {
   const lines = Array.isArray(docFull?.DocumentLines) ? docFull.DocumentLines : [];
   if (!lines.length) return 0;
 
-  const docEntry = Number(invHeader.DocEntry);
-  const docNum = Number(invHeader.DocNum);
-  const docDate = String(invHeader.DocDate || "").slice(0, 10);
-  const cardCode = String(invHeader.CardCode || "");
-  const cardName = String(invHeader.CardName || "");
+  const storedDocEntry = signedDocEntry(docType, header.DocEntry);
+  const docNum = Number(header.DocNum);
+  const docDate = String(header.DocDate || "").slice(0, 10);
+  const cardCode = String(header.CardCode || "");
+  const cardName = String(header.CardName || "");
 
   const values = [];
   const params = [];
@@ -5933,30 +5955,42 @@ async function upsertLinesToDb(invHeader, docFull) {
     if (!Number.isFinite(lineNum)) continue;
 
     const wh = String(ln.WarehouseCode || "SIN_WH").trim() || "SIN_WH";
-    const lt = Number(ln.LineTotal || 0);
-    const qty = Number(ln.Quantity || 0);
+    const lt = Math.abs(Number(ln.LineTotal || 0)) * sign;
+    const qty = Math.abs(Number(ln.Quantity || 0)) * sign;
     const itemCode = String(ln.ItemCode || "").trim();
     const itemDesc = String(ln.ItemDescription || ln.ItemName || "").trim();
-    const gp = pickGrossProfit(ln);
+    const gp = Math.abs(Number(pickGrossProfit(ln) || 0)) * sign;
 
     params.push(
-      docEntry, lineNum, docNum, docDate, cardCode, cardName,
-      wh, itemCode, itemDesc, qty, lt, gp
+      storedDocEntry,
+      lineNum,
+      String(docType || "INV").toUpperCase(),
+      docNum,
+      docDate,
+      cardCode,
+      cardName,
+      wh,
+      itemCode,
+      itemDesc,
+      qty,
+      lt,
+      gp
     );
-
     values.push(
-      `($${p++},$${p++},$${p++},$${p++}::date,$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`
+      `($${p++},$${p++},$${p++},$${p++},$${p++}::date,$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`
     );
   }
 
   if (!values.length) return 0;
 
-  await dbQuery(`
+  await dbQuery(
+    `
     INSERT INTO fact_invoice_lines
-      (doc_entry,line_num,doc_num,doc_date,card_code,card_name,warehouse_code,item_code,item_desc,quantity,line_total,gross_profit)
+      (doc_entry,line_num,doc_type,doc_num,doc_date,card_code,card_name,warehouse_code,item_code,item_desc,quantity,line_total,gross_profit)
     VALUES ${values.join(",")}
     ON CONFLICT (doc_entry,line_num)
     DO UPDATE SET
+      doc_type=EXCLUDED.doc_type,
       doc_num=EXCLUDED.doc_num,
       doc_date=EXCLUDED.doc_date,
       card_code=EXCLUDED.card_code,
@@ -5968,281 +6002,369 @@ async function upsertLinesToDb(invHeader, docFull) {
       line_total=EXCLUDED.line_total,
       gross_profit=EXCLUDED.gross_profit,
       updated_at=NOW()
-  `, params);
+    `,
+    params
+  );
 
   return values.length;
 }
 
 async function syncRangeToDb({ from, to, maxDocs = 6000 }) {
   if (!hasDb()) throw new Error("DB no configurada (DATABASE_URL)");
-  const headers = await scanInvoicesHeaders({ f: from, t: to, maxDocs });
 
-  if (!headers.length) {
-    await setState("last_sync_at", new Date().toISOString());
-    return { headers: 0, lines: 0 };
-  }
+  // limpia el rango para evitar residuos de syncs anteriores
+  await dbQuery(`DELETE FROM fact_invoice_lines WHERE doc_date >= $1::date AND doc_date <= $2::date`, [from, to]);
 
-  const CONC = 1; // estable
-  let idx = 0;
+  const invHeaders = await scanDocHeaders("Invoices", { f: from, t: to, maxDocs });
+  const crnHeaders = await scanDocHeaders("CreditNotes", { f: from, t: to, maxDocs });
+
   let totalLines = 0;
 
-  async function worker() {
-    while (idx < headers.length) {
-      const i = idx++;
-      const h = headers[i];
-      try {
-        const full = await getInvoiceDoc(h.DocEntry);
-        const inserted = await upsertLinesToDb(h, full);
-        totalLines += inserted;
-      } catch {}
-      await sleep(20);
+  for (const h of invHeaders) {
+    try {
+      const full = await getSapDocument("Invoices", h.DocEntry);
+      totalLines += await upsertLinesToDb("INV", +1, h, full);
+    } catch (e) {
+      console.error("Invoice sync error", h?.DocEntry, e?.message || String(e));
     }
+    await sleep(20);
   }
 
-  await Promise.all(Array.from({ length: CONC }, () => worker()));
+  for (const h of crnHeaders) {
+    try {
+      const full = await getSapDocument("CreditNotes", h.DocEntry);
+      totalLines += await upsertLinesToDb("CRN", -1, h, full);
+    } catch (e) {
+      console.error("Credit note sync error", h?.DocEntry, e?.message || String(e));
+    }
+    await sleep(20);
+  }
 
   await setState("last_sync_from", from);
   await setState("last_sync_to", to);
   await setState("last_sync_at", new Date().toISOString());
 
-  return { headers: headers.length, lines: totalLines };
+  return { invoices: invHeaders.length, creditNotes: crnHeaders.length, lines: totalLines };
 }
 
 /* =========================================================
-   ✅ Dashboard from DB
+   ✅ Base rows + filters
 ========================================================= */
-async function dashboardFromDb(from, to) {
-  const totalsQ = await dbQuery(
-    `
+async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "" }) {
+  const params = [from, to];
+  const where = [`l.doc_date >= $1::date`, `l.doc_date <= $2::date`];
+
+  if (cardCode) {
+    params.push(cardCode);
+    where.push(`l.card_code = $${params.length}`);
+  }
+  if (warehouse) {
+    params.push(warehouse);
+    where.push(`l.warehouse_code = $${params.length}`);
+  }
+  if (q) {
+    params.push(`%${String(q).trim()}%`);
+    const idx = params.length;
+    where.push(`(l.card_code ILIKE $${idx} OR l.card_name ILIKE $${idx} OR l.item_code ILIKE $${idx} OR l.item_desc ILIKE $${idx})`);
+  }
+
+  const sql = `
     SELECT
-      COUNT(DISTINCT doc_entry) AS invoices,
-      COALESCE(SUM(line_total),0)::numeric(18,2) AS dollars,
-      COALESCE(SUM(gross_profit),0)::numeric(18,2) AS gross_profit
-    FROM fact_invoice_lines
-    WHERE doc_date >= $1::date AND doc_date <= $2::date
-    `,
-    [from, to]
-  );
+      l.doc_type,
+      l.doc_entry,
+      l.line_num,
+      l.doc_num,
+      l.doc_date,
+      l.card_code,
+      l.card_name,
+      l.warehouse_code,
+      l.item_code,
+      l.item_desc,
+      l.quantity,
+      l.line_total,
+      l.gross_profit,
+      COALESCE(NULLIF(g.area,''), '') AS area_db,
+      COALESCE(NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo_raw
+    FROM fact_invoice_lines l
+    LEFT JOIN item_group_cache g
+      ON g.item_code = l.item_code
+    WHERE ${where.join(" AND ")}
+    ORDER BY l.doc_date DESC, l.doc_num DESC, l.line_num ASC
+  `;
+  const r = await dbQuery(sql, params);
+  return (r.rows || []).map((x) => {
+    const grupo = canonicalInvoiceGroup(x.grupo_raw || "Sin grupo");
+    const area = inferInvoiceArea(grupo, x.area_db || "");
+    return {
+      docType: String(x.doc_type || "INV").toUpperCase(),
+      docEntry: Number(x.doc_entry || 0),
+      lineNum: Number(x.line_num || 0),
+      docNum: Number(x.doc_num || 0),
+      docDate: String(x.doc_date || "").slice(0, 10),
+      cardCode: String(x.card_code || ""),
+      cardName: String(x.card_name || ""),
+      warehouse: String(x.warehouse_code || ""),
+      itemCode: String(x.item_code || ""),
+      itemDesc: String(x.item_desc || ""),
+      quantity: num(x.quantity, 4),
+      dollars: money2(x.line_total),
+      grossProfit: money2(x.gross_profit),
+      grupo,
+      area,
+    };
+  });
+}
 
-  const tableQ = await dbQuery(
-    `
-    SELECT
-      card_code AS card_code,
-      card_name AS card_name,
-      warehouse_code AS warehouse,
-      SUM(line_total)::numeric(18,2) AS dollars,
-      SUM(gross_profit)::numeric(18,2) AS gross_profit,
-      COUNT(DISTINCT doc_entry) AS invoices
-    FROM fact_invoice_lines
-    WHERE doc_date >= $1::date AND doc_date <= $2::date
-    GROUP BY 1,2,3
-    ORDER BY dollars DESC
-    `,
-    [from, to]
-  );
+function applyAreaGroupFilters(rows, { area = "__ALL__", grupo = "__ALL__" } = {}) {
+  const areaSel = String(area || "__ALL__").trim().toUpperCase();
+  const grupoSel = String(grupo || "__ALL__").trim();
+  let out = Array.isArray(rows) ? rows.slice() : [];
 
-  const byMonthQ = await dbQuery(
-    `
-    SELECT
-      to_char(date_trunc('month', doc_date), 'YYYY-MM') AS month,
-      COUNT(DISTINCT doc_entry) AS invoices,
-      COALESCE(SUM(line_total),0)::numeric(18,2) AS dollars,
-      COALESCE(SUM(gross_profit),0)::numeric(18,2) AS gross_profit
-    FROM fact_invoice_lines
-    WHERE doc_date >= $1::date AND doc_date <= $2::date
-    GROUP BY 1
-    ORDER BY 1
-    `,
-    [from, to]
-  );
+  if (areaSel !== "__ALL__") {
+    out = out.filter((r) => String(r.area || "").toUpperCase() === areaSel);
+  }
+  if (grupoSel !== "__ALL__") {
+    const gSel = canonicalInvoiceGroup(grupoSel);
+    out = out.filter((r) => canonicalInvoiceGroup(r.grupo) === gSel);
+  }
+  return out;
+}
 
-  const topWhQ = await dbQuery(
-    `
-    SELECT warehouse_code AS warehouse,
-           COALESCE(SUM(line_total),0)::numeric(18,2) AS dollars
-    FROM fact_invoice_lines
-    WHERE doc_date >= $1::date AND doc_date <= $2::date
-    GROUP BY 1
-    ORDER BY dollars DESC
-    LIMIT 50
-    `,
-    [from, to]
-  );
+function availableGroupsForArea(area) {
+  return getAllowedGroupsByArea(area).slice().sort((a, b) => a.localeCompare(b));
+}
 
-  const topCustQ = await dbQuery(
-    `
-    SELECT card_code, card_name,
-           COALESCE(SUM(line_total),0)::numeric(18,2) AS dollars
-    FROM fact_invoice_lines
-    WHERE doc_date >= $1::date AND doc_date <= $2::date
-    GROUP BY 1,2
-    ORDER BY dollars DESC
-    LIMIT 50
-    `,
-    [from, to]
-  );
+/* =========================================================
+   ✅ Dashboard from DB (neto)
+========================================================= */
+async function dashboardFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", q = "" }) {
+  const baseRows = await fetchInvoiceRows({ from, to, q });
+  const rows = applyAreaGroupFilters(baseRows, { area, grupo });
 
-  const toNum = (x) => Number(x || 0);
-  const totalDol = toNum(totalsQ.rows?.[0]?.dollars);
-  const totalGP = toNum(totalsQ.rows?.[0]?.gross_profit);
+  const docInvSet = new Set();
+  const docCrnSet = new Set();
+  const monthMap = new Map();
+  const tableMap = new Map();
+  const whMap = new Map();
+  const custMap = new Map();
+
+  let totalDol = 0;
+  let totalGP = 0;
+
+  for (const r of rows) {
+    totalDol += Number(r.dollars || 0);
+    totalGP += Number(r.grossProfit || 0);
+
+    const docKey = `${r.docType}:${r.docEntry}`;
+    if (r.docType === "CRN") docCrnSet.add(docKey);
+    else docInvSet.add(docKey);
+
+    const month = String(r.docDate || "").slice(0, 7);
+    if (month) {
+      const cur = monthMap.get(month) || { month, invoicesSet: new Set(), creditNotesSet: new Set(), dollars: 0, grossProfit: 0 };
+      if (r.docType === "CRN") cur.creditNotesSet.add(docKey);
+      else cur.invoicesSet.add(docKey);
+      cur.dollars += Number(r.dollars || 0);
+      cur.grossProfit += Number(r.grossProfit || 0);
+      monthMap.set(month, cur);
+    }
+
+    const rowKey = `${r.cardCode}||${r.cardName}||${r.warehouse}`;
+    const rowCur = tableMap.get(rowKey) || {
+      cardCode: r.cardCode,
+      cardName: r.cardName,
+      customer: `${r.cardCode} · ${r.cardName}`,
+      warehouse: r.warehouse,
+      dollars: 0,
+      grossProfit: 0,
+      invSet: new Set(),
+      crnSet: new Set(),
+    };
+    rowCur.dollars += Number(r.dollars || 0);
+    rowCur.grossProfit += Number(r.grossProfit || 0);
+    if (r.docType === "CRN") rowCur.crnSet.add(docKey);
+    else rowCur.invSet.add(docKey);
+    tableMap.set(rowKey, rowCur);
+
+    const whCur = whMap.get(r.warehouse) || { warehouse: r.warehouse, dollars: 0 };
+    whCur.dollars += Number(r.dollars || 0);
+    whMap.set(r.warehouse, whCur);
+
+    const custKey = `${r.cardCode}||${r.cardName}`;
+    const custCur = custMap.get(custKey) || {
+      cardCode: r.cardCode,
+      cardName: r.cardName,
+      customer: `${r.cardCode} · ${r.cardName}`,
+      dollars: 0,
+    };
+    custCur.dollars += Number(r.dollars || 0);
+    custMap.set(custKey, custCur);
+  }
+
+  const byMonth = Array.from(monthMap.values())
+    .sort((a, b) => String(a.month).localeCompare(String(b.month)))
+    .map((x) => {
+      const dol = money2(x.dollars);
+      const gp = money2(x.grossProfit);
+      return {
+        month: x.month,
+        invoices: x.invoicesSet.size,
+        creditNotes: x.creditNotesSet.size,
+        dollars: dol,
+        grossProfit: gp,
+        grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
+      };
+    });
+
+  const table = Array.from(tableMap.values())
+    .map((x) => {
+      const dol = money2(x.dollars);
+      const gp = money2(x.grossProfit);
+      return {
+        cardCode: x.cardCode,
+        cardName: x.cardName,
+        customer: x.customer,
+        warehouse: x.warehouse,
+        dollars: dol,
+        grossProfit: gp,
+        grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
+        invoices: x.invSet.size,
+        creditNotes: x.crnSet.size,
+      };
+    })
+    .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0));
+
+  const topWarehouses = Array.from(whMap.values())
+    .map((x) => ({ warehouse: x.warehouse, dollars: money2(x.dollars) }))
+    .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0))
+    .slice(0, 50);
+
+  const topCustomers = Array.from(custMap.values())
+    .map((x) => ({ cardCode: x.cardCode, cardName: x.cardName, customer: x.customer, dollars: money2(x.dollars) }))
+    .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0))
+    .slice(0, 50);
+
+  const totalDol2 = money2(totalDol);
+  const totalGP2 = money2(totalGP);
 
   return {
     ok: true,
     from,
     to,
+    area,
+    grupo,
+    availableAreas: ["__ALL__", "CONS", "RCI"],
+    availableGroups: availableGroupsForArea(area),
     totals: {
-      invoices: toNum(totalsQ.rows?.[0]?.invoices),
-      dollars: totalDol,
-      grossProfit: totalGP,
-      grossPct: totalDol > 0 ? Number(((totalGP / totalDol) * 100).toFixed(2)) : 0,
+      invoices: docInvSet.size,
+      creditNotes: docCrnSet.size,
+      dollars: totalDol2,
+      grossProfit: totalGP2,
+      grossPct: totalDol2 !== 0 ? num((totalGP2 / totalDol2) * 100, 2) : 0,
     },
-    byMonth: (byMonthQ.rows || []).map((r) => {
-      const dol = toNum(r.dollars);
-      const gp = toNum(r.gross_profit);
-      return {
-        month: r.month,
-        invoices: toNum(r.invoices),
-        dollars: dol,
-        grossProfit: gp,
-        grossPct: dol > 0 ? Number(((gp / dol) * 100).toFixed(2)) : 0,
-      };
-    }),
-    topWarehouses: (topWhQ.rows || []).map((r) => ({
-      warehouse: r.warehouse,
-      dollars: toNum(r.dollars),
-    })),
-    topCustomers: (topCustQ.rows || []).map((r) => ({
-      cardCode: r.card_code,
-      cardName: r.card_name,
-      customer: `${r.card_code} · ${r.card_name}`,
-      dollars: toNum(r.dollars),
-    })),
-    table: (tableQ.rows || []).map((r) => {
-      const dol = toNum(r.dollars);
-      const gp = toNum(r.gross_profit);
-      return {
-        cardCode: r.card_code,
-        cardName: r.card_name,
-        customer: `${r.card_code} · ${r.card_name}`,
-        warehouse: r.warehouse,
-        dollars: dol,
-        grossProfit: gp,
-        grossPct: dol > 0 ? Number(((gp / dol) * 100).toFixed(2)) : 0,
-        invoices: toNum(r.invoices),
-      };
-    }),
+    byMonth,
+    topWarehouses,
+    topCustomers,
+    table,
   };
 }
 
 /* =========================================================
-   ✅ Details: invoices + lines
+   ✅ Details + Top products
 ========================================================= */
-async function detailsFromDb({ from, to, cardCode, warehouse }) {
-  const q = await dbQuery(
-    `
-    SELECT
-      doc_entry, doc_num, doc_date,
-      item_code, item_desc, quantity, line_total, gross_profit
-    FROM fact_invoice_lines
-    WHERE doc_date >= $1::date AND doc_date <= $2::date
-      AND card_code = $3
-      AND warehouse_code = $4
-    ORDER BY doc_date DESC, doc_num DESC, line_num ASC
-    `,
-    [from, to, cardCode, warehouse]
-  );
+async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", grupo = "__ALL__" }) {
+  let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse });
+  rows = applyAreaGroupFilters(rows, { area, grupo });
 
-  const map = new Map(); // doc_num -> invoice
-  for (const r of q.rows || []) {
-    const dn = Number(r.doc_num);
-    if (!map.has(dn)) {
-      map.set(dn, {
-        docNum: dn,
-        docDate: String(r.doc_date).slice(0, 10),
-        docEntry: Number(r.doc_entry),
+  const map = new Map();
+  for (const r of rows) {
+    const docKey = `${r.docType}:${r.docEntry}`;
+    if (!map.has(docKey)) {
+      map.set(docKey, {
+        docType: r.docType,
+        docTypeLabel: r.docType === "CRN" ? "Nota de crédito" : "Factura",
+        docNum: r.docNum,
+        docEntry: r.docEntry,
+        docDate: r.docDate,
+        warehouse: r.warehouse,
+        cardCode: r.cardCode,
         lines: [],
         totals: { qty: 0, dollars: 0, grossProfit: 0 },
       });
     }
-    const it = map.get(dn);
-    const qty = Number(r.quantity || 0);
-    const dol = Number(r.line_total || 0);
-    const gp = Number(r.gross_profit || 0);
+    const it = map.get(docKey);
     it.lines.push({
-      itemCode: String(r.item_code || ""),
-      itemDesc: String(r.item_desc || ""),
-      quantity: qty,
-      dollars: dol,
-      grossProfit: gp,
-      grossPct: dol > 0 ? Number(((gp / dol) * 100).toFixed(2)) : 0,
+      itemCode: r.itemCode,
+      itemDesc: r.itemDesc,
+      quantity: r.quantity,
+      dollars: r.dollars,
+      grossProfit: r.grossProfit,
+      grossPct: r.dollars !== 0 ? num((r.grossProfit / r.dollars) * 100, 2) : 0,
+      area: r.area,
+      grupo: r.grupo,
     });
-    it.totals.qty += qty;
-    it.totals.dollars += dol;
-    it.totals.grossProfit += gp;
+    it.totals.qty += Number(r.quantity || 0);
+    it.totals.dollars += Number(r.dollars || 0);
+    it.totals.grossProfit += Number(r.grossProfit || 0);
   }
 
-  const invoices = Array.from(map.values()).map((inv) => {
-    inv.totals.qty = Number(inv.totals.qty.toFixed(4));
-    inv.totals.dollars = Number(inv.totals.dollars.toFixed(2));
-    inv.totals.grossProfit = Number(inv.totals.grossProfit.toFixed(2));
-    inv.totals.grossPct =
-      inv.totals.dollars > 0 ? Number(((inv.totals.grossProfit / inv.totals.dollars) * 100).toFixed(2)) : 0;
-    return inv;
-  });
+  const invoices = Array.from(map.values())
+    .map((inv) => {
+      inv.totals.qty = num(inv.totals.qty, 4);
+      inv.totals.dollars = money2(inv.totals.dollars);
+      inv.totals.grossProfit = money2(inv.totals.grossProfit);
+      inv.totals.grossPct = inv.totals.dollars !== 0 ? num((inv.totals.grossProfit / inv.totals.dollars) * 100, 2) : 0;
+      return inv;
+    })
+    .sort((a, b) => {
+      if (String(b.docDate) !== String(a.docDate)) return String(b.docDate).localeCompare(String(a.docDate));
+      if (b.docNum !== a.docNum) return Number(b.docNum) - Number(a.docNum);
+      return String(a.docType).localeCompare(String(b.docType));
+    });
 
   const totals = invoices.reduce(
     (a, x) => {
-      a.invoices += 1;
+      if (x.docType === "INV") a.invoices += 1;
+      else a.creditNotes += 1;
       a.qty += Number(x.totals.qty || 0);
       a.dollars += Number(x.totals.dollars || 0);
       a.grossProfit += Number(x.totals.grossProfit || 0);
       return a;
     },
-    { invoices: 0, qty: 0, dollars: 0, grossProfit: 0 }
+    { invoices: 0, creditNotes: 0, qty: 0, dollars: 0, grossProfit: 0 }
   );
 
-  totals.qty = Number(totals.qty.toFixed(4));
-  totals.dollars = Number(totals.dollars.toFixed(2));
-  totals.grossProfit = Number(totals.grossProfit.toFixed(2));
-  totals.grossPct = totals.dollars > 0 ? Number(((totals.grossProfit / totals.dollars) * 100).toFixed(2)) : 0;
+  totals.qty = num(totals.qty, 4);
+  totals.dollars = money2(totals.dollars);
+  totals.grossProfit = money2(totals.grossProfit);
+  totals.grossPct = totals.dollars !== 0 ? num((totals.grossProfit / totals.dollars) * 100, 2) : 0;
 
-  return { ok: true, from, to, cardCode, warehouse, totals, invoices };
+  return { ok: true, from, to, area, grupo, cardCode, warehouse, totals, invoices };
 }
 
-/* =========================================================
-   ✅ Top products
-========================================================= */
-async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", limit = 10 }) {
-  const params = [from, to];
-  let where = `doc_date >= $1::date AND doc_date <= $2::date`;
+async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area = "__ALL__", grupo = "__ALL__", limit = 10 }) {
+  let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse });
+  rows = applyAreaGroupFilters(rows, { area, grupo });
 
-  if (warehouse) {
-    params.push(warehouse);
-    where += ` AND warehouse_code = $${params.length}`;
+  const map = new Map();
+  for (const r of rows) {
+    if (!r.itemCode) continue;
+    const cur = map.get(r.itemCode) || {
+      itemCode: r.itemCode,
+      itemDesc: r.itemDesc,
+      qty: 0,
+      dollars: 0,
+      grossProfit: 0,
+      invSet: new Set(),
+      area: r.area,
+      grupo: r.grupo,
+    };
+    cur.qty += Number(r.quantity || 0);
+    cur.dollars += Number(r.dollars || 0);
+    cur.grossProfit += Number(r.grossProfit || 0);
+    if (r.docType === "INV") cur.invSet.add(`${r.docType}:${r.docEntry}`);
+    map.set(r.itemCode, cur);
   }
-  if (cardCode) {
-    params.push(cardCode);
-    where += ` AND card_code = $${params.length}`;
-  }
-
-  const q = await dbQuery(
-    `
-    SELECT
-      item_code,
-      item_desc,
-      COALESCE(SUM(quantity),0)::numeric(18,4) AS qty,
-      COALESCE(SUM(line_total),0)::numeric(18,2) AS dollars,
-      COALESCE(SUM(gross_profit),0)::numeric(18,2) AS gross_profit,
-      COUNT(DISTINCT doc_entry) AS invoices
-    FROM fact_invoice_lines
-    WHERE ${where}
-      AND item_code <> ''
-    GROUP BY 1,2
-    ORDER BY dollars DESC
-    LIMIT ${Math.max(1, Math.min(200, limit))}
-    `,
-    params
-  );
 
   return {
     ok: true,
@@ -6250,20 +6372,159 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", limi
     to,
     warehouse: warehouse || null,
     cardCode: cardCode || null,
-    top: (q.rows || []).map((r) => {
-      const dol = Number(r.dollars || 0);
-      const gp = Number(r.gross_profit || 0);
-      return {
-        itemCode: r.item_code,
-        itemDesc: r.item_desc,
-        qty: Number(r.qty || 0),
-        dollars: dol,
-        grossProfit: gp,
-        grossPct: dol > 0 ? Number(((gp / dol) * 100).toFixed(2)) : 0,
-        invoices: Number(r.invoices || 0),
-      };
-    }),
+    area,
+    grupo,
+    top: Array.from(map.values())
+      .map((x) => {
+        const dol = money2(x.dollars);
+        const gp = money2(x.grossProfit);
+        return {
+          itemCode: x.itemCode,
+          itemDesc: x.itemDesc,
+          qty: num(x.qty, 4),
+          dollars: dol,
+          grossProfit: gp,
+          grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
+          invoices: x.invSet.size,
+          area: x.area,
+          grupo: x.grupo,
+        };
+      })
+      .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0))
+      .slice(0, Math.max(1, Math.min(200, Number(limit || 10)))),
   };
+}
+
+/* =========================================================
+   ✅ IA (admin-clientes)
+========================================================= */
+function aiCompactDashboard(dashboard, focus = {}) {
+  const table = Array.isArray(dashboard?.table) ? dashboard.table.slice(0, 25) : [];
+  const byMonth = Array.isArray(dashboard?.byMonth) ? dashboard.byMonth : [];
+  const topWh = Array.isArray(dashboard?.topWarehouses) ? dashboard.topWarehouses.slice(0, 10) : [];
+  const topCust = Array.isArray(dashboard?.topCustomers) ? dashboard.topCustomers.slice(0, 10) : [];
+
+  return {
+    range: { from: dashboard?.from || "", to: dashboard?.to || "" },
+    filters: { area: dashboard?.area || "__ALL__", grupo: dashboard?.grupo || "__ALL__" },
+    totals: dashboard?.totals || {},
+    byMonth,
+    topWarehouses: topWh,
+    topCustomers: topCust,
+    table,
+    focus,
+  };
+}
+function aiCompactDetail(detail, customerLabel = "") {
+  const docs = Array.isArray(detail?.invoices) ? detail.invoices.slice(0, 15) : [];
+  return {
+    label: customerLabel,
+    cardCode: detail?.cardCode || "",
+    warehouse: detail?.warehouse || "",
+    filters: { area: detail?.area || "__ALL__", grupo: detail?.grupo || "__ALL__" },
+    totals: detail?.totals || {},
+    documents: docs.map((d) => ({
+      docType: d.docType,
+      docTypeLabel: d.docTypeLabel,
+      docNum: d.docNum,
+      docDate: d.docDate,
+      totals: d.totals,
+      lines: Array.isArray(d.lines) ? d.lines.slice(0, 20) : [],
+    })),
+  };
+}
+function extractResponseText(obj) {
+  if (!obj) return "";
+  if (typeof obj.output_text === "string" && obj.output_text.trim()) return obj.output_text.trim();
+
+  const parts = [];
+  for (const item of (obj.output || [])) {
+    if (item?.type && item.type !== "message") continue;
+    for (const c of (item.content || [])) {
+      if ((c?.type === "output_text" || c?.type === "text") && c?.text) {
+        parts.push(String(c.text));
+      }
+      if (c?.type === "refusal" && c?.refusal) {
+        parts.push(`El modelo rechazó responder: ${String(c.refusal)}`);
+      }
+    }
+  }
+  return parts.join("\n").trim();
+}
+async function openaiDbAnalystChat({ question, dashboard, detail = null, customerLabel = "" }) {
+  const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+  const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
+  if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
+
+  const compact = {
+    dashboard: aiCompactDashboard(dashboard, {
+      cardCode: detail?.cardCode || "",
+      warehouse: detail?.warehouse || "",
+    }),
+    detail: detail ? aiCompactDetail(detail, customerLabel) : null,
+  };
+
+  const system = [
+    "Eres un analista comercial interno de PRODIMA.",
+    "Usa exclusivamente el JSON entregado como fuente de verdad.",
+    "La fuente es la base de datos sincronizada del sistema, no SAP en vivo.",
+    "Las ventas del módulo están neteadas: facturas menos notas de crédito.",
+    "Respeta los filtros de área y grupo cuando existan.",
+    "Si falta información, dilo claramente y no inventes.",
+    "Responde en español, claro y útil.",
+    "Prioriza métricas concretas, hallazgos accionables y cifras redondeadas."
+  ].join(" ");
+
+  const reasoning = model.startsWith("gpt-5.1") || model.startsWith("gpt-5.2")
+    ? { effort: "none" }
+    : model.startsWith("gpt-5")
+      ? { effort: "minimal" }
+      : undefined;
+
+  const payload = {
+    model,
+    input: [
+      { role: "system", content: [{ type: "input_text", text: system }] },
+      {
+        role: "user",
+        content: [{
+          type: "input_text",
+          text:
+            `Pregunta del usuario:\n${String(question || "").trim()}\n\n` +
+            `JSON de contexto:\n${JSON.stringify(compact)}`
+        }]
+      }
+    ],
+    text: { format: { type: "text" } },
+    max_output_tokens: 1800,
+    ...(reasoning ? { reasoning } : {}),
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(data?.error?.message || data?.message || `OpenAI HTTP ${resp.status}`);
+  }
+
+  const answer = extractResponseText(data);
+  if (!answer) {
+    console.error("OpenAI empty output", {
+      model,
+      status: data?.status || null,
+      incomplete_details: data?.incomplete_details || null,
+      output_types: Array.isArray(data?.output) ? data.output.map((x) => x?.type) : [],
+    });
+    throw new Error("OpenAI devolvió salida vacía");
+  }
+  return { answer, model };
 }
 
 /* =========================================================
@@ -6291,22 +6552,21 @@ app.post("/api/admin/login", async (req, res) => {
 });
 
 /* =========================================================
-   ✅ API DB-FIRST
+   ✅ Routes
 ========================================================= */
 app.get("/api/admin/invoices/dashboard", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
 
-    const fromQ = String(req.query?.from || "");
-    const toQ = String(req.query?.to || "");
-
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
+    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
+    const to = isISO(req.query?.to) ? String(req.query.to) : today;
+    const area = String(req.query?.area || "__ALL__");
+    const grupo = String(req.query?.grupo || "__ALL__");
+    const q = String(req.query?.q || "");
 
-    const from = isISO(fromQ) ? fromQ : defaultFrom;
-    const to = isISO(toQ) ? toQ : today;
-
-    const data = await dashboardFromDb(from, to);
+    const data = await dashboardFromDb({ from, to, area, grupo, q });
+    data.lastSyncAt = await getState("last_sync_at");
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -6315,22 +6575,21 @@ app.get("/api/admin/invoices/dashboard", verifyAdmin, async (req, res) => {
 
 app.get("/api/admin/invoices/details", verifyAdmin, async (req, res) => {
   try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
-
-    const fromQ = String(req.query?.from || "");
-    const toQ = String(req.query?.to || "");
-    const cardCode = String(req.query?.cardCode || "").trim();
-    const warehouse = String(req.query?.warehouse || "").trim();
-
-    if (!cardCode || !warehouse) return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
+    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
+    const to = isISO(req.query?.to) ? String(req.query.to) : today;
+    const cardCode = String(req.query?.cardCode || "").trim();
+    const warehouse = String(req.query?.warehouse || "").trim();
+    const area = String(req.query?.area || "__ALL__");
+    const grupo = String(req.query?.grupo || "__ALL__");
 
-    const from = isISO(fromQ) ? fromQ : defaultFrom;
-    const to = isISO(toQ) ? toQ : today;
+    if (!cardCode || !warehouse) {
+      return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
+    }
 
-    const data = await detailsFromDb({ from, to, cardCode, warehouse });
+    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -6339,137 +6598,172 @@ app.get("/api/admin/invoices/details", verifyAdmin, async (req, res) => {
 
 app.get("/api/admin/invoices/top-products", verifyAdmin, async (req, res) => {
   try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
-
-    const fromQ = String(req.query?.from || "");
-    const toQ = String(req.query?.to || "");
-    const warehouse = String(req.query?.warehouse || "").trim();
-    const cardCode = String(req.query?.cardCode || "").trim();
-    const limitRaw = Number(req.query?.limit || 10);
-    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 10));
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
+    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
+    const to = isISO(req.query?.to) ? String(req.query.to) : today;
+    const warehouse = String(req.query?.warehouse || "").trim();
+    const cardCode = String(req.query?.cardCode || "").trim();
+    const area = String(req.query?.area || "__ALL__");
+    const grupo = String(req.query?.grupo || "__ALL__");
+    const limit = Math.max(1, Math.min(200, Number(req.query?.limit || 10)));
 
-    const from = isISO(fromQ) ? fromQ : defaultFrom;
-    const to = isISO(toQ) ? toQ : today;
-
-    const data = await topProductsFromDb({ from, to, warehouse, cardCode, limit });
+    const data = await topProductsFromDb({ from, to, warehouse, cardCode, area, grupo, limit });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
 
-/* =========================================================
-   ✅ EXPORT EXCEL (SERVER-SIDE) — SOLO SE AGREGA ESTO
-========================================================= */
 app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
   try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
-
-    const fromQ = String(req.query?.from || "");
-    const toQ = String(req.query?.to || "");
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
+    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
+    const to = isISO(req.query?.to) ? String(req.query.to) : today;
+    const area = String(req.query?.area || "__ALL__");
+    const grupo = String(req.query?.grupo || "__ALL__");
+    const q = String(req.query?.q || "");
 
-    const from = isISO(fromQ) ? fromQ : defaultFrom;
-    const to = isISO(toQ) ? toQ : today;
-
-    const data = await dashboardFromDb(from, to);
+    const data = await dashboardFromDb({ from, to, area, grupo, q });
 
     const wb = XLSX.utils.book_new();
-
-    const main = (data.table || []).map((r) => ({
-      CardCode: r.cardCode,
-      CardName: r.cardName,
-      Cliente: r.customer,
-      Bodega: r.warehouse,
-      Dolares: Number(r.dollars || 0),
-      GananciaBruta: Number(r.grossProfit || 0),
-      PorcentajeGP: Number(r.grossPct || 0),
-      Facturas: Number(r.invoices || 0),
+    const rows = (data.table || []).map((r) => ({
+      "Código cliente": r.cardCode,
+      "Cliente": r.cardName,
+      "Cliente label": r.customer,
+      "Bodega": r.warehouse,
+      "Ventas netas $": r.dollars,
+      "Ganancia bruta $": r.grossProfit,
+      "% GP": r.grossPct,
+      "Facturas": r.invoices,
+      "Notas de crédito": r.creditNotes,
     }));
+    const ws = XLSX.utils.json_to_sheet(rows);
+    XLSX.utils.book_append_sheet(wb, ws, "Resumen");
 
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(main), "Cliente_x_Bodega");
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(data.byMonth || []), "PorMes");
-
-    const buf = XLSX.write(wb, { bookType: "xlsx", type: "buffer" });
-
+    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", `attachment; filename="facturacion_${Date.now()}.xlsx"`);
-    return res.status(200).send(buf);
+    res.setHeader("Content-Disposition", `attachment; filename="admin-clientes_${from}_a_${to}.xlsx"`);
+    return res.end(buf);
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+    return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
 
 app.get("/api/admin/invoices/details/export", verifyAdmin, async (req, res) => {
   try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
-
-    const fromQ = String(req.query?.from || "");
-    const toQ = String(req.query?.to || "");
-    const cardCode = String(req.query?.cardCode || "").trim();
-    const warehouse = String(req.query?.warehouse || "").trim();
-
-    if (!cardCode || !warehouse) return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
+    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
+    const to = isISO(req.query?.to) ? String(req.query.to) : today;
+    const cardCode = String(req.query?.cardCode || "").trim();
+    const warehouse = String(req.query?.warehouse || "").trim();
+    const area = String(req.query?.area || "__ALL__");
+    const grupo = String(req.query?.grupo || "__ALL__");
 
-    const from = isISO(fromQ) ? fromQ : defaultFrom;
-    const to = isISO(toQ) ? toQ : today;
+    if (!cardCode || !warehouse) {
+      return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
+    }
 
-    const detail = await detailsFromDb({ from, to, cardCode, warehouse });
+    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
+    const wb = XLSX.utils.book_new();
 
     const rows = [];
-    for (const inv of detail.invoices || []) {
-      for (const ln of inv.lines || []) {
+    for (const doc of (data.invoices || [])) {
+      for (const ln of (doc.lines || [])) {
         rows.push({
-          DocNum: inv.docNum,
-          Fecha: inv.docDate,
-          ItemCode: ln.itemCode,
-          Descripcion: ln.itemDesc,
-          Cantidad: Number(ln.quantity || 0),
-          Total: Number(ln.dollars || 0),
-          GananciaBruta: Number(ln.grossProfit || 0),
-          PorcentajeGP: Number(ln.grossPct || 0),
+          "Tipo": doc.docTypeLabel,
+          "DocNum": doc.docNum,
+          "Fecha": doc.docDate,
+          "Código cliente": data.cardCode,
+          "Bodega": data.warehouse,
+          "Área": ln.area,
+          "Grupo": ln.grupo,
+          "ItemCode": ln.itemCode,
+          "Descripción": ln.itemDesc,
+          "Cantidad": ln.quantity,
+          "Ventas netas $": ln.dollars,
+          "Ganancia bruta $": ln.grossProfit,
+          "% GP": ln.grossPct,
         });
       }
     }
 
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), "Detalle");
-
-    const buf = XLSX.write(wb, { bookType: "xlsx", type: "buffer" });
+    const ws = XLSX.utils.json_to_sheet(rows);
+    XLSX.utils.book_append_sheet(wb, ws, "Detalle");
+    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="detalle_${cardCode}_${warehouse}_${Date.now()}.xlsx"`
-    );
-    return res.status(200).send(buf);
+    res.setHeader("Content-Disposition", `attachment; filename="detalle_${cardCode}_${warehouse}_${from}_a_${to}.xlsx"`);
+    return res.end(buf);
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+    return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
 
-/* =========================================================
-   ✅ SYNC endpoints (SAP -> DB)
-========================================================= */
+app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+
+    const question = String(req.body?.question || "").trim();
+    if (!question) return safeJson(res, 400, { ok: false, message: "question requerida" });
+
+    const fromQ = String(req.body?.from || req.query?.from || "");
+    const toQ = String(req.body?.to || req.query?.to || "");
+    const cardCode = String(req.body?.cardCode || "").trim();
+    const warehouse = String(req.body?.warehouse || "").trim();
+    const customerLabel = String(req.body?.customerLabel || "").trim();
+    const area = String(req.body?.area || req.query?.area || "__ALL__");
+    const grupo = String(req.body?.grupo || req.query?.grupo || "__ALL__");
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const defaultFrom = addDaysISO(today, -30);
+    const from = isISO(fromQ) ? fromQ : defaultFrom;
+    const to = isISO(toQ) ? toQ : today;
+
+    const dashboard = await dashboardFromDb({ from, to, area, grupo, q: "" });
+    let detail = null;
+    if (cardCode && warehouse) {
+      detail = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
+    }
+
+    const out = await openaiDbAnalystChat({
+      question,
+      dashboard,
+      detail,
+      customerLabel,
+    });
+
+    return safeJson(res, 200, {
+      ok: true,
+      answer: out.answer,
+      model: out.model,
+      source: "db",
+      range: { from, to },
+      filters: { area, grupo },
+      focus: detail ? { cardCode, warehouse, customerLabel } : null,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
 app.post("/api/admin/invoices/sync", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+    if (missingSapEnv()) return safeJson(res, 500, { ok: false, message: "SAP env incompleto" });
 
-    const fromQ = String(req.query?.from || "");
-    const toQ = String(req.query?.to || "");
-    if (!isISO(fromQ) || !isISO(toQ)) return safeJson(res, 400, { ok: false, message: "Requiere from y to (YYYY-MM-DD)" });
+    const fromQ = String(req.query?.from || req.body?.from || "");
+    const toQ = String(req.query?.to || req.body?.to || "");
+    const maxDocs = Math.max(500, Math.min(50000, Number(req.query?.maxDocs || req.body?.maxDocs || 12000)));
 
-    const maxDocsRaw = Number(req.query?.maxDocs || 6000);
-    const maxDocs = Math.max(50, Math.min(20000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 6000));
+    if (!isISO(fromQ) || !isISO(toQ)) {
+      return safeJson(res, 400, { ok: false, message: "from y to deben ser YYYY-MM-DD" });
+    }
 
     const out = await syncRangeToDb({ from: fromQ, to: toQ, maxDocs });
     return safeJson(res, 200, { ok: true, ...out, from: fromQ, to: toQ, maxDocs });
@@ -6481,16 +6775,13 @@ app.post("/api/admin/invoices/sync", verifyAdmin, async (req, res) => {
 app.post("/api/admin/invoices/sync/recent", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-    if (missingSapEnv()) return safeJson(res, 400, { ok: false, message: "Faltan variables SAP" });
+    if (missingSapEnv()) return safeJson(res, 500, { ok: false, message: "SAP env incompleto" });
 
-    const daysRaw = Number(req.query?.days || 10);
-    const days = Math.max(1, Math.min(120, Number.isFinite(daysRaw) ? Math.trunc(daysRaw) : 10));
-
-    const maxDocsRaw = Number(req.query?.maxDocs || 2500);
-    const maxDocs = Math.max(50, Math.min(20000, Number.isFinite(maxDocsRaw) ? Math.trunc(maxDocsRaw) : 2500));
+    const days = Math.max(1, Math.min(90, Number(req.query?.days || req.body?.days || 10)));
+    const maxDocs = Math.max(500, Math.min(50000, Number(req.query?.maxDocs || req.body?.maxDocs || 12000)));
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = addDaysISO(today, -days);
+    const from = addDaysISO(today, -(days - 1));
 
     const out = await syncRangeToDb({ from, to: today, maxDocs });
     return safeJson(res, 200, { ok: true, ...out, from, to: today, days, maxDocs });
@@ -6523,7 +6814,6 @@ __extraBootTasks.push(async () => {
   }
 });
 }
-
 
 /* =========================================================
    ✅ PRODUCCIÓN (DB + JSON local + IA)
