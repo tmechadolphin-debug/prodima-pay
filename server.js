@@ -6074,7 +6074,7 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "
       l.doc_entry,
       l.line_num,
       l.doc_num,
-      l.doc_date,
+      l.doc_date::text AS doc_date,
       l.card_code,
       l.card_name,
       l.warehouse_code,
@@ -6100,7 +6100,7 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "
       docEntry: Number(x.doc_entry || 0),
       lineNum: Number(x.line_num || 0),
       docNum: Number(x.doc_num || 0),
-      docDate: String(x.doc_date || "").slice(0, 10),
+      docDate: isoDateOnly(x.doc_date),
       cardCode: String(x.card_code || ""),
       cardName: String(x.card_name || ""),
       warehouse: String(x.warehouse_code || ""),
@@ -6113,6 +6113,14 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "
       area,
     };
   });
+}
+
+
+function isoDateOnly(v) {
+  if (!v) return "";
+  if (typeof v === "string") return v.slice(0, 10);
+  if (v instanceof Date && !Number.isNaN(v.getTime())) return v.toISOString().slice(0, 10);
+  return String(v).slice(0, 10);
 }
 
 function applyAreaGroupFilters(rows, { area = "__ALL__", grupo = "__ALL__" } = {}) {
