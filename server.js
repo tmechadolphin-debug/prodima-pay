@@ -8543,8 +8543,10 @@ async function estratLoadItemDocsForAi({ itemCode, from, to, area = "__ALL__", g
       itemCode: String(r.item_code || ""),
       itemDesc: String(r.item_desc || ""),
       quantity: Number(r.quantity || 0),
+      revenue: Number(r.revenue || 0),
       total: Number(r.revenue || 0),
       gp: Number(r.gross_profit || 0),
+      gpPct: Number(r.revenue || 0) ? Number(((Number(r.gross_profit || 0) / Number(r.revenue || 0)) * 100).toFixed(2)) : 0,
       area: areaFinal,
       grupo: grupoTxt,
     };
@@ -8754,7 +8756,7 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
 
     for (const r of rows) {
       const qty = Number(r.quantity || 0);
-      const rev = Number(r.revenue || 0);
+      const rev = Number(r.revenue ?? r.total ?? 0);
       const gp = Number(r.gp || 0);
       const month = String(r.docDate || "").slice(0, 7);
       const ckey = `${r.cardCode || ""}||${r.cardName || ""}`;
@@ -8764,24 +8766,74 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
       area = area || String(r.area || "");
       grupo = grupo || String(r.grupo || "");
 
-      totQty += qty; totRev += rev; totGp += gp;
+      totQty += qty;
+      totRev += rev;
+      totGp += gp;
 
       const c = byCustomer.get(ckey) || {
         cardCode: String(r.cardCode || ""),
         cardName: String(r.cardName || ""),
+        customer: `${String(r.cardCode || "")} · ${String(r.cardName || "")}`.trim(),
         quantity: 0,
         revenue: 0,
-        gp: 0
+        gp: 0,
+        docs: 0,
+        firstDocDate: "",
+        lastDocDate: ""
       };
-      c.quantity += qty; c.revenue += rev; c.gp += gp;
+      c.quantity += qty;
+      c.revenue += rev;
+      c.gp += gp;
+      c.docs += 1;
+      if (r.docDate) {
+        const d = String(r.docDate || "");
+        if (!c.firstDocDate || d < c.firstDocDate) c.firstDocDate = d;
+        if (!c.lastDocDate || d > c.lastDocDate) c.lastDocDate = d;
+      }
       byCustomer.set(ckey, c);
 
       if (month) {
-        const m = byMonth.get(month) || { month, quantity: 0, revenue: 0, gp: 0 };
-        m.quantity += qty; m.revenue += rev; m.gp += gp;
+        const m = byMonth.get(month) || { month, quantity: 0, revenue: 0, gp: 0, docs: 0 };
+        m.quantity += qty;
+        m.revenue += rev;
+        m.gp += gp;
+        m.docs += 1;
         byMonth.set(month, m);
       }
     }
+
+    const customersBase = Array.from(byCustomer.values()).map((x) => ({
+      cardCode: x.cardCode,
+      cardName: x.cardName,
+      customer: x.customer,
+      quantity: safeNum(x.quantity, 4),
+      revenue: safeMoney(x.revenue),
+      gp: safeMoney(x.gp),
+      gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0,
+      docs: Number(x.docs || 0),
+      firstDocDate: x.firstDocDate || "",
+      lastDocDate: x.lastDocDate || ""
+    }));
+
+    const topCustomersByRevenue = customersBase
+      .slice()
+      .sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0))
+      .slice(0, 25);
+
+    const topCustomersByMarginPct = customersBase
+      .filter((x) => Number(x.revenue || 0) > 0)
+      .slice()
+      .sort((a, b) => {
+        const d = Number(b.gpPct || 0) - Number(a.gpPct || 0);
+        if (d) return d;
+        return Number(b.gp || 0) - Number(a.gp || 0);
+      })
+      .slice(0, 25);
+
+    const topCustomersByGP = customersBase
+      .slice()
+      .sort((a, b) => Number(b.gp || 0) - Number(a.gp || 0))
+      .slice(0, 25);
 
     return {
       label: itemLabel || itemCode || itemDesc || "",
@@ -8793,33 +8845,39 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
         quantity: safeNum(totQty, 4),
         revenue: safeMoney(totRev),
         gp: safeMoney(totGp),
-        gpPct: totRev ? safeNum((totGp / totRev) * 100, 2) : 0
+        gpPct: totRev ? safeNum((totGp / totRev) * 100, 2) : 0,
+        docs: rows.length,
+        customers: customersBase.length,
       },
-      topCustomers: Array.from(byCustomer.values()).map((x) => ({
-        cardCode: x.cardCode,
-        cardName: x.cardName,
-        quantity: safeNum(x.quantity, 4),
-        revenue: safeMoney(x.revenue),
-        gp: safeMoney(x.gp),
-        gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
-      })).sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0)).slice(0, 20),
+      topCustomers: topCustomersByRevenue,
+      topCustomersByRevenue,
+      topCustomersByMarginPct,
+      topCustomersByGP,
       byMonth: Array.from(byMonth.values()).map((x) => ({
         month: x.month,
         quantity: safeNum(x.quantity, 4),
         revenue: safeMoney(x.revenue),
         gp: safeMoney(x.gp),
-        gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
+        gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0,
+        docs: Number(x.docs || 0)
       })).sort((a, b) => String(a.month).localeCompare(String(b.month))).slice(0, 24),
-      rawRows: rows.slice(0, 120).map((r) => ({
-        docDate: r.docDate,
-        cardCode: r.cardCode,
-        cardName: r.cardName,
-        quantity: safeNum(r.quantity, 4),
-        revenue: safeMoney(r.revenue),
-        gp: safeMoney(r.gp),
-        area: r.area,
-        grupo: r.grupo
-      }))
+      rawRows: rows.slice(0, 120).map((r) => {
+        const rev = Number(r.revenue ?? r.total ?? 0);
+        const gp = Number(r.gp || 0);
+        return {
+          docDate: r.docDate,
+          docType: r.docType,
+          docNum: r.docNum,
+          cardCode: r.cardCode,
+          cardName: r.cardName,
+          quantity: safeNum(r.quantity, 4),
+          revenue: safeMoney(rev),
+          gp: safeMoney(gp),
+          gpPct: rev ? safeNum((gp / rev) * 100, 2) : 0,
+          area: r.area,
+          grupo: r.grupo
+        };
+      })
     };
   })() : null;
 
@@ -8835,7 +8893,12 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
     "Respeta estrictamente los filtros activos de fecha, área, grupo, búsqueda y artículo seleccionado cuando existan.",
     "No inventes datos, no asumas ventas, stock ni márgenes que no estén presentes en el contexto.",
     "Responde siempre en español, con lenguaje claro, ejecutivo, útil y orientado a decisiones.",
+    "La sección selectedItem y sus bloques topCustomers, topCustomersByRevenue, topCustomersByMarginPct, topCustomersByGP, byMonth y rawRows provienen de la base de datos detallada sales_item_lines; trátalos como evidencia directa del comportamiento por cliente y por documento del artículo seleccionado.",
     "Te pueden preguntar, Dame o dime el detalle del codigo; ejemplo 7270, el detalle por cliente y a que clientes tienen el mayor porcentaje de ganancia bruta (Gross Margin (%)), haz la lista de mayor a menor para saber que clientes dan mayor ganancia de ese producto.",
+    "Si el usuario pide detalle por cliente de un artículo, prioriza primero topCustomersByRevenue, topCustomersByMarginPct, topCustomersByGP y rawRows. Debes mencionar clientes concretos, revenue, GP $, GP % y cantidad cuando estén disponibles.",
+    "Si el usuario pide el mayor Gross Margin (%) por cliente, ordénalo por GP % de mayor a menor usando topCustomersByMarginPct. Si dos clientes empatan en GP %, desempata por GP $ y luego por revenue.",
+    "Si el usuario pide los clientes que más aportan margen, ordénalos por GP $ usando topCustomersByGP. Si pide los clientes que más compran, ordénalos por revenue usando topCustomersByRevenue.",
+    "Nunca digas que no hay revenue por cliente ni que el porcentaje no puede calcularse si selectedItem.topCustomersByRevenue o topCustomersByMarginPct contienen revenue y gp. Usa esos datos para calcular o validar la respuesta.",
     "Prioriza hallazgos concretos sobre revenue, margen bruto, % margen, clasificación ABC, ranking, concentración, stock, mínimos, máximos, disponible, comprometido y ordenado.",
     "Cuando hables de stock, distingue con precisión si el artículo está por debajo del mínimo, dentro de rango, en máximo o por encima del máximo.",
     "Cuando hables de clasificación, explica tanto la clasificación total como ABC de revenue, GP y GP%.",
