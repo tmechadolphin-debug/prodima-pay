@@ -6794,6 +6794,269 @@ function aiCompactDetail(detail, customerLabel = "") {
   };
 }
 
+
+function aiCompactRecommendationContext(reco) {
+  if (!reco) return null;
+  return {
+    targetCustomer: reco.targetCustomer || null,
+    modeHint: reco.modeHint || "",
+    range: reco.range || null,
+    lastMonth: reco.lastMonth || "",
+    peerKeywords: Array.isArray(reco.peerKeywords) ? reco.peerKeywords.slice(0, 12) : [],
+    peerCustomersCount: Number(reco.peerCustomersCount || 0),
+    peerCustomers: Array.isArray(reco.peerCustomers) ? reco.peerCustomers.slice(0, 30) : [],
+    targetTopItemsInRange: Array.isArray(reco.targetTopItemsInRange) ? reco.targetTopItemsInRange.slice(0, 20) : [],
+    targetTopItemsLastMonth: Array.isArray(reco.targetTopItemsLastMonth) ? reco.targetTopItemsLastMonth.slice(0, 20) : [],
+    recommendationsNotBoughtInRange: Array.isArray(reco.recommendationsNotBoughtInRange) ? reco.recommendationsNotBoughtInRange.slice(0, 30) : [],
+    recommendationsNotBoughtInLastMonth: Array.isArray(reco.recommendationsNotBoughtInLastMonth) ? reco.recommendationsNotBoughtInLastMonth.slice(0, 30) : [],
+    recommendationsBoughtBeforeButNotLastMonth: Array.isArray(reco.recommendationsBoughtBeforeButNotLastMonth) ? reco.recommendationsBoughtBeforeButNotLastMonth.slice(0, 30) : [],
+  };
+}
+
+function adminClientesExtractTargetFromQuestion(rows, question, explicit = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  const customerMap = new Map();
+  for (const r of list) {
+    const code = String(r.cardCode || "").trim();
+    const name = String(r.cardName || "").trim();
+    if (!code) continue;
+    if (!customerMap.has(code)) {
+      customerMap.set(code, {
+        cardCode: code,
+        cardName: name,
+        label: `${code} · ${name}`,
+      });
+    }
+  }
+
+  const explicitCode = String(explicit.cardCode || "").trim();
+  if (explicitCode && customerMap.has(explicitCode)) return customerMap.get(explicitCode);
+
+  const qn = norm(question || "");
+  const re = /\b([A-Z]\d{3,6})\b/g;
+  let m;
+  while ((m = re.exec(String(question || ""))) !== null) {
+    const code = String(m[1] || "").toUpperCase();
+    if (customerMap.has(code)) return customerMap.get(code);
+  }
+
+  const explicitLabel = norm(explicit.customerLabel || "");
+  if (explicitLabel) {
+    for (const c of customerMap.values()) {
+      const cn = norm(c.label);
+      if (cn && (cn.includes(explicitLabel) || explicitLabel.includes(cn))) return c;
+    }
+  }
+
+  let best = null;
+  let bestScore = 0;
+  for (const c of customerMap.values()) {
+    const nameN = norm(c.cardName);
+    const labelN = norm(c.label);
+    let score = 0;
+    if (nameN && qn.includes(nameN)) score += nameN.length + 50;
+    if (labelN && qn.includes(labelN)) score += labelN.length + 80;
+    const tokens = nameN.split(/\s+/).filter(t => t && t.length >= 4 && !['super','compania','compañia','sa','s','el','la','de','del'].includes(t));
+    for (const t of tokens) {
+      if (qn.includes(t)) score += Math.min(10, t.length);
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+  return bestScore >= 12 ? best : null;
+}
+
+function adminClientesPeerKeywords(target, question) {
+  const combined = `${target?.cardName || ''} ${target?.label || ''} ${question || ''}`;
+  const text = norm(combined);
+  const ordered = [
+    'goly', 'machetazo', 'xtra', 'jumbo', 'mega depot', 'mega', '99', 'super 99', 'el machetazo', 'casa de la carne'
+  ];
+  const hits = [];
+  for (const k of ordered) {
+    if (text.includes(norm(k)) && !hits.includes(norm(k))) hits.push(norm(k));
+  }
+  if (!hits.length) {
+    const nameN = norm(target?.cardName || '');
+    if (nameN.includes('machetazo')) hits.push('machetazo');
+    if (nameN.includes('goly')) hits.push('goly');
+    if (nameN.includes('xtra')) hits.push('xtra');
+    if (nameN.includes('99')) hits.push('99');
+  }
+  return hits;
+}
+
+function adminClientesPeerMatch(cardName, keywords = []) {
+  const nameN = norm(cardName || '');
+  if (!nameN) return false;
+  return (Array.isArray(keywords) ? keywords : []).some(k => nameN.includes(norm(k)));
+}
+
+async function buildAdminClientesRecommendationAnalytics({ from, to, area = "__ALL__", grupo = "__ALL__", targetCardCode = "", customerLabel = "", question = "" }) {
+  let rows = await fetchInvoiceRows({ from, to, q: "" });
+  rows = applyAreaGroupFilters(rows, { area, grupo });
+  if (!rows.length) return null;
+
+  const target = adminClientesExtractTargetFromQuestion(rows, question, { cardCode: targetCardCode, customerLabel });
+  if (!target?.cardCode) return null;
+
+  const peerKeywords = adminClientesPeerKeywords(target, question);
+  const peerCustomerMap = new Map();
+  for (const r of rows) {
+    const code = String(r.cardCode || '').trim();
+    if (!code || code === target.cardCode) continue;
+    if (!adminClientesPeerMatch(r.cardName, peerKeywords)) continue;
+    if (!peerCustomerMap.has(code)) {
+      peerCustomerMap.set(code, { cardCode: code, cardName: String(r.cardName || ''), label: `${code} · ${String(r.cardName || '')}` });
+    }
+  }
+  const peerCodes = new Set(Array.from(peerCustomerMap.keys()));
+  if (!peerCodes.size) return {
+    targetCustomer: target,
+    modeHint: 'no_peers',
+    range: { from, to },
+    lastMonth: String(to || '').slice(0, 7),
+    peerKeywords,
+    peerCustomersCount: 0,
+    peerCustomers: [],
+    targetTopItemsInRange: [],
+    targetTopItemsLastMonth: [],
+    recommendationsNotBoughtInRange: [],
+    recommendationsNotBoughtInLastMonth: [],
+    recommendationsBoughtBeforeButNotLastMonth: [],
+  };
+
+  const lastMonth = String(to || '').slice(0, 7);
+  const targetItemsRange = new Map();
+  const targetItemsLastMonth = new Map();
+  const peerItems = new Map();
+
+  for (const r of rows) {
+    const code = String(r.cardCode || '').trim();
+    const itemCode = String(r.itemCode || '').trim() || 'SIN_ITEM';
+    const itemDesc = String(r.itemDesc || '').trim();
+    const month = String(r.docDate || '').slice(0, 7);
+    const itemKey = `${itemCode}||${itemDesc}`;
+
+    if (code === target.cardCode) {
+      const cur = targetItemsRange.get(itemKey) || {
+        itemCode, itemDesc, dollars: 0, grossProfit: 0, qty: 0,
+        firstDate: '', lastDate: '', months: new Set(), warehouses: new Set()
+      };
+      cur.dollars += Number(r.dollars || 0);
+      cur.grossProfit += Number(r.grossProfit || 0);
+      cur.qty += Number(r.quantity || 0);
+      if (!cur.firstDate || String(r.docDate) < cur.firstDate) cur.firstDate = String(r.docDate || '');
+      if (!cur.lastDate || String(r.docDate) > cur.lastDate) cur.lastDate = String(r.docDate || '');
+      if (month) cur.months.add(month);
+      if (r.warehouse) cur.warehouses.add(String(r.warehouse));
+      targetItemsRange.set(itemKey, cur);
+
+      if (month === lastMonth) {
+        const curM = targetItemsLastMonth.get(itemKey) || {
+          itemCode, itemDesc, dollars: 0, grossProfit: 0, qty: 0,
+          firstDate: '', lastDate: '', months: new Set(), warehouses: new Set()
+        };
+        curM.dollars += Number(r.dollars || 0);
+        curM.grossProfit += Number(r.grossProfit || 0);
+        curM.qty += Number(r.quantity || 0);
+        if (!curM.firstDate || String(r.docDate) < curM.firstDate) curM.firstDate = String(r.docDate || '');
+        if (!curM.lastDate || String(r.docDate) > curM.lastDate) curM.lastDate = String(r.docDate || '');
+        if (month) curM.months.add(month);
+        if (r.warehouse) curM.warehouses.add(String(r.warehouse));
+        targetItemsLastMonth.set(itemKey, curM);
+      }
+      continue;
+    }
+
+    if (!peerCodes.has(code)) continue;
+    const cur = peerItems.get(itemKey) || {
+      itemCode, itemDesc, grupo: r.grupo, area: r.area,
+      dollars: 0, grossProfit: 0, qty: 0,
+      firstDate: '', lastDate: '',
+      months: new Set(), customers: new Set(), customerNames: new Set(), warehouses: new Set()
+    };
+    cur.dollars += Number(r.dollars || 0);
+    cur.grossProfit += Number(r.grossProfit || 0);
+    cur.qty += Number(r.quantity || 0);
+    if (!cur.firstDate || String(r.docDate) < cur.firstDate) cur.firstDate = String(r.docDate || '');
+    if (!cur.lastDate || String(r.docDate) > cur.lastDate) cur.lastDate = String(r.docDate || '');
+    if (month) cur.months.add(month);
+    cur.customers.add(code);
+    if (r.cardName) cur.customerNames.add(String(r.cardName));
+    if (r.warehouse) cur.warehouses.add(String(r.warehouse));
+    peerItems.set(itemKey, cur);
+  }
+
+  const toArray = (mp, enrichMode='target') => Array.from(mp.values()).map(x => {
+    const dollars = money2(x.dollars);
+    const gp = money2(x.grossProfit);
+    return {
+      itemCode: x.itemCode,
+      itemDesc: x.itemDesc,
+      grupo: x.grupo || '',
+      area: x.area || '',
+      dollars,
+      grossProfit: gp,
+      grossPct: dollars !== 0 ? num((gp / dollars) * 100, 2) : 0,
+      qty: num(x.qty, 4),
+      firstDate: x.firstDate || '',
+      lastDate: x.lastDate || '',
+      months: Array.from(x.months || []).sort((a,b)=>String(a).localeCompare(String(b))),
+      warehouses: Array.from(x.warehouses || []).sort((a,b)=>String(a).localeCompare(String(b))),
+      customersCount: enrichMode === 'peer' ? (x.customers ? x.customers.size : 0) : undefined,
+      customerNames: enrichMode === 'peer' ? Array.from(x.customerNames || []).sort((a,b)=>String(a).localeCompare(String(b))).slice(0, 12) : undefined,
+    };
+  });
+
+  const targetTopItemsInRange = toArray(targetItemsRange, 'target')
+    .sort((a,b)=> Number(b.dollars||0)-Number(a.dollars||0))
+    .slice(0,20);
+  const targetTopItemsLastMonth = toArray(targetItemsLastMonth, 'target')
+    .sort((a,b)=> Number(b.dollars||0)-Number(a.dollars||0))
+    .slice(0,20);
+
+  const recommendationBase = toArray(peerItems, 'peer').map(x => ({
+    ...x,
+    targetBoughtInRange: targetItemsRange.has(`${x.itemCode}||${x.itemDesc}`),
+    targetBoughtInLastMonth: targetItemsLastMonth.has(`${x.itemCode}||${x.itemDesc}`),
+    targetRangeDollars: targetItemsRange.has(`${x.itemCode}||${x.itemDesc}`) ? Number(targetItemsRange.get(`${x.itemCode}||${x.itemDesc}`).dollars || 0) : 0,
+    targetLastMonthDollars: targetItemsLastMonth.has(`${x.itemCode}||${x.itemDesc}`) ? Number(targetItemsLastMonth.get(`${x.itemCode}||${x.itemDesc}`).dollars || 0) : 0,
+  }));
+
+  const sorter = (a,b) => {
+    if (Number(b.dollars||0) !== Number(a.dollars||0)) return Number(b.dollars||0) - Number(a.dollars||0);
+    if (Number(b.customersCount||0) !== Number(a.customersCount||0)) return Number(b.customersCount||0) - Number(a.customersCount||0);
+    return Number(b.grossProfit||0) - Number(a.grossProfit||0);
+  };
+
+  const recommendationsNotBoughtInRange = recommendationBase.filter(x => !x.targetBoughtInRange).sort(sorter).slice(0, 30);
+  const recommendationsNotBoughtInLastMonth = recommendationBase.filter(x => !x.targetBoughtInLastMonth).sort(sorter).slice(0, 30);
+  const recommendationsBoughtBeforeButNotLastMonth = recommendationBase.filter(x => x.targetBoughtInRange && !x.targetBoughtInLastMonth).sort(sorter).slice(0, 30);
+
+  let modeHint = 'cross_sell';
+  const qn = norm(question || '');
+  if (qn.includes('marzo') || qn.includes('mes de') || qn.includes('ultimo mes') || qn.includes('último mes')) modeHint = 'not_bought_last_month';
+  if (qn.includes('nunca') || qn.includes('jamas') || qn.includes('jamás') || qn.includes('no ha comprado')) modeHint = modeHint === 'not_bought_last_month' ? 'not_bought_last_month' : 'not_bought_in_range';
+
+  return {
+    targetCustomer: target,
+    modeHint,
+    range: { from, to },
+    lastMonth,
+    peerKeywords,
+    peerCustomersCount: peerCodes.size,
+    peerCustomers: Array.from(peerCustomerMap.values()).slice(0, 40),
+    targetTopItemsInRange,
+    targetTopItemsLastMonth,
+    recommendationsNotBoughtInRange,
+    recommendationsNotBoughtInLastMonth,
+    recommendationsBoughtBeforeButNotLastMonth,
+  };
+}
+
 function extractResponseText(obj) {
   if (!obj) return "";
   if (typeof obj.output_text === "string" && obj.output_text.trim()) return obj.output_text.trim();
@@ -6813,7 +7076,7 @@ function extractResponseText(obj) {
   return parts.join("\n").trim();
 }
 
-async function openaiDbAnalystChat({ question, dashboard, analytics = null, detail = null, customerLabel = "" }) {
+async function openaiDbAnalystChat({ question, dashboard, analytics = null, detail = null, customerLabel = "", recommendationContext = null }) {
   const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
   const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
   if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
@@ -6828,6 +7091,7 @@ async function openaiDbAnalystChat({ question, dashboard, analytics = null, deta
       }
     ),
     detail: detail ? aiCompactDetail(detail, customerLabel) : null,
+    recommendationContext: aiCompactRecommendationContext(recommendationContext),
   };
 
   const system = [
@@ -6839,6 +7103,10 @@ async function openaiDbAnalystChat({ question, dashboard, analytics = null, deta
     "Responde siempre en español, con tono profesional, claro, ejecutivo y útil.",
     "Prioriza cifras concretas, comparaciones, tendencias, hallazgos accionables y posibles causas basadas en datos.",
     "Cuando existan datos por cliente y mes, identifica clientes que cayeron, crecieron, dejaron de comprar, compraron en un mes y en otro no, clientes nuevos y clientes intermitentes.",
+    "Si existe recommendationContext, úsalo como la fuente prioritaria para responder recomendaciones de surtido, productos no comprados por un cliente objetivo, productos comprados en otras tiendas de la cadena y TOP N de artículos sugeridos.",
+    "Cuando el usuario pida tabla o Excel, devuelve primero una tabla en markdown con datos reales del sistema. No uses aproximaciones, rangos, ni texto como ~ o aprox si el contexto ya trae cifras exactas.",
+    "Para recomendaciones entre tiendas, diferencia claramente entre: no comprado en todo el rango, no comprado en el último mes del rango, y comprado antes pero no en el último mes. Usa la variante que mejor coincida con la pregunta del usuario.",
+    "En tablas de recomendación usa columnas claras como Cliente objetivo, Código, Artículo, Ventas otras tiendas USD, Unidades otras tiendas, Tiendas de la cadena, Primera compra, Última compra, Comprado por cliente objetivo en rango, Comprado por cliente objetivo en último mes.",
     "Cuando existan datos por cliente, artículo y mes, explica qué artículos provocaron la caída, crecimiento o ausencia de compra de cada cliente.",
     "Si el usuario pregunta qué cliente cayó, responde con ranking de mayores caídas, monto, porcentaje, meses comparados y artículos asociados cuando existan.",
     "Si el usuario pregunta qué cliente compró en un mes sí y en otro no, usa el detalle cliente-mes y responde con una lista directa de clientes ausentes o intermitentes entre esos meses.",
@@ -7119,12 +7387,23 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
       detail = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
     }
 
+    const recommendationContext = await buildAdminClientesRecommendationAnalytics({
+      from,
+      to,
+      area,
+      grupo,
+      targetCardCode: cardCode,
+      customerLabel,
+      question,
+    });
+
     const out = await openaiDbAnalystChat({
       question,
       dashboard,
       analytics,
       detail,
       customerLabel,
+      recommendationContext,
     });
 
     return safeJson(res, 200, {
@@ -7492,123 +7771,6 @@ async function prodGetFullItem(code) {
   }
 
   return item;
-}
-
-
-function prodNormalizeSlCollection(obj) {
-  if (Array.isArray(obj)) return obj;
-  if (Array.isArray(obj?.value)) return obj.value;
-  return [];
-}
-
-function prodExtractWeightedCostFromItem(item) {
-  if (!item || typeof item !== "object") return 0;
-
-  const whRows = Array.isArray(item.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
-  const priceKeys = ["AvgPrice", "AveragePrice", "AvgStdPrice", "AvgStdPrc", "Price"];
-  const stockKeys = ["InStock", "OnHand", "Stock"];
-  let nume = 0;
-  let den = 0;
-
-  for (const r of whRows) {
-    const wh = String(r?.WarehouseCode ?? r?.WhsCode ?? "").trim();
-    if (wh && !PROD_FINISHED_WHS.includes(wh)) continue;
-
-    let price = 0;
-    for (const k of priceKeys) {
-      if (r && r[k] != null && r[k] !== "") {
-        price = prodNum(r[k]);
-        break;
-      }
-    }
-
-    let stock = 0;
-    for (const k of stockKeys) {
-      if (r && r[k] != null && r[k] !== "") {
-        stock = prodNum(r[k]);
-        break;
-      }
-    }
-
-    if (price > 0 && stock > 0) {
-      nume += price * stock;
-      den += stock;
-    }
-  }
-
-  if (den > 0) return prodRound(nume / den, 6);
-
-  const itemKeys = ["AvgPrice", "AveragePrice", "AvgStdPrice", "AvgStdPrc", "LastPurPrc", "LastPurchasePrice"];
-  for (const k of itemKeys) {
-    if (item[k] != null && item[k] !== "") {
-      const v = prodNum(item[k]);
-      if (v > 0) return prodRound(v, 6);
-    }
-  }
-  return 0;
-}
-
-function prodNormalizeProductionOrderRow(r) {
-  const postDateRaw = r?.PostingDate ?? r?.PostDate ?? r?.StartDate ?? r?.DueDate ?? "";
-  const postDate = String(postDateRaw || "").slice(0, 10);
-  return {
-    docNum: Number(r?.DocumentNumber ?? r?.DocNum ?? r?.AbsoluteEntry ?? r?.Absoluteentry ?? 0) || null,
-    absoluteEntry: Number(r?.AbsoluteEntry ?? r?.Absoluteentry ?? r?.DocEntry ?? 0) || null,
-    itemCode: String(r?.ItemNo ?? r?.ItemCode ?? "").trim(),
-    prodName: String(r?.ProductDescription ?? r?.ProdName ?? r?.ItemName ?? "").trim(),
-    plannedQty: prodRound(r?.PlannedQuantity ?? r?.PlannedQty ?? r?.PlannedQtty ?? 0, 3),
-    completedQty: prodRound(r?.CompletedQuantity ?? r?.CmpltQty ?? r?.CompletedQty ?? 0, 3),
-    rejectedQty: prodRound(r?.RejectedQuantity ?? r?.RejectedQty ?? 0, 3),
-    postDate,
-    status: String(r?.ProductionOrderStatus ?? r?.Status ?? "").trim(),
-    warehouse: String(r?.Warehouse ?? r?.WarehouseCode ?? r?.WhsCode ?? "").trim(),
-    origin: String(r?.ProductionOrderOrigin ?? r?.Origin ?? "").trim(),
-  };
-}
-
-async function prodFetchProductionOrders(itemCode, top = 80) {
-  const code = String(itemCode || "").trim();
-  if (!code || missingSapEnv()) return { orders: [], monthly: new Map() };
-
-  const safeCode = code.replace(/'/g, "''");
-  const paths = [
-    `/ProductionOrders?$filter=ItemNo eq '${safeCode}'&$orderby=PostingDate desc&$top=${Math.max(20, Math.min(200, Number(top || 80)))}`,
-    `/ProductionOrders?$filter=ItemNo eq '${safeCode}'&$orderby=PostDate desc&$top=${Math.max(20, Math.min(200, Number(top || 80)))}`,
-    `/ProductionOrders?$filter=ItemCode eq '${safeCode}'&$orderby=PostingDate desc&$top=${Math.max(20, Math.min(200, Number(top || 80)))}`,
-    `/ProductionOrders?$filter=ItemCode eq '${safeCode}'&$orderby=PostDate desc&$top=${Math.max(20, Math.min(200, Number(top || 80)))}`,
-  ];
-
-  let raw = [];
-  let lastErr = null;
-  for (const path of paths) {
-    try {
-      const res = await slFetch(path, { timeoutMs: 120000 });
-      raw = prodNormalizeSlCollection(res);
-      if (raw.length) break;
-      if (Array.isArray(res) && res.length === 0) {
-        raw = [];
-        break;
-      }
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  if (!raw.length && lastErr) {
-    return { orders: [], monthly: new Map(), warning: lastErr.message || String(lastErr) };
-  }
-
-  const orders = raw
-    .map(prodNormalizeProductionOrderRow)
-    .filter((x) => String(x.itemCode || "") === code || !x.itemCode)
-    .sort((a, b) => String(b.postDate || "").localeCompare(String(a.postDate || "")) || Number(b.docNum || 0) - Number(a.docNum || 0));
-
-  const monthly = new Map();
-  for (const o of orders) {
-    const ym = prodYm(o.postDate || new Date());
-    const prev = monthly.get(ym) || 0;
-    monthly.set(ym, prodRound(prev + prodNum(o.completedQty), 3));
-  }
-  return { orders, monthly };
 }
 
 async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
@@ -7991,22 +8153,10 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     [code, histFrom, end]
   );
   const monthMap = new Map((monthlyRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
-
-  const sapItem = await prodGetFullItem(code).catch(() => null);
-  const weightedCost = prodExtractWeightedCostFromItem(sapItem);
-  const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map() }));
-  const prodMonthMap = prodOrders?.monthly instanceof Map ? prodOrders.monthly : new Map();
-
   const salesHistory = [];
   for (let i = 11; i >= 0; i--) {
     const ym = prodYm(prodAddMonthsISO(monthStart, -i));
-    salesHistory.push({
-      ym,
-      label: prodFormatMonthName(ym),
-      qty: prodRound(monthMap.get(ym) || 0, 2),
-      producedQty: prodRound(prodMonthMap.get(ym) || 0, 2),
-      weightedCost: prodRound(weightedCost || 0, 4),
-    });
+    salesHistory.push({ ym, label: prodFormatMonthName(ym), qty: prodRound(monthMap.get(ym) || 0, 2) });
   }
 
   let avgQty = 0;
@@ -8114,13 +8264,6 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     .filter((n) => Number.isFinite(n));
   const maxUnitsToday = maxUnitsByMaterial.length ? Math.floor(Math.min(...maxUnitsByMaterial)) : 0;
 
-  const costing = {
-    weightedCost: prodRound(weightedCost || 0, 4),
-    projectedDemandCost: prodRound((weightedCost || 0) * projectedQty, 2),
-    adjustedProductionCost: prodRound((weightedCost || 0) * productionAdjusted, 2),
-    stockValue: prodRound((weightedCost || 0) * stockTotal, 2),
-  };
-
   return {
     ok: true,
     itemCode: code,
@@ -8131,8 +8274,6 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     abcHint: "",
     period: { endDate: end, avgMonths: Math.max(1, Number(avgMonths || 5)), horizonMonths: Math.max(1, Number(horizonMonths || 3)), planStart, planEnd },
     salesHistory,
-    recentProductionOrders: (prodOrders?.orders || []).slice(0, 20),
-    costing,
     avgMonthlyQty: prodRound(avgQty, 2),
     projectedQty: prodRound(projectedQty, 2),
     inventory: {
@@ -8233,22 +8374,6 @@ function prodAiCompactPlan(plan) {
 
     avgMonthlyQty: plan.avgMonthlyQty,
     projectedQty: plan.projectedQty,
-    salesHistory: (plan.salesHistory || []).map((x) => ({
-      ym: x.ym,
-      label: x.label,
-      qty: x.qty,
-      producedQty: x.producedQty || 0,
-      weightedCost: x.weightedCost || 0,
-    })),
-    costing: plan.costing || {},
-    recentProductionOrders: (plan.recentProductionOrders || []).slice(0, 20).map((x) => ({
-      docNum: x.docNum,
-      postDate: x.postDate,
-      plannedQty: x.plannedQty,
-      completedQty: x.completedQty,
-      status: x.status,
-      warehouse: x.warehouse,
-    })),
 
     inventory: plan.inventory,
     mrp: plan.mrp,
@@ -8313,8 +8438,6 @@ const system = [
   "IMPORTANTE: si el JSON trae requirements.rawMaterials, requirements.packaging o requirements.bottlenecks, debes analizarlos y mencionarlos explícitamente.",
   "IMPORTANTE: no digas que faltan materias primas, empaques o cuellos de botella si esos arreglos existen en el JSON y tienen elementos.",
   "IMPORTANTE: usa formula.litersPerUnit, formula.baseLiquidCode y formula.litersRequired cuando existan.",
-  "IMPORTANTE: cuando existan salesHistory.producedQty o recentProductionOrders, esos son los datos válidos para responder cuánto se produjo el artículo por mes o en órdenes recientes.",
-  "IMPORTANTE: cuando exista costing.weightedCost, úsalo como costo ponderado unitario del artículo y analiza también stockValue, projectedDemandCost y adjustedProductionCost.",
   "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo:",
   "1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria / ajustada por MRP 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
   "Si realmente falta información en el JSON, dilo claramente.",
@@ -8699,10 +8822,8 @@ async function estratLoadItemDocsForAi({ itemCode, from, to, area = "__ALL__", g
       itemCode: String(r.item_code || ""),
       itemDesc: String(r.item_desc || ""),
       quantity: Number(r.quantity || 0),
-      revenue: Number(r.revenue || 0),
       total: Number(r.revenue || 0),
       gp: Number(r.gross_profit || 0),
-      gpPct: Number(r.revenue || 0) ? Number(((Number(r.gross_profit || 0) / Number(r.revenue || 0)) * 100).toFixed(2)) : 0,
       area: areaFinal,
       grupo: grupoTxt,
     };
@@ -8912,7 +9033,7 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
 
     for (const r of rows) {
       const qty = Number(r.quantity || 0);
-      const rev = Number(r.revenue ?? r.total ?? 0);
+      const rev = Number(r.revenue || 0);
       const gp = Number(r.gp || 0);
       const month = String(r.docDate || "").slice(0, 7);
       const ckey = `${r.cardCode || ""}||${r.cardName || ""}`;
@@ -8922,74 +9043,24 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
       area = area || String(r.area || "");
       grupo = grupo || String(r.grupo || "");
 
-      totQty += qty;
-      totRev += rev;
-      totGp += gp;
+      totQty += qty; totRev += rev; totGp += gp;
 
       const c = byCustomer.get(ckey) || {
         cardCode: String(r.cardCode || ""),
         cardName: String(r.cardName || ""),
-        customer: `${String(r.cardCode || "")} · ${String(r.cardName || "")}`.trim(),
         quantity: 0,
         revenue: 0,
-        gp: 0,
-        docs: 0,
-        firstDocDate: "",
-        lastDocDate: ""
+        gp: 0
       };
-      c.quantity += qty;
-      c.revenue += rev;
-      c.gp += gp;
-      c.docs += 1;
-      if (r.docDate) {
-        const d = String(r.docDate || "");
-        if (!c.firstDocDate || d < c.firstDocDate) c.firstDocDate = d;
-        if (!c.lastDocDate || d > c.lastDocDate) c.lastDocDate = d;
-      }
+      c.quantity += qty; c.revenue += rev; c.gp += gp;
       byCustomer.set(ckey, c);
 
       if (month) {
-        const m = byMonth.get(month) || { month, quantity: 0, revenue: 0, gp: 0, docs: 0 };
-        m.quantity += qty;
-        m.revenue += rev;
-        m.gp += gp;
-        m.docs += 1;
+        const m = byMonth.get(month) || { month, quantity: 0, revenue: 0, gp: 0 };
+        m.quantity += qty; m.revenue += rev; m.gp += gp;
         byMonth.set(month, m);
       }
     }
-
-    const customersBase = Array.from(byCustomer.values()).map((x) => ({
-      cardCode: x.cardCode,
-      cardName: x.cardName,
-      customer: x.customer,
-      quantity: safeNum(x.quantity, 4),
-      revenue: safeMoney(x.revenue),
-      gp: safeMoney(x.gp),
-      gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0,
-      docs: Number(x.docs || 0),
-      firstDocDate: x.firstDocDate || "",
-      lastDocDate: x.lastDocDate || ""
-    }));
-
-    const topCustomersByRevenue = customersBase
-      .slice()
-      .sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0))
-      .slice(0, 25);
-
-    const topCustomersByMarginPct = customersBase
-      .filter((x) => Number(x.revenue || 0) > 0)
-      .slice()
-      .sort((a, b) => {
-        const d = Number(b.gpPct || 0) - Number(a.gpPct || 0);
-        if (d) return d;
-        return Number(b.gp || 0) - Number(a.gp || 0);
-      })
-      .slice(0, 25);
-
-    const topCustomersByGP = customersBase
-      .slice()
-      .sort((a, b) => Number(b.gp || 0) - Number(a.gp || 0))
-      .slice(0, 25);
 
     return {
       label: itemLabel || itemCode || itemDesc || "",
@@ -9001,39 +9072,33 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
         quantity: safeNum(totQty, 4),
         revenue: safeMoney(totRev),
         gp: safeMoney(totGp),
-        gpPct: totRev ? safeNum((totGp / totRev) * 100, 2) : 0,
-        docs: rows.length,
-        customers: customersBase.length,
+        gpPct: totRev ? safeNum((totGp / totRev) * 100, 2) : 0
       },
-      topCustomers: topCustomersByRevenue,
-      topCustomersByRevenue,
-      topCustomersByMarginPct,
-      topCustomersByGP,
+      topCustomers: Array.from(byCustomer.values()).map((x) => ({
+        cardCode: x.cardCode,
+        cardName: x.cardName,
+        quantity: safeNum(x.quantity, 4),
+        revenue: safeMoney(x.revenue),
+        gp: safeMoney(x.gp),
+        gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
+      })).sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0)).slice(0, 20),
       byMonth: Array.from(byMonth.values()).map((x) => ({
         month: x.month,
         quantity: safeNum(x.quantity, 4),
         revenue: safeMoney(x.revenue),
         gp: safeMoney(x.gp),
-        gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0,
-        docs: Number(x.docs || 0)
+        gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
       })).sort((a, b) => String(a.month).localeCompare(String(b.month))).slice(0, 24),
-      rawRows: rows.slice(0, 120).map((r) => {
-        const rev = Number(r.revenue ?? r.total ?? 0);
-        const gp = Number(r.gp || 0);
-        return {
-          docDate: r.docDate,
-          docType: r.docType,
-          docNum: r.docNum,
-          cardCode: r.cardCode,
-          cardName: r.cardName,
-          quantity: safeNum(r.quantity, 4),
-          revenue: safeMoney(rev),
-          gp: safeMoney(gp),
-          gpPct: rev ? safeNum((gp / rev) * 100, 2) : 0,
-          area: r.area,
-          grupo: r.grupo
-        };
-      })
+      rawRows: rows.slice(0, 120).map((r) => ({
+        docDate: r.docDate,
+        cardCode: r.cardCode,
+        cardName: r.cardName,
+        quantity: safeNum(r.quantity, 4),
+        revenue: safeMoney(r.revenue),
+        gp: safeMoney(r.gp),
+        area: r.area,
+        grupo: r.grupo
+      }))
     };
   })() : null;
 
@@ -9049,12 +9114,7 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
     "Respeta estrictamente los filtros activos de fecha, área, grupo, búsqueda y artículo seleccionado cuando existan.",
     "No inventes datos, no asumas ventas, stock ni márgenes que no estén presentes en el contexto.",
     "Responde siempre en español, con lenguaje claro, ejecutivo, útil y orientado a decisiones.",
-    "La sección selectedItem y sus bloques topCustomers, topCustomersByRevenue, topCustomersByMarginPct, topCustomersByGP, byMonth y rawRows provienen de la base de datos detallada sales_item_lines; trátalos como evidencia directa del comportamiento por cliente y por documento del artículo seleccionado.",
     "Te pueden preguntar, Dame o dime el detalle del codigo; ejemplo 7270, el detalle por cliente y a que clientes tienen el mayor porcentaje de ganancia bruta (Gross Margin (%)), haz la lista de mayor a menor para saber que clientes dan mayor ganancia de ese producto.",
-    "Si el usuario pide detalle por cliente de un artículo, prioriza primero topCustomersByRevenue, topCustomersByMarginPct, topCustomersByGP y rawRows. Debes mencionar clientes concretos, revenue, GP $, GP % y cantidad cuando estén disponibles.",
-    "Si el usuario pide el mayor Gross Margin (%) por cliente, ordénalo por GP % de mayor a menor usando topCustomersByMarginPct. Si dos clientes empatan en GP %, desempata por GP $ y luego por revenue.",
-    "Si el usuario pide los clientes que más aportan margen, ordénalos por GP $ usando topCustomersByGP. Si pide los clientes que más compran, ordénalos por revenue usando topCustomersByRevenue.",
-    "Nunca digas que no hay revenue por cliente ni que el porcentaje no puede calcularse si selectedItem.topCustomersByRevenue o topCustomersByMarginPct contienen revenue y gp. Usa esos datos para calcular o validar la respuesta.",
     "Prioriza hallazgos concretos sobre revenue, margen bruto, % margen, clasificación ABC, ranking, concentración, stock, mínimos, máximos, disponible, comprometido y ordenado.",
     "Cuando hables de stock, distingue con precisión si el artículo está por debajo del mínimo, dentro de rango, en máximo o por encima del máximo.",
     "Cuando hables de clasificación, explica tanto la clasificación total como ABC de revenue, GP y GP%.",
