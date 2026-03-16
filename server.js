@@ -9430,7 +9430,7 @@ function buildEstratCompactContext(dashboard, itemRows = [], itemLabel = "") {
 
     for (const r of rows) {
       const qty = Number(r.quantity || 0);
-      const rev = Number(r.total ?? r.revenue || 0);
+      const rev = Number((r.total ?? r.revenue) || 0);
       const gp = Number(r.gp || 0);
       const month = String(r.docDate || "").slice(0, 7);
       const ckey = `${r.cardCode || ""}||${r.cardName || ""}`;
@@ -9497,7 +9497,7 @@ function buildEstratCompactContext(dashboard, itemRows = [], itemLabel = "") {
         cardCode: r.cardCode,
         cardName: r.cardName,
         quantity: safeNum(r.quantity, 4),
-        revenue: safeMoney(r.total ?? r.revenue || 0),
+        revenue: safeMoney((r.total ?? r.revenue) || 0),
         gp: safeMoney(r.gp),
         area: r.area,
         grupo: r.grupo
