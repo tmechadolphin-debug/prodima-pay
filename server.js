@@ -82,7 +82,7 @@ app.use((req, res, next) => {
     res.setHeader("Vary", "Origin");
   }
 
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-warehouse");
   res.setHeader("Access-Control-Max-Age", "86400");
 
@@ -2801,7 +2801,7 @@ app.use((req, res, next) => {
     res.setHeader("Vary", "Origin");
   }
 
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
   if (req.method === "OPTIONS") return res.sendStatus(204);
@@ -4217,7 +4217,7 @@ app.use((req, res, next) => {
     res.setHeader("Vary", "Origin");
   }
 
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
 
@@ -5625,7 +5625,7 @@ app.use((req, res, next) => {
     res.setHeader("Vary", "Origin");
   }
 
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
 
@@ -9055,7 +9055,9 @@ async function ensureEstratificacionMemoryDb() {
 
 __extraBootTasks.push(async () => {
   try {
-    await ensurePortalUsersDb();
+    if (typeof ensurePortalUsersDb === "function") {
+      await ensurePortalUsersDb();
+    }
     await ensureEstratificacionMemoryDb();
   } catch (e) {
     console.error("Estrat memory init error:", e?.message || String(e));
