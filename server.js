@@ -9633,7 +9633,42 @@ async function openaiEstratificacionChatWithMemory({
   };
 }
 
-app.get("/api/portal/estratificacion/me", verifyPortalAuth, async (req, res) => {
+const verifyPortalAuthEstrat = (typeof verifyPortalAuth === "function")
+  ? verifyPortalAuth
+  : function(req, res, next) {
+      const auth = String(req.headers?.authorization || "");
+      const m = auth.match(/^Bearer\s+(.+)$/i);
+      const token = m?.[1] || "";
+      if (!token) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        req.user = decoded;
+        return next();
+      } catch {
+        return safeJson(res, 401, { ok: false, message: "Invalid token" });
+      }
+    };
+
+const verifyPortalAdminEstrat = (typeof verifyPortalAdmin === "function")
+  ? verifyPortalAdmin
+  : function(req, res, next) {
+      const auth = String(req.headers?.authorization || "");
+      const m = auth.match(/^Bearer\s+(.+)$/i);
+      const token = m?.[1] || "";
+      if (!token) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded?.role !== "admin") {
+          return safeJson(res, 403, { ok: false, message: "Forbidden" });
+        }
+        req.user = decoded;
+        return next();
+      } catch {
+        return safeJson(res, 401, { ok: false, message: "Invalid token" });
+      }
+    };
+
+app.get("/api/portal/estratificacion/me", verifyPortalAuthEstrat, async (req, res) => {
   try {
     const me = await getEstratPortalMe(req.user);
     return safeJson(res, 200, { ok: true, user: me });
@@ -9642,7 +9677,7 @@ app.get("/api/portal/estratificacion/me", verifyPortalAuth, async (req, res) => 
   }
 });
 
-app.get("/api/portal/estratificacion/dashboard", verifyPortalAuth, async (req, res) => {
+app.get("/api/portal/estratificacion/dashboard", verifyPortalAuthEstrat, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
 
@@ -9669,7 +9704,7 @@ app.get("/api/portal/estratificacion/dashboard", verifyPortalAuth, async (req, r
   }
 });
 
-app.get("/api/portal/estratificacion/item-docs", verifyPortalAuth, async (req, res) => {
+app.get("/api/portal/estratificacion/item-docs", verifyPortalAuthEstrat, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
 
@@ -9698,7 +9733,7 @@ app.get("/api/portal/estratificacion/item-docs", verifyPortalAuth, async (req, r
   }
 });
 
-app.get("/api/portal/estratificacion/conversations", verifyPortalAuth, async (req, res) => {
+app.get("/api/portal/estratificacion/conversations", verifyPortalAuthEstrat, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
 
@@ -9735,7 +9770,7 @@ app.get("/api/portal/estratificacion/conversations", verifyPortalAuth, async (re
   }
 });
 
-app.get("/api/portal/estratificacion/conversations/:id/messages", verifyPortalAuth, async (req, res) => {
+app.get("/api/portal/estratificacion/conversations/:id/messages", verifyPortalAuthEstrat, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
 
@@ -9770,7 +9805,7 @@ app.get("/api/portal/estratificacion/conversations/:id/messages", verifyPortalAu
   }
 });
 
-app.post("/api/portal/estratificacion/ai-chat", verifyPortalAuth, async (req, res) => {
+app.post("/api/portal/estratificacion/ai-chat", verifyPortalAuthEstrat, async (req, res) => {
   let conv = null;
   let me = null;
   let question = "";
@@ -9917,7 +9952,7 @@ app.post("/api/portal/estratificacion/ai-chat", verifyPortalAuth, async (req, re
   }
 });
 
-app.get("/api/portal/admin/estratificacion/users/:id/areas", verifyPortalAdmin, async (req, res) => {
+app.get("/api/portal/admin/estratificacion/users/:id/areas", verifyPortalAdminEstrat, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
     const id = Number(req.params.id || 0);
@@ -9942,7 +9977,7 @@ app.get("/api/portal/admin/estratificacion/users/:id/areas", verifyPortalAdmin, 
   }
 });
 
-app.put("/api/portal/admin/estratificacion/users/:id/areas", verifyPortalAdmin, async (req, res) => {
+app.put("/api/portal/admin/estratificacion/users/:id/areas", verifyPortalAdminEstrat, async (req, res) => {
   const client = await pool.connect();
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
