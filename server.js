@@ -7494,6 +7494,123 @@ async function prodGetFullItem(code) {
   return item;
 }
 
+
+function prodNormalizeSlCollection(obj) {
+  if (Array.isArray(obj)) return obj;
+  if (Array.isArray(obj?.value)) return obj.value;
+  return [];
+}
+
+function prodExtractWeightedCostFromItem(item) {
+  if (!item || typeof item !== "object") return 0;
+
+  const whRows = Array.isArray(item.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
+  const priceKeys = ["AvgPrice", "AveragePrice", "AvgStdPrice", "AvgStdPrc", "Price"];
+  const stockKeys = ["InStock", "OnHand", "Stock"];
+  let nume = 0;
+  let den = 0;
+
+  for (const r of whRows) {
+    const wh = String(r?.WarehouseCode ?? r?.WhsCode ?? "").trim();
+    if (wh && !PROD_FINISHED_WHS.includes(wh)) continue;
+
+    let price = 0;
+    for (const k of priceKeys) {
+      if (r && r[k] != null && r[k] !== "") {
+        price = prodNum(r[k]);
+        break;
+      }
+    }
+
+    let stock = 0;
+    for (const k of stockKeys) {
+      if (r && r[k] != null && r[k] !== "") {
+        stock = prodNum(r[k]);
+        break;
+      }
+    }
+
+    if (price > 0 && stock > 0) {
+      nume += price * stock;
+      den += stock;
+    }
+  }
+
+  if (den > 0) return prodRound(nume / den, 6);
+
+  const itemKeys = ["AvgPrice", "AveragePrice", "AvgStdPrice", "AvgStdPrc", "LastPurPrc", "LastPurchasePrice"];
+  for (const k of itemKeys) {
+    if (item[k] != null && item[k] !== "") {
+      const v = prodNum(item[k]);
+      if (v > 0) return prodRound(v, 6);
+    }
+  }
+  return 0;
+}
+
+function prodNormalizeProductionOrderRow(r) {
+  const postDateRaw = r?.PostingDate ?? r?.PostDate ?? r?.StartDate ?? r?.DueDate ?? "";
+  const postDate = String(postDateRaw || "").slice(0, 10);
+  return {
+    docNum: Number(r?.DocumentNumber ?? r?.DocNum ?? r?.AbsoluteEntry ?? r?.Absoluteentry ?? 0) || null,
+    absoluteEntry: Number(r?.AbsoluteEntry ?? r?.Absoluteentry ?? r?.DocEntry ?? 0) || null,
+    itemCode: String(r?.ItemNo ?? r?.ItemCode ?? "").trim(),
+    prodName: String(r?.ProductDescription ?? r?.ProdName ?? r?.ItemName ?? "").trim(),
+    plannedQty: prodRound(r?.PlannedQuantity ?? r?.PlannedQty ?? r?.PlannedQtty ?? 0, 3),
+    completedQty: prodRound(r?.CompletedQuantity ?? r?.CmpltQty ?? r?.CompletedQty ?? 0, 3),
+    rejectedQty: prodRound(r?.RejectedQuantity ?? r?.RejectedQty ?? 0, 3),
+    postDate,
+    status: String(r?.ProductionOrderStatus ?? r?.Status ?? "").trim(),
+    warehouse: String(r?.Warehouse ?? r?.WarehouseCode ?? r?.WhsCode ?? "").trim(),
+    origin: String(r?.ProductionOrderOrigin ?? r?.Origin ?? "").trim(),
+  };
+}
+
+async function prodFetchProductionOrders(itemCode, top = 80) {
+  const code = String(itemCode || "").trim();
+  if (!code || missingSapEnv()) return { orders: [], monthly: new Map() };
+
+  const safeCode = code.replace(/'/g, "''");
+  const paths = [
+    `/ProductionOrders?$filter=ItemNo eq '${safeCode}'&$orderby=PostingDate desc&$top=${Math.max(20, Math.min(200, Number(top || 80)))}`,
+    `/ProductionOrders?$filter=ItemNo eq '${safeCode}'&$orderby=PostDate desc&$top=${Math.max(20, Math.min(200, Number(top || 80)))}`,
+    `/ProductionOrders?$filter=ItemCode eq '${safeCode}'&$orderby=PostingDate desc&$top=${Math.max(20, Math.min(200, Number(top || 80)))}`,
+    `/ProductionOrders?$filter=ItemCode eq '${safeCode}'&$orderby=PostDate desc&$top=${Math.max(20, Math.min(200, Number(top || 80)))}`,
+  ];
+
+  let raw = [];
+  let lastErr = null;
+  for (const path of paths) {
+    try {
+      const res = await slFetch(path, { timeoutMs: 120000 });
+      raw = prodNormalizeSlCollection(res);
+      if (raw.length) break;
+      if (Array.isArray(res) && res.length === 0) {
+        raw = [];
+        break;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!raw.length && lastErr) {
+    return { orders: [], monthly: new Map(), warning: lastErr.message || String(lastErr) };
+  }
+
+  const orders = raw
+    .map(prodNormalizeProductionOrderRow)
+    .filter((x) => String(x.itemCode || "") === code || !x.itemCode)
+    .sort((a, b) => String(b.postDate || "").localeCompare(String(a.postDate || "")) || Number(b.docNum || 0) - Number(a.docNum || 0));
+
+  const monthly = new Map();
+  for (const o of orders) {
+    const ym = prodYm(o.postDate || new Date());
+    const prev = monthly.get(ym) || 0;
+    monthly.set(ym, prodRound(prev + prodNum(o.completedQty), 3));
+  }
+  return { orders, monthly };
+}
+
 async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
   const r = await dbQuery(
     `
@@ -7874,10 +7991,22 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     [code, histFrom, end]
   );
   const monthMap = new Map((monthlyRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
+
+  const sapItem = await prodGetFullItem(code).catch(() => null);
+  const weightedCost = prodExtractWeightedCostFromItem(sapItem);
+  const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map() }));
+  const prodMonthMap = prodOrders?.monthly instanceof Map ? prodOrders.monthly : new Map();
+
   const salesHistory = [];
   for (let i = 11; i >= 0; i--) {
     const ym = prodYm(prodAddMonthsISO(monthStart, -i));
-    salesHistory.push({ ym, label: prodFormatMonthName(ym), qty: prodRound(monthMap.get(ym) || 0, 2) });
+    salesHistory.push({
+      ym,
+      label: prodFormatMonthName(ym),
+      qty: prodRound(monthMap.get(ym) || 0, 2),
+      producedQty: prodRound(prodMonthMap.get(ym) || 0, 2),
+      weightedCost: prodRound(weightedCost || 0, 4),
+    });
   }
 
   let avgQty = 0;
@@ -7985,6 +8114,13 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     .filter((n) => Number.isFinite(n));
   const maxUnitsToday = maxUnitsByMaterial.length ? Math.floor(Math.min(...maxUnitsByMaterial)) : 0;
 
+  const costing = {
+    weightedCost: prodRound(weightedCost || 0, 4),
+    projectedDemandCost: prodRound((weightedCost || 0) * projectedQty, 2),
+    adjustedProductionCost: prodRound((weightedCost || 0) * productionAdjusted, 2),
+    stockValue: prodRound((weightedCost || 0) * stockTotal, 2),
+  };
+
   return {
     ok: true,
     itemCode: code,
@@ -7995,6 +8131,8 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     abcHint: "",
     period: { endDate: end, avgMonths: Math.max(1, Number(avgMonths || 5)), horizonMonths: Math.max(1, Number(horizonMonths || 3)), planStart, planEnd },
     salesHistory,
+    recentProductionOrders: (prodOrders?.orders || []).slice(0, 20),
+    costing,
     avgMonthlyQty: prodRound(avgQty, 2),
     projectedQty: prodRound(projectedQty, 2),
     inventory: {
@@ -8095,6 +8233,22 @@ function prodAiCompactPlan(plan) {
 
     avgMonthlyQty: plan.avgMonthlyQty,
     projectedQty: plan.projectedQty,
+    salesHistory: (plan.salesHistory || []).map((x) => ({
+      ym: x.ym,
+      label: x.label,
+      qty: x.qty,
+      producedQty: x.producedQty || 0,
+      weightedCost: x.weightedCost || 0,
+    })),
+    costing: plan.costing || {},
+    recentProductionOrders: (plan.recentProductionOrders || []).slice(0, 20).map((x) => ({
+      docNum: x.docNum,
+      postDate: x.postDate,
+      plannedQty: x.plannedQty,
+      completedQty: x.completedQty,
+      status: x.status,
+      warehouse: x.warehouse,
+    })),
 
     inventory: plan.inventory,
     mrp: plan.mrp,
@@ -8159,6 +8313,8 @@ const system = [
   "IMPORTANTE: si el JSON trae requirements.rawMaterials, requirements.packaging o requirements.bottlenecks, debes analizarlos y mencionarlos explícitamente.",
   "IMPORTANTE: no digas que faltan materias primas, empaques o cuellos de botella si esos arreglos existen en el JSON y tienen elementos.",
   "IMPORTANTE: usa formula.litersPerUnit, formula.baseLiquidCode y formula.litersRequired cuando existan.",
+  "IMPORTANTE: cuando existan salesHistory.producedQty o recentProductionOrders, esos son los datos válidos para responder cuánto se produjo el artículo por mes o en órdenes recientes.",
+  "IMPORTANTE: cuando exista costing.weightedCost, úsalo como costo ponderado unitario del artículo y analiza también stockValue, projectedDemandCost y adjustedProductionCost.",
   "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo:",
   "1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria / ajustada por MRP 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
   "Si realmente falta información en el JSON, dilo claramente.",
