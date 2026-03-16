@@ -7736,6 +7736,7 @@ function prodExtractMrpFromItem(it) {
   };
 }
 
+
 async function prodGetFullItem(code) {
   const itemCode = String(code || "").trim();
   if (!itemCode) return null;
@@ -7744,7 +7745,14 @@ async function prodGetFullItem(code) {
   let item = null;
   try {
     item = await slFetch(
-      `/Items('${safe}')?$select=ItemCode,ItemName,ItemsGroupCode,SalesUnit,InventoryItem,Valid,FrozenFor,ProcurementMethod,PlanningSystem,LeadTime,LeadTimeDays,MinimumOrderQuantity,MinOrderQty,OrderMultiple,OrderMultipleQty,MinInventory`,
+      `/Items('${safe}')?$select=` +
+      [
+        "ItemCode","ItemName","ItemsGroupCode","SalesUnit","InventoryItem","Valid","FrozenFor",
+        "ProcurementMethod","PlanningSystem","LeadTime","LeadTimeDays","MinimumOrderQuantity",
+        "MinOrderQty","OrderMultiple","OrderMultipleQty","MinInventory","IssueMethod","TreeType",
+        "AvgPrice","AveragePrice","AvgStdPrice","AvgStdPrc","LastPurPrc","LastPurchasePrice",
+        "MainSupplier","SupplierCatalogNo","ForeignName"
+      ].join(","),
       { timeoutMs: 120000 }
     );
   } catch (e1) {
@@ -7758,7 +7766,11 @@ async function prodGetFullItem(code) {
   if (!Array.isArray(item?.ItemWarehouseInfoCollection) || !item.ItemWarehouseInfoCollection.length) {
     try {
       const whInfo = await slFetch(
-        `/Items('${safe}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,OnHand,Committed,IsCommited,Ordered,OnOrder,MinimalStock,MinStock,MaximalStock,MaxStock`,
+        `/Items('${safe}')/ItemWarehouseInfoCollection?$select=` +
+        [
+          "WarehouseCode","WhsCode","InStock","OnHand","Committed","IsCommited","Ordered","OnOrder",
+          "MinimalStock","MinStock","MaximalStock","MaxStock","AvgPrice","AveragePrice","AvgStdPrc","AvgStdPrice","Price"
+        ].join(","),
         { timeoutMs: 120000 }
       );
       if (Array.isArray(whInfo?.value)) item.ItemWarehouseInfoCollection = whInfo.value;
@@ -7771,6 +7783,341 @@ async function prodGetFullItem(code) {
   }
 
   return item;
+}
+
+function prodNormalizeSlCollection(obj) {
+  if (Array.isArray(obj)) return obj;
+  if (Array.isArray(obj?.value)) return obj.value;
+  return [];
+}
+
+function prodExtractWeightedCostFromItem(item) {
+  if (!item || typeof item !== "object") return 0;
+
+  const whRows = Array.isArray(item.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
+  const priceKeys = ["AvgPrice", "AveragePrice", "AvgStdPrice", "AvgStdPrc", "Price"];
+  const stockKeys = ["InStock", "OnHand", "Stock"];
+  let nume = 0;
+  let den = 0;
+
+  for (const r of whRows) {
+    const wh = String(r?.WarehouseCode ?? r?.WhsCode ?? "").trim();
+    if (wh && !PROD_FINISHED_WHS.includes(wh)) continue;
+
+    let price = 0;
+    for (const k of priceKeys) {
+      if (r && r[k] != null && r[k] !== "") {
+        price = prodNum(r[k]);
+        break;
+      }
+    }
+
+    let stock = 0;
+    for (const k of stockKeys) {
+      if (r && r[k] != null && r[k] !== "") {
+        stock = prodNum(r[k]);
+        break;
+      }
+    }
+
+    if (price > 0 && stock > 0) {
+      nume += price * stock;
+      den += stock;
+    }
+  }
+
+  if (den > 0) return prodRound(nume / den, 6);
+
+  const itemKeys = ["AvgPrice", "AveragePrice", "AvgStdPrice", "AvgStdPrc", "LastPurPrc", "LastPurchasePrice"];
+  for (const k of itemKeys) {
+    if (item[k] != null && item[k] !== "") {
+      const v = prodNum(item[k]);
+      if (v > 0) return prodRound(v, 6);
+    }
+  }
+  return 0;
+}
+
+function prodNormalizeProductionOrderRow(r) {
+  const postDateRaw = r?.PostingDate ?? r?.PostDate ?? r?.StartDate ?? r?.DueDate ?? "";
+  const postDate = String(postDateRaw || "").slice(0, 10);
+  return {
+    docNum: Number(r?.DocumentNumber ?? r?.DocNum ?? r?.AbsoluteEntry ?? r?.Absoluteentry ?? 0) || null,
+    absoluteEntry: Number(r?.AbsoluteEntry ?? r?.Absoluteentry ?? r?.DocEntry ?? 0) || null,
+    itemCode: String(r?.ItemNo ?? r?.ItemCode ?? "").trim(),
+    prodName: String(r?.ProductDescription ?? r?.ProdName ?? r?.ItemName ?? "").trim(),
+    plannedQty: prodRound(r?.PlannedQuantity ?? r?.PlannedQty ?? r?.PlannedQtty ?? 0, 3),
+    completedQty: prodRound(r?.CompletedQuantity ?? r?.CmpltQty ?? r?.CompletedQty ?? 0, 3),
+    rejectedQty: prodRound(r?.RejectedQuantity ?? r?.RejectedQty ?? 0, 3),
+    postDate,
+    status: String(r?.ProductionOrderStatus ?? r?.Status ?? "").trim(),
+    warehouse: String(r?.Warehouse ?? r?.WarehouseCode ?? r?.WhsCode ?? "").trim(),
+    origin: String(r?.ProductionOrderOrigin ?? r?.Origin ?? "").trim(),
+  };
+}
+
+async function prodFetchProductionOrders(itemCode, top = 80) {
+  const code = String(itemCode || "").trim();
+  if (!code || missingSapEnv()) return { orders: [], monthly: new Map() };
+
+  const safeCode = code.replace(/'/g, "''");
+  const topSafe = Math.max(20, Math.min(200, Number(top || 80)));
+  const paths = [
+    `/ProductionOrders?$filter=ItemNo eq '${safeCode}'&$orderby=PostingDate desc&$top=${topSafe}`,
+    `/ProductionOrders?$filter=ItemNo eq '${safeCode}'&$orderby=PostDate desc&$top=${topSafe}`,
+    `/ProductionOrders?$filter=ItemCode eq '${safeCode}'&$orderby=PostingDate desc&$top=${topSafe}`,
+    `/ProductionOrders?$filter=ItemCode eq '${safeCode}'&$orderby=PostDate desc&$top=${topSafe}`,
+  ];
+
+  let raw = [];
+  let lastErr = null;
+  for (const path of paths) {
+    try {
+      const res = await slFetch(path, { timeoutMs: 120000 });
+      raw = prodNormalizeSlCollection(res);
+      if (raw.length || Array.isArray(res)) break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!raw.length && lastErr) {
+    return { orders: [], monthly: new Map(), warning: lastErr.message || String(lastErr) };
+  }
+
+  const orders = raw
+    .map(prodNormalizeProductionOrderRow)
+    .filter((x) => String(x.itemCode || "") === code || !x.itemCode)
+    .sort((a, b) => String(b.postDate || "").localeCompare(String(a.postDate || "")) || Number(b.docNum || 0) - Number(a.docNum || 0));
+
+  const monthly = new Map();
+  for (const o of orders) {
+    const ym = prodYm(o.postDate || new Date());
+    const prev = monthly.get(ym) || 0;
+    monthly.set(ym, prodRound(prev + prodNum(o.completedQty), 3));
+  }
+  return { orders, monthly };
+}
+
+function prodClassifyComponentType({ code, description = "", item = null, line = null }) {
+  const txt = `${code || ""} ${description || ""} ${item?.ItemName || ""} ${item?.ForeignName || ""} ${line?.IssueMethod || ""}`.toLowerCase();
+  if (/(botella|tapa|tap[aá]|liner|etiq|label|caja|cajeta|empaque|envase|shrink|sticker|frente|repuesto|atomizador|spray|doypack|valvula|válvula|dispensador|manga|sello|carton|cartón|bandeja|bolsa|bottle|cap)/i.test(txt)) {
+    return "PACKAGING";
+  }
+  return "RAW_MATERIAL";
+}
+
+function prodExtractSupplierFromItem(item) {
+  const candidates = [
+    item?.MainSupplier,
+    item?.PreferredVendor,
+    item?.SupplierCatalogNo,
+    item?.ForeignName,
+    item?.Manufacturer,
+  ];
+  for (const c of candidates) {
+    const v = String(c || "").trim();
+    if (v) return v;
+  }
+  return "";
+}
+
+function prodExtractComponentStockInfo(item, preferredWh = "") {
+  const whRows = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
+  const preferred = String(preferredWh || "").trim();
+  let stockSpecific = 0;
+  let availableSpecific = 0;
+  let hasSpecific = false;
+  let stockTotal = 0;
+  let availableTotal = 0;
+
+  for (const r of whRows) {
+    const wh = String(r?.WarehouseCode ?? r?.WhsCode ?? "").trim();
+    const stock = prodNum(r?.InStock ?? r?.OnHand ?? 0);
+    const committed = prodNum(r?.Committed ?? r?.IsCommited ?? 0);
+    const ordered = prodNum(r?.Ordered ?? r?.OnOrder ?? 0);
+    const available = stock - committed + ordered;
+
+    stockTotal += stock;
+    availableTotal += available;
+
+    if (preferred && wh === preferred) {
+      stockSpecific += stock;
+      availableSpecific += available;
+      hasSpecific = true;
+    }
+  }
+
+  return {
+    stockQty: prodRound(hasSpecific ? stockSpecific : stockTotal, 3),
+    availableQty: prodRound(hasSpecific ? availableSpecific : availableTotal, 3),
+    stockTotal: prodRound(stockTotal, 3),
+  };
+}
+
+function prodNormalizeBomLine(line) {
+  return {
+    code: String(line?.ItemCode ?? line?.Code ?? line?.ChildCode ?? "").trim(),
+    description: String(line?.ItemName ?? line?.ItemDescription ?? line?.ProductDescription ?? line?.Description ?? "").trim(),
+    quantity: prodNum(line?.Quantity ?? line?.PlannedQuantity ?? line?.Qty ?? line?.BaseQuantity ?? 0),
+    unit: String(line?.InventoryUOM ?? line?.UoMCode ?? line?.UomCode ?? line?.UoMName ?? line?.Unit ?? "").trim(),
+    warehouse: String(line?.Warehouse ?? line?.WarehouseCode ?? line?.WhsCode ?? "").trim(),
+    issueMethod: String(line?.IssueMethod ?? "").trim(),
+    raw: line || {},
+  };
+}
+
+async function prodFetchSapBom(itemCode) {
+  const code = String(itemCode || "").trim();
+  if (!code || missingSapEnv()) return { source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] };
+
+  const safe = code.replace(/'/g, "''");
+  const tryPaths = [
+    `/ProductTrees('${safe}')?$expand=ProductTreeLines`,
+    `/ProductTrees('${safe}')`,
+    `/ProductTrees?$filter=TreeCode eq '${safe}'&$top=1`,
+    `/ProductTrees?$filter=Code eq '${safe}'&$top=1`,
+  ];
+
+  let tree = null;
+  let lastErr = null;
+  for (const path of tryPaths) {
+    try {
+      const res = await slFetch(path, { timeoutMs: 120000 });
+      tree = Array.isArray(res?.value) ? (res.value[0] || null) : (res || null);
+      if (tree) break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!tree) return { source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [], warning: lastErr?.message || "" };
+
+  let lines = [];
+  const lineKeys = ["ProductTreeLines", "Items", "BOMLines", "BillOfMaterialsLines"];
+  for (const key of lineKeys) {
+    if (Array.isArray(tree?.[key]) && tree[key].length) {
+      lines = tree[key];
+      break;
+    }
+  }
+
+  if (!lines.length) {
+    const linePaths = [
+      `/ProductTrees('${safe}')/ProductTreeLines`,
+      `/ProductTrees('${safe}')/Items`,
+    ];
+    for (const path of linePaths) {
+      try {
+        const res = await slFetch(path, { timeoutMs: 120000 });
+        const arr = prodNormalizeSlCollection(res);
+        if (arr.length) {
+          lines = arr;
+          break;
+        }
+      } catch {}
+    }
+  }
+
+  const normalized = lines
+    .map(prodNormalizeBomLine)
+    .filter((x) => String(x.code || "").trim() && prodNum(x.quantity) > 0);
+
+  const headerQty = Math.max(1, prodNum(tree?.Quantity ?? tree?.TreeQuantity ?? tree?.PlannedQuantity ?? 1));
+  return {
+    source: "SAP ProductTrees",
+    tree,
+    headerQty,
+    lines: normalized,
+  };
+}
+
+async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }) {
+  const headerQty = Math.max(1, prodNum(sapBom?.headerQty || 1));
+  const bomLines = Array.isArray(sapBom?.lines) ? sapBom.lines : [];
+  if (!bomLines.length) {
+    return {
+      source: sapBom?.source || "SAP ProductTrees",
+      all: [],
+      rawMaterials: [],
+      packaging: [],
+      bottlenecks: [],
+      bomHeaderQty: headerQty,
+      bomLines: [],
+    };
+  }
+
+  const results = [];
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(6, Math.max(1, bomLines.length)) }, async () => {
+    while (idx < bomLines.length) {
+      const current = bomLines[idx++];
+      const item = await prodGetFullItem(current.code).catch(() => null);
+      const perUnit = prodNum(current.quantity) / headerQty;
+      const requiredQty = prodRound(perUnit * prodNum(adjustedQty), 3);
+      const stockInfo = prodExtractComponentStockInfo(item, current.warehouse);
+      const stockQty = stockInfo.availableQty > 0 ? stockInfo.availableQty : stockInfo.stockQty;
+      const shortage = Math.max(0, requiredQty - stockQty);
+      const coverage = requiredQty > 0 ? stockQty / requiredQty : 0;
+      const componentType = prodClassifyComponentType({ code: current.code, description: current.description, item, line: current.raw });
+      results.push({
+        code: current.code,
+        description: current.description || String(item?.ItemName || ""),
+        requiredQty,
+        unit: current.unit || String(item?.SalesUnit || ""),
+        stockQty: prodRound(stockQty, 3),
+        shortageQty: prodRound(shortage, 3),
+        coveragePct: prodRound(coverage * 100, 1),
+        supplier: prodExtractSupplierFromItem(item),
+        cost: prodRound(prodExtractWeightedCostFromItem(item), 4),
+        status: shortage > 0 ? "FALTANTE" : "OK",
+        componentType,
+        warehouse: current.warehouse || "",
+        bomQtyBase: prodRound(current.quantity, 6),
+        perUnitQty: prodRound(perUnit, 6),
+        issueMethod: current.issueMethod || "",
+      });
+    }
+  });
+  await Promise.all(workers);
+
+  results.sort((a, b) => b.shortageQty - a.shortageQty || String(a.code).localeCompare(String(b.code)));
+  const rawMaterials = results.filter((x) => x.componentType === "RAW_MATERIAL");
+  const packaging = results.filter((x) => x.componentType === "PACKAGING");
+  const bottlenecks = results.filter((x) => x.shortageQty > 0).slice(0, 10);
+
+  return {
+    source: sapBom?.source || "SAP ProductTrees",
+    all: results,
+    rawMaterials,
+    packaging,
+    bottlenecks,
+    bomHeaderQty: headerQty,
+    bomLines,
+  };
+}
+
+function prodRecommendPracticalQty({ neededQty = 0, avgMonthlyQty = 0, minOrderQty = 0, multipleQty = 0 }) {
+  const need = Math.max(0, prodNum(neededQty));
+  if (need <= 0) return 0;
+
+  const avg = Math.max(0, prodNum(avgMonthlyQty));
+  let out = prodApplyMrp(need, minOrderQty, multipleQty);
+
+  let practicalMultiple = Math.max(0, prodNum(multipleQty));
+  if (!(practicalMultiple > 1)) {
+    if (avg >= 1000) practicalMultiple = 200;
+    else if (avg >= 500) practicalMultiple = 100;
+    else if (avg >= 100) practicalMultiple = 50;
+    else practicalMultiple = 10;
+  }
+
+  const practicalFloor = avg > 0 ? avg * 1.5 : out;
+  if (out < practicalFloor) {
+    out = Math.ceil(practicalFloor / practicalMultiple) * practicalMultiple;
+  }
+
+  if (minOrderQty > 0 && out < prodNum(minOrderQty)) out = prodNum(minOrderQty);
+  if (practicalMultiple > 1) out = Math.ceil(out / practicalMultiple) * practicalMultiple;
+  return Math.round(out);
 }
 
 async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
@@ -7968,7 +8315,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const projectedQty = avgQty * Math.max(1, Number(horizonMonths || 3));
     const stockTotal = prodNum(r.stock_total);
     const needed = Math.max(0, projectedQty - stockTotal);
-    const adjusted = prodApplyMrp(needed, r.min_order_qty, r.multiple_qty);
+    const adjusted = prodRecommendPracticalQty({ neededQty: needed, avgMonthlyQty: avgQty, minOrderQty: r.min_order_qty, multipleQty: r.multiple_qty });
 
     return {
       itemCode: String(r.item_code || ""),
@@ -8113,6 +8460,7 @@ function prodMergeMaterial(map, code, description, qty, unit, type) {
   map.set(key, cur);
 }
 
+
 async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizonMonths = 3, shiftHours = 8 }) {
   const code = String(itemCode || "").trim();
   if (!code) throw new Error("Falta itemCode");
@@ -8133,7 +8481,9 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     [code]
   );
   const row0 = itemMaster.rows?.[0] || {};
-  const itemDesc = String(row0.item_desc || meta?.description || "");
+
+  const sapItem = await prodGetFullItem(code).catch(() => null);
+  const itemDesc = String(row0.item_desc || sapItem?.ItemName || meta?.description || "");
   const grupo = prodNormalizeGrupoFinal(String(row0.grupo || ""));
   const area = String(row0.area || "") || prodInferAreaFromGroup(grupo) || "";
   const machine = prodMachineFromAreaOrGroup(area, grupo, meta);
@@ -8153,10 +8503,21 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     [code, histFrom, end]
   );
   const monthMap = new Map((monthlyRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
+
+  const weightedCost = prodExtractWeightedCostFromItem(sapItem);
+  const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map() }));
+  const prodMonthMap = prodOrders?.monthly instanceof Map ? prodOrders.monthly : new Map();
+
   const salesHistory = [];
   for (let i = 11; i >= 0; i--) {
     const ym = prodYm(prodAddMonthsISO(monthStart, -i));
-    salesHistory.push({ ym, label: prodFormatMonthName(ym), qty: prodRound(monthMap.get(ym) || 0, 2) });
+    salesHistory.push({
+      ym,
+      label: prodFormatMonthName(ym),
+      qty: prodRound(monthMap.get(ym) || 0, 2),
+      producedQty: prodRound(prodMonthMap.get(ym) || 0, 2),
+      weightedCost: prodRound(weightedCost || 0, 4),
+    });
   }
 
   let avgQty = 0;
@@ -8190,53 +8551,94 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
      FROM production_mrp_cache WHERE item_code = $1 LIMIT 1`,
     [code]
   );
-  const mrp = mrpRows.rows?.[0] || {};
+  const mrpFromDb = mrpRows.rows?.[0] || {};
+  const mrpFromSap = prodExtractMrpFromItem(sapItem || {});
+  const mrp = {
+    procurementMethod: String(mrpFromDb.procurement_method || mrpFromSap.procurementMethod || ""),
+    planningSystem: String(mrpFromDb.planning_system || mrpFromSap.planningSystem || ""),
+    leadTimeDays: prodNum(mrpFromDb.lead_time_days || mrpFromSap.leadTimeDays),
+    minOrderQty: prodNum(mrpFromDb.min_order_qty || mrpFromSap.minOrderQty),
+    multipleQty: prodNum(mrpFromDb.multiple_qty || mrpFromSap.multipleQty),
+  };
+
   const productionNeeded = Math.max(0, projectedQty - stockTotal);
-  const productionAdjusted = prodApplyMrp(productionNeeded, mrp.min_order_qty, mrp.multiple_qty);
-
-  const litersPerUnit = prodNum(meta?.litersPerUnit || prodInferLitersPerUnit(itemDesc));
-  const baseLiquidCode = String(meta?.baseLiquidCode || "");
-  const baseLiquidFormula = meta?.baseLiquidFormula || (baseLiquidCode ? local.formulas.liquids?.[baseLiquidCode] : null);
-  const litersRequired = productionAdjusted * litersPerUnit;
-
-  const reqMap = new Map();
-  const topLevel = Array.isArray(meta?.components) ? meta.components : [];
-
-  for (const c of topLevel) {
-    const qty = prodNum(c.qtyPerUnit) * productionAdjusted;
-    if (String(c.componentType || "") === "LIQUID_BASE") continue;
-    prodMergeMaterial(reqMap, c.code, c.description, qty, c.unit, c.componentType);
-  }
-  if (baseLiquidFormula && Array.isArray(baseLiquidFormula.components)) {
-    for (const c of baseLiquidFormula.components) {
-      const qty = prodNum(c.qtyPerLiter) * litersRequired;
-      prodMergeMaterial(reqMap, c.code, c.description, qty, c.unit, "RAW_MATERIAL");
-    }
-  }
-
-  const requirements = Array.from(reqMap.values()).map((x) => {
-    const stockRec = local.materials?.materials?.[x.code] || null;
-    const stockQty = prodNum(stockRec?.stockQty);
-    const shortage = Math.max(0, x.requiredQty - stockQty);
-    const coverage = x.requiredQty > 0 ? stockQty / x.requiredQty : 0;
-    return {
-      ...x,
-      requiredQty: prodRound(x.requiredQty, 3),
-      stockQty: prodRound(stockQty, 3),
-      shortageQty: prodRound(shortage, 3),
-      coveragePct: prodRound(coverage * 100, 1),
-      supplier: String(stockRec?.supplier || ""),
-      cost: prodRound(stockRec?.cost, 4),
-      status: shortage > 0 ? "FALTANTE" : "OK",
-    };
+  const mrpAdjustedQty = prodApplyMrp(productionNeeded, mrp.minOrderQty, mrp.multipleQty);
+  const productionAdjusted = prodRecommendPracticalQty({
+    neededQty: productionNeeded,
+    avgMonthlyQty: avgQty,
+    minOrderQty: mrp.minOrderQty,
+    multipleQty: mrp.multipleQty,
   });
 
-  const rawMaterials = requirements.filter((x) => x.componentType === "RAW_MATERIAL");
-  const packaging = requirements.filter((x) => x.componentType === "PACKAGING");
-  const bottlenecks = requirements
-    .filter((x) => x.shortageQty > 0)
-    .sort((a, b) => b.shortageQty - a.shortageQty)
-    .slice(0, 8);
+  const sapBom = await prodFetchSapBom(code).catch(() => ({ source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] }));
+  let requirementPack = await prodBuildRequirementsFromSapBom({ itemCode: code, adjustedQty: productionAdjusted, sapBom }).catch(() => null);
+
+  let litersPerUnit = 0;
+  let baseLiquidCode = "";
+  let litersRequired = 0;
+  let materialSource = "SAP producción · ProductTrees";
+  let usedLocalFallback = false;
+
+  if (!requirementPack || !Array.isArray(requirementPack.all) || !requirementPack.all.length) {
+    const fallbackReqMap = new Map();
+    const fallbackMeta = meta || null;
+    litersPerUnit = prodNum(fallbackMeta?.litersPerUnit || prodInferLitersPerUnit(itemDesc));
+    baseLiquidCode = String(fallbackMeta?.baseLiquidCode || "");
+    const baseLiquidFormula = fallbackMeta?.baseLiquidFormula || (baseLiquidCode ? local.formulas.liquids?.[baseLiquidCode] : null);
+    litersRequired = productionAdjusted * litersPerUnit;
+
+    const topLevel = Array.isArray(fallbackMeta?.components) ? fallbackMeta.components : [];
+    for (const c of topLevel) {
+      const qty = prodNum(c.qtyPerUnit) * productionAdjusted;
+      if (String(c.componentType || "") === "LIQUID_BASE") continue;
+      prodMergeMaterial(fallbackReqMap, c.code, c.description, qty, c.unit, c.componentType);
+    }
+    if (baseLiquidFormula && Array.isArray(baseLiquidFormula.components)) {
+      for (const c of baseLiquidFormula.components) {
+        const qty = prodNum(c.qtyPerLiter) * litersRequired;
+        prodMergeMaterial(fallbackReqMap, c.code, c.description, qty, c.unit, "RAW_MATERIAL");
+      }
+    }
+
+    const requirements = Array.from(fallbackReqMap.values()).map((x) => {
+      const stockRec = local.materials?.materials?.[x.code] || null;
+      const stockQty = prodNum(stockRec?.stockQty);
+      const shortage = Math.max(0, x.requiredQty - stockQty);
+      const coverage = x.requiredQty > 0 ? stockQty / x.requiredQty : 0;
+      return {
+        ...x,
+        requiredQty: prodRound(x.requiredQty, 3),
+        stockQty: prodRound(stockQty, 3),
+        shortageQty: prodRound(shortage, 3),
+        coveragePct: prodRound(coverage * 100, 1),
+        supplier: String(stockRec?.supplier || ""),
+        cost: prodRound(stockRec?.cost, 4),
+        status: shortage > 0 ? "FALTANTE" : "OK",
+      };
+    });
+
+    requirementPack = {
+      source: "Catálogo local de respaldo",
+      all: requirements,
+      rawMaterials: requirements.filter((x) => x.componentType === "RAW_MATERIAL"),
+      packaging: requirements.filter((x) => x.componentType === "PACKAGING"),
+      bottlenecks: requirements.filter((x) => x.shortageQty > 0).sort((a, b) => b.shortageQty - a.shortageQty).slice(0, 10),
+      bomHeaderQty: 1,
+      bomLines: [],
+    };
+    materialSource = "Catálogo local de respaldo";
+    usedLocalFallback = true;
+  } else {
+    materialSource = requirementPack.source || "SAP producción · ProductTrees";
+    litersPerUnit = prodNum(meta?.litersPerUnit || 0);
+    baseLiquidCode = String(meta?.baseLiquidCode || "");
+    litersRequired = prodRound(litersPerUnit * productionAdjusted, 3);
+  }
+
+  const requirements = Array.isArray(requirementPack?.all) ? requirementPack.all : [];
+  const rawMaterials = Array.isArray(requirementPack?.rawMaterials) ? requirementPack.rawMaterials : [];
+  const packaging = Array.isArray(requirementPack?.packaging) ? requirementPack.packaging : [];
+  const bottlenecks = Array.isArray(requirementPack?.bottlenecks) ? requirementPack.bottlenecks : [];
 
   const rate = prodNum(local.capacity?.itemRates?.[code] || local.capacity?.defaultRates?.[machine] || 0);
   const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
@@ -8264,6 +8666,13 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     .filter((n) => Number.isFinite(n));
   const maxUnitsToday = maxUnitsByMaterial.length ? Math.floor(Math.min(...maxUnitsByMaterial)) : 0;
 
+  const costing = {
+    weightedCost: prodRound(weightedCost || 0, 4),
+    projectedDemandCost: prodRound((weightedCost || 0) * projectedQty, 2),
+    adjustedProductionCost: prodRound((weightedCost || 0) * productionAdjusted, 2),
+    stockValue: prodRound((weightedCost || 0) * stockTotal, 2),
+  };
+
   return {
     ok: true,
     itemCode: code,
@@ -8272,8 +8681,16 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     area,
     machine,
     abcHint: "",
-    period: { endDate: end, avgMonths: Math.max(1, Number(avgMonths || 5)), horizonMonths: Math.max(1, Number(horizonMonths || 3)), planStart, planEnd },
+    period: {
+      endDate: end,
+      avgMonths: Math.max(1, Number(avgMonths || 5)),
+      horizonMonths: Math.max(1, Number(horizonMonths || 3)),
+      planStart,
+      planEnd
+    },
     salesHistory,
+    recentProductionOrders: (prodOrders?.orders || []).slice(0, 20),
+    costing,
     avgMonthlyQty: prodRound(avgQty, 2),
     projectedQty: prodRound(projectedQty, 2),
     inventory: {
@@ -8283,19 +8700,21 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       stockMax: prodRound(stockMax, 2),
     },
     mrp: {
-      procurementMethod: String(mrp.procurement_method || ""),
-      planningSystem: String(mrp.planning_system || ""),
-      leadTimeDays: prodNum(mrp.lead_time_days),
-      minOrderQty: prodNum(mrp.min_order_qty),
-      multipleQty: prodNum(mrp.multiple_qty),
+      procurementMethod: mrp.procurementMethod,
+      planningSystem: mrp.planningSystem,
+      leadTimeDays: prodNum(mrp.leadTimeDays),
+      minOrderQty: prodNum(mrp.minOrderQty),
+      multipleQty: prodNum(mrp.multipleQty),
     },
     production: {
       litersPerUnit: prodRound(litersPerUnit, 6),
       baseLiquidCode,
       litersRequired: prodRound(litersRequired, 3),
       neededQty: prodRound(productionNeeded, 2),
+      mrpAdjustedQty: prodRound(mrpAdjustedQty, 2),
       adjustedQty: prodRound(productionAdjusted, 2),
       maxUnitsToday,
+      practicalRule: "Se recomienda un lote práctico mínimo de 1.5 meses promedio cuando el MRP quede demasiado corto.",
     },
     capacity: {
       unitsPerHour: prodRound(rate, 2),
@@ -8315,8 +8734,16 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       packaging,
       bottlenecks,
     },
+    sapProduction: {
+      source: materialSource,
+      bomHeaderQty: prodRound(requirementPack?.bomHeaderQty || 1, 3),
+      bomLinesCount: Array.isArray(requirementPack?.bomLines) ? requirementPack.bomLines.length : 0,
+      usingLocalFallback: usedLocalFallback,
+    },
     meta: meta || null,
-    source: "base de datos sincronizada + catálogo local de fórmulas",
+    source: usedLocalFallback
+      ? "base de datos sincronizada + catálogo local de respaldo"
+      : "base de datos sincronizada + SAP producción (ProductTrees / órdenes de fabricación)",
   };
 }
 
@@ -8374,17 +8801,35 @@ function prodAiCompactPlan(plan) {
 
     avgMonthlyQty: plan.avgMonthlyQty,
     projectedQty: plan.projectedQty,
+    salesHistory: (plan.salesHistory || []).map((x) => ({
+      ym: x.ym,
+      label: x.label,
+      qty: x.qty,
+      producedQty: x.producedQty || 0,
+      weightedCost: x.weightedCost || 0,
+    })),
+    costing: plan.costing || {},
+    recentProductionOrders: (plan.recentProductionOrders || []).slice(0, 20).map((x) => ({
+      docNum: x.docNum,
+      postDate: x.postDate,
+      plannedQty: x.plannedQty,
+      completedQty: x.completedQty,
+      status: x.status,
+      warehouse: x.warehouse,
+    })),
 
     inventory: plan.inventory,
     mrp: plan.mrp,
     production: plan.production,
     capacity: plan.capacity,
+    sapProduction: plan.sapProduction || {},
 
     formula: {
       litersPerUnit: plan.production?.litersPerUnit || 0,
       baseLiquidCode: plan.production?.baseLiquidCode || "",
       litersRequired: plan.production?.litersRequired || 0,
       neededQty: plan.production?.neededQty || 0,
+      mrpAdjustedQty: plan.production?.mrpAdjustedQty || 0,
       adjustedQty: plan.production?.adjustedQty || 0
     },
 
@@ -8428,20 +8873,24 @@ async function prodOpenAiChat({ question, dashboard, plan }) {
     selectedPlan: prodAiCompactPlan(plan),
   };
 
-const system = [
-  "Eres un planificador de producción interno de PRODIMA.",
-  "Usa exclusivamente el JSON entregado como fuente de verdad.",
-  "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) y catálogo local de fórmulas/materiales.",
-  "No inventes datos que no estén en el JSON.",
-  "Responde en español.",
-  "IMPORTANTE: las cantidades de producto terminado siempre se expresan en UNIDADES, nunca en cajas.",
-  "IMPORTANTE: si el JSON trae requirements.rawMaterials, requirements.packaging o requirements.bottlenecks, debes analizarlos y mencionarlos explícitamente.",
-  "IMPORTANTE: no digas que faltan materias primas, empaques o cuellos de botella si esos arreglos existen en el JSON y tienen elementos.",
-  "IMPORTANTE: usa formula.litersPerUnit, formula.baseLiquidCode y formula.litersRequired cuando existan.",
-  "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo:",
-  "1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria / ajustada por MRP 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
-  "Si realmente falta información en el JSON, dilo claramente.",
-].join(' ');
+  const system = [
+    "Eres un planificador de producción interno de PRODIMA.",
+    "Usa exclusivamente el JSON entregado como fuente de verdad.",
+    "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) con SAP producción (ProductTrees y órdenes de fabricación).",
+    "Solo si el JSON lo indica explícitamente, puedes mencionar que hubo respaldo desde catálogo local.",
+    "No inventes datos que no estén en el JSON.",
+    "Responde en español.",
+    "IMPORTANTE: las cantidades de producto terminado siempre se expresan en UNIDADES, nunca en cajas.",
+    "IMPORTANTE: cuando exista sapProduction.source, menciónalo para dejar claro si los materiales vienen directo de SAP producción.",
+    "IMPORTANTE: cuando existan salesHistory.producedQty o recentProductionOrders, esos son los datos válidos para responder cuánto se produjo el artículo por mes o en órdenes recientes.",
+    "IMPORTANTE: cuando exista costing.weightedCost, úsalo como costo ponderado unitario del artículo y analiza también stockValue, projectedDemandCost y adjustedProductionCost.",
+    "IMPORTANTE: si production.mrpAdjustedQty y production.adjustedQty son distintos, explica que el sistema elevó la recomendación a un lote práctico para evitar producir cantidades demasiado cortas y poco eficientes.",
+    "IMPORTANTE: si requirements.rawMaterials, requirements.packaging o requirements.bottlenecks existen, debes analizarlos y mencionarlos explícitamente.",
+    "Si el usuario pide tabla, excel, ranking, lista, columnas o detalle por mes/material/orden, responde con una tabla markdown completa con encabezados claros y datos exactos.",
+    "Evita responder con slash (/), listas planas o pseudo-tablas.",
+    "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo con: 1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria, MRP y lote práctico 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
+    "Si realmente falta información en el JSON, dilo claramente.",
+  ].join(" ");
 
   const payload = {
     model,
@@ -8449,11 +8898,15 @@ const system = [
       { role: "system", content: [{ type: "input_text", text: system }] },
       {
         role: "user",
-        content: [{ type: "input_text", text: `Pregunta:\n${String(question || "").trim()}\n\nContexto JSON:\n${JSON.stringify(input)}` }],
+        content: [{ type: "input_text", text: `Pregunta:
+${String(question || "").trim()}
+
+Contexto JSON:
+${JSON.stringify(input)}` }],
       },
     ],
     text: { format: { type: "text" } },
-    max_output_tokens: 900,
+    max_output_tokens: 1200,
   };
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
@@ -8547,7 +9000,7 @@ app.post("/api/admin/production/ai-chat", verifyAdmin, async (req, res) => {
     }
 
     const out = await prodOpenAiChat({ question, dashboard, plan });
-    return safeJson(res, 200, { ok: true, answer: out.answer, model: out.model, source: "base de datos sincronizada + catálogo local" });
+    return safeJson(res, 200, { ok: true, answer: out.answer, model: out.model, source: plan?.source || "base de datos sincronizada + SAP producción" });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
