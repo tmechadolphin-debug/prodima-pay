@@ -8835,6 +8835,7 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
     "Respeta estrictamente los filtros activos de fecha, área, grupo, búsqueda y artículo seleccionado cuando existan.",
     "No inventes datos, no asumas ventas, stock ni márgenes que no estén presentes en el contexto.",
     "Responde siempre en español, con lenguaje claro, ejecutivo, útil y orientado a decisiones.",
+    "Te pueden preguntar, Dame o dime el detalle del codigo; ejemplo 7270, el detalle por cliente y a que clientes tienen el mayor porcentaje de ganancia bruta (Gross Margin (%)), haz la lista de mayor a menor para saber que clientes dan mayor ganancia de ese producto.",
     "Prioriza hallazgos concretos sobre revenue, margen bruto, % margen, clasificación ABC, ranking, concentración, stock, mínimos, máximos, disponible, comprometido y ordenado.",
     "Cuando hables de stock, distingue con precisión si el artículo está por debajo del mínimo, dentro de rango, en máximo o por encima del máximo.",
     "Cuando hables de clasificación, explica tanto la clasificación total como ABC de revenue, GP y GP%.",
