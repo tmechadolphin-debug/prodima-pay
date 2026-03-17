@@ -4311,6 +4311,8 @@ async function ensureDb() {
       item_code TEXT NOT NULL DEFAULT '',
       item_desc TEXT NOT NULL DEFAULT '',
       quantity  NUMERIC(18,4) NOT NULL DEFAULT 0,
+      num_per_msr NUMERIC(18,4) NOT NULL DEFAULT 1,
+      quantity_base NUMERIC(18,4) NOT NULL DEFAULT 0,
       revenue   NUMERIC(18,2) NOT NULL DEFAULT 0,
       gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0,
       item_group TEXT DEFAULT '',
@@ -4322,6 +4324,8 @@ async function ensureDb() {
   `);
 
   await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS doc_num INTEGER;`);
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS num_per_msr NUMERIC(18,4) NOT NULL DEFAULT 1;`);
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS quantity_base NUMERIC(18,4) NOT NULL DEFAULT 0;`);
 
   /* ✅ NUEVO: cliente en líneas (para el modal) */
   await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS card_code TEXT DEFAULT '';`);
@@ -4551,6 +4555,8 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
     const gpRaw = Number(pickGrossProfit(ln) || 0);
 
     const qty = Math.abs(qtyRaw) * sign;
+    const numPerMsr = Math.abs(Number(ln?.NumPerMsr || ln?.ItemsPerUnit || 1)) || 1;
+    const qtyBase = qty * numPerMsr;
     const rev = Math.abs(revRaw) * sign;
     const gp = Math.abs(gpRaw) * sign;
 
@@ -4558,9 +4564,9 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
       `
       INSERT INTO sales_item_lines(
         doc_entry,line_num,doc_type,doc_date,doc_num,card_code,card_name,
-        item_code,item_desc,quantity,revenue,gross_profit,updated_at
+        item_code,item_desc,quantity,num_per_msr,quantity_base,revenue,gross_profit,updated_at
       )
-      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
       ON CONFLICT(doc_entry,line_num,doc_type) DO UPDATE SET
         doc_date=EXCLUDED.doc_date,
         doc_num=EXCLUDED.doc_num,
@@ -4569,11 +4575,13 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
         item_code=EXCLUDED.item_code,
         item_desc=EXCLUDED.item_desc,
         quantity=EXCLUDED.quantity,
+        num_per_msr=EXCLUDED.num_per_msr,
+        quantity_base=EXCLUDED.quantity_base,
         revenue=EXCLUDED.revenue,
         gross_profit=EXCLUDED.gross_profit,
         updated_at=NOW()
       `,
-      [docEntry, lineNum, docType, docDate, docNum, cardCode, cardName, itemCode, itemDesc, qty, rev, gp]
+      [docEntry, lineNum, docType, docDate, docNum, cardCode, cardName, itemCode, itemDesc, qty, numPerMsr, qtyBase, rev, gp]
     );
 
     inserted++;
@@ -8847,12 +8855,15 @@ async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
 
 function prodDemandQtyExpr(tableName) {
   const t = String(tableName || '').toLowerCase();
-  if (t === 'production_demand_lines') {
-    // Para Producción trabajamos en la misma UDM visible de SAP (normalmente cajas),
-    // de modo que stock, min/max y demanda se comparen en la misma escala.
-    return `COALESCE(quantity,0)`;
+  if (t === 'production_demand_lines' || t === 'sales_item_lines') {
+    // Para Producción trabajamos en UNIDADES, igual que los informes de ventas de SAP.
+    return `COALESCE(quantity_base, quantity, 0)`;
   }
   return `COALESCE(quantity,0)`;
+}
+
+function prodSalesQtyExpr() {
+  return `COALESCE(quantity_base, quantity, 0)`;
 }
 
 function prodMonthWindowEnd(dateIso) {
@@ -8874,7 +8885,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
   const demandCount = Number(demandCountRes.rows?.[0]?.c || 0);
   const useDemandFallback = demandCount <= 0;
   const demandTable = useDemandFallback ? 'sales_item_lines' : 'production_demand_lines';
-  const demandSourceLabel = useDemandFallback ? 'Facturas (fallback temporal; ejecuta Sync para Pedidos)' : 'Pedidos SAP (cajas/UDM venta)';
+  const demandSourceLabel = useDemandFallback ? 'Facturas SAP (fallback temporal; ejecuta Sync para Pedidos)' : 'Pedidos SAP (unidades)';
   const demandQtyExpr = prodDemandQtyExpr(demandTable);
 
   const rows = await dbQuery(
@@ -8894,7 +8905,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
         MAX(NULLIF(s.item_desc,'')) AS item_desc,
         COALESCE(SUM(s.revenue),0)::numeric(18,2) AS revenue,
         COALESCE(SUM(s.gross_profit),0)::numeric(18,2) AS gp,
-        COALESCE(SUM(s.quantity),0)::numeric(18,4) AS qty,
+        COALESCE(SUM(${prodSalesQtyExpr()}),0)::numeric(18,4) AS qty,
         MAX(NULLIF(s.area,'')) AS area_s,
         MAX(NULLIF(s.item_group,'')) AS grupo_s
       FROM sales_item_lines s
@@ -9027,7 +9038,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       coverageMonthsTarget: 1,
       coveragePolicyLabel: '',
       demandSource: demandSourceLabel,
-      demandUomLabel: 'Cajas / UDM venta SAP',
+      demandUomLabel: 'Unidades SAP',
     };
   });
 
@@ -9128,7 +9139,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     horizonMonths: Math.max(1, Number(horizonMonths || 3)),
     lastSyncAt: await getState("production_last_sync_at"),
     demandSource: demandSourceLabel,
-      demandUomLabel: 'Cajas / UDM venta SAP',
+      demandUomLabel: 'Unidades SAP',
     demandCount,
     useDemandFallback,
     availableGroups,
