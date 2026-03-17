@@ -7844,6 +7844,62 @@ async function ensureProductionDb() {
     );
   `);
 
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_item_cache (
+      item_code TEXT PRIMARY KEY,
+      item_desc TEXT NOT NULL DEFAULT '',
+      weighted_cost NUMERIC(18,6) NOT NULL DEFAULT 0,
+      procurement_method TEXT NOT NULL DEFAULT '',
+      planning_system TEXT NOT NULL DEFAULT '',
+      lead_time_days NUMERIC(18,4) NOT NULL DEFAULT 0,
+      min_order_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      multiple_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      item_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      inventory_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_orders_cache (
+      item_code TEXT NOT NULL,
+      doc_num BIGINT NOT NULL,
+      absolute_entry BIGINT,
+      prod_name TEXT NOT NULL DEFAULT '',
+      planned_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      completed_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      rejected_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      post_date DATE,
+      status TEXT NOT NULL DEFAULT '',
+      warehouse TEXT NOT NULL DEFAULT '',
+      origin TEXT NOT NULL DEFAULT '',
+      updated_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY(item_code, doc_num)
+    );
+  `);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_bom_cache (
+      parent_item_code TEXT NOT NULL,
+      line_no INTEGER NOT NULL,
+      component_code TEXT NOT NULL DEFAULT '',
+      component_desc TEXT NOT NULL DEFAULT '',
+      quantity NUMERIC(18,6) NOT NULL DEFAULT 0,
+      unit TEXT NOT NULL DEFAULT '',
+      warehouse TEXT NOT NULL DEFAULT '',
+      issue_method TEXT NOT NULL DEFAULT '',
+      bom_header_qty NUMERIC(18,6) NOT NULL DEFAULT 1,
+      bom_source TEXT NOT NULL DEFAULT 'SAP ProductTrees',
+      updated_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY(parent_item_code, line_no)
+    );
+  `);
+
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_item_cache_updated ON production_item_cache(updated_at);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_orders_item_date ON production_orders_cache(item_code, post_date DESC);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_bom_parent ON production_bom_cache(parent_item_code);`);
+
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_inv_wh_item ON production_inv_wh_cache(item_code);`);
 }
 __extraBootTasks.push(async () => {
@@ -7878,7 +7934,104 @@ function prodExtractMrpFromItem(it) {
 }
 
 
-async function prodGetFullItem(code) {
+
+const PROD_ITEM_RUNTIME_CACHE = new Map();
+const PROD_ORDERS_RUNTIME_CACHE = new Map();
+const PROD_BOM_RUNTIME_CACHE = new Map();
+const PROD_PLAN_RUNTIME_CACHE = new Map();
+const PROD_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const PROD_PLAN_TTL_MS = 2 * 60 * 1000;
+
+function prodParseJsonSafe(v, fallback = {}) {
+  if (v == null || v === "") return fallback;
+  if (typeof v === "object") return v;
+  try { return JSON.parse(String(v)); } catch { return fallback; }
+}
+function prodClone(v) {
+  return v == null ? v : JSON.parse(JSON.stringify(v));
+}
+function prodCacheFresh(ts, ttlMs = PROD_CACHE_TTL_MS) {
+  const ms = new Date(ts || 0).getTime();
+  return Number.isFinite(ms) && (Date.now() - ms) < ttlMs;
+}
+function prodRuntimeGet(map, key, ttlMs = PROD_CACHE_TTL_MS) {
+  const hit = map.get(key);
+  if (!hit) return null;
+  if ((Date.now() - Number(hit.ts || 0)) > ttlMs) {
+    map.delete(key);
+    return null;
+  }
+  return prodClone(hit.data);
+}
+function prodRuntimeSet(map, key, data) {
+  map.set(key, { ts: Date.now(), data: prodClone(data) });
+}
+async function prodReadItemCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS) {
+  if (!hasDb()) return null;
+  const r = await dbQuery(
+    `SELECT item_code, item_desc, weighted_cost, procurement_method, planning_system, lead_time_days,
+            min_order_qty, multiple_qty, item_json, inventory_json, updated_at
+       FROM production_item_cache
+      WHERE item_code = $1
+      LIMIT 1`,
+    [itemCode]
+  );
+  const row = r.rows?.[0];
+  if (!row || !prodCacheFresh(row.updated_at, ttlMs)) return null;
+  const item = prodParseJsonSafe(row.item_json, {});
+  const inv = prodParseJsonSafe(row.inventory_json, {});
+  if (item && typeof item === "object") {
+    item.ItemCode = item.ItemCode || row.item_code;
+    item.ItemName = item.ItemName || row.item_desc || "";
+    if (!Array.isArray(item.ItemWarehouseInfoCollection)) {
+      item.ItemWarehouseInfoCollection = Array.isArray(inv?.rows) ? inv.rows : [];
+    }
+    if ((row.procurement_method || "") && !item.ProcurementMethod) item.ProcurementMethod = row.procurement_method;
+    if ((row.planning_system || "") && !item.PlanningSystem) item.PlanningSystem = row.planning_system;
+    if (Number(row.lead_time_days || 0) && !item.LeadTimeDays) item.LeadTimeDays = Number(row.lead_time_days);
+    if (Number(row.min_order_qty || 0) && !item.MinimumOrderQuantity) item.MinimumOrderQuantity = Number(row.min_order_qty);
+    if (Number(row.multiple_qty || 0) && !item.OrderMultiple) item.OrderMultiple = Number(row.multiple_qty);
+    if (Number(row.weighted_cost || 0) > 0 && !item.AvgPrice) item.AvgPrice = Number(row.weighted_cost);
+    return item;
+  }
+  return null;
+}
+async function prodUpsertItemCacheDb(item) {
+  if (!hasDb() || !item || !item.ItemCode) return;
+  const inv = prodExtractInventorySnapshotFromItem(item);
+  const mrp = prodExtractMrpFromItem(item);
+  const weightedCost = prodExtractWeightedCostFromItem(item);
+  await dbQuery(
+    `INSERT INTO production_item_cache(
+       item_code, item_desc, weighted_cost, procurement_method, planning_system, lead_time_days,
+       min_order_qty, multiple_qty, item_json, inventory_json, updated_at
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,NOW())
+     ON CONFLICT (item_code) DO UPDATE SET
+       item_desc = EXCLUDED.item_desc,
+       weighted_cost = EXCLUDED.weighted_cost,
+       procurement_method = EXCLUDED.procurement_method,
+       planning_system = EXCLUDED.planning_system,
+       lead_time_days = EXCLUDED.lead_time_days,
+       min_order_qty = EXCLUDED.min_order_qty,
+       multiple_qty = EXCLUDED.multiple_qty,
+       item_json = EXCLUDED.item_json,
+       inventory_json = EXCLUDED.inventory_json,
+       updated_at = NOW()`,
+    [
+      String(item.ItemCode || "").trim(),
+      String(item.ItemName || "").trim(),
+      prodNum(weightedCost),
+      String(mrp.procurementMethod || ""),
+      String(mrp.planningSystem || ""),
+      prodNum(mrp.leadTimeDays),
+      prodNum(mrp.minOrderQty),
+      prodNum(mrp.multipleQty),
+      JSON.stringify(item || {}),
+      JSON.stringify({ byWarehouse: inv.byWarehouse || {}, total: inv.total || 0, stockMin: inv.stockMin || 0, stockMax: inv.stockMax || 0, rows: Array.isArray(item.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [] }),
+    ]
+  );
+}
+async function prodFetchFullItemFromSap(code) {
   const itemCode = String(code || "").trim();
   if (!itemCode) return null;
   const safe = itemCode.replace(/'/g, "''");
@@ -7923,6 +8076,27 @@ async function prodGetFullItem(code) {
     }
   }
 
+  return item;
+}
+async function prodGetFullItem(code, { forceFresh = false, ttlMs = PROD_CACHE_TTL_MS } = {}) {
+  const itemCode = String(code || "").trim();
+  if (!itemCode) return null;
+  const runtimeKey = `item::${itemCode}`;
+  if (!forceFresh) {
+    const hit = prodRuntimeGet(PROD_ITEM_RUNTIME_CACHE, runtimeKey, ttlMs);
+    if (hit) return hit;
+    const dbHit = await prodReadItemCacheDb(itemCode, ttlMs).catch(() => null);
+    if (dbHit) {
+      prodRuntimeSet(PROD_ITEM_RUNTIME_CACHE, runtimeKey, dbHit);
+      return dbHit;
+    }
+  }
+  if (missingSapEnv()) return null;
+  const item = await prodFetchFullItemFromSap(itemCode);
+  if (item) {
+    prodRuntimeSet(PROD_ITEM_RUNTIME_CACHE, runtimeKey, item);
+    await prodUpsertItemCacheDb(item).catch(() => {});
+  }
   return item;
 }
 
@@ -8023,7 +8197,8 @@ function prodNormalizeProductionOrderRow(r) {
   };
 }
 
-async function prodFetchProductionOrders(itemCode, top = 80) {
+
+async function prodFetchProductionOrdersFromSap(itemCode, top = 80) {
   const code = String(itemCode || "").trim();
   if (!code || missingSapEnv()) return { orders: [], monthly: new Map() };
 
@@ -8056,13 +8231,99 @@ async function prodFetchProductionOrders(itemCode, top = 80) {
     .filter((x) => String(x.itemCode || "") === code || !x.itemCode)
     .sort((a, b) => String(b.postDate || "").localeCompare(String(a.postDate || "")) || Number(b.docNum || 0) - Number(a.docNum || 0));
 
+  return prodOrdersToResponse(orders);
+}
+function prodOrdersToResponse(orders) {
   const monthly = new Map();
-  for (const o of orders) {
+  for (const o of orders || []) {
     const ym = prodYm(o.postDate || new Date());
     const prev = monthly.get(ym) || 0;
     monthly.set(ym, prodRound(prev + prodNum(o.completedQty), 3));
   }
-  return { orders, monthly };
+  return { orders: Array.isArray(orders) ? orders : [], monthly };
+}
+async function prodReadOrdersCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS, top = 80) {
+  if (!hasDb()) return null;
+  const stamp = await dbQuery(`SELECT MAX(updated_at) AS updated_at FROM production_orders_cache WHERE item_code = $1`, [itemCode]);
+  const updatedAt = stamp.rows?.[0]?.updated_at;
+  if (!updatedAt || !prodCacheFresh(updatedAt, ttlMs)) return null;
+  const r = await dbQuery(
+    `SELECT item_code, doc_num, absolute_entry, prod_name, planned_qty, completed_qty, rejected_qty,
+            post_date, status, warehouse, origin
+       FROM production_orders_cache
+      WHERE item_code = $1
+      ORDER BY post_date DESC NULLS LAST, doc_num DESC
+      LIMIT $2`,
+    [itemCode, Math.max(20, Math.min(200, Number(top || 80)))]
+  );
+  const orders = (r.rows || []).map((x) => ({
+    docNum: Number(x.doc_num || 0) || null,
+    absoluteEntry: Number(x.absolute_entry || 0) || null,
+    itemCode,
+    prodName: String(x.prod_name || ""),
+    plannedQty: prodRound(x.planned_qty || 0, 3),
+    completedQty: prodRound(x.completed_qty || 0, 3),
+    rejectedQty: prodRound(x.rejected_qty || 0, 3),
+    postDate: String(x.post_date || "").slice(0, 10),
+    status: String(x.status || ""),
+    warehouse: String(x.warehouse || ""),
+    origin: String(x.origin || ""),
+  }));
+  return prodOrdersToResponse(orders);
+}
+async function prodUpsertOrdersCacheDb(itemCode, orders) {
+  if (!hasDb() || !itemCode) return;
+  await dbQuery(`DELETE FROM production_orders_cache WHERE item_code = $1`, [itemCode]);
+  for (const o of Array.isArray(orders) ? orders : []) {
+    await dbQuery(
+      `INSERT INTO production_orders_cache(
+         item_code, doc_num, absolute_entry, prod_name, planned_qty, completed_qty, rejected_qty,
+         post_date, status, warehouse, origin, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+       ON CONFLICT (item_code, doc_num) DO UPDATE SET
+         absolute_entry = EXCLUDED.absolute_entry,
+         prod_name = EXCLUDED.prod_name,
+         planned_qty = EXCLUDED.planned_qty,
+         completed_qty = EXCLUDED.completed_qty,
+         rejected_qty = EXCLUDED.rejected_qty,
+         post_date = EXCLUDED.post_date,
+         status = EXCLUDED.status,
+         warehouse = EXCLUDED.warehouse,
+         origin = EXCLUDED.origin,
+         updated_at = NOW()`,
+      [
+        itemCode,
+        Number(o.docNum || 0),
+        Number(o.absoluteEntry || 0) || null,
+        String(o.prodName || ""),
+        prodNum(o.plannedQty),
+        prodNum(o.completedQty),
+        prodNum(o.rejectedQty),
+        String(o.postDate || "").slice(0, 10) || null,
+        String(o.status || ""),
+        String(o.warehouse || ""),
+        String(o.origin || ""),
+      ]
+    );
+  }
+}
+async function prodFetchProductionOrders(itemCode, top = 80, { forceFresh = false, ttlMs = PROD_CACHE_TTL_MS } = {}) {
+  const code = String(itemCode || "").trim();
+  if (!code) return { orders: [], monthly: new Map() };
+  const runtimeKey = `orders::${code}::${Math.max(20, Math.min(200, Number(top || 80)))}`;
+  if (!forceFresh) {
+    const hit = prodRuntimeGet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, ttlMs);
+    if (hit) return { orders: hit.orders || [], monthly: new Map(Object.entries(hit.monthly || {})) };
+    const dbHit = await prodReadOrdersCacheDb(code, ttlMs, top).catch(() => null);
+    if (dbHit) {
+      prodRuntimeSet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, { orders: dbHit.orders, monthly: Object.fromEntries(dbHit.monthly.entries()) });
+      return dbHit;
+    }
+  }
+  const sapHit = await prodFetchProductionOrdersFromSap(code, top);
+  prodRuntimeSet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, { orders: sapHit.orders, monthly: Object.fromEntries((sapHit.monthly || new Map()).entries()) });
+  await prodUpsertOrdersCacheDb(code, sapHit.orders).catch(() => {});
+  return sapHit;
 }
 
 function prodLooksLikeResource({ code, description = "", item = null, line = null }) {
@@ -8144,7 +8405,8 @@ function prodNormalizeBomLine(line) {
   };
 }
 
-async function prodFetchSapBom(itemCode) {
+
+async function prodFetchSapBomFromSap(itemCode) {
   const code = String(itemCode || "").trim();
   if (!code || missingSapEnv()) return { source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] };
 
@@ -8206,6 +8468,86 @@ async function prodFetchSapBom(itemCode) {
     headerQty,
     lines: normalized,
   };
+}
+async function prodReadBomCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS) {
+  if (!hasDb()) return null;
+  const stamp = await dbQuery(`SELECT MAX(updated_at) AS updated_at FROM production_bom_cache WHERE parent_item_code = $1`, [itemCode]);
+  const updatedAt = stamp.rows?.[0]?.updated_at;
+  if (!updatedAt || !prodCacheFresh(updatedAt, ttlMs)) return null;
+  const r = await dbQuery(
+    `SELECT parent_item_code, line_no, component_code, component_desc, quantity, unit, warehouse, issue_method, bom_header_qty, bom_source
+       FROM production_bom_cache
+      WHERE parent_item_code = $1
+      ORDER BY line_no ASC`,
+    [itemCode]
+  );
+  const rows = r.rows || [];
+  if (!rows.length) return { source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] };
+  return {
+    source: String(rows[0].bom_source || "SAP ProductTrees"),
+    tree: null,
+    headerQty: prodNum(rows[0].bom_header_qty || 1),
+    lines: rows.map((x) => ({
+      code: String(x.component_code || ""),
+      description: String(x.component_desc || ""),
+      quantity: prodNum(x.quantity || 0),
+      unit: String(x.unit || ""),
+      warehouse: String(x.warehouse || ""),
+      issueMethod: String(x.issue_method || ""),
+      raw: {
+        ItemCode: String(x.component_code || ""),
+        ItemDescription: String(x.component_desc || ""),
+        Quantity: prodNum(x.quantity || 0),
+        UoMCode: String(x.unit || ""),
+        Warehouse: String(x.warehouse || ""),
+        IssueMethod: String(x.issue_method || ""),
+      },
+    })),
+  };
+}
+async function prodUpsertBomCacheDb(itemCode, bom) {
+  if (!hasDb() || !itemCode) return;
+  await dbQuery(`DELETE FROM production_bom_cache WHERE parent_item_code = $1`, [itemCode]);
+  const lines = Array.isArray(bom?.lines) ? bom.lines : [];
+  const headerQty = Math.max(1, prodNum(bom?.headerQty || 1));
+  let lineNo = 0;
+  for (const line of lines) {
+    await dbQuery(
+      `INSERT INTO production_bom_cache(
+         parent_item_code, line_no, component_code, component_desc, quantity, unit, warehouse, issue_method, bom_header_qty, bom_source, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())`,
+      [
+        itemCode,
+        ++lineNo,
+        String(line.code || ""),
+        String(line.description || ""),
+        prodNum(line.quantity),
+        String(line.unit || ""),
+        String(line.warehouse || ""),
+        String(line.issueMethod || ""),
+        headerQty,
+        String(bom?.source || "SAP ProductTrees"),
+      ]
+    );
+  }
+}
+async function prodFetchSapBom(itemCode, { forceFresh = false, ttlMs = PROD_CACHE_TTL_MS } = {}) {
+  const code = String(itemCode || "").trim();
+  if (!code) return { source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] };
+  const runtimeKey = `bom::${code}`;
+  if (!forceFresh) {
+    const hit = prodRuntimeGet(PROD_BOM_RUNTIME_CACHE, runtimeKey, ttlMs);
+    if (hit) return hit;
+    const dbHit = await prodReadBomCacheDb(code, ttlMs).catch(() => null);
+    if (dbHit) {
+      prodRuntimeSet(PROD_BOM_RUNTIME_CACHE, runtimeKey, dbHit);
+      return dbHit;
+    }
+  }
+  const sapHit = await prodFetchSapBomFromSap(code);
+  prodRuntimeSet(PROD_BOM_RUNTIME_CACHE, runtimeKey, sapHit);
+  await prodUpsertBomCacheDb(code, sapHit).catch(() => {});
+  return sapHit;
 }
 
 async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }) {
@@ -9055,6 +9397,23 @@ function prodCompactItemForAi(x) {
   };
 }
 
+
+async function productionBuildItemPlanCached(params = {}) {
+  const key = JSON.stringify({
+    itemCode: String(params.itemCode || "").trim(),
+    toDate: String(params.toDate || ""),
+    avgMonths: Number(params.avgMonths || 5),
+    horizonMonths: Number(params.horizonMonths || 3),
+    shiftHours: Number(params.shiftHours || 8),
+    plannedQtyOverride: Number(params.plannedQtyOverride || 0),
+  });
+  const hit = prodRuntimeGet(PROD_PLAN_RUNTIME_CACHE, key, PROD_PLAN_TTL_MS);
+  if (hit) return hit;
+  const plan = await productionBuildItemPlan(params);
+  prodRuntimeSet(PROD_PLAN_RUNTIME_CACHE, key, plan);
+  return plan;
+}
+
 function prodBuildUrgentAbStockItems(items) {
   return (Array.isArray(items) ? items : [])
     .filter((x) => String(x?.totalLabel || "").startsWith("AB") && prodNum(x?.stockMin) > 0 && prodNum(x?.stockTotal) < prodNum(x?.stockMin))
@@ -9288,7 +9647,7 @@ app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
     const shiftHours = Math.max(1, Math.min(24, prodNum(req.query?.shiftHours, 8)));
     const plannedQty = Math.max(0, prodNum(req.query?.plannedQty, 0));
 
-    const plan = await productionBuildItemPlan({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty });
+    const plan = await productionBuildItemPlanCached({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty });
 
     const dash = await productionDashboardFromDb({
       from: "2025-01-01",
