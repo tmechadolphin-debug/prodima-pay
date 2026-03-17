@@ -7920,6 +7920,9 @@ async function ensureProductionDb() {
     );
   `);
 
+  await dbQuery(`ALTER TABLE production_demand_lines ADD COLUMN IF NOT EXISTS num_per_msr NUMERIC(18,4) NOT NULL DEFAULT 1;`);
+  await dbQuery(`ALTER TABLE production_demand_lines ADD COLUMN IF NOT EXISTS quantity_base NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_item_cache_updated ON production_item_cache(updated_at);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_orders_item_date ON production_orders_cache(item_code, post_date DESC);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_bom_parent ON production_bom_cache(parent_item_code);`);
@@ -8810,13 +8813,15 @@ async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
         if (!itemCode) continue;
         const itemDesc = String(ln?.ItemDescription || ln?.ItemName || '').trim();
         const qty = Math.abs(Number(ln?.Quantity || 0));
+        const numPerMsr = Math.abs(Number(ln?.NumPerMsr || ln?.ItemsPerUnit || 1)) || 1;
+        const qtyBase = qty * numPerMsr;
         const rev = Math.abs(Number(ln?.LineTotal || 0));
         const gp = Math.abs(Number(pickGrossProfit(ln) || 0));
         await dbQuery(`
           INSERT INTO production_demand_lines(
             doc_entry,line_num,doc_type,doc_date,doc_num,card_code,card_name,
-            item_code,item_desc,quantity,revenue,gross_profit,updated_at
-          ) VALUES($1,$2,'ORD',$3::date,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+            item_code,item_desc,quantity,num_per_msr,quantity_base,revenue,gross_profit,updated_at
+          ) VALUES($1,$2,'ORD',$3::date,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
           ON CONFLICT(doc_entry,line_num,doc_type) DO UPDATE SET
             doc_date=EXCLUDED.doc_date,
             doc_num=EXCLUDED.doc_num,
@@ -8825,10 +8830,12 @@ async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
             item_code=EXCLUDED.item_code,
             item_desc=EXCLUDED.item_desc,
             quantity=EXCLUDED.quantity,
+            num_per_msr=EXCLUDED.num_per_msr,
+            quantity_base=EXCLUDED.quantity_base,
             revenue=EXCLUDED.revenue,
             gross_profit=EXCLUDED.gross_profit,
             updated_at=NOW()
-        `,[docEntry,lineNum,String(h.DocDate||'').slice(0,10),docNum,cardCode,cardName,itemCode,itemDesc,qty,rev,gp]);
+        `,[docEntry,lineNum,String(h.DocDate||'').slice(0,10),docNum,cardCode,cardName,itemCode,itemDesc,qty,numPerMsr,qtyBase,rev,gp]);
         saved += 1;
       }
     } catch {}
@@ -8837,15 +8844,49 @@ async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
   return saved;
 }
 
+
+function prodDemandQtyExpr(tableName) {
+  const t = String(tableName || '').toLowerCase();
+  if (t === 'production_demand_lines') {
+    return `COALESCE(quantity_base, CASE WHEN COALESCE(num_per_msr,0) > 0 THEN quantity * num_per_msr ELSE quantity END, quantity, 0)`;
+  }
+  return `COALESCE(quantity,0)`;
+}
+
+function prodMonthWindowEnd(dateIso) {
+  const d = new Date(`${String(dateIso).slice(0,10)}T00:00:00Z`);
+  if (!Number.isFinite(d.getTime())) return String(dateIso || '').slice(0,10);
+  const y=d.getUTCFullYear();
+  const m=d.getUTCMonth();
+  const last=new Date(Date.UTC(y,m+1,0));
+  return last.toISOString().slice(0,10);
+}
+
 async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 5, horizonMonths = 3 }) {
-  const demandCountRes = await dbQuery(`SELECT COUNT(*)::int AS c FROM production_demand_lines WHERE doc_date >= $1::date AND doc_date <= $2::date`, [from, to]);
+  const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN)).slice(0,10);
+  const maxMonthsWindow = Math.max(1, Number(avgMonths || 5), Number(horizonMonths || 3));
+  const monthBaseStart = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(maxMonthsWindow - 1));
+  const monthRangeEnd = prodMonthWindowEnd(monthTo);
+
+  const demandCountRes = await dbQuery(`SELECT COUNT(*)::int AS c FROM production_demand_lines WHERE doc_date >= $1::date AND doc_date <= $2::date`, [monthBaseStart, monthRangeEnd]);
   const demandCount = Number(demandCountRes.rows?.[0]?.c || 0);
   const useDemandFallback = demandCount <= 0;
   const demandTable = useDemandFallback ? 'sales_item_lines' : 'production_demand_lines';
   const demandSourceLabel = useDemandFallback ? 'Facturas (fallback temporal; ejecuta Sync para Pedidos)' : 'Pedidos';
+  const demandQtyExpr = prodDemandQtyExpr(demandTable);
+
   const rows = await dbQuery(
     `
-    WITH sales AS (
+    WITH base AS (
+      SELECT DISTINCT item_code
+      FROM sales_item_lines
+      WHERE doc_date >= $1::date AND doc_date <= $2::date AND item_code <> ''
+      UNION
+      SELECT DISTINCT item_code
+      FROM ${demandTable}
+      WHERE doc_date >= $3::date AND doc_date <= $4::date AND item_code <> ''
+    ),
+    sales AS (
       SELECT
         s.item_code,
         MAX(NULLIF(s.item_desc,'')) AS item_desc,
@@ -8854,9 +8895,20 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
         COALESCE(SUM(s.quantity),0)::numeric(18,4) AS qty,
         MAX(NULLIF(s.area,'')) AS area_s,
         MAX(NULLIF(s.item_group,'')) AS grupo_s
-      FROM ${demandTable} s
+      FROM sales_item_lines s
       WHERE s.doc_date >= $1::date AND s.doc_date <= $2::date
       GROUP BY s.item_code
+    ),
+    demand AS (
+      SELECT
+        d.item_code,
+        MAX(NULLIF(d.item_desc,'')) AS item_desc,
+        COALESCE(SUM(${demandQtyExpr}),0)::numeric(18,4) AS demand_qty,
+        MAX(NULLIF(d.area,'')) AS area_d,
+        MAX(NULLIF(d.item_group,'')) AS grupo_d
+      FROM ${demandTable} d
+      WHERE d.doc_date >= $3::date AND d.doc_date <= $4::date
+      GROUP BY d.item_code
     ),
     inv AS (
       SELECT
@@ -8872,13 +8924,14 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       GROUP BY item_code
     )
     SELECT
-      sales.item_code,
-      COALESCE(NULLIF(sales.item_desc,''), NULLIF(g.item_desc,''), '') AS item_desc,
-      COALESCE(NULLIF(sales.grupo_s,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo,
-      COALESCE(NULLIF(sales.area_s,''), NULLIF(g.area,''), '') AS area,
-      sales.revenue,
-      sales.gp,
-      sales.qty,
+      base.item_code,
+      COALESCE(NULLIF(sales.item_desc,''), NULLIF(demand.item_desc,''), NULLIF(g.item_desc,''), '') AS item_desc,
+      COALESCE(NULLIF(sales.grupo_s,''), NULLIF(demand.grupo_d,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo,
+      COALESCE(NULLIF(sales.area_s,''), NULLIF(demand.area_d,''), NULLIF(g.area,''), '') AS area,
+      COALESCE(sales.revenue,0) AS revenue,
+      COALESCE(sales.gp,0) AS gp,
+      COALESCE(sales.qty,0) AS sold_qty,
+      COALESCE(demand.demand_qty,0) AS demand_qty,
       COALESCE(inv.wh_01,0) AS wh_01,
       COALESCE(inv.wh_200,0) AS wh_200,
       COALESCE(inv.wh_300,0) AS wh_300,
@@ -8890,28 +8943,28 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       COALESCE(m.lead_time_days,0) AS lead_time_days,
       COALESCE(m.min_order_qty,0) AS min_order_qty,
       COALESCE(m.multiple_qty,0) AS multiple_qty
-    FROM sales
-    LEFT JOIN item_group_cache g ON g.item_code = sales.item_code
-    LEFT JOIN inv ON inv.item_code = sales.item_code
-    LEFT JOIN production_mrp_cache m ON m.item_code = sales.item_code
-    ORDER BY sales.revenue DESC
+    FROM base
+    LEFT JOIN sales ON sales.item_code = base.item_code
+    LEFT JOIN demand ON demand.item_code = base.item_code
+    LEFT JOIN item_group_cache g ON g.item_code = base.item_code
+    LEFT JOIN inv ON inv.item_code = base.item_code
+    LEFT JOIN production_mrp_cache m ON m.item_code = base.item_code
+    ORDER BY COALESCE(sales.revenue,0) DESC, base.item_code ASC
     `,
-    [from, to]
+    [from, to, monthBaseStart, monthRangeEnd]
   );
 
-  const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN));
-  const monthFrom = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(Math.max(1, Number(avgMonths || 5)) - 1));
   const monthRows = await dbQuery(
     `
     SELECT
       item_code,
       to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym,
-      COALESCE(SUM(quantity),0)::numeric(18,4) AS qty
+      COALESCE(SUM(${demandQtyExpr}),0)::numeric(18,4) AS qty
     FROM ${demandTable}
     WHERE doc_date >= $1::date AND doc_date <= $2::date
     GROUP BY item_code, to_char(date_trunc('month', doc_date), 'YYYY-MM')
     `,
-    [monthFrom, monthTo]
+    [monthBaseStart, monthRangeEnd]
   );
   const monthly = new Map();
   for (const r of monthRows.rows || []) {
@@ -8929,16 +8982,19 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const monthsMap = monthly.get(String(r.item_code || "")) || new Map();
 
     const avgMonthsSafe = Math.max(1, Number(avgMonths || 5));
-    const monthLabels = [];
-    let sumMonths = 0;
+    const horizonSafe = Math.max(1, Number(horizonMonths || 3));
+    let sumAvgMonths = 0;
+    let sumHorizonMonths = 0;
     for (let i = avgMonthsSafe - 1; i >= 0; i--) {
       const ym = prodYm(prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -i));
-      monthLabels.push(ym);
-      sumMonths += prodNum(monthsMap.get(ym));
+      sumAvgMonths += prodNum(monthsMap.get(ym));
     }
-    const avgQty = sumMonths / avgMonthsSafe;
-    const projectedQty = avgQty * Math.max(1, Number(horizonMonths || 3));
-    const effectiveProjectedQty = projectedQty;
+    for (let i = horizonSafe - 1; i >= 0; i--) {
+      const ym = prodYm(prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -i));
+      sumHorizonMonths += prodNum(monthsMap.get(ym));
+    }
+    const avgQty = sumAvgMonths / avgMonthsSafe;
+    const pedidosQty = sumHorizonMonths;
     const stockTotal = prodNum(r.stock_total);
 
     return {
@@ -8949,9 +9005,9 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       revenue: rev,
       gp,
       gpPct: prodRound(gpPct, 2),
-      soldQty: prodNum(r.qty),
+      soldQty: prodNum(r.sold_qty),
       avgMonthlyQty: prodRound(avgQty, 2),
-      projectedQty: prodRound(effectiveProjectedQty, 2),
+      projectedQty: prodRound(pedidosQty, 2),
       stockTotal,
       wh01: prodNum(r.wh_01),
       wh200: prodNum(r.wh_200),
@@ -9110,6 +9166,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const itemDemandCountRes = await dbQuery(`SELECT COUNT(*)::int AS c FROM production_demand_lines WHERE item_code = $1`, [code]);
   const itemUseFallback = Number(itemDemandCountRes.rows?.[0]?.c || 0) <= 0;
   const itemDemandTable = itemUseFallback ? 'sales_item_lines' : 'production_demand_lines';
+  const itemDemandQtyExpr = prodDemandQtyExpr(itemDemandTable);
 
   const itemMaster = await dbQuery(
     `
@@ -9137,13 +9194,13 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
 
   const monthlyRows = await dbQuery(
     `
-    SELECT to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym, COALESCE(SUM(quantity),0)::numeric(18,4) AS qty
+    SELECT to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym, COALESCE(SUM(${itemDemandQtyExpr}),0)::numeric(18,4) AS qty
     FROM ${itemDemandTable}
     WHERE item_code = $1 AND doc_date >= $2::date AND doc_date <= $3::date
     GROUP BY 1
     ORDER BY 1
     `,
-    [code, histFrom, end]
+    [code, histFrom, prodMonthWindowEnd(end)]
   );
   const monthMap = new Map((monthlyRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
 
@@ -9169,7 +9226,11 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     avgQty += prodNum(monthMap.get(ym) || 0);
   }
   avgQty = avgQty / Math.max(1, Number(avgMonths || 5));
-  const projectedQty = avgQty * Math.max(1, Number(horizonMonths || 3));
+  let projectedQty = 0;
+  for (let i = Math.max(1, Number(horizonMonths || 3)) - 1; i >= 0; i--) {
+    const ym = prodYm(prodAddMonthsISO(monthStart, -i));
+    projectedQty += prodNum(monthMap.get(ym) || 0);
+  }
 
   const invRows = await dbQuery(
     `SELECT warehouse, stock, stock_min, stock_max, committed, ordered, available
