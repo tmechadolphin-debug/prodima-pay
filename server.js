@@ -8372,8 +8372,9 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     }
     const avgQty = sumMonths / avgMonthsSafe;
     const projectedQty = avgQty * Math.max(1, Number(horizonMonths || 3));
+    const effectiveProjectedQty = projectedQty;
     const stockTotal = prodNum(r.stock_total);
-    const needed = Math.max(0, projectedQty - stockTotal);
+    const needed = Math.max(0, effectiveProjectedQty - stockTotal);
     const adjusted = prodRecommendPracticalQty({ neededQty: needed, avgMonthlyQty: avgQty, minOrderQty: r.min_order_qty, multipleQty: r.multiple_qty });
 
     return {
