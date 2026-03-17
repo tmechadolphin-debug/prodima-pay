@@ -7896,9 +7896,32 @@ async function ensureProductionDb() {
     );
   `);
 
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_demand_lines (
+      doc_entry BIGINT NOT NULL,
+      line_num INTEGER NOT NULL,
+      doc_type TEXT NOT NULL DEFAULT 'ORD',
+      doc_date DATE,
+      doc_num BIGINT,
+      card_code TEXT NOT NULL DEFAULT '',
+      card_name TEXT NOT NULL DEFAULT '',
+      item_code TEXT NOT NULL DEFAULT '',
+      item_desc TEXT NOT NULL DEFAULT '',
+      quantity NUMERIC(18,4) NOT NULL DEFAULT 0,
+      revenue NUMERIC(18,2) NOT NULL DEFAULT 0,
+      gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0,
+      area TEXT NOT NULL DEFAULT '',
+      item_group TEXT NOT NULL DEFAULT '',
+      updated_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY(doc_entry, line_num, doc_type)
+    );
+  `);
+
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_item_cache_updated ON production_item_cache(updated_at);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_orders_item_date ON production_orders_cache(item_code, post_date DESC);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_bom_parent ON production_bom_cache(parent_item_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_item_date ON production_demand_lines(item_code, doc_date DESC);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_date ON production_demand_lines(doc_date DESC);`);
 
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_inv_wh_item ON production_inv_wh_cache(item_code);`);
 }
@@ -8753,16 +8776,16 @@ async function syncProductionMrp({ from, to, maxItems = 2500 }) {
 function prodCoverageMonthsByLabel(totalLabel) {
   const t = String(totalLabel || '').toLowerCase();
   if (t.includes('ab crítico') || t.includes('ab critico')) return 2;
-  if (t.includes('c importante')) return 1.5;
-  if (/^d/.test(t) || t.includes(' d ')) return 0.25;
+  if (t.includes('c importante')) return 1;
+  if (/^d/.test(t) || t.includes(' d ')) return 0.5;
   return 1;
 }
 
 function prodCoverageLabel(months) {
   const n = Number(months || 0);
   if (n === 2) return '2 meses de inv';
-  if (n === 1.5) return '1.5 mes de inv';
-  if (n === 0.25) return '0.25 mes de inv';
+  if (n === 1) return '1 mes de inv';
+  if (n === 0.5) return '0.5 mes de inv';
   return `${prodRound(n,2)} mes(es) de inv`;
 }
 
@@ -9643,7 +9666,7 @@ async function prodOpenAiChat({ question, dashboard, plan, plans = [], requested
     "IMPORTANTE: cuando exista sapProduction.source, menciónalo para dejar claro si los materiales vienen directo de SAP producción.",
     "IMPORTANTE: cuando existan salesHistory.producedQty o recentProductionOrders, esos son los datos válidos para responder cuánto se produjo el artículo por mes o en órdenes recientes.",
     "IMPORTANTE: cuando exista costing.weightedCost, úsalo como costo ponderado unitario del artículo y analiza también stockValue, projectedDemandCost y adjustedProductionCost.",
-    "IMPORTANTE: toma production.neededQty como la cantidad principal a producir. La política vigente usa el máximo de SAP como base de inventario: AB Crítico = 2 meses, C Importante = 1.5 meses, D = 0.25 mes.",
+    "IMPORTANTE: toma production.neededQty como la cantidad principal a producir. La política vigente usa el máximo de SAP como base de inventario: AB Crítico = 2 meses, C Importante = 1 mes, D = 0.5 mes.",
     "IMPORTANTE: si requirements.rawMaterials, requirements.packaging, requirements.resources o requirements.bottlenecks existen, debes analizarlos y mencionarlos explícitamente.",
     "IMPORTANTE: los registros en requirements.resources son RECURSOS internos (operarios, supervisoras, líneas, gastos de fabricación) y no deben tratarse como faltantes de inventario.",
     "IMPORTANTE: usa procurementMethodLabel para explicar el método con lenguaje humano: 'Se fabrica en planta' o 'No se fabrica en planta'.",
