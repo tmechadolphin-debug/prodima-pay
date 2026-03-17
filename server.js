@@ -4656,7 +4656,7 @@ async function syncInventoryForSalesItems({ from, to, maxItems = 1200 }) {
   const r = await dbQuery(
     `
     SELECT DISTINCT item_code
-    FROM sales_item_lines
+    FROM production_demand_lines
     WHERE doc_date >= $1::date AND doc_date <= $2::date
       AND item_code <> ''
     LIMIT $3
@@ -8656,7 +8656,7 @@ async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
   const r = await dbQuery(
     `
     SELECT DISTINCT item_code
-    FROM sales_item_lines
+    FROM production_demand_lines
     WHERE doc_date >= $1::date AND doc_date <= $2::date
       AND item_code <> ''
     LIMIT $3
@@ -8749,6 +8749,68 @@ async function syncProductionMrp({ from, to, maxItems = 2500 }) {
   return saved;
 }
 
+
+function prodCoverageMonthsByLabel(totalLabel) {
+  const t = String(totalLabel || '').toLowerCase();
+  if (t.includes('ab crítico') || t.includes('ab critico')) return 2;
+  if (t.includes('c importante')) return 1.5;
+  if (/^d/.test(t) || t.includes(' d ')) return 0.25;
+  return 1;
+}
+
+function prodCoverageLabel(months) {
+  const n = Number(months || 0);
+  if (n === 2) return '2 meses de inv';
+  if (n === 1.5) return '1.5 mes de inv';
+  if (n === 0.25) return '0.25 mes de inv';
+  return `${prodRound(n,2)} mes(es) de inv`;
+}
+
+async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
+  const headers = await scanDocHeaders('Orders', { from, to, maxDocs });
+  let saved = 0;
+  for (const h of headers) {
+    try {
+      const full = await getDoc('Orders', h.DocEntry);
+      const docEntry = Number(full?.DocEntry || h.DocEntry || 0);
+      const docNum = full?.DocNum != null ? Number(full.DocNum) : (h.DocNum != null ? Number(h.DocNum) : null);
+      const cardCode = String(full?.CardCode || '').trim();
+      const cardName = String(full?.CardName || '').trim();
+      const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+      for (const ln of lines) {
+        const lineNum = Number(ln?.LineNum);
+        if (!Number.isFinite(lineNum)) continue;
+        const itemCode = String(ln?.ItemCode || '').trim();
+        if (!itemCode) continue;
+        const itemDesc = String(ln?.ItemDescription || ln?.ItemName || '').trim();
+        const qty = Math.abs(Number(ln?.Quantity || 0));
+        const rev = Math.abs(Number(ln?.LineTotal || 0));
+        const gp = Math.abs(Number(pickGrossProfit(ln) || 0));
+        await dbQuery(`
+          INSERT INTO production_demand_lines(
+            doc_entry,line_num,doc_type,doc_date,doc_num,card_code,card_name,
+            item_code,item_desc,quantity,revenue,gross_profit,updated_at
+          ) VALUES($1,$2,'ORD',$3::date,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+          ON CONFLICT(doc_entry,line_num,doc_type) DO UPDATE SET
+            doc_date=EXCLUDED.doc_date,
+            doc_num=EXCLUDED.doc_num,
+            card_code=EXCLUDED.card_code,
+            card_name=EXCLUDED.card_name,
+            item_code=EXCLUDED.item_code,
+            item_desc=EXCLUDED.item_desc,
+            quantity=EXCLUDED.quantity,
+            revenue=EXCLUDED.revenue,
+            gross_profit=EXCLUDED.gross_profit,
+            updated_at=NOW()
+        `,[docEntry,lineNum,String(h.DocDate||'').slice(0,10),docNum,cardCode,cardName,itemCode,itemDesc,qty,rev,gp]);
+        saved += 1;
+      }
+    } catch {}
+    await sleep(10);
+  }
+  return saved;
+}
+
 async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 5, horizonMonths = 3 }) {
   const rows = await dbQuery(
     `
@@ -8761,7 +8823,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
         COALESCE(SUM(s.quantity),0)::numeric(18,4) AS qty,
         MAX(NULLIF(s.area,'')) AS area_s,
         MAX(NULLIF(s.item_group,'')) AS grupo_s
-      FROM sales_item_lines s
+      FROM production_demand_lines s
       WHERE s.doc_date >= $1::date AND s.doc_date <= $2::date
       GROUP BY s.item_code
     ),
@@ -8814,7 +8876,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       item_code,
       to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym,
       COALESCE(SUM(quantity),0)::numeric(18,4) AS qty
-    FROM sales_item_lines
+    FROM production_demand_lines
     WHERE doc_date >= $1::date AND doc_date <= $2::date
     GROUP BY item_code, to_char(date_trunc('month', doc_date), 'YYYY-MM')
     `,
@@ -8847,8 +8909,6 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const projectedQty = avgQty * Math.max(1, Number(horizonMonths || 3));
     const effectiveProjectedQty = projectedQty;
     const stockTotal = prodNum(r.stock_total);
-    const needed = Math.max(0, effectiveProjectedQty - stockTotal);
-    const adjusted = prodRecommendPracticalQty({ neededQty: needed, avgMonthlyQty: avgQty, minOrderQty: r.min_order_qty, multipleQty: r.multiple_qty });
 
     return {
       itemCode: String(r.item_code || ""),
@@ -8873,8 +8933,11 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       leadTimeDays: prodNum(r.lead_time_days),
       minOrderQty: prodNum(r.min_order_qty),
       multipleQty: prodNum(r.multiple_qty),
-      productionNeeded: prodRound(needed, 2),
-      productionAdjusted: adjusted,
+      productionNeeded: 0,
+      productionAdjusted: 0,
+      coverageMonthsTarget: 1,
+      coveragePolicyLabel: '',
+      demandSource: 'Pedidos',
     };
   });
 
@@ -8904,8 +8967,11 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const local = loadProductionLocalData();
     const meta = local.formulas.products?.[it.itemCode] || null;
     const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
+    const coverageMonthsTarget = prodCoverageMonthsByLabel(total.label);
+    const targetInventoryQty = prodNum(it.stockMax) > 0 ? prodNum(it.stockMax) * coverageMonthsTarget : it.projectedQty;
+    const productionNeeded = Math.max(0, targetInventoryQty - prodNum(it.stockTotal));
     const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
-    const hoursNeeded = rate > 0 ? it.productionAdjusted / rate : 0;
+    const hoursNeeded = rate > 0 ? productionNeeded / rate : 0;
 
     return {
       ...it,
@@ -8917,6 +8983,11 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       totalTagClass: total.cls,
       totalScore: total.t,
       machine,
+      coverageMonthsTarget,
+      coveragePolicyLabel: prodCoverageLabel(coverageMonthsTarget),
+      targetInventoryQty: prodRound(targetInventoryQty, 2),
+      productionNeeded: prodRound(productionNeeded, 2),
+      productionAdjusted: prodRound(productionNeeded, 2),
       unitsPerHour: rate,
       hoursNeeded: prodRound(hoursNeeded, 2),
       hasFormula: !!meta,
@@ -9008,7 +9079,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       COALESCE(MAX(NULLIF(s.item_desc,'')), MAX(NULLIF(g.item_desc,'')), '') AS item_desc,
       COALESCE(MAX(NULLIF(g.grupo,'')), MAX(NULLIF(g.group_name,'')), MAX(NULLIF(s.item_group,'')), 'Sin grupo') AS grupo,
       COALESCE(MAX(NULLIF(g.area,'')), MAX(NULLIF(s.area,'')), '') AS area
-    FROM sales_item_lines s
+    FROM production_demand_lines s
     LEFT JOIN item_group_cache g ON g.item_code = s.item_code
     WHERE s.item_code = $1
     `,
@@ -9029,7 +9100,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const monthlyRows = await dbQuery(
     `
     SELECT to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym, COALESCE(SUM(quantity),0)::numeric(18,4) AS qty
-    FROM sales_item_lines
+    FROM production_demand_lines
     WHERE item_code = $1 AND doc_date >= $2::date AND doc_date <= $3::date
     GROUP BY 1
     ORDER BY 1
@@ -9102,16 +9173,16 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     multipleQty: prodNum(mrpFromDb.multiple_qty || mrpFromSap.multipleQty),
   };
 
+  const dashForAbc = await productionDashboardFromDb({ from: '2025-01-01', to: end, area: '__ALL__', grupo: '__ALL__', q: code, avgMonths, horizonMonths });
+  const dashRow = (dashForAbc.items || []).find((x) => String(x.itemCode || '') === code) || null;
+  const coverageMonthsTarget = dashRow ? prodNum(dashRow.coverageMonthsTarget || 1, 1) : 1;
+  const coveragePolicyLabel = prodCoverageLabel(coverageMonthsTarget);
+  const targetInventoryQty = stockMax > 0 ? stockMax * coverageMonthsTarget : projectedQty;
   const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
-  const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : projectedQty;
-  const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, projectedQty - stockTotal);
-  const mrpAdjustedQty = prodApplyMrp(productionNeeded, mrp.minOrderQty, mrp.multipleQty);
-  const productionAdjusted = prodRecommendPracticalQty({
-    neededQty: productionNeeded,
-    avgMonthlyQty: avgQty > 0 ? avgQty : (manualPlanQty > 0 ? manualPlanQty : 0),
-    minOrderQty: mrp.minOrderQty,
-    multipleQty: mrp.multipleQty,
-  });
+  const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : targetInventoryQty;
+  const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty - stockTotal);
+  const mrpAdjustedQty = productionNeeded;
+  const productionAdjusted = productionNeeded;
 
   const sapBom = await prodFetchSapBom(code).catch(() => ({ source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] }));
   let requirementPack = await prodBuildRequirementsFromSapBom({ itemCode: code, adjustedQty: productionAdjusted, sapBom }).catch(() => null);
@@ -9237,7 +9308,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     recentProductionOrders: (prodOrders?.orders || []).slice(0, 20),
     costing,
     avgMonthlyQty: prodRound(avgQty, 2),
-    projectedQty: prodRound(projectedQty, 2),
+    projectedQty: prodRound(targetInventoryQty, 2),
     inventory: {
       total: prodRound(stockTotal, 2),
       byWarehouse: byWh,
@@ -9259,10 +9330,13 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       neededQty: prodRound(productionNeeded, 2),
       mrpAdjustedQty: prodRound(mrpAdjustedQty, 2),
       adjustedQty: prodRound(productionAdjusted, 2),
+      coverageMonthsTarget: prodRound(coverageMonthsTarget,2),
+      coveragePolicyLabel,
+      targetInventoryQty: prodRound(targetInventoryQty,2),
       manualPlanQty: prodRound(manualPlanQty, 3),
       planBasis: manualPlanQty > 0 ? "SUBPLAN_COMPONENTE" : "DEMANDA_PROYECTADA",
       maxUnitsToday,
-      practicalRule: "Se recomienda un lote práctico mínimo de 1.5 meses promedio cuando el MRP quede demasiado corto.",
+      practicalRule: `Política vigente: ${coveragePolicyLabel} según clasificación ABC, usando el máximo de SAP como base de inventario.`,
     },
     capacity: {
       unitsPerHour: prodRound(rate, 2),
@@ -9569,7 +9643,7 @@ async function prodOpenAiChat({ question, dashboard, plan, plans = [], requested
     "IMPORTANTE: cuando exista sapProduction.source, menciónalo para dejar claro si los materiales vienen directo de SAP producción.",
     "IMPORTANTE: cuando existan salesHistory.producedQty o recentProductionOrders, esos son los datos válidos para responder cuánto se produjo el artículo por mes o en órdenes recientes.",
     "IMPORTANTE: cuando exista costing.weightedCost, úsalo como costo ponderado unitario del artículo y analiza también stockValue, projectedDemandCost y adjustedProductionCost.",
-    "IMPORTANTE: si production.mrpAdjustedQty y production.adjustedQty son distintos, explica que el sistema elevó la recomendación a un lote práctico para evitar producir cantidades demasiado cortas y poco eficientes.",
+    "IMPORTANTE: toma production.neededQty como la cantidad principal a producir. La política vigente usa el máximo de SAP como base de inventario: AB Crítico = 2 meses, C Importante = 1.5 meses, D = 0.25 mes.",
     "IMPORTANTE: si requirements.rawMaterials, requirements.packaging, requirements.resources o requirements.bottlenecks existen, debes analizarlos y mencionarlos explícitamente.",
     "IMPORTANTE: los registros en requirements.resources son RECURSOS internos (operarios, supervisoras, líneas, gastos de fabricación) y no deben tratarse como faltantes de inventario.",
     "IMPORTANTE: usa procurementMethodLabel para explicar el método con lenguaje humano: 'Se fabrica en planta' o 'No se fabrica en planta'.",
@@ -9579,7 +9653,7 @@ async function prodOpenAiChat({ question, dashboard, plan, plans = [], requested
     "IMPORTANTE: selectedPlan es el artículo seleccionado. requestedPlans puede traer varios planes completos sin selección manual; úsalo cuando el usuario pida varios productos o un código escrito en la pregunta.",
     "Si el usuario pide tabla, excel, ranking, lista, columnas o detalle por mes/material/orden, responde con una tabla markdown completa con encabezados claros y datos exactos.",
     "Evita responder con slash (/), listas planas o pseudo-tablas.",
-    "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo con: 1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria, MRP y lote práctico 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
+    "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo con: 1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria y política de inventario 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
     "Si realmente falta información en el JSON, dilo claramente.",
   ].join(" ");
 
@@ -9741,6 +9815,7 @@ async function handleProductionSync(req, res) {
     const syncErrors = [];
 
     const salesSaved = await globalThis.syncSales({ from, to, maxDocs });
+    const demandSaved = await syncProductionDemandOrders({ from, to, maxDocs });
 
     let groupsSaved = 0;
     try {
@@ -9779,7 +9854,7 @@ async function handleProductionSync(req, res) {
     return safeJson(res, 200, {
       ok: true,
       from, to, maxDocs,
-      salesSaved, groupsSaved, invSaved, invWhSaved, mrpSaved,
+      salesSaved, demandSaved, groupsSaved, invSaved, invWhSaved, mrpSaved,
       syncErrors,
       formulasLoaded: Object.keys(loadProductionLocalData().formulas?.products || {}).length,
       materialsLoaded: Object.keys(loadProductionLocalData().materials?.materials || {}).length,
