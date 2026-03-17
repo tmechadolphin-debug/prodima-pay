@@ -7724,11 +7724,21 @@ __extraBootTasks.push(async () => {
   }
 });
 
+function prodProcurementMethodLabel(value) {
+  const raw = String(value || "").trim();
+  const norm = raw.toLowerCase();
+  if (["bom_make", "make", "m", "tmake"].includes(norm)) return "Se fabrica en planta";
+  if (["bom_buy", "buy", "b", "tbuy"].includes(norm)) return "No se fabrica en planta";
+  return raw || "—";
+}
+
 function prodExtractMrpFromItem(it) {
+  const procurementMethod = String(it?.ProcurementMethod || it?.IssueMethod || "").trim();
   return {
     itemCode: String(it?.ItemCode || "").trim(),
     itemDesc: String(it?.ItemName || "").trim(),
-    procurementMethod: String(it?.ProcurementMethod || it?.IssueMethod || "").trim(),
+    procurementMethod,
+    procurementMethodLabel: prodProcurementMethodLabel(procurementMethod),
     planningSystem: String(it?.PlanningSystem || "").trim(),
     leadTimeDays: prodNum(it?.LeadTime ?? it?.LeadTimeDays ?? it?.LeadTm ?? 0),
     minOrderQty: prodNum(it?.MinimumOrderQuantity ?? it?.MinOrderQty ?? it?.MinOrdrQty ?? it?.MinInventory ?? 0),
@@ -7838,6 +7848,32 @@ function prodExtractWeightedCostFromItem(item) {
   return 0;
 }
 
+function prodExtractInventorySnapshotFromItem(item) {
+  const byWh = { "01": 0, "200": 0, "300": 0, "500": 0 };
+  const whRows = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
+  let total = 0;
+  let stockMin = 0;
+  let stockMax = 0;
+
+  for (const r of whRows) {
+    const wh = String(r?.WarehouseCode ?? r?.WhsCode ?? "").trim();
+    const stock = prodNum(r?.InStock ?? r?.OnHand ?? 0);
+    const minStock = prodNum(r?.MinimalStock ?? r?.MinStock ?? 0);
+    const maxStock = prodNum(r?.MaximalStock ?? r?.MaxStock ?? 0);
+    total += stock;
+    stockMin = Math.max(stockMin, minStock);
+    stockMax = Math.max(stockMax, maxStock);
+    if (Object.prototype.hasOwnProperty.call(byWh, wh)) byWh[wh] = prodRound(stock, 3);
+  }
+
+  return {
+    byWarehouse: byWh,
+    total: prodRound(total, 3),
+    stockMin: prodRound(stockMin, 3),
+    stockMax: prodRound(stockMax, 3),
+  };
+}
+
 function prodNormalizeProductionOrderRow(r) {
   const postDateRaw = r?.PostingDate ?? r?.PostDate ?? r?.StartDate ?? r?.DueDate ?? "";
   const postDate = String(postDateRaw || "").slice(0, 10);
@@ -7898,7 +7934,18 @@ async function prodFetchProductionOrders(itemCode, top = 80) {
   return { orders, monthly };
 }
 
+function prodLooksLikeResource({ code, description = "", item = null, line = null }) {
+  const txt = `${code || ""} ${description || ""} ${item?.ItemName || ""} ${item?.ForeignName || ""} ${line?.IssueMethod || ""} ${line?.ItemType || ""} ${line?.Type || ""}`.toLowerCase();
+  const codeTxt = String(code || "").trim().toLowerCase();
+  const inventoryFlag = String(item?.InventoryItem || "").trim().toLowerCase();
+  if (/(operari|supervisor|linea de produccion|línea de producción|mano de obra|recurso|resource|labor|overhead|gastos? de fabricaci|horas? hombre|maquina de limpieza|maquina de salsas|servicio interno)/i.test(txt)) return true;
+  if (/^(ogf|mli|mlim|mosup|m00\d|mo\d{2,}|res)/i.test(codeTxt)) return true;
+  if (["tno", "no", "n", "f"].includes(inventoryFlag) && /(operari|supervisor|linea|línea|gasto|recurso|labor|overhead|servicio)/i.test(txt)) return true;
+  return false;
+}
+
 function prodClassifyComponentType({ code, description = "", item = null, line = null }) {
+  if (prodLooksLikeResource({ code, description, item, line })) return "RESOURCE";
   const txt = `${code || ""} ${description || ""} ${item?.ItemName || ""} ${item?.ForeignName || ""} ${line?.IssueMethod || ""}`.toLowerCase();
   if (/(botella|tapa|tap[aá]|liner|etiq|label|caja|cajeta|empaque|envase|shrink|sticker|frente|repuesto|atomizador|spray|doypack|valvula|válvula|dispensador|manga|sello|carton|cartón|bandeja|bolsa|bottle|cap)/i.test(txt)) {
     return "PACKAGING";
@@ -8053,11 +8100,12 @@ async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }
       const item = await prodGetFullItem(current.code).catch(() => null);
       const perUnit = prodNum(current.quantity) / headerQty;
       const requiredQty = prodRound(perUnit * prodNum(adjustedQty), 3);
-      const stockInfo = prodExtractComponentStockInfo(item, current.warehouse);
-      const stockQty = stockInfo.availableQty > 0 ? stockInfo.availableQty : stockInfo.stockQty;
-      const shortage = Math.max(0, requiredQty - stockQty);
-      const coverage = requiredQty > 0 ? stockQty / requiredQty : 0;
       const componentType = prodClassifyComponentType({ code: current.code, description: current.description, item, line: current.raw });
+      const isResource = componentType === "RESOURCE";
+      const stockInfo = isResource ? { stockQty: 0, availableQty: 0 } : prodExtractComponentStockInfo(item, current.warehouse);
+      const stockQty = isResource ? 0 : (stockInfo.availableQty > 0 ? stockInfo.availableQty : stockInfo.stockQty);
+      const shortage = isResource ? 0 : Math.max(0, requiredQty - stockQty);
+      const coverage = isResource ? 1 : (requiredQty > 0 ? stockQty / requiredQty : 0);
       results.push({
         code: current.code,
         description: current.description || String(item?.ItemName || ""),
@@ -8066,29 +8114,40 @@ async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }
         stockQty: prodRound(stockQty, 3),
         shortageQty: prodRound(shortage, 3),
         coveragePct: prodRound(coverage * 100, 1),
-        supplier: prodExtractSupplierFromItem(item),
+        supplier: isResource ? "Recurso interno" : prodExtractSupplierFromItem(item),
         cost: prodRound(prodExtractWeightedCostFromItem(item), 4),
-        status: shortage > 0 ? "FALTANTE" : "OK",
+        status: isResource ? "OK" : (shortage > 0 ? "FALTANTE" : "OK"),
         componentType,
         warehouse: current.warehouse || "",
         bomQtyBase: prodRound(current.quantity, 6),
         perUnitQty: prodRound(perUnit, 6),
         issueMethod: current.issueMethod || "",
+        isResource,
+        inventoryTracked: !isResource,
+        subPlanQty: prodRound(shortage > 0 ? shortage : requiredQty, 3),
+        resourceNote: isResource ? "Recurso de producción; no consume inventario y no debe tratarse como faltante." : "",
       });
     }
   });
   await Promise.all(workers);
 
-  results.sort((a, b) => b.shortageQty - a.shortageQty || String(a.code).localeCompare(String(b.code)));
+  results.sort((a, b) => {
+    const aRes = a.componentType === "RESOURCE" ? 1 : 0;
+    const bRes = b.componentType === "RESOURCE" ? 1 : 0;
+    if (aRes !== bRes) return aRes - bRes;
+    return b.shortageQty - a.shortageQty || String(a.code).localeCompare(String(b.code));
+  });
   const rawMaterials = results.filter((x) => x.componentType === "RAW_MATERIAL");
   const packaging = results.filter((x) => x.componentType === "PACKAGING");
-  const bottlenecks = results.filter((x) => x.shortageQty > 0).slice(0, 10);
+  const resources = results.filter((x) => x.componentType === "RESOURCE");
+  const bottlenecks = results.filter((x) => x.shortageQty > 0 && x.componentType !== "RESOURCE").slice(0, 10);
 
   return {
     source: sapBom?.source || "SAP ProductTrees",
     all: results,
     rawMaterials,
     packaging,
+    resources,
     bottlenecks,
     bomHeaderQty: headerQty,
     bomLines,
@@ -8327,7 +8386,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       gpPct: prodRound(gpPct, 2),
       soldQty: prodNum(r.qty),
       avgMonthlyQty: prodRound(avgQty, 2),
-      projectedQty: prodRound(projectedQty, 2),
+      projectedQty: prodRound(effectiveProjectedQty, 2),
       stockTotal,
       wh01: prodNum(r.wh_01),
       wh200: prodNum(r.wh_200),
@@ -8336,6 +8395,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       stockMin: prodNum(r.stock_min),
       stockMax: prodNum(r.stock_max),
       procurementMethod: String(r.procurement_method || ""),
+      procurementMethodLabel: prodProcurementMethodLabel(String(r.procurement_method || "")),
       leadTimeDays: prodNum(r.lead_time_days),
       minOrderQty: prodNum(r.min_order_qty),
       multipleQty: prodNum(r.multiple_qty),
@@ -8461,7 +8521,7 @@ function prodMergeMaterial(map, code, description, qty, unit, type) {
 }
 
 
-async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizonMonths = 3, shiftHours = 8 }) {
+async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizonMonths = 3, shiftHours = 8, plannedQtyOverride = 0 }) {
   const code = String(itemCode || "").trim();
   if (!code) throw new Error("Falta itemCode");
 
@@ -8540,10 +8600,17 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   let stockMax = 0;
   for (const r of invRows.rows || []) {
     const wh = String(r.warehouse || "").trim();
-    byWh[wh] = prodNum(r.stock);
+    if (Object.prototype.hasOwnProperty.call(byWh, wh)) byWh[wh] = prodNum(r.stock);
     stockTotal += prodNum(r.stock);
     stockMin = Math.max(stockMin, prodNum(r.stock_min));
     stockMax = Math.max(stockMax, prodNum(r.stock_max));
+  }
+  if ((!invRows.rows || !invRows.rows.length) && sapItem) {
+    const sapInv = prodExtractInventorySnapshotFromItem(sapItem);
+    stockTotal = sapInv.total;
+    stockMin = sapInv.stockMin;
+    stockMax = sapInv.stockMax;
+    Object.assign(byWh, sapInv.byWarehouse || {});
   }
 
   const mrpRows = await dbQuery(
@@ -8561,11 +8628,13 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     multipleQty: prodNum(mrpFromDb.multiple_qty || mrpFromSap.multipleQty),
   };
 
-  const productionNeeded = Math.max(0, projectedQty - stockTotal);
+  const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
+  const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : projectedQty;
+  const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, projectedQty - stockTotal);
   const mrpAdjustedQty = prodApplyMrp(productionNeeded, mrp.minOrderQty, mrp.multipleQty);
   const productionAdjusted = prodRecommendPracticalQty({
     neededQty: productionNeeded,
-    avgMonthlyQty: avgQty,
+    avgMonthlyQty: avgQty > 0 ? avgQty : (manualPlanQty > 0 ? manualPlanQty : 0),
     minOrderQty: mrp.minOrderQty,
     multipleQty: mrp.multipleQty,
   });
@@ -8622,7 +8691,8 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       all: requirements,
       rawMaterials: requirements.filter((x) => x.componentType === "RAW_MATERIAL"),
       packaging: requirements.filter((x) => x.componentType === "PACKAGING"),
-      bottlenecks: requirements.filter((x) => x.shortageQty > 0).sort((a, b) => b.shortageQty - a.shortageQty).slice(0, 10),
+      resources: requirements.filter((x) => x.componentType === "RESOURCE"),
+      bottlenecks: requirements.filter((x) => x.shortageQty > 0 && x.componentType !== "RESOURCE").sort((a, b) => b.shortageQty - a.shortageQty).slice(0, 10),
       bomHeaderQty: 1,
       bomLines: [],
     };
@@ -8638,6 +8708,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const requirements = Array.isArray(requirementPack?.all) ? requirementPack.all : [];
   const rawMaterials = Array.isArray(requirementPack?.rawMaterials) ? requirementPack.rawMaterials : [];
   const packaging = Array.isArray(requirementPack?.packaging) ? requirementPack.packaging : [];
+  const resources = Array.isArray(requirementPack?.resources) ? requirementPack.resources : [];
   const bottlenecks = Array.isArray(requirementPack?.bottlenecks) ? requirementPack.bottlenecks : [];
 
   const rate = prodNum(local.capacity?.itemRates?.[code] || local.capacity?.defaultRates?.[machine] || 0);
@@ -8658,7 +8729,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   else laborRecommendation = "Se recomienda doble turno + sábado o reprogramar";
 
   const maxUnitsByMaterial = requirements
-    .filter((x) => x.requiredQty > 0)
+    .filter((x) => x.requiredQty > 0 && x.componentType !== "RESOURCE")
     .map((x) => {
       const perUnit = productionAdjusted > 0 ? x.requiredQty / productionAdjusted : 0;
       return perUnit > 0 ? prodNum(x.stockQty) / perUnit : Number.POSITIVE_INFINITY;
@@ -8668,7 +8739,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
 
   const costing = {
     weightedCost: prodRound(weightedCost || 0, 4),
-    projectedDemandCost: prodRound((weightedCost || 0) * projectedQty, 2),
+    projectedDemandCost: prodRound((weightedCost || 0) * effectiveProjectedQty, 2),
     adjustedProductionCost: prodRound((weightedCost || 0) * productionAdjusted, 2),
     stockValue: prodRound((weightedCost || 0) * stockTotal, 2),
   };
@@ -8701,6 +8772,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     },
     mrp: {
       procurementMethod: mrp.procurementMethod,
+      procurementMethodLabel: prodProcurementMethodLabel(mrp.procurementMethod),
       planningSystem: mrp.planningSystem,
       leadTimeDays: prodNum(mrp.leadTimeDays),
       minOrderQty: prodNum(mrp.minOrderQty),
@@ -8713,6 +8785,8 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       neededQty: prodRound(productionNeeded, 2),
       mrpAdjustedQty: prodRound(mrpAdjustedQty, 2),
       adjustedQty: prodRound(productionAdjusted, 2),
+      manualPlanQty: prodRound(manualPlanQty, 3),
+      planBasis: manualPlanQty > 0 ? "SUBPLAN_COMPONENTE" : "DEMANDA_PROYECTADA",
       maxUnitsToday,
       practicalRule: "Se recomienda un lote práctico mínimo de 1.5 meses promedio cuando el MRP quede demasiado corto.",
     },
@@ -8732,6 +8806,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       all: requirements,
       rawMaterials,
       packaging,
+      resources,
       bottlenecks,
     },
     sapProduction: {
@@ -8791,6 +8866,10 @@ function prodAiCompactPlan(plan) {
     ? plan.requirements.bottlenecks
     : [];
 
+  const resources = Array.isArray(plan.requirements?.resources)
+    ? plan.requirements.resources
+    : [];
+
   return {
     itemCode: plan.itemCode,
     itemDesc: plan.itemDesc,
@@ -8837,14 +8916,17 @@ function prodAiCompactPlan(plan) {
       hasRawMaterials: rawMaterials.length > 0,
       hasPackaging: packaging.length > 0,
       hasBottlenecks: bottlenecks.length > 0,
+      hasResources: resources.length > 0,
 
       rawMaterialsCount: rawMaterials.length,
       packagingCount: packaging.length,
       bottlenecksCount: bottlenecks.length,
+      resourcesCount: resources.length,
 
       rawMaterials,
       packaging,
-      bottlenecks
+      bottlenecks,
+      resources
     }
   };
 }
@@ -8885,7 +8967,10 @@ async function prodOpenAiChat({ question, dashboard, plan }) {
     "IMPORTANTE: cuando existan salesHistory.producedQty o recentProductionOrders, esos son los datos válidos para responder cuánto se produjo el artículo por mes o en órdenes recientes.",
     "IMPORTANTE: cuando exista costing.weightedCost, úsalo como costo ponderado unitario del artículo y analiza también stockValue, projectedDemandCost y adjustedProductionCost.",
     "IMPORTANTE: si production.mrpAdjustedQty y production.adjustedQty son distintos, explica que el sistema elevó la recomendación a un lote práctico para evitar producir cantidades demasiado cortas y poco eficientes.",
-    "IMPORTANTE: si requirements.rawMaterials, requirements.packaging o requirements.bottlenecks existen, debes analizarlos y mencionarlos explícitamente.",
+    "IMPORTANTE: si requirements.rawMaterials, requirements.packaging, requirements.resources o requirements.bottlenecks existen, debes analizarlos y mencionarlos explícitamente.",
+    "IMPORTANTE: los registros en requirements.resources son RECURSOS internos (operarios, supervisoras, líneas, gastos de fabricación) y no deben tratarse como faltantes de inventario.",
+    "IMPORTANTE: usa procurementMethodLabel para explicar el método con lenguaje humano: 'Se fabrica en planta' o 'No se fabrica en planta'.",
+    "IMPORTANTE: si el usuario compara varios planes, identifica si los mismos resources aparecen en más de un lote y advierte posibles choques de capacidad.",
     "Si el usuario pide tabla, excel, ranking, lista, columnas o detalle por mes/material/orden, responde con una tabla markdown completa con encabezados claros y datos exactos.",
     "Evita responder con slash (/), listas planas o pseudo-tablas.",
     "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo con: 1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria, MRP y lote práctico 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
@@ -8954,8 +9039,9 @@ app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, 5)));
     const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 3)));
     const shiftHours = Math.max(1, Math.min(24, prodNum(req.query?.shiftHours, 8)));
+    const plannedQty = Math.max(0, prodNum(req.query?.plannedQty, 0));
 
-    const plan = await productionBuildItemPlan({ itemCode, toDate, avgMonths, horizonMonths, shiftHours });
+    const plan = await productionBuildItemPlan({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty });
 
     const dash = await productionDashboardFromDb({
       from: "2025-01-01",
