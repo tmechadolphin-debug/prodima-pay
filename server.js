@@ -6894,6 +6894,117 @@ function adminClientesPeerMatch(cardName, keywords = []) {
   return (Array.isArray(keywords) ? keywords : []).some(k => nameN.includes(norm(k)));
 }
 
+
+function adminNormalizeCardCodeLoose(v) {
+  const raw = String(v || '').trim().toUpperCase();
+  if (!raw) return '';
+  const m = raw.match(/^([A-Z]{0,3})0*([0-9]+)$/i);
+  if (m) return `${m[1] || ''}${m[2] || ''}`;
+  return raw.replace(/\s+/g, '');
+}
+
+function adminExtractCustomerCodesFromText(text) {
+  const src = String(text || '').toUpperCase();
+  const matches = src.match(/[A-Z]{0,3}\d{2,7}/g) || [];
+  const out = [];
+  const seen = new Set();
+  for (const code of matches) {
+    const k = adminNormalizeCardCodeLoose(code);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(String(code || '').trim());
+  }
+  return out;
+}
+
+function adminFindDashboardRowsByCardCode(rows, code) {
+  const wanted = String(code || '').trim();
+  if (!wanted) return [];
+  const wantedLoose = adminNormalizeCardCodeLoose(wanted);
+  return (Array.isArray(rows) ? rows : []).filter((r) => {
+    const cardCode = String(r?.cardCode || '').trim();
+    return cardCode && (
+      cardCode.toUpperCase() === wanted.toUpperCase() ||
+      adminNormalizeCardCodeLoose(cardCode) === wantedLoose
+    );
+  });
+}
+
+function adminChooseBestRow(rows, warehouse = '') {
+  const list = Array.isArray(rows) ? rows.slice() : [];
+  if (!list.length) return null;
+  const wh = String(warehouse || '').trim().toUpperCase();
+  const sorted = list.sort((a, b) => Number(b?.dollars || 0) - Number(a?.dollars || 0));
+  if (wh) {
+    const exact = sorted.find((r) => String(r?.warehouse || '').trim().toUpperCase() === wh);
+    if (exact) return exact;
+  }
+  return sorted[0] || null;
+}
+
+function adminResolveDashboardFocus({ dashboard = null, question = '', q = '', cardCode = '', warehouse = '', customerLabel = '' }) {
+  const rows = Array.isArray(dashboard?.table) ? dashboard.table : [];
+  if (!rows.length) return null;
+
+  const buildFocus = (row, source = 'inferred') => row ? ({
+    cardCode: String(row.cardCode || '').trim(),
+    warehouse: String(row.warehouse || '').trim(),
+    label: String(row.customer || `${row.cardCode || ''} · ${row.cardName || ''}`).trim(),
+    customerLabel: String(row.customer || `${row.cardCode || ''} · ${row.cardName || ''}`).trim(),
+    inferred: source !== 'explicit',
+    source,
+  }) : null;
+
+  if (cardCode) {
+    const chosen = adminChooseBestRow(adminFindDashboardRowsByCardCode(rows, cardCode), warehouse);
+    if (chosen) return buildFocus(chosen, warehouse ? 'explicit' : 'explicit_code');
+  }
+
+  const combined = `${String(question || '').trim()} ${String(q || '').trim()} ${String(customerLabel || '').trim()}`.trim();
+  for (const code of adminExtractCustomerCodesFromText(combined)) {
+    const chosen = adminChooseBestRow(adminFindDashboardRowsByCardCode(rows, code), warehouse);
+    if (chosen) return buildFocus(chosen, 'question_code');
+  }
+
+  const qn = norm(`${customerLabel || ''} ${q || ''}`);
+  if (qn) {
+    const directMatches = rows.filter((r) => {
+      const cardN = norm(r?.cardCode || '');
+      const nameN = norm(r?.cardName || '');
+      const custN = norm(r?.customer || '');
+      return cardN === qn || custN.includes(qn) || nameN.includes(qn) || qn.includes(cardN);
+    });
+    const uniqCodes = Array.from(new Set(directMatches.map((r) => String(r.cardCode || '').trim()).filter(Boolean)));
+    if (uniqCodes.length === 1) {
+      const chosen = adminChooseBestRow(directMatches, warehouse);
+      if (chosen) return buildFocus(chosen, 'search');
+    }
+
+    let bestRow = null;
+    let bestScore = 0;
+    for (const r of rows) {
+      const codeN = norm(r?.cardCode || '');
+      const nameN = norm(r?.cardName || '');
+      const custN = norm(r?.customer || '');
+      let score = 0;
+      if (codeN && qn.includes(codeN)) score += 100 + codeN.length;
+      if (custN && qn.includes(custN)) score += 90 + custN.length;
+      if (nameN && qn.includes(nameN)) score += 80 + nameN.length;
+      const tokens = nameN.split(/\s+/).filter((t) => t && t.length >= 4 && !['super','compania','compañia','sa','s','el','la','de','del'].includes(t));
+      for (const t of tokens) {
+        if (qn.includes(t)) score += Math.min(12, t.length);
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestRow = r;
+      }
+    }
+    if (bestRow && bestScore >= 14) return buildFocus(bestRow, 'search_scored');
+  }
+
+  return null;
+}
+
 async function buildAdminClientesRecommendationAnalytics({ from, to, area = "__ALL__", grupo = "__ALL__", targetCardCode = "", customerLabel = "", question = "" }) {
   let rows = await fetchInvoiceRows({ from, to, q: "" });
   rows = applyAreaGroupFilters(rows, { area, grupo });
@@ -7382,9 +7493,22 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
     const dashboard = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
     const analytics = await buildAdminClientesAiAnalytics({ from, to, area, grupo, q });
 
+    const resolvedFocus = adminResolveDashboardFocus({
+      dashboard,
+      question,
+      q,
+      cardCode,
+      warehouse,
+      customerLabel,
+    });
+
+    const focusCardCode = String(resolvedFocus?.cardCode || cardCode || "").trim();
+    const focusWarehouse = String(resolvedFocus?.warehouse || warehouse || "").trim();
+    const focusLabel = String(resolvedFocus?.label || customerLabel || "").trim();
+
     let detail = null;
-    if (cardCode && warehouse) {
-      detail = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
+    if (focusCardCode && focusWarehouse) {
+      detail = await detailsFromDb({ from, to, cardCode: focusCardCode, warehouse: focusWarehouse, area, grupo });
     }
 
     const recommendationContext = await buildAdminClientesRecommendationAnalytics({
@@ -7392,8 +7516,8 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
       to,
       area,
       grupo,
-      targetCardCode: cardCode,
-      customerLabel,
+      targetCardCode: focusCardCode,
+      customerLabel: focusLabel,
       question,
     });
 
@@ -7402,7 +7526,7 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
       dashboard,
       analytics,
       detail,
-      customerLabel,
+      customerLabel: focusLabel,
       recommendationContext,
     });
 
@@ -7413,7 +7537,14 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
       source: "db",
       range: { from, to },
       filters: { area, grupo, q },
-      focus: detail ? { cardCode, warehouse, customerLabel } : null,
+      focus: focusCardCode ? {
+        cardCode: focusCardCode,
+        warehouse: focusWarehouse,
+        customerLabel: focusLabel || `${focusCardCode}`,
+        label: focusLabel || `${focusCardCode}`,
+        inferred: !(cardCode && warehouse),
+        source: resolvedFocus?.source || (cardCode && warehouse ? 'explicit' : 'none'),
+      } : null,
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -9637,7 +9768,163 @@ function estratExtractResponseText(obj) {
   return out.join("\n\n").trim();
 }
 
-async function openaiEstratificacionChat({ question, dashboard, itemRows = [], itemLabel = "" }) {
+
+function estratNormalizeItemCodeLoose(v) {
+  const raw = String(v || '').trim().toUpperCase();
+  if (!raw) return '';
+  const m = raw.match(/^0*([0-9]+)([.-][A-Z0-9]+)?$/i);
+  if (m) return `${m[1] || ''}${m[2] || ''}`;
+  return raw.replace(/^0+(\d)/, '$1');
+}
+
+function estratExtractCodesFromText(text) {
+  const src = String(text || '').toUpperCase();
+  const matches = src.match(/\d{3,6}(?:[.-][A-Z0-9]+)?/g) || [];
+  const out = [];
+  const seen = new Set();
+  for (const code of matches) {
+    const key = estratNormalizeItemCodeLoose(code);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(String(code || '').trim());
+  }
+  return out;
+}
+
+function estratFindDashboardItemByCode(items, code) {
+  const wanted = String(code || '').trim();
+  if (!wanted) return null;
+  const wantedLoose = estratNormalizeItemCodeLoose(wanted);
+  for (const item of Array.isArray(items) ? items : []) {
+    const itemCode = String(item?.itemCode || '').trim();
+    if (!itemCode) continue;
+    if (itemCode.toUpperCase() === wanted.toUpperCase()) return item;
+    if (estratNormalizeItemCodeLoose(itemCode) === wantedLoose) return item;
+  }
+  return null;
+}
+
+function estratFindDashboardItemsByText(items, text) {
+  const qn = norm(text || '');
+  if (!qn) return [];
+  return (Array.isArray(items) ? items : []).filter((item) => {
+    const codeN = norm(item?.itemCode || '');
+    const descN = norm(item?.itemDesc || '');
+    return codeN === qn || descN.includes(qn) || qn.includes(codeN);
+  });
+}
+
+function estratResolveRequestedCodes({ question = '', q = '', itemCode = '', dashboard = null }) {
+  const items = Array.isArray(dashboard?.items) ? dashboard.items : [];
+  const out = [];
+  const seen = new Set();
+  const pushCode = (code) => {
+    const found = estratFindDashboardItemByCode(items, code);
+    const finalCode = String(found?.itemCode || code || '').trim();
+    const key = estratNormalizeItemCodeLoose(finalCode);
+    if (!finalCode || !key || seen.has(key)) return;
+    seen.add(key);
+    out.push(finalCode);
+  };
+
+  if (itemCode) pushCode(itemCode);
+
+  const qTrim = String(q || '').trim();
+  if (qTrim) {
+    const direct = estratFindDashboardItemByCode(items, qTrim);
+    if (direct) pushCode(direct.itemCode);
+    const byText = estratFindDashboardItemsByText(items, qTrim);
+    if (byText.length === 1) pushCode(byText[0].itemCode);
+    if (!out.length && Array.isArray(items) && items.length === 1) pushCode(items[0].itemCode);
+  }
+
+  for (const code of estratExtractCodesFromText(`${String(question || '')} ${String(q || '')}`)) {
+    pushCode(code);
+  }
+
+  return out;
+}
+
+function estratCompactSelectedItem(rows, itemLabel = '') {
+  const safeNum = (x, d = 0) => {
+    const n = Number(x || 0);
+    return Number.isFinite(n) ? Number(n.toFixed(d)) : 0;
+  };
+  const safeMoney = (x) => safeNum(x, 2);
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) return null;
+
+  const byCustomer = new Map();
+  const byMonth = new Map();
+  let totQty = 0, totRev = 0, totGp = 0;
+  let area = '', grupo = '', itemCode = '', itemDesc = '';
+
+  for (const r of list) {
+    const qty = Number(r.quantity || 0);
+    const rev = Number(r.revenue || 0);
+    const gp = Number(r.gp || 0);
+    const month = String(r.docDate || '').slice(0, 7);
+    const ckey = `${r.cardCode || ''}||${r.cardName || ''}`;
+
+    itemCode = itemCode || String(r.itemCode || '');
+    itemDesc = itemDesc || String(r.itemDesc || '');
+    area = area || String(r.area || '');
+    grupo = grupo || String(r.grupo || '');
+
+    totQty += qty; totRev += rev; totGp += gp;
+
+    const c = byCustomer.get(ckey) || { cardCode: String(r.cardCode || ''), cardName: String(r.cardName || ''), quantity: 0, revenue: 0, gp: 0 };
+    c.quantity += qty; c.revenue += rev; c.gp += gp;
+    byCustomer.set(ckey, c);
+
+    if (month) {
+      const m = byMonth.get(month) || { month, quantity: 0, revenue: 0, gp: 0 };
+      m.quantity += qty; m.revenue += rev; m.gp += gp;
+      byMonth.set(month, m);
+    }
+  }
+
+  return {
+    label: itemLabel || itemCode || itemDesc || '',
+    itemCode,
+    itemDesc,
+    area,
+    grupo,
+    totals: {
+      quantity: safeNum(totQty, 4),
+      revenue: safeMoney(totRev),
+      gp: safeMoney(totGp),
+      gpPct: totRev ? safeNum((totGp / totRev) * 100, 2) : 0
+    },
+    topCustomers: Array.from(byCustomer.values()).map((x) => ({
+      cardCode: x.cardCode,
+      cardName: x.cardName,
+      quantity: safeNum(x.quantity, 4),
+      revenue: safeMoney(x.revenue),
+      gp: safeMoney(x.gp),
+      gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
+    })).sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0)).slice(0, 20),
+    byMonth: Array.from(byMonth.values()).map((x) => ({
+      month: x.month,
+      quantity: safeNum(x.quantity, 4),
+      revenue: safeMoney(x.revenue),
+      gp: safeMoney(x.gp),
+      gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
+    })).sort((a, b) => String(a.month).localeCompare(String(b.month))).slice(0, 24),
+    rawRows: list.slice(0, 120).map((r) => ({
+      docDate: r.docDate,
+      cardCode: r.cardCode,
+      cardName: r.cardName,
+      quantity: safeNum(r.quantity, 4),
+      revenue: safeMoney(r.revenue),
+      gp: safeMoney(r.gp),
+      area: r.area,
+      grupo: r.grupo
+    }))
+  };
+}
+
+async function openaiEstratificacionChat({ question, dashboard, itemRows = [], itemLabel = "", itemDetails = [], requestedCodes = [], matchedItems = [] }) {
   const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
   const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
   if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
@@ -9701,87 +9988,30 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
     })),
   };
 
-  const selectedItem = itemRows.length ? (() => {
-    const rows = Array.isArray(itemRows) ? itemRows : [];
-    const byCustomer = new Map();
-    const byMonth = new Map();
-    let totQty = 0, totRev = 0, totGp = 0;
-    let area = "", grupo = "", itemCode = "", itemDesc = "";
-
-    for (const r of rows) {
-      const qty = Number(r.quantity || 0);
-      const rev = Number(r.revenue || 0);
-      const gp = Number(r.gp || 0);
-      const month = String(r.docDate || "").slice(0, 7);
-      const ckey = `${r.cardCode || ""}||${r.cardName || ""}`;
-
-      itemCode = itemCode || String(r.itemCode || "");
-      itemDesc = itemDesc || String(r.itemDesc || "");
-      area = area || String(r.area || "");
-      grupo = grupo || String(r.grupo || "");
-
-      totQty += qty; totRev += rev; totGp += gp;
-
-      const c = byCustomer.get(ckey) || {
-        cardCode: String(r.cardCode || ""),
-        cardName: String(r.cardName || ""),
-        quantity: 0,
-        revenue: 0,
-        gp: 0
-      };
-      c.quantity += qty; c.revenue += rev; c.gp += gp;
-      byCustomer.set(ckey, c);
-
-      if (month) {
-        const m = byMonth.get(month) || { month, quantity: 0, revenue: 0, gp: 0 };
-        m.quantity += qty; m.revenue += rev; m.gp += gp;
-        byMonth.set(month, m);
-      }
-    }
-
-    return {
-      label: itemLabel || itemCode || itemDesc || "",
-      itemCode,
-      itemDesc,
-      area,
-      grupo,
-      totals: {
-        quantity: safeNum(totQty, 4),
-        revenue: safeMoney(totRev),
-        gp: safeMoney(totGp),
-        gpPct: totRev ? safeNum((totGp / totRev) * 100, 2) : 0
-      },
-      topCustomers: Array.from(byCustomer.values()).map((x) => ({
-        cardCode: x.cardCode,
-        cardName: x.cardName,
-        quantity: safeNum(x.quantity, 4),
-        revenue: safeMoney(x.revenue),
-        gp: safeMoney(x.gp),
-        gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
-      })).sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0)).slice(0, 20),
-      byMonth: Array.from(byMonth.values()).map((x) => ({
-        month: x.month,
-        quantity: safeNum(x.quantity, 4),
-        revenue: safeMoney(x.revenue),
-        gp: safeMoney(x.gp),
-        gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
-      })).sort((a, b) => String(a.month).localeCompare(String(b.month))).slice(0, 24),
-      rawRows: rows.slice(0, 120).map((r) => ({
-        docDate: r.docDate,
-        cardCode: r.cardCode,
-        cardName: r.cardName,
-        quantity: safeNum(r.quantity, 4),
-        revenue: safeMoney(r.revenue),
-        gp: safeMoney(r.gp),
-        area: r.area,
-        grupo: r.grupo
-      }))
-    };
-  })() : null;
+  const selectedItem = estratCompactSelectedItem(itemRows, itemLabel);
+  const requestedItems = (Array.isArray(itemDetails) ? itemDetails : [])
+    .map((x) => estratCompactSelectedItem(x?.rows || [], x?.label || x?.itemCode || ''))
+    .filter(Boolean)
+    .slice(0, 5);
 
   const compact = {
     dashboard: compactDashboard,
-    selectedItem
+    selectedItem,
+    requestedCodes: Array.isArray(requestedCodes) ? requestedCodes : [],
+    matchedItems: (Array.isArray(matchedItems) ? matchedItems : []).map((x) => ({
+      itemCode: x?.itemCode || '',
+      itemDesc: x?.itemDesc || '',
+      area: x?.area || '',
+      grupo: x?.grupo || '',
+      totalLabel: x?.totalLabel || '',
+      stock: safeNum(x?.stock, 2),
+      stockMin: safeNum(x?.stockMin, 2),
+      stockMax: safeNum(x?.stockMax, 2),
+      revenue: safeMoney(x?.revenue),
+      gp: safeMoney(x?.gp),
+      gpPct: safeNum(x?.gpPct, 2),
+    })),
+    requestedItems
   };
 
   const system = [
@@ -9798,6 +10028,8 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
     "Si el usuario pregunta por artículos críticos, prioriza artículos A o AB, especialmente los que estén bajo mínimo o con alta participación de ventas.",
     "Si el usuario pregunta por oportunidades, identifica artículos con buen margen, artículos con stock alto y baja venta, y artículos con potencial de mejora.",
     "Si hay un artículo seleccionado, analízalo primero. Luego compáralo contra el contexto general solo si eso agrega valor.",
+    "IMPORTANTE: aunque no exista artículo seleccionado manualmente, si requestedCodes, matchedItems o requestedItems traen uno o más artículos inferidos desde la pregunta o la búsqueda, debes analizarlos como contexto principal. No digas que un código no aparece si está en requestedCodes, matchedItems o requestedItems.",
+    "Si requestedItems trae varios artículos, compáralos directamente en la respuesta y usa tablas markdown cuando eso ayude.",
     "Si hay datos del artículo por cliente o por mes, menciona qué clientes lo compran más, cómo se comporta en el tiempo y si su margen cambia.",
     "Cuando compares artículos, usa métricas concretas: revenue, GP, GP%, stock, disponible, comprometido, ordenado y clasificación.",
     "Si detectas riesgo, explica por qué: por ejemplo alto revenue con stock bajo, margen bajo, sobrestock, dependencia de un grupo o concentración excesiva.",
@@ -9912,15 +10144,36 @@ app.post("/api/admin/estratificacion/ai-chat", verifyAdmin, async (req, res) => 
     const to = isISO(toQ) ? toQ : today;
 
     const dashboard = await loadEstratificacionDashboardForAi({ from, to, area, grupo, q });
-    const itemRows = itemCode
-      ? await estratLoadItemDocsForAi({ itemCode, from, to, area, grupo })
-      : [];
+    const requestedCodes = estratResolveRequestedCodes({ question, q, itemCode, dashboard });
+    const matchedItems = requestedCodes
+      .map((code) => estratFindDashboardItemByCode(dashboard?.items || [], code))
+      .filter(Boolean);
+
+    const itemDetails = [];
+    for (const code of requestedCodes.slice(0, 5)) {
+      try {
+        const rows = await estratLoadItemDocsForAi({ itemCode: code, from, to, area, grupo });
+        const matched = estratFindDashboardItemByCode(dashboard?.items || [], code);
+        if (rows.length || matched) {
+          itemDetails.push({
+            itemCode: String(matched?.itemCode || code || '').trim(),
+            label: String(matched?.itemDesc || itemLabel || code || '').trim(),
+            rows,
+          });
+        }
+      } catch {}
+    }
+
+    const primaryDetail = itemDetails[0] || null;
 
     const out = await openaiEstratificacionChat({
       question,
       dashboard,
-      itemRows,
-      itemLabel: itemLabel || itemCode,
+      itemRows: primaryDetail?.rows || [],
+      itemLabel: primaryDetail?.label || itemLabel || itemCode,
+      itemDetails,
+      requestedCodes,
+      matchedItems,
     });
 
     return safeJson(res, 200, {
@@ -9930,7 +10183,14 @@ app.post("/api/admin/estratificacion/ai-chat", verifyAdmin, async (req, res) => 
       source: "db",
       range: { from, to },
       filters: { area, grupo, q },
-      focus: itemCode ? { itemCode, itemLabel: itemLabel || itemCode } : null,
+      focus: primaryDetail ? {
+        itemCode: primaryDetail.itemCode,
+        itemLabel: primaryDetail.label || primaryDetail.itemCode,
+        label: primaryDetail.label || primaryDetail.itemCode,
+        inferred: !itemCode || String(primaryDetail.itemCode || '') !== String(itemCode || ''),
+      } : null,
+      requestedCodes,
+      matchedItems: matchedItems.map((x) => String(x?.itemCode || '').trim()).filter(Boolean),
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
