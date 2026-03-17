@@ -8823,33 +8823,142 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   };
 }
 
+function prodNormalizeItemCodeLoose(v) {
+  const raw = String(v || "").trim().toUpperCase();
+  if (!raw) return "";
+  const m = raw.match(/^0*([0-9]+)(-[A-Z0-9]+)?$/i);
+  if (m) return `${m[1]}${m[2] || ""}`;
+  return raw.replace(/^0+(\d)/, "$1");
+}
+
+function prodExtractCodesFromText(text) {
+  const src = String(text || "").toUpperCase();
+  const matches = src.match(/\d{3,6}(?:-[A-Z0-9]+)?/g) || [];
+  const out = [];
+  const seen = new Set();
+  for (const code of matches) {
+    const normalized = prodNormalizeItemCodeLoose(code);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(String(code || "").trim());
+  }
+  return out;
+}
+
+function prodFindDashboardItemByCode(items, code) {
+  const wanted = String(code || "").trim();
+  if (!wanted) return null;
+  const wantedLoose = prodNormalizeItemCodeLoose(wanted);
+  for (const item of Array.isArray(items) ? items : []) {
+    const itemCode = String(item?.itemCode || "").trim();
+    if (!itemCode) continue;
+    if (itemCode.toUpperCase() === wanted.toUpperCase()) return item;
+    if (prodNormalizeItemCodeLoose(itemCode) === wantedLoose) return item;
+  }
+  return null;
+}
+
+function prodResolveRequestedCodes({ question = "", q = "", itemCode = "", dashboard = null }) {
+  const items = Array.isArray(dashboard?.items) ? dashboard.items : [];
+  const out = [];
+  const seen = new Set();
+  const pushCode = (code) => {
+    const found = prodFindDashboardItemByCode(items, code);
+    const finalCode = String(found?.itemCode || code || "").trim();
+    const key = prodNormalizeItemCodeLoose(finalCode);
+    if (!finalCode || !key || seen.has(key)) return;
+    seen.add(key);
+    out.push(finalCode);
+  };
+
+  if (itemCode) pushCode(itemCode);
+
+  const qTrim = String(q || "").trim();
+  if (qTrim) {
+    const direct = prodFindDashboardItemByCode(items, qTrim);
+    if (direct) pushCode(direct.itemCode);
+  }
+
+  for (const code of prodExtractCodesFromText(`${String(question || "")} ${String(q || "")}`)) {
+    pushCode(code);
+  }
+
+  return out;
+}
+
+function prodQuestionNeedsUrgentAbList(question) {
+  const q = String(question || "").toLowerCase();
+  return /(productos?|art[ií]culos?|tabla|lista|ranking)/.test(q) && /ab/.test(q) && /(urgente|cr[ií]tic|riesgo)/.test(q) && /stock/.test(q);
+}
+
+function prodQuestionNeedsPlanDetails(question) {
+  const q = String(question || "").toLowerCase();
+  return /(plan de producci[oó]n|materia prima|materias primas|empaque|empaques|cuello|botella|orden(?:es)? de producci[oó]n|costo ponderado|fabricar)/.test(q);
+}
+
+function prodCompactItemForAi(x) {
+  const stockTotal = prodNum(x?.stockTotal);
+  const stockMin = prodNum(x?.stockMin);
+  const stockMax = prodNum(x?.stockMax);
+  const productionNeeded = prodNum(x?.productionNeeded);
+  const gapToMin = stockMin > stockTotal ? prodRound(stockMin - stockTotal, 2) : 0;
+  return {
+    itemCode: x?.itemCode || "",
+    itemDesc: x?.itemDesc || "",
+    grupo: x?.grupo || "",
+    area: x?.area || "",
+    totalLabel: x?.totalLabel || "",
+    avgMonthlyQty: prodNum(x?.avgMonthlyQty),
+    projectedQty: prodNum(x?.projectedQty),
+    stockTotal,
+    stockMin,
+    stockMax,
+    gapToMin,
+    productionNeeded,
+    productionAdjusted: prodNum(x?.productionAdjusted),
+    machine: x?.machine || "",
+    hoursNeeded: prodNum(x?.hoursNeeded),
+    leadTimeDays: prodNum(x?.leadTimeDays),
+    belowMin: stockMin > 0 ? stockTotal < stockMin : productionNeeded > 0,
+    aboveMax: stockMax > 0 ? stockTotal > stockMax : false,
+  };
+}
+
+function prodBuildUrgentAbStockItems(items) {
+  return (Array.isArray(items) ? items : [])
+    .filter((x) => String(x?.totalLabel || "").startsWith("AB") && prodNum(x?.stockMin) > 0 && prodNum(x?.stockTotal) < prodNum(x?.stockMin))
+    .map((x) => ({
+      ...prodCompactItemForAi(x),
+      urgencyPctVsMin: prodRound((prodNum(x.stockMin) - prodNum(x.stockTotal)) / Math.max(prodNum(x.stockMin), 1) * 100, 1),
+    }))
+    .sort((a, b) => {
+      const d1 = prodNum(b.urgencyPctVsMin) - prodNum(a.urgencyPctVsMin);
+      if (d1) return d1;
+      const d2 = prodNum(b.gapToMin) - prodNum(a.gapToMin);
+      if (d2) return d2;
+      return prodNum(b.productionNeeded) - prodNum(a.productionNeeded);
+    });
+}
+
 function prodAiCompactDashboard(data) {
-  const topItems = (data?.items || []).slice(0, 25).map((x) => ({
-    itemCode: x.itemCode,
-    itemDesc: x.itemDesc,
-    grupo: x.grupo,
-    totalLabel: x.totalLabel,
-    avgMonthlyQty: x.avgMonthlyQty,
-    projectedQty: x.projectedQty,
-    stockTotal: x.stockTotal,
-    productionNeeded: x.productionNeeded,
-    productionAdjusted: x.productionAdjusted,
-    machine: x.machine,
-    hoursNeeded: x.hoursNeeded,
-    leadTimeDays: x.leadTimeDays,
-  }));
+  const items = Array.isArray(data?.items) ? data.items : [];
+  const compactItems = items.slice(0, 160).map(prodCompactItemForAi);
+  const urgentAbStockRiskItems = prodBuildUrgentAbStockItems(items).slice(0, 80);
   return {
     filters: {
       from: data?.from || "",
       to: data?.to || "",
       area: data?.area || "__ALL__",
       grupo: data?.grupo || "__ALL__",
+      q: data?.q || "",
       avgMonths: data?.avgMonths || 5,
       horizonMonths: data?.horizonMonths || 3,
     },
     totals: data?.totals || {},
     machineAgg: data?.machineAgg || [],
-    topItems,
+    filteredItemsCount: items.length,
+    filteredItems: compactItems,
+    urgentAbStockRiskItems,
   };
 }
 function prodAiCompactPlan(plan) {
@@ -8946,14 +9055,17 @@ function prodExtractResponseText(obj) {
   }
   return out.join("\n\n").trim();
 }
-async function prodOpenAiChat({ question, dashboard, plan }) {
+async function prodOpenAiChat({ question, dashboard, plan, plans = [], requestedCodes = [], questionMatches = [] }) {
   const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
   const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
   if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
 
   const input = {
     dashboard: prodAiCompactDashboard(dashboard),
+    requestedCodes: Array.isArray(requestedCodes) ? requestedCodes : [],
+    questionMatches: (Array.isArray(questionMatches) ? questionMatches : []).map(prodCompactItemForAi),
     selectedPlan: prodAiCompactPlan(plan),
+    requestedPlans: (Array.isArray(plans) ? plans : []).map((x) => prodAiCompactPlan(x)).filter(Boolean).slice(0, 8),
   };
 
   const system = [
@@ -8972,6 +9084,9 @@ async function prodOpenAiChat({ question, dashboard, plan }) {
     "IMPORTANTE: los registros en requirements.resources son RECURSOS internos (operarios, supervisoras, líneas, gastos de fabricación) y no deben tratarse como faltantes de inventario.",
     "IMPORTANTE: usa procurementMethodLabel para explicar el método con lenguaje humano: 'Se fabrica en planta' o 'No se fabrica en planta'.",
     "IMPORTANTE: si el usuario compara varios planes, identifica si los mismos resources aparecen en más de un lote y advierte posibles choques de capacidad.",
+    "IMPORTANTE: para riesgo de stock urgente usa SOLO dashboard.urgentAbStockRiskItems o el criterio estricto stockTotal < stockMin. No incluyas ítems en o por encima del stock mínimo, y nunca marques como urgentes artículos por encima del máximo.",
+    "IMPORTANTE: aunque no haya artículo seleccionado, si la pregunta menciona códigos o el buscador coincide, debes usar requestedCodes, questionMatches y requestedPlans. No digas que un código no aparece en el JSON si existe en requestedPlans, questionMatches o filteredItems.",
+    "IMPORTANTE: selectedPlan es el artículo seleccionado. requestedPlans puede traer varios planes completos sin selección manual; úsalo cuando el usuario pida varios productos o un código escrito en la pregunta.",
     "Si el usuario pide tabla, excel, ranking, lista, columnas o detalle por mes/material/orden, responde con una tabla markdown completa con encabezados claros y datos exactos.",
     "Evita responder con slash (/), listas planas o pseudo-tablas.",
     "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo con: 1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria, MRP y lote práctico 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
@@ -9080,14 +9195,36 @@ app.post("/api/admin/production/ai-chat", verifyAdmin, async (req, res) => {
     const itemCode = String(req.body?.itemCode || "").trim();
 
     const dashboard = await productionDashboardFromDb({ from, to, area, grupo, q, avgMonths, horizonMonths });
-    const plan = itemCode ? await productionBuildItemPlan({ itemCode, toDate: to, avgMonths, horizonMonths, shiftHours }) : null;
-    if (plan && dashboard?.items?.length) {
-      const row = dashboard.items.find((x) => String(x.itemCode || "") === itemCode);
-      if (row) plan.abcHint = row.totalLabel || "";
+    const requestedCodes = prodResolveRequestedCodes({ question, q, itemCode, dashboard });
+    const questionMatches = requestedCodes.map((code) => prodFindDashboardItemByCode(dashboard?.items || [], code)).filter(Boolean);
+
+    const planCodes = requestedCodes.slice(0, 8);
+    const plans = [];
+    for (const code of planCodes) {
+      try {
+        const built = await productionBuildItemPlan({ itemCode: code, toDate: to, avgMonths, horizonMonths, shiftHours });
+        const row = prodFindDashboardItemByCode(dashboard?.items || [], code);
+        if (row) built.abcHint = row.totalLabel || "";
+        plans.push(built);
+      } catch {}
     }
 
-    const out = await prodOpenAiChat({ question, dashboard, plan });
-    return safeJson(res, 200, { ok: true, answer: out.answer, model: out.model, source: plan?.source || "base de datos sincronizada + SAP producción" });
+    if (!plans.length && prodQuestionNeedsPlanDetails(question) && prodQuestionNeedsUrgentAbList(question)) {
+      const fallbackCodes = prodBuildUrgentAbStockItems(dashboard?.items || []).slice(0, 5).map((x) => x.itemCode);
+      for (const code of fallbackCodes) {
+        try {
+          const built = await productionBuildItemPlan({ itemCode: code, toDate: to, avgMonths, horizonMonths, shiftHours });
+          const row = prodFindDashboardItemByCode(dashboard?.items || [], code);
+          if (row) built.abcHint = row.totalLabel || "";
+          plans.push(built);
+        } catch {}
+      }
+    }
+
+    const plan = plans[0] || null;
+    const out = await prodOpenAiChat({ question, dashboard, plan, plans, requestedCodes, questionMatches });
+    const source = plans[0]?.source || plan?.source || "base de datos sincronizada + SAP producción";
+    return safeJson(res, 200, { ok: true, answer: out.answer, model: out.model, source, requestedCodes, matchedPlans: plans.map((x) => x.itemCode) });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
