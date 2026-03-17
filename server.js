@@ -5888,8 +5888,11 @@ async function slFetch(path, options = {}) {
 /* =========================================================
    ✅ SAP: scan invoices + credit notes
 ========================================================= */
-async function scanDocHeaders(entity, { f, t, maxDocs = 3000 }) {
-  const toPlus1 = addDaysISO(t, 1);
+async function scanDocHeaders(entity, { f, t, from, to, maxDocs = 3000 }) {
+  const fromDate = String(f || from || '').slice(0,10);
+  const toDate = String(t || to || '').slice(0,10);
+  if (!fromDate || !toDate) throw new Error('scanDocHeaders requiere rango de fechas');
+  const toPlus1 = addDaysISO(toDate, 1);
   const batchTop = 200;
   let skipSap = 0;
   const out = [];
@@ -5897,7 +5900,7 @@ async function scanDocHeaders(entity, { f, t, maxDocs = 3000 }) {
   for (let page = 0; page < 500; page++) {
     const raw = await slFetch(
       `/${entity}?$select=DocEntry,DocNum,DocDate,CardCode,CardName` +
-        `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
+        `&$filter=${encodeURIComponent(`DocDate ge '${fromDate}' and DocDate lt '${toPlus1}'`)}` +
         `&$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skipSap}`,
       { timeoutMs: 60000 }
     );
@@ -8835,6 +8838,11 @@ async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
 }
 
 async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 5, horizonMonths = 3 }) {
+  const demandCountRes = await dbQuery(`SELECT COUNT(*)::int AS c FROM production_demand_lines WHERE doc_date >= $1::date AND doc_date <= $2::date`, [from, to]);
+  const demandCount = Number(demandCountRes.rows?.[0]?.c || 0);
+  const useDemandFallback = demandCount <= 0;
+  const demandTable = useDemandFallback ? 'sales_item_lines' : 'production_demand_lines';
+  const demandSourceLabel = useDemandFallback ? 'Facturas (fallback temporal; ejecuta Sync para Pedidos)' : 'Pedidos';
   const rows = await dbQuery(
     `
     WITH sales AS (
@@ -8846,7 +8854,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
         COALESCE(SUM(s.quantity),0)::numeric(18,4) AS qty,
         MAX(NULLIF(s.area,'')) AS area_s,
         MAX(NULLIF(s.item_group,'')) AS grupo_s
-      FROM production_demand_lines s
+      FROM ${demandTable} s
       WHERE s.doc_date >= $1::date AND s.doc_date <= $2::date
       GROUP BY s.item_code
     ),
@@ -8899,7 +8907,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       item_code,
       to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym,
       COALESCE(SUM(quantity),0)::numeric(18,4) AS qty
-    FROM production_demand_lines
+    FROM ${demandTable}
     WHERE doc_date >= $1::date AND doc_date <= $2::date
     GROUP BY item_code, to_char(date_trunc('month', doc_date), 'YYYY-MM')
     `,
@@ -8930,6 +8938,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     }
     const avgQty = sumMonths / avgMonthsSafe;
     const projectedQty = avgQty * Math.max(1, Number(horizonMonths || 3));
+  const demandSourceLabel = itemUseFallback ? 'Facturas (fallback temporal; ejecuta Sync para Pedidos)' : 'Pedidos';
     const effectiveProjectedQty = projectedQty;
     const stockTotal = prodNum(r.stock_total);
 
@@ -8960,7 +8969,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       productionAdjusted: 0,
       coverageMonthsTarget: 1,
       coveragePolicyLabel: '',
-      demandSource: 'Pedidos',
+      demandSource: demandSourceLabel,
     };
   });
 
@@ -9060,6 +9069,9 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     avgMonths: Math.max(1, Number(avgMonths || 5)),
     horizonMonths: Math.max(1, Number(horizonMonths || 3)),
     lastSyncAt: await getState("production_last_sync_at"),
+    demandSource: demandSourceLabel,
+    demandCount,
+    useDemandFallback,
     availableGroups,
     totals: {
       revenue: prodRound(totals.revenue, 2),
@@ -9096,13 +9108,17 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const local = loadProductionLocalData();
   const meta = local.formulas.products?.[code] || local.formulas.products?.[String(code).replace(/^0+/, "")] || null;
 
+  const itemDemandCountRes = await dbQuery(`SELECT COUNT(*)::int AS c FROM production_demand_lines WHERE item_code = $1`, [code]);
+  const itemUseFallback = Number(itemDemandCountRes.rows?.[0]?.c || 0) <= 0;
+  const itemDemandTable = itemUseFallback ? 'sales_item_lines' : 'production_demand_lines';
+
   const itemMaster = await dbQuery(
     `
     SELECT
       COALESCE(MAX(NULLIF(s.item_desc,'')), MAX(NULLIF(g.item_desc,'')), '') AS item_desc,
       COALESCE(MAX(NULLIF(g.grupo,'')), MAX(NULLIF(g.group_name,'')), MAX(NULLIF(s.item_group,'')), 'Sin grupo') AS grupo,
       COALESCE(MAX(NULLIF(g.area,'')), MAX(NULLIF(s.area,'')), '') AS area
-    FROM production_demand_lines s
+    FROM ${itemDemandTable} s
     LEFT JOIN item_group_cache g ON g.item_code = s.item_code
     WHERE s.item_code = $1
     `,
@@ -9123,7 +9139,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const monthlyRows = await dbQuery(
     `
     SELECT to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym, COALESCE(SUM(quantity),0)::numeric(18,4) AS qty
-    FROM production_demand_lines
+    FROM ${itemDemandTable}
     WHERE item_code = $1 AND doc_date >= $2::date AND doc_date <= $3::date
     GROUP BY 1
     ORDER BY 1
