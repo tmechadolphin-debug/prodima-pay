@@ -4311,6 +4311,8 @@ async function ensureDb() {
       item_code TEXT NOT NULL DEFAULT '',
       item_desc TEXT NOT NULL DEFAULT '',
       quantity  NUMERIC(18,4) NOT NULL DEFAULT 0,
+      num_per_msr NUMERIC(18,4) NOT NULL DEFAULT 1,
+      quantity_base NUMERIC(18,4) NOT NULL DEFAULT 0,
       revenue   NUMERIC(18,2) NOT NULL DEFAULT 0,
       gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0,
       item_group TEXT DEFAULT '',
@@ -4322,6 +4324,8 @@ async function ensureDb() {
   `);
 
   await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS doc_num INTEGER;`);
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS num_per_msr NUMERIC(18,4) NOT NULL DEFAULT 1;`);
+  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS quantity_base NUMERIC(18,4) NOT NULL DEFAULT 0;`);
 
   /* ✅ NUEVO: cliente en líneas (para el modal) */
   await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS card_code TEXT DEFAULT '';`);
@@ -4551,6 +4555,8 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
     const gpRaw = Number(pickGrossProfit(ln) || 0);
 
     const qty = Math.abs(qtyRaw) * sign;
+    const numPerMsr = Math.abs(Number(ln?.NumPerMsr || ln?.ItemsPerUnit || 1)) || 1;
+    const qtyBase = qty * numPerMsr;
     const rev = Math.abs(revRaw) * sign;
     const gp = Math.abs(gpRaw) * sign;
 
@@ -4558,9 +4564,9 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
       `
       INSERT INTO sales_item_lines(
         doc_entry,line_num,doc_type,doc_date,doc_num,card_code,card_name,
-        item_code,item_desc,quantity,revenue,gross_profit,updated_at
+        item_code,item_desc,quantity,num_per_msr,quantity_base,revenue,gross_profit,updated_at
       )
-      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
       ON CONFLICT(doc_entry,line_num,doc_type) DO UPDATE SET
         doc_date=EXCLUDED.doc_date,
         doc_num=EXCLUDED.doc_num,
@@ -4569,11 +4575,13 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
         item_code=EXCLUDED.item_code,
         item_desc=EXCLUDED.item_desc,
         quantity=EXCLUDED.quantity,
+        num_per_msr=EXCLUDED.num_per_msr,
+        quantity_base=EXCLUDED.quantity_base,
         revenue=EXCLUDED.revenue,
         gross_profit=EXCLUDED.gross_profit,
         updated_at=NOW()
       `,
-      [docEntry, lineNum, docType, docDate, docNum, cardCode, cardName, itemCode, itemDesc, qty, rev, gp]
+      [docEntry, lineNum, docType, docDate, docNum, cardCode, cardName, itemCode, itemDesc, qty, numPerMsr, qtyBase, rev, gp]
     );
 
     inserted++;
@@ -4656,7 +4664,7 @@ async function syncInventoryForSalesItems({ from, to, maxItems = 1200 }) {
   const r = await dbQuery(
     `
     SELECT DISTINCT item_code
-    FROM sales_item_lines
+    FROM production_demand_lines
     WHERE doc_date >= $1::date AND doc_date <= $2::date
       AND item_code <> ''
     LIMIT $3
@@ -5888,8 +5896,11 @@ async function slFetch(path, options = {}) {
 /* =========================================================
    ✅ SAP: scan invoices + credit notes
 ========================================================= */
-async function scanDocHeaders(entity, { f, t, maxDocs = 3000 }) {
-  const toPlus1 = addDaysISO(t, 1);
+async function scanDocHeaders(entity, { f, t, from, to, maxDocs = 3000 }) {
+  const fromDate = String(f || from || '').slice(0,10);
+  const toDate = String(t || to || '').slice(0,10);
+  if (!fromDate || !toDate) throw new Error('scanDocHeaders requiere rango de fechas');
+  const toPlus1 = addDaysISO(toDate, 1);
   const batchTop = 200;
   let skipSap = 0;
   const out = [];
@@ -5897,7 +5908,7 @@ async function scanDocHeaders(entity, { f, t, maxDocs = 3000 }) {
   for (let page = 0; page < 500; page++) {
     const raw = await slFetch(
       `/${entity}?$select=DocEntry,DocNum,DocDate,CardCode,CardName` +
-        `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
+        `&$filter=${encodeURIComponent(`DocDate ge '${fromDate}' and DocDate lt '${toPlus1}'`)}` +
         `&$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skipSap}`,
       { timeoutMs: 60000 }
     );
@@ -6794,6 +6805,380 @@ function aiCompactDetail(detail, customerLabel = "") {
   };
 }
 
+
+function aiCompactRecommendationContext(reco) {
+  if (!reco) return null;
+  return {
+    targetCustomer: reco.targetCustomer || null,
+    modeHint: reco.modeHint || "",
+    range: reco.range || null,
+    lastMonth: reco.lastMonth || "",
+    peerKeywords: Array.isArray(reco.peerKeywords) ? reco.peerKeywords.slice(0, 12) : [],
+    peerCustomersCount: Number(reco.peerCustomersCount || 0),
+    peerCustomers: Array.isArray(reco.peerCustomers) ? reco.peerCustomers.slice(0, 30) : [],
+    targetTopItemsInRange: Array.isArray(reco.targetTopItemsInRange) ? reco.targetTopItemsInRange.slice(0, 20) : [],
+    targetTopItemsLastMonth: Array.isArray(reco.targetTopItemsLastMonth) ? reco.targetTopItemsLastMonth.slice(0, 20) : [],
+    recommendationsNotBoughtInRange: Array.isArray(reco.recommendationsNotBoughtInRange) ? reco.recommendationsNotBoughtInRange.slice(0, 30) : [],
+    recommendationsNotBoughtInLastMonth: Array.isArray(reco.recommendationsNotBoughtInLastMonth) ? reco.recommendationsNotBoughtInLastMonth.slice(0, 30) : [],
+    recommendationsBoughtBeforeButNotLastMonth: Array.isArray(reco.recommendationsBoughtBeforeButNotLastMonth) ? reco.recommendationsBoughtBeforeButNotLastMonth.slice(0, 30) : [],
+  };
+}
+
+function adminClientesExtractTargetFromQuestion(rows, question, explicit = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  const customerMap = new Map();
+  for (const r of list) {
+    const code = String(r.cardCode || "").trim();
+    const name = String(r.cardName || "").trim();
+    if (!code) continue;
+    if (!customerMap.has(code)) {
+      customerMap.set(code, {
+        cardCode: code,
+        cardName: name,
+        label: `${code} · ${name}`,
+      });
+    }
+  }
+
+  const explicitCode = String(explicit.cardCode || "").trim();
+  if (explicitCode && customerMap.has(explicitCode)) return customerMap.get(explicitCode);
+
+  const qn = norm(question || "");
+  const re = /\b([A-Z]\d{3,6})\b/g;
+  let m;
+  while ((m = re.exec(String(question || ""))) !== null) {
+    const code = String(m[1] || "").toUpperCase();
+    if (customerMap.has(code)) return customerMap.get(code);
+  }
+
+  const explicitLabel = norm(explicit.customerLabel || "");
+  if (explicitLabel) {
+    for (const c of customerMap.values()) {
+      const cn = norm(c.label);
+      if (cn && (cn.includes(explicitLabel) || explicitLabel.includes(cn))) return c;
+    }
+  }
+
+  let best = null;
+  let bestScore = 0;
+  for (const c of customerMap.values()) {
+    const nameN = norm(c.cardName);
+    const labelN = norm(c.label);
+    let score = 0;
+    if (nameN && qn.includes(nameN)) score += nameN.length + 50;
+    if (labelN && qn.includes(labelN)) score += labelN.length + 80;
+    const tokens = nameN.split(/\s+/).filter(t => t && t.length >= 4 && !['super','compania','compañia','sa','s','el','la','de','del'].includes(t));
+    for (const t of tokens) {
+      if (qn.includes(t)) score += Math.min(10, t.length);
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+  return bestScore >= 12 ? best : null;
+}
+
+function adminClientesPeerKeywords(target, question) {
+  const combined = `${target?.cardName || ''} ${target?.label || ''} ${question || ''}`;
+  const text = norm(combined);
+  const ordered = [
+    'goly', 'machetazo', 'xtra', 'jumbo', 'mega depot', 'mega', '99', 'super 99', 'el machetazo', 'casa de la carne'
+  ];
+  const hits = [];
+  for (const k of ordered) {
+    if (text.includes(norm(k)) && !hits.includes(norm(k))) hits.push(norm(k));
+  }
+  if (!hits.length) {
+    const nameN = norm(target?.cardName || '');
+    if (nameN.includes('machetazo')) hits.push('machetazo');
+    if (nameN.includes('goly')) hits.push('goly');
+    if (nameN.includes('xtra')) hits.push('xtra');
+    if (nameN.includes('99')) hits.push('99');
+  }
+  return hits;
+}
+
+function adminClientesPeerMatch(cardName, keywords = []) {
+  const nameN = norm(cardName || '');
+  if (!nameN) return false;
+  return (Array.isArray(keywords) ? keywords : []).some(k => nameN.includes(norm(k)));
+}
+
+
+function adminNormalizeCardCodeLoose(v) {
+  const raw = String(v || '').trim().toUpperCase();
+  if (!raw) return '';
+  const m = raw.match(/^([A-Z]{0,3})0*([0-9]+)$/i);
+  if (m) return `${m[1] || ''}${m[2] || ''}`;
+  return raw.replace(/\s+/g, '');
+}
+
+function adminExtractCustomerCodesFromText(text) {
+  const src = String(text || '').toUpperCase();
+  const matches = src.match(/[A-Z]{0,3}\d{2,7}/g) || [];
+  const out = [];
+  const seen = new Set();
+  for (const code of matches) {
+    const k = adminNormalizeCardCodeLoose(code);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(String(code || '').trim());
+  }
+  return out;
+}
+
+function adminFindDashboardRowsByCardCode(rows, code) {
+  const wanted = String(code || '').trim();
+  if (!wanted) return [];
+  const wantedLoose = adminNormalizeCardCodeLoose(wanted);
+  return (Array.isArray(rows) ? rows : []).filter((r) => {
+    const cardCode = String(r?.cardCode || '').trim();
+    return cardCode && (
+      cardCode.toUpperCase() === wanted.toUpperCase() ||
+      adminNormalizeCardCodeLoose(cardCode) === wantedLoose
+    );
+  });
+}
+
+function adminChooseBestRow(rows, warehouse = '') {
+  const list = Array.isArray(rows) ? rows.slice() : [];
+  if (!list.length) return null;
+  const wh = String(warehouse || '').trim().toUpperCase();
+  const sorted = list.sort((a, b) => Number(b?.dollars || 0) - Number(a?.dollars || 0));
+  if (wh) {
+    const exact = sorted.find((r) => String(r?.warehouse || '').trim().toUpperCase() === wh);
+    if (exact) return exact;
+  }
+  return sorted[0] || null;
+}
+
+function adminResolveDashboardFocus({ dashboard = null, question = '', q = '', cardCode = '', warehouse = '', customerLabel = '' }) {
+  const rows = Array.isArray(dashboard?.table) ? dashboard.table : [];
+  if (!rows.length) return null;
+
+  const buildFocus = (row, source = 'inferred') => row ? ({
+    cardCode: String(row.cardCode || '').trim(),
+    warehouse: String(row.warehouse || '').trim(),
+    label: String(row.customer || `${row.cardCode || ''} · ${row.cardName || ''}`).trim(),
+    customerLabel: String(row.customer || `${row.cardCode || ''} · ${row.cardName || ''}`).trim(),
+    inferred: source !== 'explicit',
+    source,
+  }) : null;
+
+  if (cardCode) {
+    const chosen = adminChooseBestRow(adminFindDashboardRowsByCardCode(rows, cardCode), warehouse);
+    if (chosen) return buildFocus(chosen, warehouse ? 'explicit' : 'explicit_code');
+  }
+
+  const combined = `${String(question || '').trim()} ${String(q || '').trim()} ${String(customerLabel || '').trim()}`.trim();
+  for (const code of adminExtractCustomerCodesFromText(combined)) {
+    const chosen = adminChooseBestRow(adminFindDashboardRowsByCardCode(rows, code), warehouse);
+    if (chosen) return buildFocus(chosen, 'question_code');
+  }
+
+  const qn = norm(`${customerLabel || ''} ${q || ''}`);
+  if (qn) {
+    const directMatches = rows.filter((r) => {
+      const cardN = norm(r?.cardCode || '');
+      const nameN = norm(r?.cardName || '');
+      const custN = norm(r?.customer || '');
+      return cardN === qn || custN.includes(qn) || nameN.includes(qn) || qn.includes(cardN);
+    });
+    const uniqCodes = Array.from(new Set(directMatches.map((r) => String(r.cardCode || '').trim()).filter(Boolean)));
+    if (uniqCodes.length === 1) {
+      const chosen = adminChooseBestRow(directMatches, warehouse);
+      if (chosen) return buildFocus(chosen, 'search');
+    }
+
+    let bestRow = null;
+    let bestScore = 0;
+    for (const r of rows) {
+      const codeN = norm(r?.cardCode || '');
+      const nameN = norm(r?.cardName || '');
+      const custN = norm(r?.customer || '');
+      let score = 0;
+      if (codeN && qn.includes(codeN)) score += 100 + codeN.length;
+      if (custN && qn.includes(custN)) score += 90 + custN.length;
+      if (nameN && qn.includes(nameN)) score += 80 + nameN.length;
+      const tokens = nameN.split(/\s+/).filter((t) => t && t.length >= 4 && !['super','compania','compañia','sa','s','el','la','de','del'].includes(t));
+      for (const t of tokens) {
+        if (qn.includes(t)) score += Math.min(12, t.length);
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestRow = r;
+      }
+    }
+    if (bestRow && bestScore >= 14) return buildFocus(bestRow, 'search_scored');
+  }
+
+  return null;
+}
+
+async function buildAdminClientesRecommendationAnalytics({ from, to, area = "__ALL__", grupo = "__ALL__", targetCardCode = "", customerLabel = "", question = "" }) {
+  let rows = await fetchInvoiceRows({ from, to, q: "" });
+  rows = applyAreaGroupFilters(rows, { area, grupo });
+  if (!rows.length) return null;
+
+  const target = adminClientesExtractTargetFromQuestion(rows, question, { cardCode: targetCardCode, customerLabel });
+  if (!target?.cardCode) return null;
+
+  const peerKeywords = adminClientesPeerKeywords(target, question);
+  const peerCustomerMap = new Map();
+  for (const r of rows) {
+    const code = String(r.cardCode || '').trim();
+    if (!code || code === target.cardCode) continue;
+    if (!adminClientesPeerMatch(r.cardName, peerKeywords)) continue;
+    if (!peerCustomerMap.has(code)) {
+      peerCustomerMap.set(code, { cardCode: code, cardName: String(r.cardName || ''), label: `${code} · ${String(r.cardName || '')}` });
+    }
+  }
+  const peerCodes = new Set(Array.from(peerCustomerMap.keys()));
+  if (!peerCodes.size) return {
+    targetCustomer: target,
+    modeHint: 'no_peers',
+    range: { from, to },
+    lastMonth: String(to || '').slice(0, 7),
+    peerKeywords,
+    peerCustomersCount: 0,
+    peerCustomers: [],
+    targetTopItemsInRange: [],
+    targetTopItemsLastMonth: [],
+    recommendationsNotBoughtInRange: [],
+    recommendationsNotBoughtInLastMonth: [],
+    recommendationsBoughtBeforeButNotLastMonth: [],
+  };
+
+  const lastMonth = String(to || '').slice(0, 7);
+  const targetItemsRange = new Map();
+  const targetItemsLastMonth = new Map();
+  const peerItems = new Map();
+
+  for (const r of rows) {
+    const code = String(r.cardCode || '').trim();
+    const itemCode = String(r.itemCode || '').trim() || 'SIN_ITEM';
+    const itemDesc = String(r.itemDesc || '').trim();
+    const month = String(r.docDate || '').slice(0, 7);
+    const itemKey = `${itemCode}||${itemDesc}`;
+
+    if (code === target.cardCode) {
+      const cur = targetItemsRange.get(itemKey) || {
+        itemCode, itemDesc, dollars: 0, grossProfit: 0, qty: 0,
+        firstDate: '', lastDate: '', months: new Set(), warehouses: new Set()
+      };
+      cur.dollars += Number(r.dollars || 0);
+      cur.grossProfit += Number(r.grossProfit || 0);
+      cur.qty += Number(r.quantity || 0);
+      if (!cur.firstDate || String(r.docDate) < cur.firstDate) cur.firstDate = String(r.docDate || '');
+      if (!cur.lastDate || String(r.docDate) > cur.lastDate) cur.lastDate = String(r.docDate || '');
+      if (month) cur.months.add(month);
+      if (r.warehouse) cur.warehouses.add(String(r.warehouse));
+      targetItemsRange.set(itemKey, cur);
+
+      if (month === lastMonth) {
+        const curM = targetItemsLastMonth.get(itemKey) || {
+          itemCode, itemDesc, dollars: 0, grossProfit: 0, qty: 0,
+          firstDate: '', lastDate: '', months: new Set(), warehouses: new Set()
+        };
+        curM.dollars += Number(r.dollars || 0);
+        curM.grossProfit += Number(r.grossProfit || 0);
+        curM.qty += Number(r.quantity || 0);
+        if (!curM.firstDate || String(r.docDate) < curM.firstDate) curM.firstDate = String(r.docDate || '');
+        if (!curM.lastDate || String(r.docDate) > curM.lastDate) curM.lastDate = String(r.docDate || '');
+        if (month) curM.months.add(month);
+        if (r.warehouse) curM.warehouses.add(String(r.warehouse));
+        targetItemsLastMonth.set(itemKey, curM);
+      }
+      continue;
+    }
+
+    if (!peerCodes.has(code)) continue;
+    const cur = peerItems.get(itemKey) || {
+      itemCode, itemDesc, grupo: r.grupo, area: r.area,
+      dollars: 0, grossProfit: 0, qty: 0,
+      firstDate: '', lastDate: '',
+      months: new Set(), customers: new Set(), customerNames: new Set(), warehouses: new Set()
+    };
+    cur.dollars += Number(r.dollars || 0);
+    cur.grossProfit += Number(r.grossProfit || 0);
+    cur.qty += Number(r.quantity || 0);
+    if (!cur.firstDate || String(r.docDate) < cur.firstDate) cur.firstDate = String(r.docDate || '');
+    if (!cur.lastDate || String(r.docDate) > cur.lastDate) cur.lastDate = String(r.docDate || '');
+    if (month) cur.months.add(month);
+    cur.customers.add(code);
+    if (r.cardName) cur.customerNames.add(String(r.cardName));
+    if (r.warehouse) cur.warehouses.add(String(r.warehouse));
+    peerItems.set(itemKey, cur);
+  }
+
+  const toArray = (mp, enrichMode='target') => Array.from(mp.values()).map(x => {
+    const dollars = money2(x.dollars);
+    const gp = money2(x.grossProfit);
+    return {
+      itemCode: x.itemCode,
+      itemDesc: x.itemDesc,
+      grupo: x.grupo || '',
+      area: x.area || '',
+      dollars,
+      grossProfit: gp,
+      grossPct: dollars !== 0 ? num((gp / dollars) * 100, 2) : 0,
+      qty: num(x.qty, 4),
+      firstDate: x.firstDate || '',
+      lastDate: x.lastDate || '',
+      months: Array.from(x.months || []).sort((a,b)=>String(a).localeCompare(String(b))),
+      warehouses: Array.from(x.warehouses || []).sort((a,b)=>String(a).localeCompare(String(b))),
+      customersCount: enrichMode === 'peer' ? (x.customers ? x.customers.size : 0) : undefined,
+      customerNames: enrichMode === 'peer' ? Array.from(x.customerNames || []).sort((a,b)=>String(a).localeCompare(String(b))).slice(0, 12) : undefined,
+    };
+  });
+
+  const targetTopItemsInRange = toArray(targetItemsRange, 'target')
+    .sort((a,b)=> Number(b.dollars||0)-Number(a.dollars||0))
+    .slice(0,20);
+  const targetTopItemsLastMonth = toArray(targetItemsLastMonth, 'target')
+    .sort((a,b)=> Number(b.dollars||0)-Number(a.dollars||0))
+    .slice(0,20);
+
+  const recommendationBase = toArray(peerItems, 'peer').map(x => ({
+    ...x,
+    targetBoughtInRange: targetItemsRange.has(`${x.itemCode}||${x.itemDesc}`),
+    targetBoughtInLastMonth: targetItemsLastMonth.has(`${x.itemCode}||${x.itemDesc}`),
+    targetRangeDollars: targetItemsRange.has(`${x.itemCode}||${x.itemDesc}`) ? Number(targetItemsRange.get(`${x.itemCode}||${x.itemDesc}`).dollars || 0) : 0,
+    targetLastMonthDollars: targetItemsLastMonth.has(`${x.itemCode}||${x.itemDesc}`) ? Number(targetItemsLastMonth.get(`${x.itemCode}||${x.itemDesc}`).dollars || 0) : 0,
+  }));
+
+  const sorter = (a,b) => {
+    if (Number(b.dollars||0) !== Number(a.dollars||0)) return Number(b.dollars||0) - Number(a.dollars||0);
+    if (Number(b.customersCount||0) !== Number(a.customersCount||0)) return Number(b.customersCount||0) - Number(a.customersCount||0);
+    return Number(b.grossProfit||0) - Number(a.grossProfit||0);
+  };
+
+  const recommendationsNotBoughtInRange = recommendationBase.filter(x => !x.targetBoughtInRange).sort(sorter).slice(0, 30);
+  const recommendationsNotBoughtInLastMonth = recommendationBase.filter(x => !x.targetBoughtInLastMonth).sort(sorter).slice(0, 30);
+  const recommendationsBoughtBeforeButNotLastMonth = recommendationBase.filter(x => x.targetBoughtInRange && !x.targetBoughtInLastMonth).sort(sorter).slice(0, 30);
+
+  let modeHint = 'cross_sell';
+  const qn = norm(question || '');
+  if (qn.includes('marzo') || qn.includes('mes de') || qn.includes('ultimo mes') || qn.includes('último mes')) modeHint = 'not_bought_last_month';
+  if (qn.includes('nunca') || qn.includes('jamas') || qn.includes('jamás') || qn.includes('no ha comprado')) modeHint = modeHint === 'not_bought_last_month' ? 'not_bought_last_month' : 'not_bought_in_range';
+
+  return {
+    targetCustomer: target,
+    modeHint,
+    range: { from, to },
+    lastMonth,
+    peerKeywords,
+    peerCustomersCount: peerCodes.size,
+    peerCustomers: Array.from(peerCustomerMap.values()).slice(0, 40),
+    targetTopItemsInRange,
+    targetTopItemsLastMonth,
+    recommendationsNotBoughtInRange,
+    recommendationsNotBoughtInLastMonth,
+    recommendationsBoughtBeforeButNotLastMonth,
+  };
+}
+
 function extractResponseText(obj) {
   if (!obj) return "";
   if (typeof obj.output_text === "string" && obj.output_text.trim()) return obj.output_text.trim();
@@ -6813,7 +7198,7 @@ function extractResponseText(obj) {
   return parts.join("\n").trim();
 }
 
-async function openaiDbAnalystChat({ question, dashboard, analytics = null, detail = null, customerLabel = "" }) {
+async function openaiDbAnalystChat({ question, dashboard, analytics = null, detail = null, customerLabel = "", recommendationContext = null }) {
   const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
   const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
   if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
@@ -6828,6 +7213,7 @@ async function openaiDbAnalystChat({ question, dashboard, analytics = null, deta
       }
     ),
     detail: detail ? aiCompactDetail(detail, customerLabel) : null,
+    recommendationContext: aiCompactRecommendationContext(recommendationContext),
   };
 
   const system = [
@@ -6839,6 +7225,10 @@ async function openaiDbAnalystChat({ question, dashboard, analytics = null, deta
     "Responde siempre en español, con tono profesional, claro, ejecutivo y útil.",
     "Prioriza cifras concretas, comparaciones, tendencias, hallazgos accionables y posibles causas basadas en datos.",
     "Cuando existan datos por cliente y mes, identifica clientes que cayeron, crecieron, dejaron de comprar, compraron en un mes y en otro no, clientes nuevos y clientes intermitentes.",
+    "Si existe recommendationContext, úsalo como la fuente prioritaria para responder recomendaciones de surtido, productos no comprados por un cliente objetivo, productos comprados en otras tiendas de la cadena y TOP N de artículos sugeridos.",
+    "Cuando el usuario pida tabla o Excel, devuelve primero una tabla en markdown con datos reales del sistema. No uses aproximaciones, rangos, ni texto como ~ o aprox si el contexto ya trae cifras exactas.",
+    "Para recomendaciones entre tiendas, diferencia claramente entre: no comprado en todo el rango, no comprado en el último mes del rango, y comprado antes pero no en el último mes. Usa la variante que mejor coincida con la pregunta del usuario.",
+    "En tablas de recomendación usa columnas claras como Cliente objetivo, Código, Artículo, Ventas otras tiendas USD, Unidades otras tiendas, Tiendas de la cadena, Primera compra, Última compra, Comprado por cliente objetivo en rango, Comprado por cliente objetivo en último mes.",
     "Cuando existan datos por cliente, artículo y mes, explica qué artículos provocaron la caída, crecimiento o ausencia de compra de cada cliente.",
     "Si el usuario pregunta qué cliente cayó, responde con ranking de mayores caídas, monto, porcentaje, meses comparados y artículos asociados cuando existan.",
     "Si el usuario pregunta qué cliente compró en un mes sí y en otro no, usa el detalle cliente-mes y responde con una lista directa de clientes ausentes o intermitentes entre esos meses.",
@@ -7114,17 +7504,41 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
     const dashboard = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
     const analytics = await buildAdminClientesAiAnalytics({ from, to, area, grupo, q });
 
+    const resolvedFocus = adminResolveDashboardFocus({
+      dashboard,
+      question,
+      q,
+      cardCode,
+      warehouse,
+      customerLabel,
+    });
+
+    const focusCardCode = String(resolvedFocus?.cardCode || cardCode || "").trim();
+    const focusWarehouse = String(resolvedFocus?.warehouse || warehouse || "").trim();
+    const focusLabel = String(resolvedFocus?.label || customerLabel || "").trim();
+
     let detail = null;
-    if (cardCode && warehouse) {
-      detail = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
+    if (focusCardCode && focusWarehouse) {
+      detail = await detailsFromDb({ from, to, cardCode: focusCardCode, warehouse: focusWarehouse, area, grupo });
     }
+
+    const recommendationContext = await buildAdminClientesRecommendationAnalytics({
+      from,
+      to,
+      area,
+      grupo,
+      targetCardCode: focusCardCode,
+      customerLabel: focusLabel,
+      question,
+    });
 
     const out = await openaiDbAnalystChat({
       question,
       dashboard,
       analytics,
       detail,
-      customerLabel,
+      customerLabel: focusLabel,
+      recommendationContext,
     });
 
     return safeJson(res, 200, {
@@ -7134,7 +7548,14 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
       source: "db",
       range: { from, to },
       filters: { area, grupo, q },
-      focus: detail ? { cardCode, warehouse, customerLabel } : null,
+      focus: focusCardCode ? {
+        cardCode: focusCardCode,
+        warehouse: focusWarehouse,
+        customerLabel: focusLabel || `${focusCardCode}`,
+        label: focusLabel || `${focusCardCode}`,
+        inferred: !(cardCode && warehouse),
+        source: resolvedFocus?.source || (cardCode && warehouse ? 'explicit' : 'none'),
+      } : null,
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -7434,6 +7855,88 @@ async function ensureProductionDb() {
     );
   `);
 
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_item_cache (
+      item_code TEXT PRIMARY KEY,
+      item_desc TEXT NOT NULL DEFAULT '',
+      weighted_cost NUMERIC(18,6) NOT NULL DEFAULT 0,
+      procurement_method TEXT NOT NULL DEFAULT '',
+      planning_system TEXT NOT NULL DEFAULT '',
+      lead_time_days NUMERIC(18,4) NOT NULL DEFAULT 0,
+      min_order_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      multiple_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      item_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      inventory_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_orders_cache (
+      item_code TEXT NOT NULL,
+      doc_num BIGINT NOT NULL,
+      absolute_entry BIGINT,
+      prod_name TEXT NOT NULL DEFAULT '',
+      planned_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      completed_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      rejected_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      post_date DATE,
+      status TEXT NOT NULL DEFAULT '',
+      warehouse TEXT NOT NULL DEFAULT '',
+      origin TEXT NOT NULL DEFAULT '',
+      updated_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY(item_code, doc_num)
+    );
+  `);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_bom_cache (
+      parent_item_code TEXT NOT NULL,
+      line_no INTEGER NOT NULL,
+      component_code TEXT NOT NULL DEFAULT '',
+      component_desc TEXT NOT NULL DEFAULT '',
+      quantity NUMERIC(18,6) NOT NULL DEFAULT 0,
+      unit TEXT NOT NULL DEFAULT '',
+      warehouse TEXT NOT NULL DEFAULT '',
+      issue_method TEXT NOT NULL DEFAULT '',
+      bom_header_qty NUMERIC(18,6) NOT NULL DEFAULT 1,
+      bom_source TEXT NOT NULL DEFAULT 'SAP ProductTrees',
+      updated_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY(parent_item_code, line_no)
+    );
+  `);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_demand_lines (
+      doc_entry BIGINT NOT NULL,
+      line_num INTEGER NOT NULL,
+      doc_type TEXT NOT NULL DEFAULT 'ORD',
+      doc_date DATE,
+      doc_num BIGINT,
+      card_code TEXT NOT NULL DEFAULT '',
+      card_name TEXT NOT NULL DEFAULT '',
+      item_code TEXT NOT NULL DEFAULT '',
+      item_desc TEXT NOT NULL DEFAULT '',
+      quantity NUMERIC(18,4) NOT NULL DEFAULT 0,
+      revenue NUMERIC(18,2) NOT NULL DEFAULT 0,
+      gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0,
+      area TEXT NOT NULL DEFAULT '',
+      item_group TEXT NOT NULL DEFAULT '',
+      updated_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY(doc_entry, line_num, doc_type)
+    );
+  `);
+
+  await dbQuery(`ALTER TABLE production_demand_lines ADD COLUMN IF NOT EXISTS num_per_msr NUMERIC(18,4) NOT NULL DEFAULT 1;`);
+  await dbQuery(`ALTER TABLE production_demand_lines ADD COLUMN IF NOT EXISTS quantity_base NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_item_cache_updated ON production_item_cache(updated_at);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_orders_item_date ON production_orders_cache(item_code, post_date DESC);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_bom_parent ON production_bom_cache(parent_item_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_item_date ON production_demand_lines(item_code, doc_date DESC);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_date ON production_demand_lines(doc_date DESC);`);
+
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_inv_wh_item ON production_inv_wh_cache(item_code);`);
 }
 __extraBootTasks.push(async () => {
@@ -7445,11 +7948,21 @@ __extraBootTasks.push(async () => {
   }
 });
 
+function prodProcurementMethodLabel(value) {
+  const raw = String(value || "").trim();
+  const norm = raw.toLowerCase();
+  if (["bom_make", "make", "m", "tmake"].includes(norm)) return "Se fabrica en planta";
+  if (["bom_buy", "buy", "b", "tbuy"].includes(norm)) return "No se fabrica en planta";
+  return raw || "—";
+}
+
 function prodExtractMrpFromItem(it) {
+  const procurementMethod = String(it?.ProcurementMethod || it?.IssueMethod || "").trim();
   return {
     itemCode: String(it?.ItemCode || "").trim(),
     itemDesc: String(it?.ItemName || "").trim(),
-    procurementMethod: String(it?.ProcurementMethod || it?.IssueMethod || "").trim(),
+    procurementMethod,
+    procurementMethodLabel: prodProcurementMethodLabel(procurementMethod),
     planningSystem: String(it?.PlanningSystem || "").trim(),
     leadTimeDays: prodNum(it?.LeadTime ?? it?.LeadTimeDays ?? it?.LeadTm ?? 0),
     minOrderQty: prodNum(it?.MinimumOrderQuantity ?? it?.MinOrderQty ?? it?.MinOrdrQty ?? it?.MinInventory ?? 0),
@@ -7457,7 +7970,105 @@ function prodExtractMrpFromItem(it) {
   };
 }
 
-async function prodGetFullItem(code) {
+
+
+const PROD_ITEM_RUNTIME_CACHE = new Map();
+const PROD_ORDERS_RUNTIME_CACHE = new Map();
+const PROD_BOM_RUNTIME_CACHE = new Map();
+const PROD_PLAN_RUNTIME_CACHE = new Map();
+const PROD_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const PROD_PLAN_TTL_MS = 2 * 60 * 1000;
+
+function prodParseJsonSafe(v, fallback = {}) {
+  if (v == null || v === "") return fallback;
+  if (typeof v === "object") return v;
+  try { return JSON.parse(String(v)); } catch { return fallback; }
+}
+function prodClone(v) {
+  return v == null ? v : JSON.parse(JSON.stringify(v));
+}
+function prodCacheFresh(ts, ttlMs = PROD_CACHE_TTL_MS) {
+  const ms = new Date(ts || 0).getTime();
+  return Number.isFinite(ms) && (Date.now() - ms) < ttlMs;
+}
+function prodRuntimeGet(map, key, ttlMs = PROD_CACHE_TTL_MS) {
+  const hit = map.get(key);
+  if (!hit) return null;
+  if ((Date.now() - Number(hit.ts || 0)) > ttlMs) {
+    map.delete(key);
+    return null;
+  }
+  return prodClone(hit.data);
+}
+function prodRuntimeSet(map, key, data) {
+  map.set(key, { ts: Date.now(), data: prodClone(data) });
+}
+async function prodReadItemCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS) {
+  if (!hasDb()) return null;
+  const r = await dbQuery(
+    `SELECT item_code, item_desc, weighted_cost, procurement_method, planning_system, lead_time_days,
+            min_order_qty, multiple_qty, item_json, inventory_json, updated_at
+       FROM production_item_cache
+      WHERE item_code = $1
+      LIMIT 1`,
+    [itemCode]
+  );
+  const row = r.rows?.[0];
+  if (!row || !prodCacheFresh(row.updated_at, ttlMs)) return null;
+  const item = prodParseJsonSafe(row.item_json, {});
+  const inv = prodParseJsonSafe(row.inventory_json, {});
+  if (item && typeof item === "object") {
+    item.ItemCode = item.ItemCode || row.item_code;
+    item.ItemName = item.ItemName || row.item_desc || "";
+    if (!Array.isArray(item.ItemWarehouseInfoCollection)) {
+      item.ItemWarehouseInfoCollection = Array.isArray(inv?.rows) ? inv.rows : [];
+    }
+    if ((row.procurement_method || "") && !item.ProcurementMethod) item.ProcurementMethod = row.procurement_method;
+    if ((row.planning_system || "") && !item.PlanningSystem) item.PlanningSystem = row.planning_system;
+    if (Number(row.lead_time_days || 0) && !item.LeadTimeDays) item.LeadTimeDays = Number(row.lead_time_days);
+    if (Number(row.min_order_qty || 0) && !item.MinimumOrderQuantity) item.MinimumOrderQuantity = Number(row.min_order_qty);
+    if (Number(row.multiple_qty || 0) && !item.OrderMultiple) item.OrderMultiple = Number(row.multiple_qty);
+    if (Number(row.weighted_cost || 0) > 0 && !item.AvgPrice) item.AvgPrice = Number(row.weighted_cost);
+    return item;
+  }
+  return null;
+}
+async function prodUpsertItemCacheDb(item) {
+  if (!hasDb() || !item || !item.ItemCode) return;
+  const inv = prodExtractInventorySnapshotFromItem(item);
+  const mrp = prodExtractMrpFromItem(item);
+  const weightedCost = prodExtractWeightedCostFromItem(item);
+  await dbQuery(
+    `INSERT INTO production_item_cache(
+       item_code, item_desc, weighted_cost, procurement_method, planning_system, lead_time_days,
+       min_order_qty, multiple_qty, item_json, inventory_json, updated_at
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,NOW())
+     ON CONFLICT (item_code) DO UPDATE SET
+       item_desc = EXCLUDED.item_desc,
+       weighted_cost = EXCLUDED.weighted_cost,
+       procurement_method = EXCLUDED.procurement_method,
+       planning_system = EXCLUDED.planning_system,
+       lead_time_days = EXCLUDED.lead_time_days,
+       min_order_qty = EXCLUDED.min_order_qty,
+       multiple_qty = EXCLUDED.multiple_qty,
+       item_json = EXCLUDED.item_json,
+       inventory_json = EXCLUDED.inventory_json,
+       updated_at = NOW()`,
+    [
+      String(item.ItemCode || "").trim(),
+      String(item.ItemName || "").trim(),
+      prodNum(weightedCost),
+      String(mrp.procurementMethod || ""),
+      String(mrp.planningSystem || ""),
+      prodNum(mrp.leadTimeDays),
+      prodNum(mrp.minOrderQty),
+      prodNum(mrp.multipleQty),
+      JSON.stringify(item || {}),
+      JSON.stringify({ byWarehouse: inv.byWarehouse || {}, total: inv.total || 0, stockMin: inv.stockMin || 0, stockMax: inv.stockMax || 0, rows: Array.isArray(item.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [] }),
+    ]
+  );
+}
+async function prodFetchFullItemFromSap(code) {
   const itemCode = String(code || "").trim();
   if (!itemCode) return null;
   const safe = itemCode.replace(/'/g, "''");
@@ -7465,7 +8076,14 @@ async function prodGetFullItem(code) {
   let item = null;
   try {
     item = await slFetch(
-      `/Items('${safe}')?$select=ItemCode,ItemName,ItemsGroupCode,SalesUnit,InventoryItem,Valid,FrozenFor,ProcurementMethod,PlanningSystem,LeadTime,LeadTimeDays,MinimumOrderQuantity,MinOrderQty,OrderMultiple,OrderMultipleQty,MinInventory`,
+      `/Items('${safe}')?$select=` +
+      [
+        "ItemCode","ItemName","ItemsGroupCode","SalesUnit","InventoryItem","Valid","FrozenFor",
+        "ProcurementMethod","PlanningSystem","LeadTime","LeadTimeDays","MinimumOrderQuantity",
+        "MinOrderQty","OrderMultiple","OrderMultipleQty","MinInventory","IssueMethod","TreeType",
+        "AvgPrice","AveragePrice","AvgStdPrice","AvgStdPrc","LastPurPrc","LastPurchasePrice",
+        "MainSupplier","SupplierCatalogNo","ForeignName"
+      ].join(","),
       { timeoutMs: 120000 }
     );
   } catch (e1) {
@@ -7479,7 +8097,11 @@ async function prodGetFullItem(code) {
   if (!Array.isArray(item?.ItemWarehouseInfoCollection) || !item.ItemWarehouseInfoCollection.length) {
     try {
       const whInfo = await slFetch(
-        `/Items('${safe}')/ItemWarehouseInfoCollection?$select=WarehouseCode,InStock,OnHand,Committed,IsCommited,Ordered,OnOrder,MinimalStock,MinStock,MaximalStock,MaxStock`,
+        `/Items('${safe}')/ItemWarehouseInfoCollection?$select=` +
+        [
+          "WarehouseCode","WhsCode","InStock","OnHand","Committed","IsCommited","Ordered","OnOrder",
+          "MinimalStock","MinStock","MaximalStock","MaxStock","AvgPrice","AveragePrice","AvgStdPrc","AvgStdPrice","Price"
+        ].join(","),
         { timeoutMs: 120000 }
       );
       if (Array.isArray(whInfo?.value)) item.ItemWarehouseInfoCollection = whInfo.value;
@@ -7493,12 +8115,585 @@ async function prodGetFullItem(code) {
 
   return item;
 }
+async function prodGetFullItem(code, { forceFresh = false, ttlMs = PROD_CACHE_TTL_MS } = {}) {
+  const itemCode = String(code || "").trim();
+  if (!itemCode) return null;
+  const runtimeKey = `item::${itemCode}`;
+  if (!forceFresh) {
+    const hit = prodRuntimeGet(PROD_ITEM_RUNTIME_CACHE, runtimeKey, ttlMs);
+    if (hit) return hit;
+    const dbHit = await prodReadItemCacheDb(itemCode, ttlMs).catch(() => null);
+    if (dbHit) {
+      prodRuntimeSet(PROD_ITEM_RUNTIME_CACHE, runtimeKey, dbHit);
+      return dbHit;
+    }
+  }
+  if (missingSapEnv()) return null;
+  const item = await prodFetchFullItemFromSap(itemCode);
+  if (item) {
+    prodRuntimeSet(PROD_ITEM_RUNTIME_CACHE, runtimeKey, item);
+    await prodUpsertItemCacheDb(item).catch(() => {});
+  }
+  return item;
+}
+
+function prodNormalizeSlCollection(obj) {
+  if (Array.isArray(obj)) return obj;
+  if (Array.isArray(obj?.value)) return obj.value;
+  return [];
+}
+
+function prodExtractWeightedCostFromItem(item) {
+  if (!item || typeof item !== "object") return 0;
+
+  const whRows = Array.isArray(item.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
+  const priceKeys = ["AvgPrice", "AveragePrice", "AvgStdPrice", "AvgStdPrc", "Price"];
+  const stockKeys = ["InStock", "OnHand", "Stock"];
+  let nume = 0;
+  let den = 0;
+
+  for (const r of whRows) {
+    const wh = String(r?.WarehouseCode ?? r?.WhsCode ?? "").trim();
+    if (wh && !PROD_FINISHED_WHS.includes(wh)) continue;
+
+    let price = 0;
+    for (const k of priceKeys) {
+      if (r && r[k] != null && r[k] !== "") {
+        price = prodNum(r[k]);
+        break;
+      }
+    }
+
+    let stock = 0;
+    for (const k of stockKeys) {
+      if (r && r[k] != null && r[k] !== "") {
+        stock = prodNum(r[k]);
+        break;
+      }
+    }
+
+    if (price > 0 && stock > 0) {
+      nume += price * stock;
+      den += stock;
+    }
+  }
+
+  if (den > 0) return prodRound(nume / den, 6);
+
+  const itemKeys = ["AvgPrice", "AveragePrice", "AvgStdPrice", "AvgStdPrc", "LastPurPrc", "LastPurchasePrice"];
+  for (const k of itemKeys) {
+    if (item[k] != null && item[k] !== "") {
+      const v = prodNum(item[k]);
+      if (v > 0) return prodRound(v, 6);
+    }
+  }
+  return 0;
+}
+
+function prodExtractInventorySnapshotFromItem(item) {
+  const byWh = { "01": 0, "200": 0, "300": 0, "500": 0 };
+  const whRows = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
+  let total = 0;
+  let stockMin = 0;
+  let stockMax = 0;
+
+  for (const r of whRows) {
+    const wh = String(r?.WarehouseCode ?? r?.WhsCode ?? "").trim();
+    const stock = prodNum(r?.InStock ?? r?.OnHand ?? 0);
+    const minStock = prodNum(r?.MinimalStock ?? r?.MinStock ?? 0);
+    const maxStock = prodNum(r?.MaximalStock ?? r?.MaxStock ?? 0);
+    total += stock;
+    stockMin = Math.max(stockMin, minStock);
+    stockMax = Math.max(stockMax, maxStock);
+    if (Object.prototype.hasOwnProperty.call(byWh, wh)) byWh[wh] = prodRound(stock, 3);
+  }
+
+  return {
+    byWarehouse: byWh,
+    total: prodRound(total, 3),
+    stockMin: prodRound(stockMin, 3),
+    stockMax: prodRound(stockMax, 3),
+  };
+}
+
+function prodNormalizeProductionOrderRow(r) {
+  const postDateRaw = r?.PostingDate ?? r?.PostDate ?? r?.StartDate ?? r?.DueDate ?? "";
+  const postDate = String(postDateRaw || "").slice(0, 10);
+  return {
+    docNum: Number(r?.DocumentNumber ?? r?.DocNum ?? r?.AbsoluteEntry ?? r?.Absoluteentry ?? 0) || null,
+    absoluteEntry: Number(r?.AbsoluteEntry ?? r?.Absoluteentry ?? r?.DocEntry ?? 0) || null,
+    itemCode: String(r?.ItemNo ?? r?.ItemCode ?? "").trim(),
+    prodName: String(r?.ProductDescription ?? r?.ProdName ?? r?.ItemName ?? "").trim(),
+    plannedQty: prodRound(r?.PlannedQuantity ?? r?.PlannedQty ?? r?.PlannedQtty ?? 0, 3),
+    completedQty: prodRound(r?.CompletedQuantity ?? r?.CmpltQty ?? r?.CompletedQty ?? 0, 3),
+    rejectedQty: prodRound(r?.RejectedQuantity ?? r?.RejectedQty ?? 0, 3),
+    postDate,
+    status: String(r?.ProductionOrderStatus ?? r?.Status ?? "").trim(),
+    warehouse: String(r?.Warehouse ?? r?.WarehouseCode ?? r?.WhsCode ?? "").trim(),
+    origin: String(r?.ProductionOrderOrigin ?? r?.Origin ?? "").trim(),
+  };
+}
+
+
+async function prodFetchProductionOrdersFromSap(itemCode, top = 80) {
+  const code = String(itemCode || "").trim();
+  if (!code || missingSapEnv()) return { orders: [], monthly: new Map() };
+
+  const safeCode = code.replace(/'/g, "''");
+  const topSafe = Math.max(20, Math.min(200, Number(top || 80)));
+  const paths = [
+    `/ProductionOrders?$filter=ItemNo eq '${safeCode}'&$orderby=PostingDate desc&$top=${topSafe}`,
+    `/ProductionOrders?$filter=ItemNo eq '${safeCode}'&$orderby=PostDate desc&$top=${topSafe}`,
+    `/ProductionOrders?$filter=ItemCode eq '${safeCode}'&$orderby=PostingDate desc&$top=${topSafe}`,
+    `/ProductionOrders?$filter=ItemCode eq '${safeCode}'&$orderby=PostDate desc&$top=${topSafe}`,
+  ];
+
+  let raw = [];
+  let lastErr = null;
+  for (const path of paths) {
+    try {
+      const res = await slFetch(path, { timeoutMs: 120000 });
+      raw = prodNormalizeSlCollection(res);
+      if (raw.length || Array.isArray(res)) break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!raw.length && lastErr) {
+    return { orders: [], monthly: new Map(), warning: lastErr.message || String(lastErr) };
+  }
+
+  const orders = raw
+    .map(prodNormalizeProductionOrderRow)
+    .filter((x) => String(x.itemCode || "") === code || !x.itemCode)
+    .sort((a, b) => String(b.postDate || "").localeCompare(String(a.postDate || "")) || Number(b.docNum || 0) - Number(a.docNum || 0));
+
+  return prodOrdersToResponse(orders);
+}
+function prodOrdersToResponse(orders) {
+  const monthly = new Map();
+  for (const o of orders || []) {
+    const ym = prodYm(o.postDate || new Date());
+    const prev = monthly.get(ym) || 0;
+    monthly.set(ym, prodRound(prev + prodNum(o.completedQty), 3));
+  }
+  return { orders: Array.isArray(orders) ? orders : [], monthly };
+}
+async function prodReadOrdersCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS, top = 80) {
+  if (!hasDb()) return null;
+  const stamp = await dbQuery(`SELECT MAX(updated_at) AS updated_at FROM production_orders_cache WHERE item_code = $1`, [itemCode]);
+  const updatedAt = stamp.rows?.[0]?.updated_at;
+  if (!updatedAt || !prodCacheFresh(updatedAt, ttlMs)) return null;
+  const r = await dbQuery(
+    `SELECT item_code, doc_num, absolute_entry, prod_name, planned_qty, completed_qty, rejected_qty,
+            post_date, status, warehouse, origin
+       FROM production_orders_cache
+      WHERE item_code = $1
+      ORDER BY post_date DESC NULLS LAST, doc_num DESC
+      LIMIT $2`,
+    [itemCode, Math.max(20, Math.min(200, Number(top || 80)))]
+  );
+  const orders = (r.rows || []).map((x) => ({
+    docNum: Number(x.doc_num || 0) || null,
+    absoluteEntry: Number(x.absolute_entry || 0) || null,
+    itemCode,
+    prodName: String(x.prod_name || ""),
+    plannedQty: prodRound(x.planned_qty || 0, 3),
+    completedQty: prodRound(x.completed_qty || 0, 3),
+    rejectedQty: prodRound(x.rejected_qty || 0, 3),
+    postDate: String(x.post_date || "").slice(0, 10),
+    status: String(x.status || ""),
+    warehouse: String(x.warehouse || ""),
+    origin: String(x.origin || ""),
+  }));
+  return prodOrdersToResponse(orders);
+}
+async function prodUpsertOrdersCacheDb(itemCode, orders) {
+  if (!hasDb() || !itemCode) return;
+  await dbQuery(`DELETE FROM production_orders_cache WHERE item_code = $1`, [itemCode]);
+  for (const o of Array.isArray(orders) ? orders : []) {
+    await dbQuery(
+      `INSERT INTO production_orders_cache(
+         item_code, doc_num, absolute_entry, prod_name, planned_qty, completed_qty, rejected_qty,
+         post_date, status, warehouse, origin, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+       ON CONFLICT (item_code, doc_num) DO UPDATE SET
+         absolute_entry = EXCLUDED.absolute_entry,
+         prod_name = EXCLUDED.prod_name,
+         planned_qty = EXCLUDED.planned_qty,
+         completed_qty = EXCLUDED.completed_qty,
+         rejected_qty = EXCLUDED.rejected_qty,
+         post_date = EXCLUDED.post_date,
+         status = EXCLUDED.status,
+         warehouse = EXCLUDED.warehouse,
+         origin = EXCLUDED.origin,
+         updated_at = NOW()`,
+      [
+        itemCode,
+        Number(o.docNum || 0),
+        Number(o.absoluteEntry || 0) || null,
+        String(o.prodName || ""),
+        prodNum(o.plannedQty),
+        prodNum(o.completedQty),
+        prodNum(o.rejectedQty),
+        String(o.postDate || "").slice(0, 10) || null,
+        String(o.status || ""),
+        String(o.warehouse || ""),
+        String(o.origin || ""),
+      ]
+    );
+  }
+}
+async function prodFetchProductionOrders(itemCode, top = 80, { forceFresh = false, ttlMs = PROD_CACHE_TTL_MS } = {}) {
+  const code = String(itemCode || "").trim();
+  if (!code) return { orders: [], monthly: new Map() };
+  const runtimeKey = `orders::${code}::${Math.max(20, Math.min(200, Number(top || 80)))}`;
+  if (!forceFresh) {
+    const hit = prodRuntimeGet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, ttlMs);
+    if (hit) return { orders: hit.orders || [], monthly: new Map(Object.entries(hit.monthly || {})) };
+    const dbHit = await prodReadOrdersCacheDb(code, ttlMs, top).catch(() => null);
+    if (dbHit) {
+      prodRuntimeSet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, { orders: dbHit.orders, monthly: Object.fromEntries(dbHit.monthly.entries()) });
+      return dbHit;
+    }
+  }
+  const sapHit = await prodFetchProductionOrdersFromSap(code, top);
+  prodRuntimeSet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, { orders: sapHit.orders, monthly: Object.fromEntries((sapHit.monthly || new Map()).entries()) });
+  await prodUpsertOrdersCacheDb(code, sapHit.orders).catch(() => {});
+  return sapHit;
+}
+
+function prodLooksLikeResource({ code, description = "", item = null, line = null }) {
+  const txt = `${code || ""} ${description || ""} ${item?.ItemName || ""} ${item?.ForeignName || ""} ${line?.IssueMethod || ""} ${line?.ItemType || ""} ${line?.Type || ""}`.toLowerCase();
+  const codeTxt = String(code || "").trim().toLowerCase();
+  const inventoryFlag = String(item?.InventoryItem || "").trim().toLowerCase();
+  if (/(operari|supervisor|linea de produccion|línea de producción|mano de obra|recurso|resource|labor|overhead|gastos? de fabricaci|horas? hombre|maquina de limpieza|maquina de salsas|servicio interno)/i.test(txt)) return true;
+  if (/^(ogf|mli|mlim|mosup|m00\d|mo\d{2,}|res)/i.test(codeTxt)) return true;
+  if (["tno", "no", "n", "f"].includes(inventoryFlag) && /(operari|supervisor|linea|línea|gasto|recurso|labor|overhead|servicio)/i.test(txt)) return true;
+  return false;
+}
+
+function prodClassifyComponentType({ code, description = "", item = null, line = null }) {
+  if (prodLooksLikeResource({ code, description, item, line })) return "RESOURCE";
+  const txt = `${code || ""} ${description || ""} ${item?.ItemName || ""} ${item?.ForeignName || ""} ${line?.IssueMethod || ""}`.toLowerCase();
+  if (/(botella|tapa|tap[aá]|liner|etiq|label|caja|cajeta|empaque|envase|shrink|sticker|frente|repuesto|atomizador|spray|doypack|valvula|válvula|dispensador|manga|sello|carton|cartón|bandeja|bolsa|bottle|cap)/i.test(txt)) {
+    return "PACKAGING";
+  }
+  return "RAW_MATERIAL";
+}
+
+function prodExtractSupplierFromItem(item) {
+  const candidates = [
+    item?.MainSupplier,
+    item?.PreferredVendor,
+    item?.SupplierCatalogNo,
+    item?.ForeignName,
+    item?.Manufacturer,
+  ];
+  for (const c of candidates) {
+    const v = String(c || "").trim();
+    if (v) return v;
+  }
+  return "";
+}
+
+function prodExtractComponentStockInfo(item, preferredWh = "") {
+  const whRows = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
+  const preferred = String(preferredWh || "").trim();
+  let stockSpecific = 0;
+  let availableSpecific = 0;
+  let hasSpecific = false;
+  let stockTotal = 0;
+  let availableTotal = 0;
+
+  for (const r of whRows) {
+    const wh = String(r?.WarehouseCode ?? r?.WhsCode ?? "").trim();
+    const stock = prodNum(r?.InStock ?? r?.OnHand ?? 0);
+    const committed = prodNum(r?.Committed ?? r?.IsCommited ?? 0);
+    const ordered = prodNum(r?.Ordered ?? r?.OnOrder ?? 0);
+    const available = stock - committed + ordered;
+
+    stockTotal += stock;
+    availableTotal += available;
+
+    if (preferred && wh === preferred) {
+      stockSpecific += stock;
+      availableSpecific += available;
+      hasSpecific = true;
+    }
+  }
+
+  return {
+    stockQty: prodRound(hasSpecific ? stockSpecific : stockTotal, 3),
+    availableQty: prodRound(hasSpecific ? availableSpecific : availableTotal, 3),
+    stockTotal: prodRound(stockTotal, 3),
+  };
+}
+
+function prodNormalizeBomLine(line) {
+  return {
+    code: String(line?.ItemCode ?? line?.Code ?? line?.ChildCode ?? "").trim(),
+    description: String(line?.ItemName ?? line?.ItemDescription ?? line?.ProductDescription ?? line?.Description ?? "").trim(),
+    quantity: prodNum(line?.Quantity ?? line?.PlannedQuantity ?? line?.Qty ?? line?.BaseQuantity ?? 0),
+    unit: String(line?.InventoryUOM ?? line?.UoMCode ?? line?.UomCode ?? line?.UoMName ?? line?.Unit ?? "").trim(),
+    warehouse: String(line?.Warehouse ?? line?.WarehouseCode ?? line?.WhsCode ?? "").trim(),
+    issueMethod: String(line?.IssueMethod ?? "").trim(),
+    raw: line || {},
+  };
+}
+
+
+async function prodFetchSapBomFromSap(itemCode) {
+  const code = String(itemCode || "").trim();
+  if (!code || missingSapEnv()) return { source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] };
+
+  const safe = code.replace(/'/g, "''");
+  const tryPaths = [
+    `/ProductTrees('${safe}')?$expand=ProductTreeLines`,
+    `/ProductTrees('${safe}')`,
+    `/ProductTrees?$filter=TreeCode eq '${safe}'&$top=1`,
+    `/ProductTrees?$filter=Code eq '${safe}'&$top=1`,
+  ];
+
+  let tree = null;
+  let lastErr = null;
+  for (const path of tryPaths) {
+    try {
+      const res = await slFetch(path, { timeoutMs: 120000 });
+      tree = Array.isArray(res?.value) ? (res.value[0] || null) : (res || null);
+      if (tree) break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!tree) return { source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [], warning: lastErr?.message || "" };
+
+  let lines = [];
+  const lineKeys = ["ProductTreeLines", "Items", "BOMLines", "BillOfMaterialsLines"];
+  for (const key of lineKeys) {
+    if (Array.isArray(tree?.[key]) && tree[key].length) {
+      lines = tree[key];
+      break;
+    }
+  }
+
+  if (!lines.length) {
+    const linePaths = [
+      `/ProductTrees('${safe}')/ProductTreeLines`,
+      `/ProductTrees('${safe}')/Items`,
+    ];
+    for (const path of linePaths) {
+      try {
+        const res = await slFetch(path, { timeoutMs: 120000 });
+        const arr = prodNormalizeSlCollection(res);
+        if (arr.length) {
+          lines = arr;
+          break;
+        }
+      } catch {}
+    }
+  }
+
+  const normalized = lines
+    .map(prodNormalizeBomLine)
+    .filter((x) => String(x.code || "").trim() && prodNum(x.quantity) > 0);
+
+  const headerQty = Math.max(1, prodNum(tree?.Quantity ?? tree?.TreeQuantity ?? tree?.PlannedQuantity ?? 1));
+  return {
+    source: "SAP ProductTrees",
+    tree,
+    headerQty,
+    lines: normalized,
+  };
+}
+async function prodReadBomCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS) {
+  if (!hasDb()) return null;
+  const stamp = await dbQuery(`SELECT MAX(updated_at) AS updated_at FROM production_bom_cache WHERE parent_item_code = $1`, [itemCode]);
+  const updatedAt = stamp.rows?.[0]?.updated_at;
+  if (!updatedAt || !prodCacheFresh(updatedAt, ttlMs)) return null;
+  const r = await dbQuery(
+    `SELECT parent_item_code, line_no, component_code, component_desc, quantity, unit, warehouse, issue_method, bom_header_qty, bom_source
+       FROM production_bom_cache
+      WHERE parent_item_code = $1
+      ORDER BY line_no ASC`,
+    [itemCode]
+  );
+  const rows = r.rows || [];
+  if (!rows.length) return { source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] };
+  return {
+    source: String(rows[0].bom_source || "SAP ProductTrees"),
+    tree: null,
+    headerQty: prodNum(rows[0].bom_header_qty || 1),
+    lines: rows.map((x) => ({
+      code: String(x.component_code || ""),
+      description: String(x.component_desc || ""),
+      quantity: prodNum(x.quantity || 0),
+      unit: String(x.unit || ""),
+      warehouse: String(x.warehouse || ""),
+      issueMethod: String(x.issue_method || ""),
+      raw: {
+        ItemCode: String(x.component_code || ""),
+        ItemDescription: String(x.component_desc || ""),
+        Quantity: prodNum(x.quantity || 0),
+        UoMCode: String(x.unit || ""),
+        Warehouse: String(x.warehouse || ""),
+        IssueMethod: String(x.issue_method || ""),
+      },
+    })),
+  };
+}
+async function prodUpsertBomCacheDb(itemCode, bom) {
+  if (!hasDb() || !itemCode) return;
+  await dbQuery(`DELETE FROM production_bom_cache WHERE parent_item_code = $1`, [itemCode]);
+  const lines = Array.isArray(bom?.lines) ? bom.lines : [];
+  const headerQty = Math.max(1, prodNum(bom?.headerQty || 1));
+  let lineNo = 0;
+  for (const line of lines) {
+    await dbQuery(
+      `INSERT INTO production_bom_cache(
+         parent_item_code, line_no, component_code, component_desc, quantity, unit, warehouse, issue_method, bom_header_qty, bom_source, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())`,
+      [
+        itemCode,
+        ++lineNo,
+        String(line.code || ""),
+        String(line.description || ""),
+        prodNum(line.quantity),
+        String(line.unit || ""),
+        String(line.warehouse || ""),
+        String(line.issueMethod || ""),
+        headerQty,
+        String(bom?.source || "SAP ProductTrees"),
+      ]
+    );
+  }
+}
+async function prodFetchSapBom(itemCode, { forceFresh = false, ttlMs = PROD_CACHE_TTL_MS } = {}) {
+  const code = String(itemCode || "").trim();
+  if (!code) return { source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] };
+  const runtimeKey = `bom::${code}`;
+  if (!forceFresh) {
+    const hit = prodRuntimeGet(PROD_BOM_RUNTIME_CACHE, runtimeKey, ttlMs);
+    if (hit) return hit;
+    const dbHit = await prodReadBomCacheDb(code, ttlMs).catch(() => null);
+    if (dbHit) {
+      prodRuntimeSet(PROD_BOM_RUNTIME_CACHE, runtimeKey, dbHit);
+      return dbHit;
+    }
+  }
+  const sapHit = await prodFetchSapBomFromSap(code);
+  prodRuntimeSet(PROD_BOM_RUNTIME_CACHE, runtimeKey, sapHit);
+  await prodUpsertBomCacheDb(code, sapHit).catch(() => {});
+  return sapHit;
+}
+
+async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }) {
+  const headerQty = Math.max(1, prodNum(sapBom?.headerQty || 1));
+  const bomLines = Array.isArray(sapBom?.lines) ? sapBom.lines : [];
+  if (!bomLines.length) {
+    return {
+      source: sapBom?.source || "SAP ProductTrees",
+      all: [],
+      rawMaterials: [],
+      packaging: [],
+      bottlenecks: [],
+      bomHeaderQty: headerQty,
+      bomLines: [],
+    };
+  }
+
+  const results = [];
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(6, Math.max(1, bomLines.length)) }, async () => {
+    while (idx < bomLines.length) {
+      const current = bomLines[idx++];
+      const item = await prodGetFullItem(current.code).catch(() => null);
+      const perUnit = prodNum(current.quantity) / headerQty;
+      const requiredQty = prodRound(perUnit * prodNum(adjustedQty), 3);
+      const componentType = prodClassifyComponentType({ code: current.code, description: current.description, item, line: current.raw });
+      const isResource = componentType === "RESOURCE";
+      const stockInfo = isResource ? { stockQty: 0, availableQty: 0 } : prodExtractComponentStockInfo(item, current.warehouse);
+      const stockQty = isResource ? 0 : (stockInfo.availableQty > 0 ? stockInfo.availableQty : stockInfo.stockQty);
+      const shortage = isResource ? 0 : Math.max(0, requiredQty - stockQty);
+      const coverage = isResource ? 1 : (requiredQty > 0 ? stockQty / requiredQty : 0);
+      results.push({
+        code: current.code,
+        description: current.description || String(item?.ItemName || ""),
+        requiredQty,
+        unit: current.unit || String(item?.SalesUnit || ""),
+        stockQty: prodRound(stockQty, 3),
+        shortageQty: prodRound(shortage, 3),
+        coveragePct: prodRound(coverage * 100, 1),
+        supplier: isResource ? "Recurso interno" : prodExtractSupplierFromItem(item),
+        cost: prodRound(prodExtractWeightedCostFromItem(item), 4),
+        status: isResource ? "OK" : (shortage > 0 ? "FALTANTE" : "OK"),
+        componentType,
+        warehouse: current.warehouse || "",
+        bomQtyBase: prodRound(current.quantity, 6),
+        perUnitQty: prodRound(perUnit, 6),
+        issueMethod: current.issueMethod || "",
+        isResource,
+        inventoryTracked: !isResource,
+        subPlanQty: prodRound(shortage > 0 ? shortage : requiredQty, 3),
+        resourceNote: isResource ? "Recurso de producción; no consume inventario y no debe tratarse como faltante." : "",
+      });
+    }
+  });
+  await Promise.all(workers);
+
+  results.sort((a, b) => {
+    const aRes = a.componentType === "RESOURCE" ? 1 : 0;
+    const bRes = b.componentType === "RESOURCE" ? 1 : 0;
+    if (aRes !== bRes) return aRes - bRes;
+    return b.shortageQty - a.shortageQty || String(a.code).localeCompare(String(b.code));
+  });
+  const rawMaterials = results.filter((x) => x.componentType === "RAW_MATERIAL");
+  const packaging = results.filter((x) => x.componentType === "PACKAGING");
+  const resources = results.filter((x) => x.componentType === "RESOURCE");
+  const bottlenecks = results.filter((x) => x.shortageQty > 0 && x.componentType !== "RESOURCE").slice(0, 10);
+
+  return {
+    source: sapBom?.source || "SAP ProductTrees",
+    all: results,
+    rawMaterials,
+    packaging,
+    resources,
+    bottlenecks,
+    bomHeaderQty: headerQty,
+    bomLines,
+  };
+}
+
+function prodRecommendPracticalQty({ neededQty = 0, avgMonthlyQty = 0, minOrderQty = 0, multipleQty = 0 }) {
+  const need = Math.max(0, prodNum(neededQty));
+  if (need <= 0) return 0;
+
+  const avg = Math.max(0, prodNum(avgMonthlyQty));
+  let out = prodApplyMrp(need, minOrderQty, multipleQty);
+
+  let practicalMultiple = Math.max(0, prodNum(multipleQty));
+  if (!(practicalMultiple > 1)) {
+    if (avg >= 1000) practicalMultiple = 200;
+    else if (avg >= 500) practicalMultiple = 100;
+    else if (avg >= 100) practicalMultiple = 50;
+    else practicalMultiple = 10;
+  }
+
+  const practicalFloor = avg > 0 ? avg * 1.5 : out;
+  if (out < practicalFloor) {
+    out = Math.ceil(practicalFloor / practicalMultiple) * practicalMultiple;
+  }
+
+  if (minOrderQty > 0 && out < prodNum(minOrderQty)) out = prodNum(minOrderQty);
+  if (practicalMultiple > 1) out = Math.ceil(out / practicalMultiple) * practicalMultiple;
+  return Math.round(out);
+}
 
 async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
   const r = await dbQuery(
     `
     SELECT DISTINCT item_code
-    FROM sales_item_lines
+    FROM production_demand_lines
     WHERE doc_date >= $1::date AND doc_date <= $2::date
       AND item_code <> ''
     LIMIT $3
@@ -7591,21 +8786,144 @@ async function syncProductionMrp({ from, to, maxItems = 2500 }) {
   return saved;
 }
 
+
+function prodCoverageMonthsByLabel(totalLabel) {
+  const t = String(totalLabel || '').toLowerCase();
+  if (t.includes('ab crítico') || t.includes('ab critico')) return 2;
+  if (t.includes('c importante')) return 1;
+  if (/^d/.test(t) || t.includes(' d ')) return 0.5;
+  return 1;
+}
+
+function prodCoverageLabel(months) {
+  const n = Number(months || 0);
+  if (n === 2) return '2 meses de inv';
+  if (n === 1) return '1 mes de inv';
+  if (n === 0.5) return '0.5 mes de inv';
+  return `${prodRound(n,2)} mes(es) de inv`;
+}
+
+async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
+  const headers = await scanDocHeaders('Orders', { from, to, maxDocs });
+  let saved = 0;
+  for (const h of headers) {
+    try {
+      const full = await getDoc('Orders', h.DocEntry);
+      const docEntry = Number(full?.DocEntry || h.DocEntry || 0);
+      const docNum = full?.DocNum != null ? Number(full.DocNum) : (h.DocNum != null ? Number(h.DocNum) : null);
+      const cardCode = String(full?.CardCode || '').trim();
+      const cardName = String(full?.CardName || '').trim();
+      const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+      for (const ln of lines) {
+        const lineNum = Number(ln?.LineNum);
+        if (!Number.isFinite(lineNum)) continue;
+        const itemCode = String(ln?.ItemCode || '').trim();
+        if (!itemCode) continue;
+        const itemDesc = String(ln?.ItemDescription || ln?.ItemName || '').trim();
+        const qty = Math.abs(Number(ln?.Quantity || 0));
+        const numPerMsr = Math.abs(Number(ln?.NumPerMsr || ln?.ItemsPerUnit || 1)) || 1;
+        const qtyBase = qty * numPerMsr;
+        const rev = Math.abs(Number(ln?.LineTotal || 0));
+        const gp = Math.abs(Number(pickGrossProfit(ln) || 0));
+        await dbQuery(`
+          INSERT INTO production_demand_lines(
+            doc_entry,line_num,doc_type,doc_date,doc_num,card_code,card_name,
+            item_code,item_desc,quantity,num_per_msr,quantity_base,revenue,gross_profit,updated_at
+          ) VALUES($1,$2,'ORD',$3::date,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
+          ON CONFLICT(doc_entry,line_num,doc_type) DO UPDATE SET
+            doc_date=EXCLUDED.doc_date,
+            doc_num=EXCLUDED.doc_num,
+            card_code=EXCLUDED.card_code,
+            card_name=EXCLUDED.card_name,
+            item_code=EXCLUDED.item_code,
+            item_desc=EXCLUDED.item_desc,
+            quantity=EXCLUDED.quantity,
+            num_per_msr=EXCLUDED.num_per_msr,
+            quantity_base=EXCLUDED.quantity_base,
+            revenue=EXCLUDED.revenue,
+            gross_profit=EXCLUDED.gross_profit,
+            updated_at=NOW()
+        `,[docEntry,lineNum,String(h.DocDate||'').slice(0,10),docNum,cardCode,cardName,itemCode,itemDesc,qty,numPerMsr,qtyBase,rev,gp]);
+        saved += 1;
+      }
+    } catch {}
+    await sleep(10);
+  }
+  return saved;
+}
+
+
+function prodUnitsExpr(alias = '') {
+  const p = alias ? `${alias}.` : '';
+  // Igual que en SAP análisis de ventas: Quantity * NumPerMsr = unidades reales.
+  // Si quantity_base está vacío o quedó viejo, recalculamos en línea para no depender del sync previo.
+  return `COALESCE(NULLIF(${p}quantity_base,0), (COALESCE(${p}quantity,0) * COALESCE(NULLIF(${p}num_per_msr,0),1)), COALESCE(${p}quantity,0))`;
+}
+
+function prodDemandQtyExpr(alias = '') {
+  return prodUnitsExpr(alias);
+}
+
+function prodSalesQtyExpr(alias = '') {
+  return prodUnitsExpr(alias);
+}
+
+function prodMonthWindowEnd(dateIso) {
+  const d = new Date(`${String(dateIso).slice(0,10)}T00:00:00Z`);
+  if (!Number.isFinite(d.getTime())) return String(dateIso || '').slice(0,10);
+  const y=d.getUTCFullYear();
+  const m=d.getUTCMonth();
+  const last=new Date(Date.UTC(y,m+1,0));
+  return last.toISOString().slice(0,10);
+}
+
 async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 5, horizonMonths = 3 }) {
+  const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN)).slice(0,10);
+  const maxMonthsWindow = Math.max(1, Number(avgMonths || 5), Number(horizonMonths || 3));
+  const monthBaseStart = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(maxMonthsWindow - 1));
+  const monthRangeEnd = String(monthTo || '').slice(0,10);
+
+  const demandCountRes = await dbQuery(`SELECT COUNT(*)::int AS c FROM production_demand_lines WHERE doc_date >= $1::date AND doc_date <= $2::date`, [monthBaseStart, monthRangeEnd]);
+  const demandCount = Number(demandCountRes.rows?.[0]?.c || 0);
+  const useDemandFallback = demandCount <= 0;
+  const demandTable = useDemandFallback ? 'sales_item_lines' : 'production_demand_lines';
+  const demandSourceLabel = useDemandFallback ? 'Facturas SAP (fallback temporal; ejecuta Sync para Pedidos)' : 'Pedidos SAP (unidades)';
+  const demandQtyExpr = prodDemandQtyExpr('d');
+
   const rows = await dbQuery(
     `
-    WITH sales AS (
+    WITH base AS (
+      SELECT DISTINCT item_code
+      FROM sales_item_lines
+      WHERE doc_date >= $1::date AND doc_date <= $2::date AND item_code <> ''
+      UNION
+      SELECT DISTINCT item_code
+      FROM ${demandTable}
+      WHERE doc_date >= $3::date AND doc_date <= $4::date AND item_code <> ''
+    ),
+    sales AS (
       SELECT
         s.item_code,
         MAX(NULLIF(s.item_desc,'')) AS item_desc,
         COALESCE(SUM(s.revenue),0)::numeric(18,2) AS revenue,
         COALESCE(SUM(s.gross_profit),0)::numeric(18,2) AS gp,
-        COALESCE(SUM(s.quantity),0)::numeric(18,4) AS qty,
+        COALESCE(SUM(${prodSalesQtyExpr('s')}),0)::numeric(18,4) AS qty,
         MAX(NULLIF(s.area,'')) AS area_s,
         MAX(NULLIF(s.item_group,'')) AS grupo_s
       FROM sales_item_lines s
       WHERE s.doc_date >= $1::date AND s.doc_date <= $2::date
       GROUP BY s.item_code
+    ),
+    demand AS (
+      SELECT
+        d.item_code,
+        MAX(NULLIF(d.item_desc,'')) AS item_desc,
+        COALESCE(SUM(${demandQtyExpr}),0)::numeric(18,4) AS demand_qty,
+        MAX(NULLIF(d.area,'')) AS area_d,
+        MAX(NULLIF(d.item_group,'')) AS grupo_d
+      FROM ${demandTable} d
+      WHERE d.doc_date >= $3::date AND d.doc_date <= $4::date
+      GROUP BY d.item_code
     ),
     inv AS (
       SELECT
@@ -7621,13 +8939,14 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       GROUP BY item_code
     )
     SELECT
-      sales.item_code,
-      COALESCE(NULLIF(sales.item_desc,''), NULLIF(g.item_desc,''), '') AS item_desc,
-      COALESCE(NULLIF(sales.grupo_s,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo,
-      COALESCE(NULLIF(sales.area_s,''), NULLIF(g.area,''), '') AS area,
-      sales.revenue,
-      sales.gp,
-      sales.qty,
+      base.item_code,
+      COALESCE(NULLIF(sales.item_desc,''), NULLIF(demand.item_desc,''), NULLIF(g.item_desc,''), '') AS item_desc,
+      COALESCE(NULLIF(sales.grupo_s,''), NULLIF(demand.grupo_d,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo,
+      COALESCE(NULLIF(sales.area_s,''), NULLIF(demand.area_d,''), NULLIF(g.area,''), '') AS area,
+      COALESCE(sales.revenue,0) AS revenue,
+      COALESCE(sales.gp,0) AS gp,
+      COALESCE(sales.qty,0) AS sold_qty,
+      COALESCE(demand.demand_qty,0) AS demand_qty,
       COALESCE(inv.wh_01,0) AS wh_01,
       COALESCE(inv.wh_200,0) AS wh_200,
       COALESCE(inv.wh_300,0) AS wh_300,
@@ -7639,28 +8958,28 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       COALESCE(m.lead_time_days,0) AS lead_time_days,
       COALESCE(m.min_order_qty,0) AS min_order_qty,
       COALESCE(m.multiple_qty,0) AS multiple_qty
-    FROM sales
-    LEFT JOIN item_group_cache g ON g.item_code = sales.item_code
-    LEFT JOIN inv ON inv.item_code = sales.item_code
-    LEFT JOIN production_mrp_cache m ON m.item_code = sales.item_code
-    ORDER BY sales.revenue DESC
+    FROM base
+    LEFT JOIN sales ON sales.item_code = base.item_code
+    LEFT JOIN demand ON demand.item_code = base.item_code
+    LEFT JOIN item_group_cache g ON g.item_code = base.item_code
+    LEFT JOIN inv ON inv.item_code = base.item_code
+    LEFT JOIN production_mrp_cache m ON m.item_code = base.item_code
+    ORDER BY COALESCE(sales.revenue,0) DESC, base.item_code ASC
     `,
-    [from, to]
+    [from, to, monthBaseStart, monthRangeEnd]
   );
 
-  const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN));
-  const monthFrom = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(Math.max(1, Number(avgMonths || 5)) - 1));
   const monthRows = await dbQuery(
     `
     SELECT
       item_code,
       to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym,
-      COALESCE(SUM(quantity),0)::numeric(18,4) AS qty
-    FROM sales_item_lines
+      COALESCE(SUM(${prodDemandQtyExpr()}),0)::numeric(18,4) AS qty
+    FROM ${demandTable}
     WHERE doc_date >= $1::date AND doc_date <= $2::date
     GROUP BY item_code, to_char(date_trunc('month', doc_date), 'YYYY-MM')
     `,
-    [monthFrom, monthTo]
+    [monthBaseStart, monthRangeEnd]
   );
   const monthly = new Map();
   for (const r of monthRows.rows || []) {
@@ -7678,18 +8997,20 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const monthsMap = monthly.get(String(r.item_code || "")) || new Map();
 
     const avgMonthsSafe = Math.max(1, Number(avgMonths || 5));
-    const monthLabels = [];
-    let sumMonths = 0;
+    const horizonSafe = Math.max(1, Number(horizonMonths || 3));
+    let sumAvgMonths = 0;
+    let sumHorizonMonths = 0;
     for (let i = avgMonthsSafe - 1; i >= 0; i--) {
       const ym = prodYm(prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -i));
-      monthLabels.push(ym);
-      sumMonths += prodNum(monthsMap.get(ym));
+      sumAvgMonths += prodNum(monthsMap.get(ym));
     }
-    const avgQty = sumMonths / avgMonthsSafe;
-    const projectedQty = avgQty * Math.max(1, Number(horizonMonths || 3));
+    for (let i = horizonSafe - 1; i >= 0; i--) {
+      const ym = prodYm(prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -i));
+      sumHorizonMonths += prodNum(monthsMap.get(ym));
+    }
+    const avgQty = sumAvgMonths / avgMonthsSafe;
+    const pedidosQty = sumHorizonMonths;
     const stockTotal = prodNum(r.stock_total);
-    const needed = Math.max(0, projectedQty - stockTotal);
-    const adjusted = prodApplyMrp(needed, r.min_order_qty, r.multiple_qty);
 
     return {
       itemCode: String(r.item_code || ""),
@@ -7699,9 +9020,9 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       revenue: rev,
       gp,
       gpPct: prodRound(gpPct, 2),
-      soldQty: prodNum(r.qty),
+      soldQty: prodNum(r.sold_qty),
       avgMonthlyQty: prodRound(avgQty, 2),
-      projectedQty: prodRound(projectedQty, 2),
+      projectedQty: prodRound(pedidosQty, 2),
       stockTotal,
       wh01: prodNum(r.wh_01),
       wh200: prodNum(r.wh_200),
@@ -7710,11 +9031,16 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       stockMin: prodNum(r.stock_min),
       stockMax: prodNum(r.stock_max),
       procurementMethod: String(r.procurement_method || ""),
+      procurementMethodLabel: prodProcurementMethodLabel(String(r.procurement_method || "")),
       leadTimeDays: prodNum(r.lead_time_days),
       minOrderQty: prodNum(r.min_order_qty),
       multipleQty: prodNum(r.multiple_qty),
-      productionNeeded: prodRound(needed, 2),
-      productionAdjusted: adjusted,
+      productionNeeded: 0,
+      productionAdjusted: 0,
+      coverageMonthsTarget: 1,
+      coveragePolicyLabel: '',
+      demandSource: demandSourceLabel,
+      demandUomLabel: 'Unidades SAP',
     };
   });
 
@@ -7744,8 +9070,11 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const local = loadProductionLocalData();
     const meta = local.formulas.products?.[it.itemCode] || null;
     const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
+    const coverageMonthsTarget = prodCoverageMonthsByLabel(total.label);
+    const targetInventoryQty = prodNum(it.stockMax) > 0 ? prodNum(it.stockMax) * coverageMonthsTarget : it.projectedQty;
+    const productionNeeded = Math.max(0, targetInventoryQty - prodNum(it.stockTotal));
     const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
-    const hoursNeeded = rate > 0 ? it.productionAdjusted / rate : 0;
+    const hoursNeeded = rate > 0 ? productionNeeded / rate : 0;
 
     return {
       ...it,
@@ -7757,6 +9086,11 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       totalTagClass: total.cls,
       totalScore: total.t,
       machine,
+      coverageMonthsTarget,
+      coveragePolicyLabel: prodCoverageLabel(coverageMonthsTarget),
+      targetInventoryQty: prodRound(targetInventoryQty, 2),
+      productionNeeded: prodRound(productionNeeded, 2),
+      productionAdjusted: prodRound(productionNeeded, 2),
       unitsPerHour: rate,
       hoursNeeded: prodRound(hoursNeeded, 2),
       hasFormula: !!meta,
@@ -7806,6 +9140,10 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     avgMonths: Math.max(1, Number(avgMonths || 5)),
     horizonMonths: Math.max(1, Number(horizonMonths || 3)),
     lastSyncAt: await getState("production_last_sync_at"),
+    demandSource: demandSourceLabel,
+      demandUomLabel: 'Unidades SAP',
+    demandCount,
+    useDemandFallback,
     availableGroups,
     totals: {
       revenue: prodRound(totals.revenue, 2),
@@ -7834,12 +9172,18 @@ function prodMergeMaterial(map, code, description, qty, unit, type) {
   map.set(key, cur);
 }
 
-async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizonMonths = 3, shiftHours = 8 }) {
+
+async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizonMonths = 3, shiftHours = 8, plannedQtyOverride = 0 }) {
   const code = String(itemCode || "").trim();
   if (!code) throw new Error("Falta itemCode");
 
   const local = loadProductionLocalData();
   const meta = local.formulas.products?.[code] || local.formulas.products?.[String(code).replace(/^0+/, "")] || null;
+
+  const itemDemandCountRes = await dbQuery(`SELECT COUNT(*)::int AS c FROM production_demand_lines WHERE item_code = $1`, [code]);
+  const itemUseFallback = Number(itemDemandCountRes.rows?.[0]?.c || 0) <= 0;
+  const itemDemandTable = itemUseFallback ? 'sales_item_lines' : 'production_demand_lines';
+  const itemDemandQtyExpr = prodDemandQtyExpr();
 
   const itemMaster = await dbQuery(
     `
@@ -7847,14 +9191,16 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       COALESCE(MAX(NULLIF(s.item_desc,'')), MAX(NULLIF(g.item_desc,'')), '') AS item_desc,
       COALESCE(MAX(NULLIF(g.grupo,'')), MAX(NULLIF(g.group_name,'')), MAX(NULLIF(s.item_group,'')), 'Sin grupo') AS grupo,
       COALESCE(MAX(NULLIF(g.area,'')), MAX(NULLIF(s.area,'')), '') AS area
-    FROM sales_item_lines s
+    FROM ${itemDemandTable} s
     LEFT JOIN item_group_cache g ON g.item_code = s.item_code
     WHERE s.item_code = $1
     `,
     [code]
   );
   const row0 = itemMaster.rows?.[0] || {};
-  const itemDesc = String(row0.item_desc || meta?.description || "");
+
+  const sapItem = await prodGetFullItem(code).catch(() => null);
+  const itemDesc = String(row0.item_desc || sapItem?.ItemName || meta?.description || "");
   const grupo = prodNormalizeGrupoFinal(String(row0.grupo || ""));
   const area = String(row0.area || "") || prodInferAreaFromGroup(grupo) || "";
   const machine = prodMachineFromAreaOrGroup(area, grupo, meta);
@@ -7865,8 +9211,8 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
 
   const monthlyRows = await dbQuery(
     `
-    SELECT to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym, COALESCE(SUM(quantity),0)::numeric(18,4) AS qty
-    FROM sales_item_lines
+    SELECT to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym, COALESCE(SUM(${itemDemandQtyExpr}),0)::numeric(18,4) AS qty
+    FROM ${itemDemandTable}
     WHERE item_code = $1 AND doc_date >= $2::date AND doc_date <= $3::date
     GROUP BY 1
     ORDER BY 1
@@ -7874,10 +9220,21 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     [code, histFrom, end]
   );
   const monthMap = new Map((monthlyRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
+
+  const weightedCost = prodExtractWeightedCostFromItem(sapItem);
+  const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map() }));
+  const prodMonthMap = prodOrders?.monthly instanceof Map ? prodOrders.monthly : new Map();
+
   const salesHistory = [];
   for (let i = 11; i >= 0; i--) {
     const ym = prodYm(prodAddMonthsISO(monthStart, -i));
-    salesHistory.push({ ym, label: prodFormatMonthName(ym), qty: prodRound(monthMap.get(ym) || 0, 2) });
+    salesHistory.push({
+      ym,
+      label: prodFormatMonthName(ym),
+      qty: prodRound(monthMap.get(ym) || 0, 2),
+      producedQty: prodRound(prodMonthMap.get(ym) || 0, 2),
+      weightedCost: prodRound(weightedCost || 0, 4),
+    });
   }
 
   let avgQty = 0;
@@ -7886,7 +9243,11 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     avgQty += prodNum(monthMap.get(ym) || 0);
   }
   avgQty = avgQty / Math.max(1, Number(avgMonths || 5));
-  const projectedQty = avgQty * Math.max(1, Number(horizonMonths || 3));
+  let projectedQty = 0;
+  for (let i = Math.max(1, Number(horizonMonths || 3)) - 1; i >= 0; i--) {
+    const ym = prodYm(prodAddMonthsISO(monthStart, -i));
+    projectedQty += prodNum(monthMap.get(ym) || 0);
+  }
 
   const invRows = await dbQuery(
     `SELECT warehouse, stock, stock_min, stock_max, committed, ordered, available
@@ -7900,10 +9261,17 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   let stockMax = 0;
   for (const r of invRows.rows || []) {
     const wh = String(r.warehouse || "").trim();
-    byWh[wh] = prodNum(r.stock);
+    if (Object.prototype.hasOwnProperty.call(byWh, wh)) byWh[wh] = prodNum(r.stock);
     stockTotal += prodNum(r.stock);
     stockMin = Math.max(stockMin, prodNum(r.stock_min));
     stockMax = Math.max(stockMax, prodNum(r.stock_max));
+  }
+  if ((!invRows.rows || !invRows.rows.length) && sapItem) {
+    const sapInv = prodExtractInventorySnapshotFromItem(sapItem);
+    stockTotal = sapInv.total;
+    stockMin = sapInv.stockMin;
+    stockMax = sapInv.stockMax;
+    Object.assign(byWh, sapInv.byWarehouse || {});
   }
 
   const mrpRows = await dbQuery(
@@ -7911,53 +9279,98 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
      FROM production_mrp_cache WHERE item_code = $1 LIMIT 1`,
     [code]
   );
-  const mrp = mrpRows.rows?.[0] || {};
-  const productionNeeded = Math.max(0, projectedQty - stockTotal);
-  const productionAdjusted = prodApplyMrp(productionNeeded, mrp.min_order_qty, mrp.multiple_qty);
+  const mrpFromDb = mrpRows.rows?.[0] || {};
+  const mrpFromSap = prodExtractMrpFromItem(sapItem || {});
+  const mrp = {
+    procurementMethod: String(mrpFromDb.procurement_method || mrpFromSap.procurementMethod || ""),
+    planningSystem: String(mrpFromDb.planning_system || mrpFromSap.planningSystem || ""),
+    leadTimeDays: prodNum(mrpFromDb.lead_time_days || mrpFromSap.leadTimeDays),
+    minOrderQty: prodNum(mrpFromDb.min_order_qty || mrpFromSap.minOrderQty),
+    multipleQty: prodNum(mrpFromDb.multiple_qty || mrpFromSap.multipleQty),
+  };
 
-  const litersPerUnit = prodNum(meta?.litersPerUnit || prodInferLitersPerUnit(itemDesc));
-  const baseLiquidCode = String(meta?.baseLiquidCode || "");
-  const baseLiquidFormula = meta?.baseLiquidFormula || (baseLiquidCode ? local.formulas.liquids?.[baseLiquidCode] : null);
-  const litersRequired = productionAdjusted * litersPerUnit;
+  const dashForAbc = await productionDashboardFromDb({ from: '2025-01-01', to: end, area: '__ALL__', grupo: '__ALL__', q: code, avgMonths, horizonMonths });
+  const dashRow = (dashForAbc.items || []).find((x) => String(x.itemCode || '') === code) || null;
+  const coverageMonthsTarget = dashRow ? prodNum(dashRow.coverageMonthsTarget || 1, 1) : 1;
+  const coveragePolicyLabel = prodCoverageLabel(coverageMonthsTarget);
+  const targetInventoryQty = stockMax > 0 ? stockMax * coverageMonthsTarget : projectedQty;
+  const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
+  const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : targetInventoryQty;
+  const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty - stockTotal);
+  const mrpAdjustedQty = productionNeeded;
+  const productionAdjusted = productionNeeded;
 
-  const reqMap = new Map();
-  const topLevel = Array.isArray(meta?.components) ? meta.components : [];
+  const sapBom = await prodFetchSapBom(code).catch(() => ({ source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] }));
+  let requirementPack = await prodBuildRequirementsFromSapBom({ itemCode: code, adjustedQty: productionAdjusted, sapBom }).catch(() => null);
 
-  for (const c of topLevel) {
-    const qty = prodNum(c.qtyPerUnit) * productionAdjusted;
-    if (String(c.componentType || "") === "LIQUID_BASE") continue;
-    prodMergeMaterial(reqMap, c.code, c.description, qty, c.unit, c.componentType);
-  }
-  if (baseLiquidFormula && Array.isArray(baseLiquidFormula.components)) {
-    for (const c of baseLiquidFormula.components) {
-      const qty = prodNum(c.qtyPerLiter) * litersRequired;
-      prodMergeMaterial(reqMap, c.code, c.description, qty, c.unit, "RAW_MATERIAL");
+  let litersPerUnit = 0;
+  let baseLiquidCode = "";
+  let litersRequired = 0;
+  let materialSource = "SAP producción · ProductTrees";
+  let usedLocalFallback = false;
+
+  if (!requirementPack || !Array.isArray(requirementPack.all) || !requirementPack.all.length) {
+    const fallbackReqMap = new Map();
+    const fallbackMeta = meta || null;
+    litersPerUnit = prodNum(fallbackMeta?.litersPerUnit || prodInferLitersPerUnit(itemDesc));
+    baseLiquidCode = String(fallbackMeta?.baseLiquidCode || "");
+    const baseLiquidFormula = fallbackMeta?.baseLiquidFormula || (baseLiquidCode ? local.formulas.liquids?.[baseLiquidCode] : null);
+    litersRequired = productionAdjusted * litersPerUnit;
+
+    const topLevel = Array.isArray(fallbackMeta?.components) ? fallbackMeta.components : [];
+    for (const c of topLevel) {
+      const qty = prodNum(c.qtyPerUnit) * productionAdjusted;
+      if (String(c.componentType || "") === "LIQUID_BASE") continue;
+      prodMergeMaterial(fallbackReqMap, c.code, c.description, qty, c.unit, c.componentType);
     }
+    if (baseLiquidFormula && Array.isArray(baseLiquidFormula.components)) {
+      for (const c of baseLiquidFormula.components) {
+        const qty = prodNum(c.qtyPerLiter) * litersRequired;
+        prodMergeMaterial(fallbackReqMap, c.code, c.description, qty, c.unit, "RAW_MATERIAL");
+      }
+    }
+
+    const requirements = Array.from(fallbackReqMap.values()).map((x) => {
+      const stockRec = local.materials?.materials?.[x.code] || null;
+      const stockQty = prodNum(stockRec?.stockQty);
+      const shortage = Math.max(0, x.requiredQty - stockQty);
+      const coverage = x.requiredQty > 0 ? stockQty / x.requiredQty : 0;
+      return {
+        ...x,
+        requiredQty: prodRound(x.requiredQty, 3),
+        stockQty: prodRound(stockQty, 3),
+        shortageQty: prodRound(shortage, 3),
+        coveragePct: prodRound(coverage * 100, 1),
+        supplier: String(stockRec?.supplier || ""),
+        cost: prodRound(stockRec?.cost, 4),
+        status: shortage > 0 ? "FALTANTE" : "OK",
+      };
+    });
+
+    requirementPack = {
+      source: "Catálogo local de respaldo",
+      all: requirements,
+      rawMaterials: requirements.filter((x) => x.componentType === "RAW_MATERIAL"),
+      packaging: requirements.filter((x) => x.componentType === "PACKAGING"),
+      resources: requirements.filter((x) => x.componentType === "RESOURCE"),
+      bottlenecks: requirements.filter((x) => x.shortageQty > 0 && x.componentType !== "RESOURCE").sort((a, b) => b.shortageQty - a.shortageQty).slice(0, 10),
+      bomHeaderQty: 1,
+      bomLines: [],
+    };
+    materialSource = "Catálogo local de respaldo";
+    usedLocalFallback = true;
+  } else {
+    materialSource = requirementPack.source || "SAP producción · ProductTrees";
+    litersPerUnit = prodNum(meta?.litersPerUnit || 0);
+    baseLiquidCode = String(meta?.baseLiquidCode || "");
+    litersRequired = prodRound(litersPerUnit * productionAdjusted, 3);
   }
 
-  const requirements = Array.from(reqMap.values()).map((x) => {
-    const stockRec = local.materials?.materials?.[x.code] || null;
-    const stockQty = prodNum(stockRec?.stockQty);
-    const shortage = Math.max(0, x.requiredQty - stockQty);
-    const coverage = x.requiredQty > 0 ? stockQty / x.requiredQty : 0;
-    return {
-      ...x,
-      requiredQty: prodRound(x.requiredQty, 3),
-      stockQty: prodRound(stockQty, 3),
-      shortageQty: prodRound(shortage, 3),
-      coveragePct: prodRound(coverage * 100, 1),
-      supplier: String(stockRec?.supplier || ""),
-      cost: prodRound(stockRec?.cost, 4),
-      status: shortage > 0 ? "FALTANTE" : "OK",
-    };
-  });
-
-  const rawMaterials = requirements.filter((x) => x.componentType === "RAW_MATERIAL");
-  const packaging = requirements.filter((x) => x.componentType === "PACKAGING");
-  const bottlenecks = requirements
-    .filter((x) => x.shortageQty > 0)
-    .sort((a, b) => b.shortageQty - a.shortageQty)
-    .slice(0, 8);
+  const requirements = Array.isArray(requirementPack?.all) ? requirementPack.all : [];
+  const rawMaterials = Array.isArray(requirementPack?.rawMaterials) ? requirementPack.rawMaterials : [];
+  const packaging = Array.isArray(requirementPack?.packaging) ? requirementPack.packaging : [];
+  const resources = Array.isArray(requirementPack?.resources) ? requirementPack.resources : [];
+  const bottlenecks = Array.isArray(requirementPack?.bottlenecks) ? requirementPack.bottlenecks : [];
 
   const rate = prodNum(local.capacity?.itemRates?.[code] || local.capacity?.defaultRates?.[machine] || 0);
   const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
@@ -7977,13 +9390,20 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   else laborRecommendation = "Se recomienda doble turno + sábado o reprogramar";
 
   const maxUnitsByMaterial = requirements
-    .filter((x) => x.requiredQty > 0)
+    .filter((x) => x.requiredQty > 0 && x.componentType !== "RESOURCE")
     .map((x) => {
       const perUnit = productionAdjusted > 0 ? x.requiredQty / productionAdjusted : 0;
       return perUnit > 0 ? prodNum(x.stockQty) / perUnit : Number.POSITIVE_INFINITY;
     })
     .filter((n) => Number.isFinite(n));
   const maxUnitsToday = maxUnitsByMaterial.length ? Math.floor(Math.min(...maxUnitsByMaterial)) : 0;
+
+  const costing = {
+    weightedCost: prodRound(weightedCost || 0, 4),
+    projectedDemandCost: prodRound((weightedCost || 0) * effectiveProjectedQty, 2),
+    adjustedProductionCost: prodRound((weightedCost || 0) * productionAdjusted, 2),
+    stockValue: prodRound((weightedCost || 0) * stockTotal, 2),
+  };
 
   return {
     ok: true,
@@ -7993,10 +9413,18 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     area,
     machine,
     abcHint: "",
-    period: { endDate: end, avgMonths: Math.max(1, Number(avgMonths || 5)), horizonMonths: Math.max(1, Number(horizonMonths || 3)), planStart, planEnd },
+    period: {
+      endDate: end,
+      avgMonths: Math.max(1, Number(avgMonths || 5)),
+      horizonMonths: Math.max(1, Number(horizonMonths || 3)),
+      planStart,
+      planEnd
+    },
     salesHistory,
+    recentProductionOrders: (prodOrders?.orders || []).slice(0, 20),
+    costing,
     avgMonthlyQty: prodRound(avgQty, 2),
-    projectedQty: prodRound(projectedQty, 2),
+    projectedQty: prodRound(targetInventoryQty, 2),
     inventory: {
       total: prodRound(stockTotal, 2),
       byWarehouse: byWh,
@@ -8004,19 +9432,27 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       stockMax: prodRound(stockMax, 2),
     },
     mrp: {
-      procurementMethod: String(mrp.procurement_method || ""),
-      planningSystem: String(mrp.planning_system || ""),
-      leadTimeDays: prodNum(mrp.lead_time_days),
-      minOrderQty: prodNum(mrp.min_order_qty),
-      multipleQty: prodNum(mrp.multiple_qty),
+      procurementMethod: mrp.procurementMethod,
+      procurementMethodLabel: prodProcurementMethodLabel(mrp.procurementMethod),
+      planningSystem: mrp.planningSystem,
+      leadTimeDays: prodNum(mrp.leadTimeDays),
+      minOrderQty: prodNum(mrp.minOrderQty),
+      multipleQty: prodNum(mrp.multipleQty),
     },
     production: {
       litersPerUnit: prodRound(litersPerUnit, 6),
       baseLiquidCode,
       litersRequired: prodRound(litersRequired, 3),
       neededQty: prodRound(productionNeeded, 2),
+      mrpAdjustedQty: prodRound(mrpAdjustedQty, 2),
       adjustedQty: prodRound(productionAdjusted, 2),
+      coverageMonthsTarget: prodRound(coverageMonthsTarget,2),
+      coveragePolicyLabel,
+      targetInventoryQty: prodRound(targetInventoryQty,2),
+      manualPlanQty: prodRound(manualPlanQty, 3),
+      planBasis: manualPlanQty > 0 ? "SUBPLAN_COMPONENTE" : "DEMANDA_PROYECTADA",
       maxUnitsToday,
+      practicalRule: `Política vigente: ${coveragePolicyLabel} según clasificación ABC, usando el máximo de SAP como base de inventario.`,
     },
     capacity: {
       unitsPerHour: prodRound(rate, 2),
@@ -8034,40 +9470,175 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       all: requirements,
       rawMaterials,
       packaging,
+      resources,
       bottlenecks,
     },
+    sapProduction: {
+      source: materialSource,
+      bomHeaderQty: prodRound(requirementPack?.bomHeaderQty || 1, 3),
+      bomLinesCount: Array.isArray(requirementPack?.bomLines) ? requirementPack.bomLines.length : 0,
+      usingLocalFallback: usedLocalFallback,
+    },
     meta: meta || null,
-    source: "base de datos sincronizada + catálogo local de fórmulas",
+    source: usedLocalFallback
+      ? "base de datos sincronizada + catálogo local de respaldo"
+      : "base de datos sincronizada + SAP producción (ProductTrees / órdenes de fabricación)",
   };
 }
 
+function prodNormalizeItemCodeLoose(v) {
+  const raw = String(v || "").trim().toUpperCase();
+  if (!raw) return "";
+  const m = raw.match(/^0*([0-9]+)(-[A-Z0-9]+)?$/i);
+  if (m) return `${m[1]}${m[2] || ""}`;
+  return raw.replace(/^0+(\d)/, "$1");
+}
+
+function prodExtractCodesFromText(text) {
+  const src = String(text || "").toUpperCase();
+  const matches = src.match(/\b\d{3,6}(?:-[A-Z0-9]+)?\b/g) || [];
+  const out = [];
+  const seen = new Set();
+  for (const code of matches) {
+    const normalized = prodNormalizeItemCodeLoose(code);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(String(code || "").trim());
+  }
+  return out;
+}
+
+function prodFindDashboardItemByCode(items, code) {
+  const wanted = String(code || "").trim();
+  if (!wanted) return null;
+  const wantedLoose = prodNormalizeItemCodeLoose(wanted);
+  for (const item of Array.isArray(items) ? items : []) {
+    const itemCode = String(item?.itemCode || "").trim();
+    if (!itemCode) continue;
+    if (itemCode.toUpperCase() === wanted.toUpperCase()) return item;
+    if (prodNormalizeItemCodeLoose(itemCode) === wantedLoose) return item;
+  }
+  return null;
+}
+
+function prodResolveRequestedCodes({ question = "", q = "", itemCode = "", dashboard = null }) {
+  const items = Array.isArray(dashboard?.items) ? dashboard.items : [];
+  const out = [];
+  const seen = new Set();
+  const pushCode = (code) => {
+    const found = prodFindDashboardItemByCode(items, code);
+    const finalCode = String(found?.itemCode || code || "").trim();
+    const key = prodNormalizeItemCodeLoose(finalCode);
+    if (!finalCode || !key || seen.has(key)) return;
+    seen.add(key);
+    out.push(finalCode);
+  };
+
+  if (itemCode) pushCode(itemCode);
+
+  const qTrim = String(q || "").trim();
+  if (qTrim) {
+    const direct = prodFindDashboardItemByCode(items, qTrim);
+    if (direct) pushCode(direct.itemCode);
+  }
+
+  for (const code of prodExtractCodesFromText(`${String(question || "")} ${String(q || "")}`)) {
+    pushCode(code);
+  }
+
+  return out;
+}
+
+function prodQuestionNeedsUrgentAbList(question) {
+  const q = String(question || "").toLowerCase();
+  return /(productos?|art[ií]culos?|tabla|lista|ranking)/.test(q) && /ab/.test(q) && /(urgente|cr[ií]tic|riesgo)/.test(q) && /stock/.test(q);
+}
+
+function prodQuestionNeedsPlanDetails(question) {
+  const q = String(question || "").toLowerCase();
+  return /(plan de producci[oó]n|materia prima|materias primas|empaque|empaques|cuello|botella|orden(?:es)? de producci[oó]n|costo ponderado|fabricar)/.test(q);
+}
+
+function prodCompactItemForAi(x) {
+  const stockTotal = prodNum(x?.stockTotal);
+  const stockMin = prodNum(x?.stockMin);
+  const stockMax = prodNum(x?.stockMax);
+  const productionNeeded = prodNum(x?.productionNeeded);
+  const gapToMin = stockMin > stockTotal ? prodRound(stockMin - stockTotal, 2) : 0;
+  return {
+    itemCode: x?.itemCode || "",
+    itemDesc: x?.itemDesc || "",
+    grupo: x?.grupo || "",
+    area: x?.area || "",
+    totalLabel: x?.totalLabel || "",
+    avgMonthlyQty: prodNum(x?.avgMonthlyQty),
+    projectedQty: prodNum(x?.projectedQty),
+    stockTotal,
+    stockMin,
+    stockMax,
+    gapToMin,
+    productionNeeded,
+    productionAdjusted: prodNum(x?.productionAdjusted),
+    machine: x?.machine || "",
+    hoursNeeded: prodNum(x?.hoursNeeded),
+    leadTimeDays: prodNum(x?.leadTimeDays),
+    belowMin: stockMin > 0 ? stockTotal < stockMin : productionNeeded > 0,
+    aboveMax: stockMax > 0 ? stockTotal > stockMax : false,
+  };
+}
+
+
+async function productionBuildItemPlanCached(params = {}) {
+  const key = JSON.stringify({
+    itemCode: String(params.itemCode || "").trim(),
+    toDate: String(params.toDate || ""),
+    avgMonths: Number(params.avgMonths || 5),
+    horizonMonths: Number(params.horizonMonths || 3),
+    shiftHours: Number(params.shiftHours || 8),
+    plannedQtyOverride: Number(params.plannedQtyOverride || 0),
+  });
+  const hit = prodRuntimeGet(PROD_PLAN_RUNTIME_CACHE, key, PROD_PLAN_TTL_MS);
+  if (hit) return hit;
+  const plan = await productionBuildItemPlan(params);
+  prodRuntimeSet(PROD_PLAN_RUNTIME_CACHE, key, plan);
+  return plan;
+}
+
+function prodBuildUrgentAbStockItems(items) {
+  return (Array.isArray(items) ? items : [])
+    .filter((x) => String(x?.totalLabel || "").startsWith("AB") && prodNum(x?.stockMin) > 0 && prodNum(x?.stockTotal) < prodNum(x?.stockMin))
+    .map((x) => ({
+      ...prodCompactItemForAi(x),
+      urgencyPctVsMin: prodRound((prodNum(x.stockMin) - prodNum(x.stockTotal)) / Math.max(prodNum(x.stockMin), 1) * 100, 1),
+    }))
+    .sort((a, b) => {
+      const d1 = prodNum(b.urgencyPctVsMin) - prodNum(a.urgencyPctVsMin);
+      if (d1) return d1;
+      const d2 = prodNum(b.gapToMin) - prodNum(a.gapToMin);
+      if (d2) return d2;
+      return prodNum(b.productionNeeded) - prodNum(a.productionNeeded);
+    });
+}
+
 function prodAiCompactDashboard(data) {
-  const topItems = (data?.items || []).slice(0, 25).map((x) => ({
-    itemCode: x.itemCode,
-    itemDesc: x.itemDesc,
-    grupo: x.grupo,
-    totalLabel: x.totalLabel,
-    avgMonthlyQty: x.avgMonthlyQty,
-    projectedQty: x.projectedQty,
-    stockTotal: x.stockTotal,
-    productionNeeded: x.productionNeeded,
-    productionAdjusted: x.productionAdjusted,
-    machine: x.machine,
-    hoursNeeded: x.hoursNeeded,
-    leadTimeDays: x.leadTimeDays,
-  }));
+  const items = Array.isArray(data?.items) ? data.items : [];
+  const compactItems = items.slice(0, 160).map(prodCompactItemForAi);
+  const urgentAbStockRiskItems = prodBuildUrgentAbStockItems(items).slice(0, 80);
   return {
     filters: {
       from: data?.from || "",
       to: data?.to || "",
       area: data?.area || "__ALL__",
       grupo: data?.grupo || "__ALL__",
+      q: data?.q || "",
       avgMonths: data?.avgMonths || 5,
       horizonMonths: data?.horizonMonths || 3,
     },
     totals: data?.totals || {},
     machineAgg: data?.machineAgg || [],
-    topItems,
+    filteredItemsCount: items.length,
+    filteredItems: compactItems,
+    urgentAbStockRiskItems,
   };
 }
 function prodAiCompactPlan(plan) {
@@ -8085,6 +9656,10 @@ function prodAiCompactPlan(plan) {
     ? plan.requirements.bottlenecks
     : [];
 
+  const resources = Array.isArray(plan.requirements?.resources)
+    ? plan.requirements.resources
+    : [];
+
   return {
     itemCode: plan.itemCode,
     itemDesc: plan.itemDesc,
@@ -8095,17 +9670,35 @@ function prodAiCompactPlan(plan) {
 
     avgMonthlyQty: plan.avgMonthlyQty,
     projectedQty: plan.projectedQty,
+    salesHistory: (plan.salesHistory || []).map((x) => ({
+      ym: x.ym,
+      label: x.label,
+      qty: x.qty,
+      producedQty: x.producedQty || 0,
+      weightedCost: x.weightedCost || 0,
+    })),
+    costing: plan.costing || {},
+    recentProductionOrders: (plan.recentProductionOrders || []).slice(0, 20).map((x) => ({
+      docNum: x.docNum,
+      postDate: x.postDate,
+      plannedQty: x.plannedQty,
+      completedQty: x.completedQty,
+      status: x.status,
+      warehouse: x.warehouse,
+    })),
 
     inventory: plan.inventory,
     mrp: plan.mrp,
     production: plan.production,
     capacity: plan.capacity,
+    sapProduction: plan.sapProduction || {},
 
     formula: {
       litersPerUnit: plan.production?.litersPerUnit || 0,
       baseLiquidCode: plan.production?.baseLiquidCode || "",
       litersRequired: plan.production?.litersRequired || 0,
       neededQty: plan.production?.neededQty || 0,
+      mrpAdjustedQty: plan.production?.mrpAdjustedQty || 0,
       adjustedQty: plan.production?.adjustedQty || 0
     },
 
@@ -8113,14 +9706,17 @@ function prodAiCompactPlan(plan) {
       hasRawMaterials: rawMaterials.length > 0,
       hasPackaging: packaging.length > 0,
       hasBottlenecks: bottlenecks.length > 0,
+      hasResources: resources.length > 0,
 
       rawMaterialsCount: rawMaterials.length,
       packagingCount: packaging.length,
       bottlenecksCount: bottlenecks.length,
+      resourcesCount: resources.length,
 
       rawMaterials,
       packaging,
-      bottlenecks
+      bottlenecks,
+      resources
     }
   };
 }
@@ -8139,30 +9735,43 @@ function prodExtractResponseText(obj) {
   }
   return out.join("\n\n").trim();
 }
-async function prodOpenAiChat({ question, dashboard, plan }) {
+async function prodOpenAiChat({ question, dashboard, plan, plans = [], requestedCodes = [], questionMatches = [] }) {
   const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
   const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
   if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
 
   const input = {
     dashboard: prodAiCompactDashboard(dashboard),
+    requestedCodes: Array.isArray(requestedCodes) ? requestedCodes : [],
+    questionMatches: (Array.isArray(questionMatches) ? questionMatches : []).map(prodCompactItemForAi),
     selectedPlan: prodAiCompactPlan(plan),
+    requestedPlans: (Array.isArray(plans) ? plans : []).map((x) => prodAiCompactPlan(x)).filter(Boolean).slice(0, 8),
   };
 
-const system = [
-  "Eres un planificador de producción interno de PRODIMA.",
-  "Usa exclusivamente el JSON entregado como fuente de verdad.",
-  "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) y catálogo local de fórmulas/materiales.",
-  "No inventes datos que no estén en el JSON.",
-  "Responde en español.",
-  "IMPORTANTE: las cantidades de producto terminado siempre se expresan en UNIDADES, nunca en cajas.",
-  "IMPORTANTE: si el JSON trae requirements.rawMaterials, requirements.packaging o requirements.bottlenecks, debes analizarlos y mencionarlos explícitamente.",
-  "IMPORTANTE: no digas que faltan materias primas, empaques o cuellos de botella si esos arreglos existen en el JSON y tienen elementos.",
-  "IMPORTANTE: usa formula.litersPerUnit, formula.baseLiquidCode y formula.litersRequired cuando existan.",
-  "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo:",
-  "1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria / ajustada por MRP 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
-  "Si realmente falta información en el JSON, dilo claramente.",
-].join(' ');
+  const system = [
+    "Eres un planificador de producción interno de PRODIMA.",
+    "Usa exclusivamente el JSON entregado como fuente de verdad.",
+    "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) con SAP producción (ProductTrees y órdenes de fabricación).",
+    "Solo si el JSON lo indica explícitamente, puedes mencionar que hubo respaldo desde catálogo local.",
+    "No inventes datos que no estén en el JSON.",
+    "Responde en español.",
+    "IMPORTANTE: las cantidades de producto terminado siempre se expresan en UNIDADES, nunca en cajas.",
+    "IMPORTANTE: cuando exista sapProduction.source, menciónalo para dejar claro si los materiales vienen directo de SAP producción.",
+    "IMPORTANTE: cuando existan salesHistory.producedQty o recentProductionOrders, esos son los datos válidos para responder cuánto se produjo el artículo por mes o en órdenes recientes.",
+    "IMPORTANTE: cuando exista costing.weightedCost, úsalo como costo ponderado unitario del artículo y analiza también stockValue, projectedDemandCost y adjustedProductionCost.",
+    "IMPORTANTE: toma production.neededQty como la cantidad principal a producir. La política vigente usa el máximo de SAP como base de inventario: AB Crítico = 2 meses, C Importante = 1 mes, D = 0.5 mes.",
+    "IMPORTANTE: si requirements.rawMaterials, requirements.packaging, requirements.resources o requirements.bottlenecks existen, debes analizarlos y mencionarlos explícitamente.",
+    "IMPORTANTE: los registros en requirements.resources son RECURSOS internos (operarios, supervisoras, líneas, gastos de fabricación) y no deben tratarse como faltantes de inventario.",
+    "IMPORTANTE: usa procurementMethodLabel para explicar el método con lenguaje humano: 'Se fabrica en planta' o 'No se fabrica en planta'.",
+    "IMPORTANTE: si el usuario compara varios planes, identifica si los mismos resources aparecen en más de un lote y advierte posibles choques de capacidad.",
+    "IMPORTANTE: para riesgo de stock urgente usa SOLO dashboard.urgentAbStockRiskItems o el criterio estricto stockTotal < stockMin. No incluyas ítems en o por encima del stock mínimo, y nunca marques como urgentes artículos por encima del máximo.",
+    "IMPORTANTE: aunque no haya artículo seleccionado, si la pregunta menciona códigos o el buscador coincide, debes usar requestedCodes, questionMatches y requestedPlans. No digas que un código no aparece en el JSON si existe en requestedPlans, questionMatches o filteredItems.",
+    "IMPORTANTE: selectedPlan es el artículo seleccionado. requestedPlans puede traer varios planes completos sin selección manual; úsalo cuando el usuario pida varios productos o un código escrito en la pregunta.",
+    "Si el usuario pide tabla, excel, ranking, lista, columnas o detalle por mes/material/orden, responde con una tabla markdown completa con encabezados claros y datos exactos.",
+    "Evita responder con slash (/), listas planas o pseudo-tablas.",
+    "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo con: 1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria y política de inventario 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
+    "Si realmente falta información en el JSON, dilo claramente.",
+  ].join(" ");
 
   const payload = {
     model,
@@ -8170,11 +9779,15 @@ const system = [
       { role: "system", content: [{ type: "input_text", text: system }] },
       {
         role: "user",
-        content: [{ type: "input_text", text: `Pregunta:\n${String(question || "").trim()}\n\nContexto JSON:\n${JSON.stringify(input)}` }],
+        content: [{ type: "input_text", text: `Pregunta:
+${String(question || "").trim()}
+
+Contexto JSON:
+${JSON.stringify(input)}` }],
       },
     ],
     text: { format: { type: "text" } },
-    max_output_tokens: 900,
+    max_output_tokens: 1200,
   };
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
@@ -8222,8 +9835,9 @@ app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, 5)));
     const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 3)));
     const shiftHours = Math.max(1, Math.min(24, prodNum(req.query?.shiftHours, 8)));
+    const plannedQty = Math.max(0, prodNum(req.query?.plannedQty, 0));
 
-    const plan = await productionBuildItemPlan({ itemCode, toDate, avgMonths, horizonMonths, shiftHours });
+    const plan = await productionBuildItemPlanCached({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty });
 
     const dash = await productionDashboardFromDb({
       from: "2025-01-01",
@@ -8261,14 +9875,36 @@ app.post("/api/admin/production/ai-chat", verifyAdmin, async (req, res) => {
     const itemCode = String(req.body?.itemCode || "").trim();
 
     const dashboard = await productionDashboardFromDb({ from, to, area, grupo, q, avgMonths, horizonMonths });
-    const plan = itemCode ? await productionBuildItemPlan({ itemCode, toDate: to, avgMonths, horizonMonths, shiftHours }) : null;
-    if (plan && dashboard?.items?.length) {
-      const row = dashboard.items.find((x) => String(x.itemCode || "") === itemCode);
-      if (row) plan.abcHint = row.totalLabel || "";
+    const requestedCodes = prodResolveRequestedCodes({ question, q, itemCode, dashboard });
+    const questionMatches = requestedCodes.map((code) => prodFindDashboardItemByCode(dashboard?.items || [], code)).filter(Boolean);
+
+    const planCodes = requestedCodes.slice(0, 8);
+    const plans = [];
+    for (const code of planCodes) {
+      try {
+        const built = await productionBuildItemPlan({ itemCode: code, toDate: to, avgMonths, horizonMonths, shiftHours });
+        const row = prodFindDashboardItemByCode(dashboard?.items || [], code);
+        if (row) built.abcHint = row.totalLabel || "";
+        plans.push(built);
+      } catch {}
     }
 
-    const out = await prodOpenAiChat({ question, dashboard, plan });
-    return safeJson(res, 200, { ok: true, answer: out.answer, model: out.model, source: "base de datos sincronizada + catálogo local" });
+    if (!plans.length && prodQuestionNeedsPlanDetails(question) && prodQuestionNeedsUrgentAbList(question)) {
+      const fallbackCodes = prodBuildUrgentAbStockItems(dashboard?.items || []).slice(0, 5).map((x) => x.itemCode);
+      for (const code of fallbackCodes) {
+        try {
+          const built = await productionBuildItemPlan({ itemCode: code, toDate: to, avgMonths, horizonMonths, shiftHours });
+          const row = prodFindDashboardItemByCode(dashboard?.items || [], code);
+          if (row) built.abcHint = row.totalLabel || "";
+          plans.push(built);
+        } catch {}
+      }
+    }
+
+    const plan = plans[0] || null;
+    const out = await prodOpenAiChat({ question, dashboard, plan, plans, requestedCodes, questionMatches });
+    const source = plans[0]?.source || plan?.source || "base de datos sincronizada + SAP producción";
+    return safeJson(res, 200, { ok: true, answer: out.answer, model: out.model, source, requestedCodes, matchedPlans: plans.map((x) => x.itemCode) });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -8295,6 +9931,7 @@ async function handleProductionSync(req, res) {
     const syncErrors = [];
 
     const salesSaved = await globalThis.syncSales({ from, to, maxDocs });
+    const demandSaved = await syncProductionDemandOrders({ from, to, maxDocs });
 
     let groupsSaved = 0;
     try {
@@ -8333,7 +9970,7 @@ async function handleProductionSync(req, res) {
     return safeJson(res, 200, {
       ok: true,
       from, to, maxDocs,
-      salesSaved, groupsSaved, invSaved, invWhSaved, mrpSaved,
+      salesSaved, demandSaved, groupsSaved, invSaved, invWhSaved, mrpSaved,
       syncErrors,
       formulasLoaded: Object.keys(loadProductionLocalData().formulas?.products || {}).length,
       materialsLoaded: Object.keys(loadProductionLocalData().materials?.materials || {}).length,
@@ -8681,7 +10318,163 @@ function estratExtractResponseText(obj) {
   return out.join("\n\n").trim();
 }
 
-async function openaiEstratificacionChat({ question, dashboard, itemRows = [], itemLabel = "" }) {
+
+function estratNormalizeItemCodeLoose(v) {
+  const raw = String(v || '').trim().toUpperCase();
+  if (!raw) return '';
+  const m = raw.match(/^0*([0-9]+)([.-][A-Z0-9]+)?$/i);
+  if (m) return `${m[1] || ''}${m[2] || ''}`;
+  return raw.replace(/^0+(\d)/, '$1');
+}
+
+function estratExtractCodesFromText(text) {
+  const src = String(text || '').toUpperCase();
+  const matches = src.match(/\d{3,6}(?:[.-][A-Z0-9]+)?/g) || [];
+  const out = [];
+  const seen = new Set();
+  for (const code of matches) {
+    const key = estratNormalizeItemCodeLoose(code);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(String(code || '').trim());
+  }
+  return out;
+}
+
+function estratFindDashboardItemByCode(items, code) {
+  const wanted = String(code || '').trim();
+  if (!wanted) return null;
+  const wantedLoose = estratNormalizeItemCodeLoose(wanted);
+  for (const item of Array.isArray(items) ? items : []) {
+    const itemCode = String(item?.itemCode || '').trim();
+    if (!itemCode) continue;
+    if (itemCode.toUpperCase() === wanted.toUpperCase()) return item;
+    if (estratNormalizeItemCodeLoose(itemCode) === wantedLoose) return item;
+  }
+  return null;
+}
+
+function estratFindDashboardItemsByText(items, text) {
+  const qn = norm(text || '');
+  if (!qn) return [];
+  return (Array.isArray(items) ? items : []).filter((item) => {
+    const codeN = norm(item?.itemCode || '');
+    const descN = norm(item?.itemDesc || '');
+    return codeN === qn || descN.includes(qn) || qn.includes(codeN);
+  });
+}
+
+function estratResolveRequestedCodes({ question = '', q = '', itemCode = '', dashboard = null }) {
+  const items = Array.isArray(dashboard?.items) ? dashboard.items : [];
+  const out = [];
+  const seen = new Set();
+  const pushCode = (code) => {
+    const found = estratFindDashboardItemByCode(items, code);
+    const finalCode = String(found?.itemCode || code || '').trim();
+    const key = estratNormalizeItemCodeLoose(finalCode);
+    if (!finalCode || !key || seen.has(key)) return;
+    seen.add(key);
+    out.push(finalCode);
+  };
+
+  if (itemCode) pushCode(itemCode);
+
+  const qTrim = String(q || '').trim();
+  if (qTrim) {
+    const direct = estratFindDashboardItemByCode(items, qTrim);
+    if (direct) pushCode(direct.itemCode);
+    const byText = estratFindDashboardItemsByText(items, qTrim);
+    if (byText.length === 1) pushCode(byText[0].itemCode);
+    if (!out.length && Array.isArray(items) && items.length === 1) pushCode(items[0].itemCode);
+  }
+
+  for (const code of estratExtractCodesFromText(`${String(question || '')} ${String(q || '')}`)) {
+    pushCode(code);
+  }
+
+  return out;
+}
+
+function estratCompactSelectedItem(rows, itemLabel = '') {
+  const safeNum = (x, d = 0) => {
+    const n = Number(x || 0);
+    return Number.isFinite(n) ? Number(n.toFixed(d)) : 0;
+  };
+  const safeMoney = (x) => safeNum(x, 2);
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) return null;
+
+  const byCustomer = new Map();
+  const byMonth = new Map();
+  let totQty = 0, totRev = 0, totGp = 0;
+  let area = '', grupo = '', itemCode = '', itemDesc = '';
+
+  for (const r of list) {
+    const qty = Number(r.quantity || 0);
+    const rev = Number(r.revenue || 0);
+    const gp = Number(r.gp || 0);
+    const month = String(r.docDate || '').slice(0, 7);
+    const ckey = `${r.cardCode || ''}||${r.cardName || ''}`;
+
+    itemCode = itemCode || String(r.itemCode || '');
+    itemDesc = itemDesc || String(r.itemDesc || '');
+    area = area || String(r.area || '');
+    grupo = grupo || String(r.grupo || '');
+
+    totQty += qty; totRev += rev; totGp += gp;
+
+    const c = byCustomer.get(ckey) || { cardCode: String(r.cardCode || ''), cardName: String(r.cardName || ''), quantity: 0, revenue: 0, gp: 0 };
+    c.quantity += qty; c.revenue += rev; c.gp += gp;
+    byCustomer.set(ckey, c);
+
+    if (month) {
+      const m = byMonth.get(month) || { month, quantity: 0, revenue: 0, gp: 0 };
+      m.quantity += qty; m.revenue += rev; m.gp += gp;
+      byMonth.set(month, m);
+    }
+  }
+
+  return {
+    label: itemLabel || itemCode || itemDesc || '',
+    itemCode,
+    itemDesc,
+    area,
+    grupo,
+    totals: {
+      quantity: safeNum(totQty, 4),
+      revenue: safeMoney(totRev),
+      gp: safeMoney(totGp),
+      gpPct: totRev ? safeNum((totGp / totRev) * 100, 2) : 0
+    },
+    topCustomers: Array.from(byCustomer.values()).map((x) => ({
+      cardCode: x.cardCode,
+      cardName: x.cardName,
+      quantity: safeNum(x.quantity, 4),
+      revenue: safeMoney(x.revenue),
+      gp: safeMoney(x.gp),
+      gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
+    })).sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0)).slice(0, 20),
+    byMonth: Array.from(byMonth.values()).map((x) => ({
+      month: x.month,
+      quantity: safeNum(x.quantity, 4),
+      revenue: safeMoney(x.revenue),
+      gp: safeMoney(x.gp),
+      gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
+    })).sort((a, b) => String(a.month).localeCompare(String(b.month))).slice(0, 24),
+    rawRows: list.slice(0, 120).map((r) => ({
+      docDate: r.docDate,
+      cardCode: r.cardCode,
+      cardName: r.cardName,
+      quantity: safeNum(r.quantity, 4),
+      revenue: safeMoney(r.revenue),
+      gp: safeMoney(r.gp),
+      area: r.area,
+      grupo: r.grupo
+    }))
+  };
+}
+
+async function openaiEstratificacionChat({ question, dashboard, itemRows = [], itemLabel = "", itemDetails = [], requestedCodes = [], matchedItems = [] }) {
   const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
   const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
   if (!apiKey) throw new Error("OPENAI_API_KEY no configurada");
@@ -8745,87 +10538,30 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
     })),
   };
 
-  const selectedItem = itemRows.length ? (() => {
-    const rows = Array.isArray(itemRows) ? itemRows : [];
-    const byCustomer = new Map();
-    const byMonth = new Map();
-    let totQty = 0, totRev = 0, totGp = 0;
-    let area = "", grupo = "", itemCode = "", itemDesc = "";
-
-    for (const r of rows) {
-      const qty = Number(r.quantity || 0);
-      const rev = Number(r.revenue || 0);
-      const gp = Number(r.gp || 0);
-      const month = String(r.docDate || "").slice(0, 7);
-      const ckey = `${r.cardCode || ""}||${r.cardName || ""}`;
-
-      itemCode = itemCode || String(r.itemCode || "");
-      itemDesc = itemDesc || String(r.itemDesc || "");
-      area = area || String(r.area || "");
-      grupo = grupo || String(r.grupo || "");
-
-      totQty += qty; totRev += rev; totGp += gp;
-
-      const c = byCustomer.get(ckey) || {
-        cardCode: String(r.cardCode || ""),
-        cardName: String(r.cardName || ""),
-        quantity: 0,
-        revenue: 0,
-        gp: 0
-      };
-      c.quantity += qty; c.revenue += rev; c.gp += gp;
-      byCustomer.set(ckey, c);
-
-      if (month) {
-        const m = byMonth.get(month) || { month, quantity: 0, revenue: 0, gp: 0 };
-        m.quantity += qty; m.revenue += rev; m.gp += gp;
-        byMonth.set(month, m);
-      }
-    }
-
-    return {
-      label: itemLabel || itemCode || itemDesc || "",
-      itemCode,
-      itemDesc,
-      area,
-      grupo,
-      totals: {
-        quantity: safeNum(totQty, 4),
-        revenue: safeMoney(totRev),
-        gp: safeMoney(totGp),
-        gpPct: totRev ? safeNum((totGp / totRev) * 100, 2) : 0
-      },
-      topCustomers: Array.from(byCustomer.values()).map((x) => ({
-        cardCode: x.cardCode,
-        cardName: x.cardName,
-        quantity: safeNum(x.quantity, 4),
-        revenue: safeMoney(x.revenue),
-        gp: safeMoney(x.gp),
-        gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
-      })).sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0)).slice(0, 20),
-      byMonth: Array.from(byMonth.values()).map((x) => ({
-        month: x.month,
-        quantity: safeNum(x.quantity, 4),
-        revenue: safeMoney(x.revenue),
-        gp: safeMoney(x.gp),
-        gpPct: x.revenue ? safeNum((x.gp / x.revenue) * 100, 2) : 0
-      })).sort((a, b) => String(a.month).localeCompare(String(b.month))).slice(0, 24),
-      rawRows: rows.slice(0, 120).map((r) => ({
-        docDate: r.docDate,
-        cardCode: r.cardCode,
-        cardName: r.cardName,
-        quantity: safeNum(r.quantity, 4),
-        revenue: safeMoney(r.revenue),
-        gp: safeMoney(r.gp),
-        area: r.area,
-        grupo: r.grupo
-      }))
-    };
-  })() : null;
+  const selectedItem = estratCompactSelectedItem(itemRows, itemLabel);
+  const requestedItems = (Array.isArray(itemDetails) ? itemDetails : [])
+    .map((x) => estratCompactSelectedItem(x?.rows || [], x?.label || x?.itemCode || ''))
+    .filter(Boolean)
+    .slice(0, 5);
 
   const compact = {
     dashboard: compactDashboard,
-    selectedItem
+    selectedItem,
+    requestedCodes: Array.isArray(requestedCodes) ? requestedCodes : [],
+    matchedItems: (Array.isArray(matchedItems) ? matchedItems : []).map((x) => ({
+      itemCode: x?.itemCode || '',
+      itemDesc: x?.itemDesc || '',
+      area: x?.area || '',
+      grupo: x?.grupo || '',
+      totalLabel: x?.totalLabel || '',
+      stock: safeNum(x?.stock, 2),
+      stockMin: safeNum(x?.stockMin, 2),
+      stockMax: safeNum(x?.stockMax, 2),
+      revenue: safeMoney(x?.revenue),
+      gp: safeMoney(x?.gp),
+      gpPct: safeNum(x?.gpPct, 2),
+    })),
+    requestedItems
   };
 
   const system = [
@@ -8842,6 +10578,8 @@ async function openaiEstratificacionChat({ question, dashboard, itemRows = [], i
     "Si el usuario pregunta por artículos críticos, prioriza artículos A o AB, especialmente los que estén bajo mínimo o con alta participación de ventas.",
     "Si el usuario pregunta por oportunidades, identifica artículos con buen margen, artículos con stock alto y baja venta, y artículos con potencial de mejora.",
     "Si hay un artículo seleccionado, analízalo primero. Luego compáralo contra el contexto general solo si eso agrega valor.",
+    "IMPORTANTE: aunque no exista artículo seleccionado manualmente, si requestedCodes, matchedItems o requestedItems traen uno o más artículos inferidos desde la pregunta o la búsqueda, debes analizarlos como contexto principal. No digas que un código no aparece si está en requestedCodes, matchedItems o requestedItems.",
+    "Si requestedItems trae varios artículos, compáralos directamente en la respuesta y usa tablas markdown cuando eso ayude.",
     "Si hay datos del artículo por cliente o por mes, menciona qué clientes lo compran más, cómo se comporta en el tiempo y si su margen cambia.",
     "Cuando compares artículos, usa métricas concretas: revenue, GP, GP%, stock, disponible, comprometido, ordenado y clasificación.",
     "Si detectas riesgo, explica por qué: por ejemplo alto revenue con stock bajo, margen bajo, sobrestock, dependencia de un grupo o concentración excesiva.",
@@ -8956,15 +10694,36 @@ app.post("/api/admin/estratificacion/ai-chat", verifyAdmin, async (req, res) => 
     const to = isISO(toQ) ? toQ : today;
 
     const dashboard = await loadEstratificacionDashboardForAi({ from, to, area, grupo, q });
-    const itemRows = itemCode
-      ? await estratLoadItemDocsForAi({ itemCode, from, to, area, grupo })
-      : [];
+    const requestedCodes = estratResolveRequestedCodes({ question, q, itemCode, dashboard });
+    const matchedItems = requestedCodes
+      .map((code) => estratFindDashboardItemByCode(dashboard?.items || [], code))
+      .filter(Boolean);
+
+    const itemDetails = [];
+    for (const code of requestedCodes.slice(0, 5)) {
+      try {
+        const rows = await estratLoadItemDocsForAi({ itemCode: code, from, to, area, grupo });
+        const matched = estratFindDashboardItemByCode(dashboard?.items || [], code);
+        if (rows.length || matched) {
+          itemDetails.push({
+            itemCode: String(matched?.itemCode || code || '').trim(),
+            label: String(matched?.itemDesc || itemLabel || code || '').trim(),
+            rows,
+          });
+        }
+      } catch {}
+    }
+
+    const primaryDetail = itemDetails[0] || null;
 
     const out = await openaiEstratificacionChat({
       question,
       dashboard,
-      itemRows,
-      itemLabel: itemLabel || itemCode,
+      itemRows: primaryDetail?.rows || [],
+      itemLabel: primaryDetail?.label || itemLabel || itemCode,
+      itemDetails,
+      requestedCodes,
+      matchedItems,
     });
 
     return safeJson(res, 200, {
@@ -8974,7 +10733,14 @@ app.post("/api/admin/estratificacion/ai-chat", verifyAdmin, async (req, res) => 
       source: "db",
       range: { from, to },
       filters: { area, grupo, q },
-      focus: itemCode ? { itemCode, itemLabel: itemLabel || itemCode } : null,
+      focus: primaryDetail ? {
+        itemCode: primaryDetail.itemCode,
+        itemLabel: primaryDetail.label || primaryDetail.itemCode,
+        label: primaryDetail.label || primaryDetail.itemCode,
+        inferred: !itemCode || String(primaryDetail.itemCode || '') !== String(itemCode || ''),
+      } : null,
+      requestedCodes,
+      matchedItems: matchedItems.map((x) => String(x?.itemCode || '').trim()).filter(Boolean),
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
