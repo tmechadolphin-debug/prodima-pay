@@ -4311,8 +4311,6 @@ async function ensureDb() {
       item_code TEXT NOT NULL DEFAULT '',
       item_desc TEXT NOT NULL DEFAULT '',
       quantity  NUMERIC(18,4) NOT NULL DEFAULT 0,
-      num_per_msr NUMERIC(18,4) NOT NULL DEFAULT 1,
-      quantity_base NUMERIC(18,4) NOT NULL DEFAULT 0,
       revenue   NUMERIC(18,2) NOT NULL DEFAULT 0,
       gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0,
       item_group TEXT DEFAULT '',
@@ -4324,8 +4322,6 @@ async function ensureDb() {
   `);
 
   await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS doc_num INTEGER;`);
-  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS num_per_msr NUMERIC(18,4) NOT NULL DEFAULT 1;`);
-  await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS quantity_base NUMERIC(18,4) NOT NULL DEFAULT 0;`);
 
   /* ✅ NUEVO: cliente en líneas (para el modal) */
   await dbQuery(`ALTER TABLE sales_item_lines ADD COLUMN IF NOT EXISTS card_code TEXT DEFAULT '';`);
@@ -4555,8 +4551,6 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
     const gpRaw = Number(pickGrossProfit(ln) || 0);
 
     const qty = Math.abs(qtyRaw) * sign;
-    const numPerMsr = Math.abs(Number(ln?.NumPerMsr || ln?.ItemsPerUnit || 1)) || 1;
-    const qtyBase = qty * numPerMsr;
     const rev = Math.abs(revRaw) * sign;
     const gp = Math.abs(gpRaw) * sign;
 
@@ -4564,9 +4558,9 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
       `
       INSERT INTO sales_item_lines(
         doc_entry,line_num,doc_type,doc_date,doc_num,card_code,card_name,
-        item_code,item_desc,quantity,num_per_msr,quantity_base,revenue,gross_profit,updated_at
+        item_code,item_desc,quantity,revenue,gross_profit,updated_at
       )
-      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
+      VALUES($1,$2,$3,$4::date,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
       ON CONFLICT(doc_entry,line_num,doc_type) DO UPDATE SET
         doc_date=EXCLUDED.doc_date,
         doc_num=EXCLUDED.doc_num,
@@ -4575,13 +4569,11 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
         item_code=EXCLUDED.item_code,
         item_desc=EXCLUDED.item_desc,
         quantity=EXCLUDED.quantity,
-        num_per_msr=EXCLUDED.num_per_msr,
-        quantity_base=EXCLUDED.quantity_base,
         revenue=EXCLUDED.revenue,
         gross_profit=EXCLUDED.gross_profit,
         updated_at=NOW()
       `,
-      [docEntry, lineNum, docType, docDate, docNum, cardCode, cardName, itemCode, itemDesc, qty, numPerMsr, qtyBase, rev, gp]
+      [docEntry, lineNum, docType, docDate, docNum, cardCode, cardName, itemCode, itemDesc, qty, rev, gp]
     );
 
     inserted++;
@@ -4664,7 +4656,7 @@ async function syncInventoryForSalesItems({ from, to, maxItems = 1200 }) {
   const r = await dbQuery(
     `
     SELECT DISTINCT item_code
-    FROM production_demand_lines
+    FROM sales_item_lines
     WHERE doc_date >= $1::date AND doc_date <= $2::date
       AND item_code <> ''
     LIMIT $3
@@ -5896,11 +5888,8 @@ async function slFetch(path, options = {}) {
 /* =========================================================
    ✅ SAP: scan invoices + credit notes
 ========================================================= */
-async function scanDocHeaders(entity, { f, t, from, to, maxDocs = 3000 }) {
-  const fromDate = String(f || from || '').slice(0,10);
-  const toDate = String(t || to || '').slice(0,10);
-  if (!fromDate || !toDate) throw new Error('scanDocHeaders requiere rango de fechas');
-  const toPlus1 = addDaysISO(toDate, 1);
+async function scanDocHeaders(entity, { f, t, maxDocs = 3000 }) {
+  const toPlus1 = addDaysISO(t, 1);
   const batchTop = 200;
   let skipSap = 0;
   const out = [];
@@ -5908,7 +5897,7 @@ async function scanDocHeaders(entity, { f, t, from, to, maxDocs = 3000 }) {
   for (let page = 0; page < 500; page++) {
     const raw = await slFetch(
       `/${entity}?$select=DocEntry,DocNum,DocDate,CardCode,CardName` +
-        `&$filter=${encodeURIComponent(`DocDate ge '${fromDate}' and DocDate lt '${toPlus1}'`)}` +
+        `&$filter=${encodeURIComponent(`DocDate ge '${f}' and DocDate lt '${toPlus1}'`)}` +
         `&$orderby=DocDate asc,DocEntry asc&$top=${batchTop}&$skip=${skipSap}`,
       { timeoutMs: 60000 }
     );
@@ -7907,35 +7896,9 @@ async function ensureProductionDb() {
     );
   `);
 
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS production_demand_lines (
-      doc_entry BIGINT NOT NULL,
-      line_num INTEGER NOT NULL,
-      doc_type TEXT NOT NULL DEFAULT 'ORD',
-      doc_date DATE,
-      doc_num BIGINT,
-      card_code TEXT NOT NULL DEFAULT '',
-      card_name TEXT NOT NULL DEFAULT '',
-      item_code TEXT NOT NULL DEFAULT '',
-      item_desc TEXT NOT NULL DEFAULT '',
-      quantity NUMERIC(18,4) NOT NULL DEFAULT 0,
-      revenue NUMERIC(18,2) NOT NULL DEFAULT 0,
-      gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0,
-      area TEXT NOT NULL DEFAULT '',
-      item_group TEXT NOT NULL DEFAULT '',
-      updated_at TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY(doc_entry, line_num, doc_type)
-    );
-  `);
-
-  await dbQuery(`ALTER TABLE production_demand_lines ADD COLUMN IF NOT EXISTS num_per_msr NUMERIC(18,4) NOT NULL DEFAULT 1;`);
-  await dbQuery(`ALTER TABLE production_demand_lines ADD COLUMN IF NOT EXISTS quantity_base NUMERIC(18,4) NOT NULL DEFAULT 0;`);
-
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_item_cache_updated ON production_item_cache(updated_at);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_orders_item_date ON production_orders_cache(item_code, post_date DESC);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_bom_parent ON production_bom_cache(parent_item_code);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_item_date ON production_demand_lines(item_code, doc_date DESC);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_date ON production_demand_lines(doc_date DESC);`);
 
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_inv_wh_item ON production_inv_wh_cache(item_code);`);
 }
@@ -8693,7 +8656,7 @@ async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
   const r = await dbQuery(
     `
     SELECT DISTINCT item_code
-    FROM production_demand_lines
+    FROM sales_item_lines
     WHERE doc_date >= $1::date AND doc_date <= $2::date
       AND item_code <> ''
     LIMIT $3
@@ -8786,144 +8749,21 @@ async function syncProductionMrp({ from, to, maxItems = 2500 }) {
   return saved;
 }
 
-
-function prodCoverageMonthsByLabel(totalLabel) {
-  const t = String(totalLabel || '').toLowerCase();
-  if (t.includes('ab crítico') || t.includes('ab critico')) return 2;
-  if (t.includes('c importante')) return 1;
-  if (/^d/.test(t) || t.includes(' d ')) return 0.5;
-  return 1;
-}
-
-function prodCoverageLabel(months) {
-  const n = Number(months || 0);
-  if (n === 2) return '2 meses de inv';
-  if (n === 1) return '1 mes de inv';
-  if (n === 0.5) return '0.5 mes de inv';
-  return `${prodRound(n,2)} mes(es) de inv`;
-}
-
-async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
-  const headers = await scanDocHeaders('Orders', { from, to, maxDocs });
-  let saved = 0;
-  for (const h of headers) {
-    try {
-      const full = await getDoc('Orders', h.DocEntry);
-      const docEntry = Number(full?.DocEntry || h.DocEntry || 0);
-      const docNum = full?.DocNum != null ? Number(full.DocNum) : (h.DocNum != null ? Number(h.DocNum) : null);
-      const cardCode = String(full?.CardCode || '').trim();
-      const cardName = String(full?.CardName || '').trim();
-      const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
-      for (const ln of lines) {
-        const lineNum = Number(ln?.LineNum);
-        if (!Number.isFinite(lineNum)) continue;
-        const itemCode = String(ln?.ItemCode || '').trim();
-        if (!itemCode) continue;
-        const itemDesc = String(ln?.ItemDescription || ln?.ItemName || '').trim();
-        const qty = Math.abs(Number(ln?.Quantity || 0));
-        const numPerMsr = Math.abs(Number(ln?.NumPerMsr || ln?.ItemsPerUnit || 1)) || 1;
-        const qtyBase = qty * numPerMsr;
-        const rev = Math.abs(Number(ln?.LineTotal || 0));
-        const gp = Math.abs(Number(pickGrossProfit(ln) || 0));
-        await dbQuery(`
-          INSERT INTO production_demand_lines(
-            doc_entry,line_num,doc_type,doc_date,doc_num,card_code,card_name,
-            item_code,item_desc,quantity,num_per_msr,quantity_base,revenue,gross_profit,updated_at
-          ) VALUES($1,$2,'ORD',$3::date,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
-          ON CONFLICT(doc_entry,line_num,doc_type) DO UPDATE SET
-            doc_date=EXCLUDED.doc_date,
-            doc_num=EXCLUDED.doc_num,
-            card_code=EXCLUDED.card_code,
-            card_name=EXCLUDED.card_name,
-            item_code=EXCLUDED.item_code,
-            item_desc=EXCLUDED.item_desc,
-            quantity=EXCLUDED.quantity,
-            num_per_msr=EXCLUDED.num_per_msr,
-            quantity_base=EXCLUDED.quantity_base,
-            revenue=EXCLUDED.revenue,
-            gross_profit=EXCLUDED.gross_profit,
-            updated_at=NOW()
-        `,[docEntry,lineNum,String(h.DocDate||'').slice(0,10),docNum,cardCode,cardName,itemCode,itemDesc,qty,numPerMsr,qtyBase,rev,gp]);
-        saved += 1;
-      }
-    } catch {}
-    await sleep(10);
-  }
-  return saved;
-}
-
-
-function prodUnitsExpr(alias = '') {
-  const p = alias ? `${alias}.` : '';
-  // Igual que en SAP análisis de ventas: Quantity * NumPerMsr = unidades reales.
-  // Si quantity_base está vacío o quedó viejo, recalculamos en línea para no depender del sync previo.
-  return `COALESCE(NULLIF(${p}quantity_base,0), (COALESCE(${p}quantity,0) * COALESCE(NULLIF(${p}num_per_msr,0),1)), COALESCE(${p}quantity,0))`;
-}
-
-function prodDemandQtyExpr(alias = '') {
-  return prodUnitsExpr(alias);
-}
-
-function prodSalesQtyExpr(alias = '') {
-  return prodUnitsExpr(alias);
-}
-
-function prodMonthWindowEnd(dateIso) {
-  const d = new Date(`${String(dateIso).slice(0,10)}T00:00:00Z`);
-  if (!Number.isFinite(d.getTime())) return String(dateIso || '').slice(0,10);
-  const y=d.getUTCFullYear();
-  const m=d.getUTCMonth();
-  const last=new Date(Date.UTC(y,m+1,0));
-  return last.toISOString().slice(0,10);
-}
-
 async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 5, horizonMonths = 3 }) {
-  const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN)).slice(0,10);
-  const maxMonthsWindow = Math.max(1, Number(avgMonths || 5), Number(horizonMonths || 3));
-  const monthBaseStart = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(maxMonthsWindow - 1));
-  const monthRangeEnd = String(monthTo || '').slice(0,10);
-
-  const demandCountRes = await dbQuery(`SELECT COUNT(*)::int AS c FROM production_demand_lines WHERE doc_date >= $1::date AND doc_date <= $2::date`, [monthBaseStart, monthRangeEnd]);
-  const demandCount = Number(demandCountRes.rows?.[0]?.c || 0);
-  const useDemandFallback = demandCount <= 0;
-  const demandTable = useDemandFallback ? 'sales_item_lines' : 'production_demand_lines';
-  const demandSourceLabel = useDemandFallback ? 'Facturas SAP (fallback temporal; ejecuta Sync para Pedidos)' : 'Pedidos SAP (unidades)';
-  const demandQtyExpr = prodDemandQtyExpr('d');
-
   const rows = await dbQuery(
     `
-    WITH base AS (
-      SELECT DISTINCT item_code
-      FROM sales_item_lines
-      WHERE doc_date >= $1::date AND doc_date <= $2::date AND item_code <> ''
-      UNION
-      SELECT DISTINCT item_code
-      FROM ${demandTable}
-      WHERE doc_date >= $3::date AND doc_date <= $4::date AND item_code <> ''
-    ),
-    sales AS (
+    WITH sales AS (
       SELECT
         s.item_code,
         MAX(NULLIF(s.item_desc,'')) AS item_desc,
         COALESCE(SUM(s.revenue),0)::numeric(18,2) AS revenue,
         COALESCE(SUM(s.gross_profit),0)::numeric(18,2) AS gp,
-        COALESCE(SUM(${prodSalesQtyExpr('s')}),0)::numeric(18,4) AS qty,
+        COALESCE(SUM(s.quantity),0)::numeric(18,4) AS qty,
         MAX(NULLIF(s.area,'')) AS area_s,
         MAX(NULLIF(s.item_group,'')) AS grupo_s
       FROM sales_item_lines s
       WHERE s.doc_date >= $1::date AND s.doc_date <= $2::date
       GROUP BY s.item_code
-    ),
-    demand AS (
-      SELECT
-        d.item_code,
-        MAX(NULLIF(d.item_desc,'')) AS item_desc,
-        COALESCE(SUM(${demandQtyExpr}),0)::numeric(18,4) AS demand_qty,
-        MAX(NULLIF(d.area,'')) AS area_d,
-        MAX(NULLIF(d.item_group,'')) AS grupo_d
-      FROM ${demandTable} d
-      WHERE d.doc_date >= $3::date AND d.doc_date <= $4::date
-      GROUP BY d.item_code
     ),
     inv AS (
       SELECT
@@ -8939,14 +8779,13 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       GROUP BY item_code
     )
     SELECT
-      base.item_code,
-      COALESCE(NULLIF(sales.item_desc,''), NULLIF(demand.item_desc,''), NULLIF(g.item_desc,''), '') AS item_desc,
-      COALESCE(NULLIF(sales.grupo_s,''), NULLIF(demand.grupo_d,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo,
-      COALESCE(NULLIF(sales.area_s,''), NULLIF(demand.area_d,''), NULLIF(g.area,''), '') AS area,
-      COALESCE(sales.revenue,0) AS revenue,
-      COALESCE(sales.gp,0) AS gp,
-      COALESCE(sales.qty,0) AS sold_qty,
-      COALESCE(demand.demand_qty,0) AS demand_qty,
+      sales.item_code,
+      COALESCE(NULLIF(sales.item_desc,''), NULLIF(g.item_desc,''), '') AS item_desc,
+      COALESCE(NULLIF(sales.grupo_s,''), NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo,
+      COALESCE(NULLIF(sales.area_s,''), NULLIF(g.area,''), '') AS area,
+      sales.revenue,
+      sales.gp,
+      sales.qty,
       COALESCE(inv.wh_01,0) AS wh_01,
       COALESCE(inv.wh_200,0) AS wh_200,
       COALESCE(inv.wh_300,0) AS wh_300,
@@ -8958,28 +8797,28 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       COALESCE(m.lead_time_days,0) AS lead_time_days,
       COALESCE(m.min_order_qty,0) AS min_order_qty,
       COALESCE(m.multiple_qty,0) AS multiple_qty
-    FROM base
-    LEFT JOIN sales ON sales.item_code = base.item_code
-    LEFT JOIN demand ON demand.item_code = base.item_code
-    LEFT JOIN item_group_cache g ON g.item_code = base.item_code
-    LEFT JOIN inv ON inv.item_code = base.item_code
-    LEFT JOIN production_mrp_cache m ON m.item_code = base.item_code
-    ORDER BY COALESCE(sales.revenue,0) DESC, base.item_code ASC
+    FROM sales
+    LEFT JOIN item_group_cache g ON g.item_code = sales.item_code
+    LEFT JOIN inv ON inv.item_code = sales.item_code
+    LEFT JOIN production_mrp_cache m ON m.item_code = sales.item_code
+    ORDER BY sales.revenue DESC
     `,
-    [from, to, monthBaseStart, monthRangeEnd]
+    [from, to]
   );
 
+  const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN));
+  const monthFrom = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(Math.max(1, Number(avgMonths || 5)) - 1));
   const monthRows = await dbQuery(
     `
     SELECT
       item_code,
       to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym,
-      COALESCE(SUM(${prodDemandQtyExpr()}),0)::numeric(18,4) AS qty
-    FROM ${demandTable}
+      COALESCE(SUM(quantity),0)::numeric(18,4) AS qty
+    FROM sales_item_lines
     WHERE doc_date >= $1::date AND doc_date <= $2::date
     GROUP BY item_code, to_char(date_trunc('month', doc_date), 'YYYY-MM')
     `,
-    [monthBaseStart, monthRangeEnd]
+    [monthFrom, monthTo]
   );
   const monthly = new Map();
   for (const r of monthRows.rows || []) {
@@ -8997,20 +8836,19 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const monthsMap = monthly.get(String(r.item_code || "")) || new Map();
 
     const avgMonthsSafe = Math.max(1, Number(avgMonths || 5));
-    const horizonSafe = Math.max(1, Number(horizonMonths || 3));
-    let sumAvgMonths = 0;
-    let sumHorizonMonths = 0;
+    const monthLabels = [];
+    let sumMonths = 0;
     for (let i = avgMonthsSafe - 1; i >= 0; i--) {
       const ym = prodYm(prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -i));
-      sumAvgMonths += prodNum(monthsMap.get(ym));
+      monthLabels.push(ym);
+      sumMonths += prodNum(monthsMap.get(ym));
     }
-    for (let i = horizonSafe - 1; i >= 0; i--) {
-      const ym = prodYm(prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -i));
-      sumHorizonMonths += prodNum(monthsMap.get(ym));
-    }
-    const avgQty = sumAvgMonths / avgMonthsSafe;
-    const pedidosQty = sumHorizonMonths;
+    const avgQty = sumMonths / avgMonthsSafe;
+    const projectedQty = avgQty * Math.max(1, Number(horizonMonths || 3));
+    const effectiveProjectedQty = projectedQty;
     const stockTotal = prodNum(r.stock_total);
+    const needed = Math.max(0, effectiveProjectedQty - stockTotal);
+    const adjusted = prodRecommendPracticalQty({ neededQty: needed, avgMonthlyQty: avgQty, minOrderQty: r.min_order_qty, multipleQty: r.multiple_qty });
 
     return {
       itemCode: String(r.item_code || ""),
@@ -9020,9 +8858,9 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       revenue: rev,
       gp,
       gpPct: prodRound(gpPct, 2),
-      soldQty: prodNum(r.sold_qty),
+      soldQty: prodNum(r.qty),
       avgMonthlyQty: prodRound(avgQty, 2),
-      projectedQty: prodRound(pedidosQty, 2),
+      projectedQty: prodRound(effectiveProjectedQty, 2),
       stockTotal,
       wh01: prodNum(r.wh_01),
       wh200: prodNum(r.wh_200),
@@ -9035,12 +8873,8 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       leadTimeDays: prodNum(r.lead_time_days),
       minOrderQty: prodNum(r.min_order_qty),
       multipleQty: prodNum(r.multiple_qty),
-      productionNeeded: 0,
-      productionAdjusted: 0,
-      coverageMonthsTarget: 1,
-      coveragePolicyLabel: '',
-      demandSource: demandSourceLabel,
-      demandUomLabel: 'Unidades SAP',
+      productionNeeded: prodRound(needed, 2),
+      productionAdjusted: adjusted,
     };
   });
 
@@ -9070,11 +8904,8 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const local = loadProductionLocalData();
     const meta = local.formulas.products?.[it.itemCode] || null;
     const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
-    const coverageMonthsTarget = prodCoverageMonthsByLabel(total.label);
-    const targetInventoryQty = prodNum(it.stockMax) > 0 ? prodNum(it.stockMax) * coverageMonthsTarget : it.projectedQty;
-    const productionNeeded = Math.max(0, targetInventoryQty - prodNum(it.stockTotal));
     const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
-    const hoursNeeded = rate > 0 ? productionNeeded / rate : 0;
+    const hoursNeeded = rate > 0 ? it.productionAdjusted / rate : 0;
 
     return {
       ...it,
@@ -9086,11 +8917,6 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       totalTagClass: total.cls,
       totalScore: total.t,
       machine,
-      coverageMonthsTarget,
-      coveragePolicyLabel: prodCoverageLabel(coverageMonthsTarget),
-      targetInventoryQty: prodRound(targetInventoryQty, 2),
-      productionNeeded: prodRound(productionNeeded, 2),
-      productionAdjusted: prodRound(productionNeeded, 2),
       unitsPerHour: rate,
       hoursNeeded: prodRound(hoursNeeded, 2),
       hasFormula: !!meta,
@@ -9140,10 +8966,6 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     avgMonths: Math.max(1, Number(avgMonths || 5)),
     horizonMonths: Math.max(1, Number(horizonMonths || 3)),
     lastSyncAt: await getState("production_last_sync_at"),
-    demandSource: demandSourceLabel,
-      demandUomLabel: 'Unidades SAP',
-    demandCount,
-    useDemandFallback,
     availableGroups,
     totals: {
       revenue: prodRound(totals.revenue, 2),
@@ -9180,18 +9002,13 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const local = loadProductionLocalData();
   const meta = local.formulas.products?.[code] || local.formulas.products?.[String(code).replace(/^0+/, "")] || null;
 
-  const itemDemandCountRes = await dbQuery(`SELECT COUNT(*)::int AS c FROM production_demand_lines WHERE item_code = $1`, [code]);
-  const itemUseFallback = Number(itemDemandCountRes.rows?.[0]?.c || 0) <= 0;
-  const itemDemandTable = itemUseFallback ? 'sales_item_lines' : 'production_demand_lines';
-  const itemDemandQtyExpr = prodDemandQtyExpr();
-
   const itemMaster = await dbQuery(
     `
     SELECT
       COALESCE(MAX(NULLIF(s.item_desc,'')), MAX(NULLIF(g.item_desc,'')), '') AS item_desc,
       COALESCE(MAX(NULLIF(g.grupo,'')), MAX(NULLIF(g.group_name,'')), MAX(NULLIF(s.item_group,'')), 'Sin grupo') AS grupo,
       COALESCE(MAX(NULLIF(g.area,'')), MAX(NULLIF(s.area,'')), '') AS area
-    FROM ${itemDemandTable} s
+    FROM sales_item_lines s
     LEFT JOIN item_group_cache g ON g.item_code = s.item_code
     WHERE s.item_code = $1
     `,
@@ -9211,8 +9028,8 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
 
   const monthlyRows = await dbQuery(
     `
-    SELECT to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym, COALESCE(SUM(${itemDemandQtyExpr}),0)::numeric(18,4) AS qty
-    FROM ${itemDemandTable}
+    SELECT to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym, COALESCE(SUM(quantity),0)::numeric(18,4) AS qty
+    FROM sales_item_lines
     WHERE item_code = $1 AND doc_date >= $2::date AND doc_date <= $3::date
     GROUP BY 1
     ORDER BY 1
@@ -9243,11 +9060,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     avgQty += prodNum(monthMap.get(ym) || 0);
   }
   avgQty = avgQty / Math.max(1, Number(avgMonths || 5));
-  let projectedQty = 0;
-  for (let i = Math.max(1, Number(horizonMonths || 3)) - 1; i >= 0; i--) {
-    const ym = prodYm(prodAddMonthsISO(monthStart, -i));
-    projectedQty += prodNum(monthMap.get(ym) || 0);
-  }
+  const projectedQty = avgQty * Math.max(1, Number(horizonMonths || 3));
 
   const invRows = await dbQuery(
     `SELECT warehouse, stock, stock_min, stock_max, committed, ordered, available
@@ -9289,16 +9102,16 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     multipleQty: prodNum(mrpFromDb.multiple_qty || mrpFromSap.multipleQty),
   };
 
-  const dashForAbc = await productionDashboardFromDb({ from: '2025-01-01', to: end, area: '__ALL__', grupo: '__ALL__', q: code, avgMonths, horizonMonths });
-  const dashRow = (dashForAbc.items || []).find((x) => String(x.itemCode || '') === code) || null;
-  const coverageMonthsTarget = dashRow ? prodNum(dashRow.coverageMonthsTarget || 1, 1) : 1;
-  const coveragePolicyLabel = prodCoverageLabel(coverageMonthsTarget);
-  const targetInventoryQty = stockMax > 0 ? stockMax * coverageMonthsTarget : projectedQty;
   const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
-  const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : targetInventoryQty;
-  const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty - stockTotal);
-  const mrpAdjustedQty = productionNeeded;
-  const productionAdjusted = productionNeeded;
+  const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : projectedQty;
+  const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, projectedQty - stockTotal);
+  const mrpAdjustedQty = prodApplyMrp(productionNeeded, mrp.minOrderQty, mrp.multipleQty);
+  const productionAdjusted = prodRecommendPracticalQty({
+    neededQty: productionNeeded,
+    avgMonthlyQty: avgQty > 0 ? avgQty : (manualPlanQty > 0 ? manualPlanQty : 0),
+    minOrderQty: mrp.minOrderQty,
+    multipleQty: mrp.multipleQty,
+  });
 
   const sapBom = await prodFetchSapBom(code).catch(() => ({ source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] }));
   let requirementPack = await prodBuildRequirementsFromSapBom({ itemCode: code, adjustedQty: productionAdjusted, sapBom }).catch(() => null);
@@ -9424,7 +9237,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     recentProductionOrders: (prodOrders?.orders || []).slice(0, 20),
     costing,
     avgMonthlyQty: prodRound(avgQty, 2),
-    projectedQty: prodRound(targetInventoryQty, 2),
+    projectedQty: prodRound(projectedQty, 2),
     inventory: {
       total: prodRound(stockTotal, 2),
       byWarehouse: byWh,
@@ -9446,13 +9259,10 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       neededQty: prodRound(productionNeeded, 2),
       mrpAdjustedQty: prodRound(mrpAdjustedQty, 2),
       adjustedQty: prodRound(productionAdjusted, 2),
-      coverageMonthsTarget: prodRound(coverageMonthsTarget,2),
-      coveragePolicyLabel,
-      targetInventoryQty: prodRound(targetInventoryQty,2),
       manualPlanQty: prodRound(manualPlanQty, 3),
       planBasis: manualPlanQty > 0 ? "SUBPLAN_COMPONENTE" : "DEMANDA_PROYECTADA",
       maxUnitsToday,
-      practicalRule: `Política vigente: ${coveragePolicyLabel} según clasificación ABC, usando el máximo de SAP como base de inventario.`,
+      practicalRule: "Se recomienda un lote práctico mínimo de 1.5 meses promedio cuando el MRP quede demasiado corto.",
     },
     capacity: {
       unitsPerHour: prodRound(rate, 2),
@@ -9759,7 +9569,7 @@ async function prodOpenAiChat({ question, dashboard, plan, plans = [], requested
     "IMPORTANTE: cuando exista sapProduction.source, menciónalo para dejar claro si los materiales vienen directo de SAP producción.",
     "IMPORTANTE: cuando existan salesHistory.producedQty o recentProductionOrders, esos son los datos válidos para responder cuánto se produjo el artículo por mes o en órdenes recientes.",
     "IMPORTANTE: cuando exista costing.weightedCost, úsalo como costo ponderado unitario del artículo y analiza también stockValue, projectedDemandCost y adjustedProductionCost.",
-    "IMPORTANTE: toma production.neededQty como la cantidad principal a producir. La política vigente usa el máximo de SAP como base de inventario: AB Crítico = 2 meses, C Importante = 1 mes, D = 0.5 mes.",
+    "IMPORTANTE: si production.mrpAdjustedQty y production.adjustedQty son distintos, explica que el sistema elevó la recomendación a un lote práctico para evitar producir cantidades demasiado cortas y poco eficientes.",
     "IMPORTANTE: si requirements.rawMaterials, requirements.packaging, requirements.resources o requirements.bottlenecks existen, debes analizarlos y mencionarlos explícitamente.",
     "IMPORTANTE: los registros en requirements.resources son RECURSOS internos (operarios, supervisoras, líneas, gastos de fabricación) y no deben tratarse como faltantes de inventario.",
     "IMPORTANTE: usa procurementMethodLabel para explicar el método con lenguaje humano: 'Se fabrica en planta' o 'No se fabrica en planta'.",
@@ -9769,7 +9579,7 @@ async function prodOpenAiChat({ question, dashboard, plan, plans = [], requested
     "IMPORTANTE: selectedPlan es el artículo seleccionado. requestedPlans puede traer varios planes completos sin selección manual; úsalo cuando el usuario pida varios productos o un código escrito en la pregunta.",
     "Si el usuario pide tabla, excel, ranking, lista, columnas o detalle por mes/material/orden, responde con una tabla markdown completa con encabezados claros y datos exactos.",
     "Evita responder con slash (/), listas planas o pseudo-tablas.",
-    "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo con: 1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria y política de inventario 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
+    "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo con: 1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria, MRP y lote práctico 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
     "Si realmente falta información en el JSON, dilo claramente.",
   ].join(" ");
 
@@ -9931,7 +9741,6 @@ async function handleProductionSync(req, res) {
     const syncErrors = [];
 
     const salesSaved = await globalThis.syncSales({ from, to, maxDocs });
-    const demandSaved = await syncProductionDemandOrders({ from, to, maxDocs });
 
     let groupsSaved = 0;
     try {
@@ -9970,7 +9779,7 @@ async function handleProductionSync(req, res) {
     return safeJson(res, 200, {
       ok: true,
       from, to, maxDocs,
-      salesSaved, demandSaved, groupsSaved, invSaved, invWhSaved, mrpSaved,
+      salesSaved, groupsSaved, invSaved, invWhSaved, mrpSaved,
       syncErrors,
       formulasLoaded: Object.keys(loadProductionLocalData().formulas?.products || {}).length,
       materialsLoaded: Object.keys(loadProductionLocalData().materials?.materials || {}).length,
