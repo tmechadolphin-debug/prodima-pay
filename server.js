@@ -8938,7 +8938,6 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     }
     const avgQty = sumMonths / avgMonthsSafe;
     const projectedQty = avgQty * Math.max(1, Number(horizonMonths || 3));
-  const demandSourceLabel = itemUseFallback ? 'Facturas (fallback temporal; ejecuta Sync para Pedidos)' : 'Pedidos';
     const effectiveProjectedQty = projectedQty;
     const stockTotal = prodNum(r.stock_total);
 
