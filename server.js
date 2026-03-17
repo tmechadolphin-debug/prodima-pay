@@ -8833,7 +8833,7 @@ function prodNormalizeItemCodeLoose(v) {
 
 function prodExtractCodesFromText(text) {
   const src = String(text || "").toUpperCase();
-  const matches = src.match(/\d{3,6}(?:-[A-Z0-9]+)?/g) || [];
+  const matches = src.match(/\b\d{3,6}(?:-[A-Z0-9]+)?\b/g) || [];
   const out = [];
   const seen = new Set();
   for (const code of matches) {
