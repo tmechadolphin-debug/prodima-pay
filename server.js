@@ -4539,6 +4539,7 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
   if (!docEntry || !lines.length) return 0;
 
   let inserted = 0;
+  const itemMasterCache = new Map();
 
   for (const ln of lines) {
     const lineNum = Number(ln?.LineNum);
@@ -4555,7 +4556,16 @@ async function upsertSalesLines(docType, docDate, docFull, sign) {
     const gpRaw = Number(pickGrossProfit(ln) || 0);
 
     const qty = Math.abs(qtyRaw) * sign;
-    const numPerMsr = Math.abs(Number(ln?.NumPerMsr || ln?.ItemsPerUnit || 1)) || 1;
+    let itemMaster = null;
+    const lineNeedsFallback = !(Number(Math.abs(Number(ln?.ItemsPerUnit || 0))) > 0 || Number(Math.abs(Number(ln?.NumPerMsr || 0))) > 0);
+    if (lineNeedsFallback) {
+      if (itemMasterCache.has(itemCode)) itemMaster = itemMasterCache.get(itemCode);
+      else {
+        itemMaster = await prodGetFullItem(itemCode).catch(() => null);
+        itemMasterCache.set(itemCode, itemMaster || null);
+      }
+    }
+    const numPerMsr = prodLineItemsPerUnit(ln, itemMaster);
     const qtyBase = qty * numPerMsr;
     const rev = Math.abs(revRaw) * sign;
     const gp = Math.abs(gpRaw) * sign;
@@ -8190,6 +8200,75 @@ function prodExtractWeightedCostFromItem(item) {
   return 0;
 }
 
+
+function prodLineItemsPerUnit(line, itemMaster = null) {
+  const candidates = [
+    line?.ItemsPerUnit,
+    line?.NumPerMsr,
+    line?.UnitsOfMeasurment,
+    line?.U_ArticulosPorUnidad,
+    line?.U_ItemsPerUnit,
+    line?.U_CantPorCaja,
+    line?.U_CantidadCaja,
+    line?.U_QtyPerBox,
+  ];
+  for (const raw of candidates) {
+    const n = Math.abs(Number(raw || 0));
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+
+  const itemCandidates = [
+    itemMaster?.SalesItemsPerUnit,
+    itemMaster?.SalesQtyPerPackUnit,
+    itemMaster?.SalesQtyPerPackage,
+    itemMaster?.SalesPackagingUnit,
+    itemMaster?.ItemsPerUnit,
+    itemMaster?.NumPerMsr,
+  ];
+  for (const raw of itemCandidates) {
+    const n = Math.abs(Number(raw || 0));
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+
+  try {
+    const coll = Array.isArray(itemMaster?.ItemUnitOfMeasurementCollection)
+      ? itemMaster.ItemUnitOfMeasurementCollection
+      : [];
+    const lineUom = String(
+      line?.MeasureUnit ||
+      line?.UnitMsr ||
+      line?.UoMCode ||
+      line?.UomCode ||
+      line?.UomEntry ||
+      ''
+    ).trim().toLowerCase();
+
+    let row = null;
+    if (lineUom) {
+      row = coll.find((x) => {
+        const code = String(x?.UoMCode || x?.UomCode || x?.UoMEntry || '').trim().toLowerCase();
+        const type = String(x?.UoMType || '').trim().toLowerCase();
+        return code === lineUom || type === lineUom;
+      }) || null;
+    }
+    if (!row) {
+      row = coll.find((x) => String(x?.UoMType || '').toLowerCase().includes('sales')) ||
+            coll.find((x) => Number(x?.BaseQuantity || 0) > 1) || null;
+    }
+    if (row) {
+      const b = Number(row?.BaseQuantity ?? row?.BaseQty ?? null);
+      const a = Number(row?.AlternateQuantity ?? row?.AltQty ?? row?.AlternativeQuantity ?? null);
+      if (Number.isFinite(b) && b > 0 && Number.isFinite(a) && a > 0) {
+        const f = b / a;
+        if (Number.isFinite(f) && f > 0) return f;
+      }
+      if (Number.isFinite(b) && b > 0) return b;
+    }
+  } catch {}
+
+  return 1;
+}
+
 function prodExtractInventorySnapshotFromItem(item) {
   const byWh = { "01": 0, "200": 0, "300": 0, "500": 0 };
   const whRows = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
@@ -8806,6 +8885,7 @@ function prodCoverageLabel(months) {
 async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
   const headers = await scanDocHeaders('Orders', { from, to, maxDocs });
   let saved = 0;
+  const itemMasterCache = new Map();
   for (const h of headers) {
     try {
       const full = await getDoc('Orders', h.DocEntry);
@@ -8821,7 +8901,16 @@ async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
         if (!itemCode) continue;
         const itemDesc = String(ln?.ItemDescription || ln?.ItemName || '').trim();
         const qty = Math.abs(Number(ln?.Quantity || 0));
-        const numPerMsr = Math.abs(Number(ln?.NumPerMsr || ln?.ItemsPerUnit || 1)) || 1;
+        let itemMaster = null;
+        const lineNeedsFallback = !(Number(Math.abs(Number(ln?.ItemsPerUnit || 0))) > 0 || Number(Math.abs(Number(ln?.NumPerMsr || 0))) > 0);
+        if (lineNeedsFallback) {
+          if (itemMasterCache.has(itemCode)) itemMaster = itemMasterCache.get(itemCode);
+          else {
+            itemMaster = await prodGetFullItem(itemCode).catch(() => null);
+            itemMasterCache.set(itemCode, itemMaster || null);
+          }
+        }
+        const numPerMsr = prodLineItemsPerUnit(ln, itemMaster);
         const qtyBase = qty * numPerMsr;
         const rev = Math.abs(Number(ln?.LineTotal || 0));
         const gp = Math.abs(Number(pickGrossProfit(ln) || 0));
@@ -9184,6 +9273,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const itemUseFallback = Number(itemDemandCountRes.rows?.[0]?.c || 0) <= 0;
   const itemDemandTable = itemUseFallback ? 'sales_item_lines' : 'production_demand_lines';
   const itemDemandQtyExpr = prodDemandQtyExpr();
+  const itemDemandSourceLabel = itemUseFallback ? 'Ventas desde facturas SAP convertidas a unidades (fallback temporal)' : 'Pedidos SAP convertidos a unidades';
 
   const itemMaster = await dbQuery(
     `
@@ -9209,19 +9299,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const monthStart = `${String(end).slice(0, 7)}-01`;
   const histFrom = prodAddMonthsISO(monthStart, -11);
 
-  const monthlySalesRows = await dbQuery(
-    `
-    SELECT to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym, COALESCE(SUM(${prodSalesQtyExpr()}),0)::numeric(18,4) AS qty
-    FROM sales_item_lines
-    WHERE item_code = $1 AND doc_date >= $2::date AND doc_date <= $3::date
-    GROUP BY 1
-    ORDER BY 1
-    `,
-    [code, histFrom, end]
-  );
-  const monthMap = new Map((monthlySalesRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
-
-  const monthlyDemandRows = await dbQuery(
+  const monthlyRows = await dbQuery(
     `
     SELECT to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym, COALESCE(SUM(${itemDemandQtyExpr}),0)::numeric(18,4) AS qty
     FROM ${itemDemandTable}
@@ -9231,7 +9309,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     `,
     [code, histFrom, end]
   );
-  const demandMonthMap = new Map((monthlyDemandRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
+  const monthMap = new Map((monthlyRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
 
   const weightedCost = prodExtractWeightedCostFromItem(sapItem);
   const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map() }));
@@ -9244,9 +9322,9 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       ym,
       label: prodFormatMonthName(ym),
       qty: prodRound(monthMap.get(ym) || 0, 2),
-      demandQty: prodRound(demandMonthMap.get(ym) || 0, 2),
       producedQty: prodRound(prodMonthMap.get(ym) || 0, 2),
       weightedCost: prodRound(weightedCost || 0, 4),
+      source: itemDemandSourceLabel,
     });
   }
 
@@ -9434,6 +9512,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       planEnd
     },
     salesHistory,
+    salesHistorySource: itemDemandSourceLabel,
     recentProductionOrders: (prodOrders?.orders || []).slice(0, 20),
     costing,
     avgMonthlyQty: prodRound(avgQty, 2),
