@@ -8853,17 +8853,19 @@ async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
 }
 
 
-function prodDemandQtyExpr(tableName) {
-  const t = String(tableName || '').toLowerCase();
-  if (t === 'production_demand_lines' || t === 'sales_item_lines') {
-    // Para Producción trabajamos en UNIDADES, igual que los informes de ventas de SAP.
-    return `COALESCE(quantity_base, quantity, 0)`;
-  }
-  return `COALESCE(quantity,0)`;
+function prodUnitsExpr(alias = '') {
+  const p = alias ? `${alias}.` : '';
+  // Igual que en SAP análisis de ventas: Quantity * NumPerMsr = unidades reales.
+  // Si quantity_base está vacío o quedó viejo, recalculamos en línea para no depender del sync previo.
+  return `COALESCE(NULLIF(${p}quantity_base,0), (COALESCE(${p}quantity,0) * COALESCE(NULLIF(${p}num_per_msr,0),1)), COALESCE(${p}quantity,0))`;
 }
 
-function prodSalesQtyExpr() {
-  return `COALESCE(quantity_base, quantity, 0)`;
+function prodDemandQtyExpr(alias = '') {
+  return prodUnitsExpr(alias);
+}
+
+function prodSalesQtyExpr(alias = '') {
+  return prodUnitsExpr(alias);
 }
 
 function prodMonthWindowEnd(dateIso) {
@@ -8879,14 +8881,14 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
   const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN)).slice(0,10);
   const maxMonthsWindow = Math.max(1, Number(avgMonths || 5), Number(horizonMonths || 3));
   const monthBaseStart = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(maxMonthsWindow - 1));
-  const monthRangeEnd = prodMonthWindowEnd(monthTo);
+  const monthRangeEnd = String(monthTo || '').slice(0,10);
 
   const demandCountRes = await dbQuery(`SELECT COUNT(*)::int AS c FROM production_demand_lines WHERE doc_date >= $1::date AND doc_date <= $2::date`, [monthBaseStart, monthRangeEnd]);
   const demandCount = Number(demandCountRes.rows?.[0]?.c || 0);
   const useDemandFallback = demandCount <= 0;
   const demandTable = useDemandFallback ? 'sales_item_lines' : 'production_demand_lines';
   const demandSourceLabel = useDemandFallback ? 'Facturas SAP (fallback temporal; ejecuta Sync para Pedidos)' : 'Pedidos SAP (unidades)';
-  const demandQtyExpr = prodDemandQtyExpr(demandTable);
+  const demandQtyExpr = prodDemandQtyExpr('d');
 
   const rows = await dbQuery(
     `
@@ -8905,7 +8907,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
         MAX(NULLIF(s.item_desc,'')) AS item_desc,
         COALESCE(SUM(s.revenue),0)::numeric(18,2) AS revenue,
         COALESCE(SUM(s.gross_profit),0)::numeric(18,2) AS gp,
-        COALESCE(SUM(${prodSalesQtyExpr()}),0)::numeric(18,4) AS qty,
+        COALESCE(SUM(${prodSalesQtyExpr('s')}),0)::numeric(18,4) AS qty,
         MAX(NULLIF(s.area,'')) AS area_s,
         MAX(NULLIF(s.item_group,'')) AS grupo_s
       FROM sales_item_lines s
@@ -8972,7 +8974,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     SELECT
       item_code,
       to_char(date_trunc('month', doc_date), 'YYYY-MM') AS ym,
-      COALESCE(SUM(${demandQtyExpr}),0)::numeric(18,4) AS qty
+      COALESCE(SUM(${prodDemandQtyExpr()}),0)::numeric(18,4) AS qty
     FROM ${demandTable}
     WHERE doc_date >= $1::date AND doc_date <= $2::date
     GROUP BY item_code, to_char(date_trunc('month', doc_date), 'YYYY-MM')
@@ -9181,7 +9183,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const itemDemandCountRes = await dbQuery(`SELECT COUNT(*)::int AS c FROM production_demand_lines WHERE item_code = $1`, [code]);
   const itemUseFallback = Number(itemDemandCountRes.rows?.[0]?.c || 0) <= 0;
   const itemDemandTable = itemUseFallback ? 'sales_item_lines' : 'production_demand_lines';
-  const itemDemandQtyExpr = prodDemandQtyExpr(itemDemandTable);
+  const itemDemandQtyExpr = prodDemandQtyExpr();
 
   const itemMaster = await dbQuery(
     `
@@ -9215,7 +9217,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     GROUP BY 1
     ORDER BY 1
     `,
-    [code, histFrom, prodMonthWindowEnd(end)]
+    [code, histFrom, end]
   );
   const monthMap = new Map((monthlyRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
 
