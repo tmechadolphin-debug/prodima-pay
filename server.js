@@ -5559,8 +5559,7 @@ const PORTAL_ALL_AREAS = ["CONS", "RCI"];
 const PORTAL_MODULE_KEYS = new Set(["admin-clientes", "estratificacion", "produccion"]);
 
 function normalizePortalModuleKey(v) {
-  const s = String(v || "").trim().toLowerCase();
-  return s;
+  return String(v || "").trim().toLowerCase();
 }
 
 function normalizePortalAreaCode(v) {
@@ -5583,6 +5582,25 @@ function normalizePortalAreaList(arr) {
     out.push(code);
   }
   return out;
+}
+
+function normalizeModulePermissionKey(moduleKey) {
+  const mk = normalizePortalModuleKey(moduleKey);
+  return mk ? `module:${mk}` : "";
+}
+
+function listPortalPermissions(raw) {
+  return Array.isArray(raw) ? raw.map((x) => String(x || "").trim()).filter(Boolean) : [];
+}
+
+function portalUserHasModulePermission(user, moduleKey) {
+  if (!user) return false;
+  const mk = normalizePortalModuleKey(moduleKey);
+  const perms = listPortalPermissions(user.permissions_json ?? user.permissions);
+  if (user.role === "admin") return true;
+  if (perms.includes("*")) return true;
+  const key = normalizeModulePermissionKey(mk);
+  return !!(mk && (perms.includes(mk) || perms.includes(key)));
 }
 
 async function ensurePortalModuleScopeDb() {
@@ -5624,11 +5642,6 @@ async function ensurePortalModuleScopeDb() {
   `);
 
   await dbQuery(`
-    CREATE INDEX IF NOT EXISTS idx_app_audit_log_user_module_created
-    ON app_audit_log(user_id, module_key, created_at DESC);
-  `);
-
-  await dbQuery(`
     CREATE TABLE IF NOT EXISTS app_user_memory (
       user_id INTEGER NOT NULL REFERENCES portal_users(id) ON DELETE CASCADE,
       module_key TEXT NOT NULL,
@@ -5639,144 +5652,126 @@ async function ensurePortalModuleScopeDb() {
   `);
 }
 
-async function portalLoadUserById(userId) {
-  if (!hasDb()) return null;
+async function getPortalUserById(userId) {
   const id = Number(userId || 0);
-  if (!Number.isFinite(id) || id <= 0) return null;
-
-  const r = await dbQuery(
-    `SELECT id, username, full_name, role, is_active, permissions_json
-     FROM portal_users
-     WHERE id=$1
-     LIMIT 1`,
-    [id]
-  );
+  if (!id) return null;
+  const r = await dbQuery(`
+    SELECT id, username, full_name, role, is_active, permissions_json
+    FROM portal_users
+    WHERE id=$1
+    LIMIT 1
+  `, [id]);
   return r.rows?.[0] || null;
 }
 
-function portalPermissionsFromRow(row) {
-  return Array.isArray(row?.permissions_json)
-    ? row.permissions_json.map((x) => String(x || "").trim()).filter(Boolean)
-    : [];
-}
-
-function portalUserIsAdminByRow(row) {
-  return String(row?.role || "").trim().toLowerCase() === "admin";
-}
-
-function portalUserHasModulePermission(row, moduleKey) {
-  if (portalUserIsAdminByRow(row)) return true;
-  const perms = portalPermissionsFromRow(row);
-  return perms.includes("*") || perms.includes(moduleKey);
-}
-
-async function portalGetModuleAreasForUser(userId, moduleKey) {
-  if (!hasDb()) return PORTAL_ALL_AREAS.slice();
+async function getPortalUserAllowedAreas(userId, moduleKey) {
   const id = Number(userId || 0);
-  if (!Number.isFinite(id) || id <= 0) return PORTAL_ALL_AREAS.slice();
-
   const mk = normalizePortalModuleKey(moduleKey);
-  const r = await dbQuery(
-    `SELECT area_code
-     FROM portal_user_module_areas
-     WHERE user_id=$1 AND module_key=$2
-     ORDER BY area_code`,
-    [id, mk]
-  );
+  if (!id || !mk) return [];
 
-  const areas = normalizePortalAreaList((r.rows || []).map((x) => x.area_code));
-  return areas.length ? areas : PORTAL_ALL_AREAS.slice();
+  const r = await dbQuery(`
+    SELECT area_code
+    FROM portal_user_module_areas
+    WHERE user_id=$1 AND module_key=$2
+    ORDER BY area_code ASC
+  `, [id, mk]);
+
+  const list = normalizePortalAreaList((r.rows || []).map((x) => x.area_code));
+  return list.length ? list : PORTAL_ALL_AREAS.slice();
 }
 
-function portalResolveEffectiveArea(access, requestedArea = "__ALL__") {
-  const allowed = normalizePortalAreaList(access?.areas || []);
-  const req = normalizePortalAreaCode(requestedArea);
-  if (!allowed.length || allowed.length >= 2) {
-    return req || "__ALL__";
-  }
-  return allowed[0];
-}
-
-function portalAvailableAreasForAccess(access) {
-  const allowed = normalizePortalAreaList(access?.areas || []);
-  if (!allowed.length || allowed.length >= 2) return ["__ALL__", ...PORTAL_ALL_AREAS];
-  return allowed.slice();
-}
-
-async function portalGetModuleAccessContext(authUser, moduleKey) {
+async function getPortalModuleAccessForUser(userId, moduleKey) {
   const mk = normalizePortalModuleKey(moduleKey);
-  if (!PORTAL_MODULE_KEYS.has(mk)) {
-    return {
-      ok: false,
-      canAccess: false,
-      isAdmin: false,
-      moduleKey: mk,
-      areas: [],
-      availableAreas: [],
-      permissions: [],
-      user: authUser || null,
-    };
+  const user = await getPortalUserById(userId);
+  if (!user || !user.is_active) {
+    return { moduleKey: mk, canAccess: false, isAdmin: false, areas: [] };
   }
-
-  if (Number(authUser?.id || 0) === 0 && String(authUser?.role || "").toLowerCase() === "admin") {
-    return {
-      ok: true,
-      canAccess: true,
-      isAdmin: true,
-      moduleKey: mk,
-      areas: PORTAL_ALL_AREAS.slice(),
-      availableAreas: ["__ALL__", ...PORTAL_ALL_AREAS],
-      permissions: ["*"],
-      user: authUser,
-    };
-  }
-
-  const row = await portalLoadUserById(authUser?.id);
-  if (!row || !row.is_active) {
-    return {
-      ok: false,
-      canAccess: false,
-      isAdmin: false,
-      moduleKey: mk,
-      areas: [],
-      availableAreas: [],
-      permissions: [],
-      user: authUser || null,
-    };
-  }
-
-  const permissions = portalPermissionsFromRow(row);
-  const isAdmin = portalUserIsAdminByRow(row) || permissions.includes("*");
-  const canAccess = isAdmin || permissions.includes(mk);
-  const areas = canAccess ? await portalGetModuleAreasForUser(row.id, mk) : [];
+  const canAccess = portalUserHasModulePermission(user, mk);
+  const areas = canAccess ? await getPortalUserAllowedAreas(user.id, mk) : [];
   return {
-    ok: true,
-    canAccess,
-    isAdmin,
     moduleKey: mk,
+    canAccess,
+    isAdmin: user.role === "admin",
     areas,
-    availableAreas: canAccess ? portalAvailableAreasForAccess({ areas }) : [],
-    permissions,
     user: {
-      id: row.id,
-      username: row.username,
-      full_name: row.full_name || "",
-      role: row.role || "user",
+      id: user.id,
+      username: user.username,
+      full_name: user.full_name,
+      role: user.role,
     },
   };
 }
 
+function coercePortalAreaForAccess(rawArea, access) {
+  if (!access?.canAccess) return "__DENY__";
+
+  const requested = normalizePortalAreaCode(rawArea || "__ALL__");
+  const allowed = Array.isArray(access?.areas) && access.areas.length ? access.areas : PORTAL_ALL_AREAS.slice();
+
+  if (access?.isAdmin) return requested || "__ALL__";
+  if (allowed.length === 1) return allowed[0];
+  if (!requested || requested === "__ALL__") return "__ALL__";
+  if (!allowed.includes(requested)) return "__DENY__";
+  return requested;
+}
+
+async function writePortalAudit(data = {}) {
+  try {
+    if (!hasDb()) return;
+    await dbQuery(`
+      INSERT INTO app_audit_log
+      (user_id, module_key, action_type, entity_type, entity_code, entity_name, area_code,
+       request_id, status, message, filters_json, payload_json)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb)
+    `, [
+      Number(data.userId || 0) || null,
+      String(data.moduleKey || ""),
+      String(data.actionType || ""),
+      String(data.entityType || ""),
+      String(data.entityCode || ""),
+      String(data.entityName || ""),
+      String(data.areaCode || ""),
+      String(data.requestId || ""),
+      String(data.status || "ok"),
+      String(data.message || ""),
+      JSON.stringify(data.filters || {}),
+      JSON.stringify(data.payload || {}),
+    ]);
+  } catch (e) {
+    console.error("writePortalAudit error:", e.message || String(e));
+  }
+}
+
+async function savePortalUserMemory(userId, moduleKey, memory) {
+  try {
+    if (!hasDb()) return;
+    const id = Number(userId || 0);
+    const mk = normalizePortalModuleKey(moduleKey);
+    if (!id || !mk) return;
+    await dbQuery(`
+      INSERT INTO app_user_memory(user_id, module_key, memory_json, updated_at)
+      VALUES ($1, $2, $3::jsonb, NOW())
+      ON CONFLICT (user_id, module_key)
+      DO UPDATE SET memory_json = EXCLUDED.memory_json, updated_at = NOW()
+    `, [id, mk, JSON.stringify(memory || {})]);
+  } catch (e) {
+    console.error("savePortalUserMemory error:", e.message || String(e));
+  }
+}
+
 function verifyPortalModule(moduleKey, opts = {}) {
+  const mk = normalizePortalModuleKey(moduleKey);
+  const adminOnly = !!opts.adminOnly;
   return async (req, res, next) => {
     try {
-      const access = await portalGetModuleAccessContext(req.user, moduleKey);
-      if (!access?.canAccess) {
-        return safeJson(res, 403, { ok: false, message: `Sin acceso al módulo ${moduleKey}` });
+      const access = await getPortalModuleAccessForUser(req.user?.id, mk);
+      req.portalModuleAccess = access;
+      if (!access.canAccess) {
+        return safeJson(res, 403, { ok: false, message: `Sin acceso al módulo ${mk}` });
       }
-      if (opts.adminOnly && !access.isAdmin) {
-        return safeJson(res, 403, { ok: false, message: "Permiso de administrador requerido" });
+      if (adminOnly && !access.isAdmin) {
+        return safeJson(res, 403, { ok: false, message: `Solo admin puede usar ${mk}` });
       }
-      req.moduleAccess = access;
       return next();
     } catch (e) {
       return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -5784,99 +5779,14 @@ function verifyPortalModule(moduleKey, opts = {}) {
   };
 }
 
-async function writePortalAudit({
-  userId = null,
-  moduleKey = "",
-  actionType = "",
-  entityType = "",
-  entityCode = "",
-  entityName = "",
-  areaCode = "",
-  requestId = "",
-  status = "ok",
-  message = "",
-  filters = {},
-  payload = {},
-} = {}) {
-  try {
-    if (!hasDb()) return;
-    await dbQuery(
-      `INSERT INTO app_audit_log(
-        user_id, module_key, action_type, entity_type, entity_code, entity_name,
-        area_code, request_id, status, message, filters_json, payload_json
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb)`,
-      [
-        Number.isFinite(Number(userId)) ? Number(userId) : null,
-        String(moduleKey || ""),
-        String(actionType || ""),
-        String(entityType || ""),
-        String(entityCode || ""),
-        String(entityName || ""),
-        String(areaCode || ""),
-        String(requestId || ""),
-        String(status || "ok"),
-        truncate(message || "", 240),
-        JSON.stringify(filters || {}),
-        JSON.stringify(payload || {}),
-      ]
-    );
-  } catch {}
-}
-
-async function savePortalUserMemory(userId, moduleKey, memory = {}) {
-  try {
-    if (!hasDb()) return;
-    const id = Number(userId || 0);
-    if (!Number.isFinite(id) || id <= 0) return;
-
-    await dbQuery(
-      `INSERT INTO app_user_memory(user_id, module_key, memory_json, updated_at)
-       VALUES ($1,$2,$3::jsonb,NOW())
-       ON CONFLICT (user_id, module_key)
-       DO UPDATE SET memory_json = EXCLUDED.memory_json, updated_at = NOW()`,
-      [id, String(moduleKey || ""), JSON.stringify(memory || {})]
-    );
-  } catch {}
-}
-
-async function loadPortalUserMemory(userId, moduleKey) {
-  try {
-    if (!hasDb()) return {};
-    const id = Number(userId || 0);
-    if (!Number.isFinite(id) || id <= 0) return {};
-    const r = await dbQuery(
-      `SELECT memory_json
-       FROM app_user_memory
-       WHERE user_id=$1 AND module_key=$2
-       LIMIT 1`,
-      [id, String(moduleKey || "")]
-    );
-    const raw = r.rows?.[0]?.memory_json;
-    return raw && typeof raw === "object" ? raw : {};
-  } catch {
-    return {};
-  }
-}
-
 app.get("/api/portal/modules/:moduleKey/access", verifyPortalAuth, async (req, res) => {
   try {
     const moduleKey = normalizePortalModuleKey(req.params.moduleKey);
     if (!PORTAL_MODULE_KEYS.has(moduleKey)) {
-      return safeJson(res, 400, { ok: false, message: "moduleKey inválido" });
+      return safeJson(res, 404, { ok: false, message: "Módulo no soportado" });
     }
-    const access = await portalGetModuleAccessContext(req.user, moduleKey);
-    const memory = access?.canAccess ? await loadPortalUserMemory(req.user?.id, moduleKey) : {};
-    return safeJson(res, 200, {
-      ok: true,
-      moduleKey,
-      canAccess: !!access?.canAccess,
-      isAdmin: !!access?.isAdmin,
-      areas: access?.areas || [],
-      availableAreas: access?.availableAreas || [],
-      permissions: access?.permissions || [],
-      memory,
-      user: access?.user || req.user || null,
-    });
+    const access = await getPortalModuleAccessForUser(req.user?.id, moduleKey);
+    return safeJson(res, 200, { ok: true, ...access });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -5885,52 +5795,36 @@ app.get("/api/portal/modules/:moduleKey/access", verifyPortalAuth, async (req, r
 app.get("/api/portal/admin/modules/:moduleKey/users", verifyPortalAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
+
     const moduleKey = normalizePortalModuleKey(req.params.moduleKey);
     if (!PORTAL_MODULE_KEYS.has(moduleKey)) {
-      return safeJson(res, 400, { ok: false, message: "moduleKey inválido" });
+      return safeJson(res, 404, { ok: false, message: "Módulo no soportado" });
     }
 
-    const usersR = await dbQuery(
-      `SELECT id, username, full_name, role, is_active, permissions_json, created_at
-       FROM portal_users
-       ORDER BY id DESC`
-    );
+    const r = await dbQuery(`
+      SELECT id, username, full_name, role, is_active, permissions_json, created_at
+      FROM portal_users
+      ORDER BY role='admin' DESC, username ASC
+    `);
 
-    const areaR = await dbQuery(
-      `SELECT user_id, module_key, area_code
-       FROM portal_user_module_areas
-       WHERE module_key=$1`,
-      [moduleKey]
-    );
-
-    const areaMap = new Map();
-    for (const row of areaR.rows || []) {
-      const key = `${row.user_id}::${row.module_key}`;
-      const cur = areaMap.get(key) || [];
-      cur.push(row.area_code);
-      areaMap.set(key, cur);
-    }
-
-    const users = (usersR.rows || []).map((u) => {
-      const perms = Array.isArray(u.permissions_json) ? u.permissions_json : [];
-      const isAdmin = String(u.role || "").toLowerCase() === "admin" || perms.includes("*");
-      const moduleEnabled = isAdmin || perms.includes(moduleKey);
-      const areas = moduleEnabled
-        ? normalizePortalAreaList(areaMap.get(`${u.id}::${moduleKey}`) || []).concat()
-        : [];
-      return {
+    const users = [];
+    for (const u of (r.rows || [])) {
+      const enabled = portalUserHasModulePermission(u, moduleKey);
+      const areas = enabled ? await getPortalUserAllowedAreas(u.id, moduleKey) : [];
+      users.push({
         id: u.id,
         username: u.username,
-        full_name: u.full_name || "",
-        role: u.role || "user",
+        full_name: u.full_name,
+        role: u.role,
         is_active: !!u.is_active,
+        permissions: listPortalPermissions(u.permissions_json),
+        module_enabled: enabled,
+        areas,
         created_at: u.created_at,
-        module_enabled: moduleEnabled,
-        areas: moduleEnabled ? (areas.length ? areas : PORTAL_ALL_AREAS.slice()) : [],
-      };
-    });
+      });
+    }
 
-    return safeJson(res, 200, { ok: true, moduleKey, users });
+    return safeJson(res, 200, { ok: true, moduleKey, areasCatalog: PORTAL_ALL_AREAS, users });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -5941,65 +5835,46 @@ app.patch("/api/portal/admin/modules/:moduleKey/users/:id/access", verifyPortalA
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
 
     const moduleKey = normalizePortalModuleKey(req.params.moduleKey);
-    const userId = Number(req.params.id || 0);
+    const id = Number(req.params.id || 0);
     if (!PORTAL_MODULE_KEYS.has(moduleKey)) {
-      return safeJson(res, 400, { ok: false, message: "moduleKey inválido" });
+      return safeJson(res, 404, { ok: false, message: "Módulo no soportado" });
     }
-    if (!Number.isFinite(userId) || userId <= 0) {
+    if (!Number.isFinite(id) || id <= 0) {
       return safeJson(res, 400, { ok: false, message: "ID inválido" });
     }
 
+    const user = await getPortalUserById(id);
+    if (!user) return safeJson(res, 404, { ok: false, message: "Usuario no encontrado" });
+
     const moduleEnabled = !!req.body?.module_enabled;
-    const desiredAreas = normalizePortalAreaList(req.body?.areas || []);
-
-    const u = await portalLoadUserById(userId);
-    if (!u) return safeJson(res, 404, { ok: false, message: "Usuario no encontrado" });
-
-    const isTargetAdmin = portalUserIsAdminByRow(u) || portalPermissionsFromRow(u).includes("*");
-    let perms = portalPermissionsFromRow(u);
-
-    if (!isTargetAdmin) {
-      if (moduleEnabled && !perms.includes(moduleKey)) perms.push(moduleKey);
-      if (!moduleEnabled) perms = perms.filter((x) => x !== moduleKey);
-      await dbQuery(
-        `UPDATE portal_users
-         SET permissions_json=$2::jsonb
-         WHERE id=$1`,
-        [userId, JSON.stringify(perms)]
-      );
+    const areas = normalizePortalAreaList(req.body?.areas || []);
+    if (moduleEnabled && !areas.length && user.role !== "admin") {
+      return safeJson(res, 400, { ok: false, message: "Selecciona al menos un área" });
     }
 
-    await dbQuery(
-      `DELETE FROM portal_user_module_areas
-       WHERE user_id=$1 AND module_key=$2`,
-      [userId, moduleKey]
-    );
+    const perms = new Set(listPortalPermissions(user.permissions_json));
+    const permKey = normalizeModulePermissionKey(moduleKey);
+    perms.delete(moduleKey);
+    perms.delete(permKey);
+    if (moduleEnabled || user.role === "admin") perms.add(permKey);
+    if (user.role === "admin") perms.add("*");
 
-    if (moduleEnabled) {
-      const areasToStore = desiredAreas.length ? desiredAreas : PORTAL_ALL_AREAS.slice();
-      for (const areaCode of areasToStore) {
-        await dbQuery(
-          `INSERT INTO portal_user_module_areas(user_id, module_key, area_code)
-           VALUES ($1,$2,$3)
-           ON CONFLICT (user_id, module_key, area_code) DO NOTHING`,
-          [userId, moduleKey, areaCode]
-        );
-      }
+    await dbQuery(`UPDATE portal_users SET permissions_json=$2::jsonb WHERE id=$1`, [
+      id,
+      JSON.stringify(Array.from(perms)),
+    ]);
+
+    await dbQuery(`DELETE FROM portal_user_module_areas WHERE user_id=$1 AND module_key=$2`, [id, moduleKey]);
+    const areasToSave = user.role === "admin" ? PORTAL_ALL_AREAS.slice() : areas;
+    for (const area of areasToSave) {
+      await dbQuery(`
+        INSERT INTO portal_user_module_areas(user_id, module_key, area_code)
+        VALUES ($1,$2,$3)
+        ON CONFLICT (user_id, module_key, area_code) DO NOTHING
+      `, [id, moduleKey, area]);
     }
 
-    const access = await portalGetModuleAccessContext({ id: userId }, moduleKey);
-    return safeJson(res, 200, {
-      ok: true,
-      moduleKey,
-      user: {
-        id: userId,
-        username: u.username,
-        full_name: u.full_name || "",
-        role: u.role || "user",
-        module_enabled: !!access?.canAccess,
-        areas: access?.areas || [],
-      },
-    });
+    return safeJson(res, 200, { ok: true });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -6012,36 +5887,21 @@ app.get("/api/portal/admin-clientes/dashboard", verifyPortalAuth, verifyPortalMo
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
     const to = isISO(req.query?.to) ? String(req.query.to) : today;
-    const area = portalResolveEffectiveArea(req.moduleAccess, req.query?.area || "__ALL__");
+    const area = coercePortalAreaForAccess(req.query?.area, req.portalModuleAccess);
     const grupo = String(req.query?.grupo || "__ALL__");
     const q = String(req.query?.q || "");
+    if (area === "__DENY__") return safeJson(res, 403, { ok: false, message: "Área no permitida" });
 
     const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
     data.lastSyncAt = await getState("last_sync_at");
-    data.access = {
-      moduleKey: "admin-clientes",
-      isAdmin: !!req.moduleAccess?.isAdmin,
-      areas: req.moduleAccess?.areas || [],
-      availableAreas: portalAvailableAreasForAccess(req.moduleAccess),
-      effectiveArea: area,
-    };
+    data.portalAccess = req.portalModuleAccess;
 
-    await savePortalUserMemory(req.user?.id, "admin-clientes", {
-      lastRange: { from, to },
-      lastFilters: { area, grupo, q },
-      updatedAt: new Date().toISOString(),
-    });
-    await writePortalAudit({
-      userId: req.user?.id,
-      moduleKey: "admin-clientes",
-      actionType: "dashboard_load",
-      areaCode: area === "__ALL__" ? "" : area,
-      filters: { from, to, area, grupo, q },
-    });
+    await savePortalUserMemory(req.user?.id, "admin-clientes", { lastArea: area, lastGroup: grupo, lastDateFrom: from, lastDateTo: to, lastSearch: q });
+    await writePortalAudit({ userId: req.user?.id, moduleKey: "admin-clientes", actionType: "dashboard", areaCode: area, filters: { from, to, area, grupo, q } });
 
     return safeJson(res, 200, data);
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+    return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
 
@@ -6054,42 +5914,16 @@ app.get("/api/portal/admin-clientes/details", verifyPortalAuth, verifyPortalModu
     const to = isISO(req.query?.to) ? String(req.query.to) : today;
     const cardCode = String(req.query?.cardCode || "").trim();
     const warehouse = String(req.query?.warehouse || "").trim();
-    const area = portalResolveEffectiveArea(req.moduleAccess, req.query?.area || "__ALL__");
+    const area = coercePortalAreaForAccess(req.query?.area, req.portalModuleAccess);
     const grupo = String(req.query?.grupo || "__ALL__");
-
-    if (!cardCode || !warehouse) {
-      return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
-    }
+    if (!cardCode || !warehouse) return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
+    if (area === "__DENY__") return safeJson(res, 403, { ok: false, message: "Área no permitida" });
 
     const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
-    data.access = {
-      moduleKey: "admin-clientes",
-      isAdmin: !!req.moduleAccess?.isAdmin,
-      areas: req.moduleAccess?.areas || [],
-      availableAreas: portalAvailableAreasForAccess(req.moduleAccess),
-      effectiveArea: area,
-    };
-
-    await savePortalUserMemory(req.user?.id, "admin-clientes", {
-      lastRange: { from, to },
-      lastFilters: { area, grupo },
-      lastFocus: { cardCode, warehouse },
-      updatedAt: new Date().toISOString(),
-    });
-    await writePortalAudit({
-      userId: req.user?.id,
-      moduleKey: "admin-clientes",
-      actionType: "open_detail",
-      entityType: "customer_warehouse",
-      entityCode: `${cardCode}|${warehouse}`,
-      entityName: `${cardCode} @ ${warehouse}`,
-      areaCode: area === "__ALL__" ? "" : area,
-      filters: { from, to, area, grupo },
-    });
-
+    await writePortalAudit({ userId: req.user?.id, moduleKey: "admin-clientes", actionType: "details", entityType: "client", entityCode: cardCode, entityName: warehouse, areaCode: area, filters: { from, to, area, grupo } });
     return safeJson(res, 200, data);
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+    return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
 
@@ -6102,21 +5936,15 @@ app.get("/api/portal/admin-clientes/top-products", verifyPortalAuth, verifyPorta
     const to = isISO(req.query?.to) ? String(req.query.to) : today;
     const warehouse = String(req.query?.warehouse || "").trim();
     const cardCode = String(req.query?.cardCode || "").trim();
-    const area = portalResolveEffectiveArea(req.moduleAccess, req.query?.area || "__ALL__");
+    const area = coercePortalAreaForAccess(req.query?.area, req.portalModuleAccess);
     const grupo = String(req.query?.grupo || "__ALL__");
     const limit = Math.max(1, Math.min(200, Number(req.query?.limit || 10)));
+    if (area === "__DENY__") return safeJson(res, 403, { ok: false, message: "Área no permitida" });
 
     const data = await topProductsFromDb({ from, to, warehouse, cardCode, area, grupo, limit });
-    data.access = {
-      moduleKey: "admin-clientes",
-      isAdmin: !!req.moduleAccess?.isAdmin,
-      areas: req.moduleAccess?.areas || [],
-      availableAreas: portalAvailableAreasForAccess(req.moduleAccess),
-      effectiveArea: area,
-    };
     return safeJson(res, 200, data);
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+    return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
 
@@ -6127,12 +5955,12 @@ app.get("/api/portal/admin-clientes/export", verifyPortalAuth, verifyPortalModul
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
     const to = isISO(req.query?.to) ? String(req.query.to) : today;
-    const area = portalResolveEffectiveArea(req.moduleAccess, req.query?.area || "__ALL__");
+    const area = coercePortalAreaForAccess(req.query?.area, req.portalModuleAccess);
     const grupo = String(req.query?.grupo || "__ALL__");
     const q = String(req.query?.q || "");
+    if (area === "__DENY__") return safeJson(res, 403, { ok: false, message: "Área no permitida" });
 
     const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
-
     const wb = XLSX.utils.book_new();
     const rows = (data.table || []).map((r) => ({
       "Código cliente": r.cardCode,
@@ -6145,23 +5973,14 @@ app.get("/api/portal/admin-clientes/export", verifyPortalAuth, verifyPortalModul
       "Facturas": r.invoices,
       "Notas de crédito": r.creditNotes,
     }));
-    const ws = XLSX.utils.json_to_sheet(rows);
-    XLSX.utils.book_append_sheet(wb, ws, "Resumen");
-
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), "Resumen");
     const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-    await writePortalAudit({
-      userId: req.user?.id,
-      moduleKey: "admin-clientes",
-      actionType: "export_excel",
-      areaCode: area === "__ALL__" ? "" : area,
-      filters: { from, to, area, grupo, q },
-      payload: { rows: rows.length },
-    });
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="admin-clientes_${from}_a_${to}.xlsx"`);
+    await writePortalAudit({ userId: req.user?.id, moduleKey: "admin-clientes", actionType: "export_excel", areaCode: area, filters: { from, to, area, grupo, q } });
     return res.end(buf);
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+    return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
 
@@ -6174,16 +5993,13 @@ app.get("/api/portal/admin-clientes/details/export", verifyPortalAuth, verifyPor
     const to = isISO(req.query?.to) ? String(req.query.to) : today;
     const cardCode = String(req.query?.cardCode || "").trim();
     const warehouse = String(req.query?.warehouse || "").trim();
-    const area = portalResolveEffectiveArea(req.moduleAccess, req.query?.area || "__ALL__");
+    const area = coercePortalAreaForAccess(req.query?.area, req.portalModuleAccess);
     const grupo = String(req.query?.grupo || "__ALL__");
-
-    if (!cardCode || !warehouse) {
-      return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
-    }
+    if (!cardCode || !warehouse) return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
+    if (area === "__DENY__") return safeJson(res, 403, { ok: false, message: "Área no permitida" });
 
     const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
     const wb = XLSX.utils.book_new();
-
     const rows = [];
     for (const doc of (data.invoices || [])) {
       for (const ln of (doc.lines || [])) {
@@ -6204,27 +6020,14 @@ app.get("/api/portal/admin-clientes/details/export", verifyPortalAuth, verifyPor
         });
       }
     }
-
-    const ws = XLSX.utils.json_to_sheet(rows);
-    XLSX.utils.book_append_sheet(wb, ws, "Detalle");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), "Detalle");
     const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-
-    await writePortalAudit({
-      userId: req.user?.id,
-      moduleKey: "admin-clientes",
-      actionType: "export_detail_excel",
-      entityType: "customer_warehouse",
-      entityCode: `${cardCode}|${warehouse}`,
-      areaCode: area === "__ALL__" ? "" : area,
-      filters: { from, to, area, grupo },
-      payload: { rows: rows.length },
-    });
-
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", `attachment; filename="detalle_${cardCode}_${warehouse}_${from}_a_${to}.xlsx"`);
+    res.setHeader("Content-Disposition", `attachment; filename="admin-clientes_detalle_${cardCode}_${warehouse}_${from}_a_${to}.xlsx"`);
+    await writePortalAudit({ userId: req.user?.id, moduleKey: "admin-clientes", actionType: "export_excel_detail", entityType: "client", entityCode: cardCode, entityName: warehouse, areaCode: area, filters: { from, to, area, grupo } });
     return res.end(buf);
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+    return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
 
@@ -6240,9 +6043,10 @@ app.post("/api/portal/admin-clientes/ai-chat", verifyPortalAuth, verifyPortalMod
     const cardCode = String(req.body?.cardCode || "").trim();
     const warehouse = String(req.body?.warehouse || "").trim();
     const customerLabel = String(req.body?.customerLabel || "").trim();
-    const area = portalResolveEffectiveArea(req.moduleAccess, req.body?.area || req.query?.area || "__ALL__");
+    const area = coercePortalAreaForAccess(req.body?.area || req.query?.area || "__ALL__", req.portalModuleAccess);
     const grupo = String(req.body?.grupo || req.query?.grupo || "__ALL__");
     const q = String(req.body?.q || req.query?.q || "").trim();
+    if (area === "__DENY__") return safeJson(res, 403, { ok: false, message: "Área no permitida" });
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const defaultFrom = addDaysISO(today, -30);
@@ -6290,27 +6094,25 @@ app.post("/api/portal/admin-clientes/ai-chat", verifyPortalAuth, verifyPortalMod
     });
 
     await savePortalUserMemory(req.user?.id, "admin-clientes", {
-      lastRange: { from, to },
-      lastFilters: { area, grupo, q },
-      lastFocus: focusCardCode ? { cardCode: focusCardCode, warehouse: focusWarehouse, label: focusLabel } : null,
+      lastArea: area,
+      lastGroup: grupo,
+      lastDateFrom: from,
+      lastDateTo: to,
+      lastSearch: q,
+      lastCustomerCode: focusCardCode,
+      lastWarehouse: focusWarehouse,
       lastQuestion: question,
-      lastAnswerPreview: truncate(out.answer || "", 300),
-      updatedAt: new Date().toISOString(),
     });
-
     await writePortalAudit({
       userId: req.user?.id,
       moduleKey: "admin-clientes",
       actionType: "ai_question",
-      entityType: focusCardCode ? "customer_warehouse" : "",
-      entityCode: focusCardCode ? `${focusCardCode}|${focusWarehouse}` : "",
-      entityName: focusLabel || "",
-      areaCode: area === "__ALL__" ? "" : area,
+      entityType: "client",
+      entityCode: focusCardCode,
+      entityName: focusLabel || focusWarehouse,
+      areaCode: area,
       filters: { from, to, area, grupo, q },
-      payload: {
-        inferred_focus: !!resolvedFocus?.cardCode,
-        question: truncate(question, 400),
-      },
+      payload: { question, focusWarehouse },
     });
 
     return safeJson(res, 200, {
@@ -6320,13 +6122,6 @@ app.post("/api/portal/admin-clientes/ai-chat", verifyPortalAuth, verifyPortalMod
       source: "db",
       range: { from, to },
       filters: { area, grupo, q },
-      access: {
-        moduleKey: "admin-clientes",
-        isAdmin: !!req.moduleAccess?.isAdmin,
-        areas: req.moduleAccess?.areas || [],
-        availableAreas: portalAvailableAreasForAccess(req.moduleAccess),
-        effectiveArea: area,
-      },
       focus: focusCardCode ? {
         cardCode: focusCardCode,
         warehouse: focusWarehouse,
@@ -6349,19 +6144,12 @@ app.post("/api/portal/admin-clientes/sync", verifyPortalAuth, verifyPortalModule
     const fromQ = String(req.query?.from || req.body?.from || "");
     const toQ = String(req.query?.to || req.body?.to || "");
     const maxDocs = Math.max(500, Math.min(50000, Number(req.query?.maxDocs || req.body?.maxDocs || 12000)));
-
     if (!isISO(fromQ) || !isISO(toQ)) {
       return safeJson(res, 400, { ok: false, message: "from y to deben ser YYYY-MM-DD" });
     }
 
     const out = await syncRangeToDb({ from: fromQ, to: toQ, maxDocs });
-    await writePortalAudit({
-      userId: req.user?.id,
-      moduleKey: "admin-clientes",
-      actionType: "sync_range",
-      filters: { from: fromQ, to: toQ, maxDocs },
-      payload: out,
-    });
+    await writePortalAudit({ userId: req.user?.id, moduleKey: "admin-clientes", actionType: "sync", filters: { from: fromQ, to: toQ, maxDocs } });
     return safeJson(res, 200, { ok: true, ...out, from: fromQ, to: toQ, maxDocs });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -6375,18 +6163,11 @@ app.post("/api/portal/admin-clientes/sync/recent", verifyPortalAuth, verifyPorta
 
     const days = Math.max(1, Math.min(90, Number(req.query?.days || req.body?.days || 10)));
     const maxDocs = Math.max(500, Math.min(50000, Number(req.query?.maxDocs || req.body?.maxDocs || 12000)));
-
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const from = addDaysISO(today, -(days - 1));
 
     const out = await syncRangeToDb({ from, to: today, maxDocs });
-    await writePortalAudit({
-      userId: req.user?.id,
-      moduleKey: "admin-clientes",
-      actionType: "sync_recent",
-      filters: { from, to: today, days, maxDocs },
-      payload: out,
-    });
+    await writePortalAudit({ userId: req.user?.id, moduleKey: "admin-clientes", actionType: "sync_recent", filters: { from, to: today, days, maxDocs } });
     return safeJson(res, 200, { ok: true, ...out, from, to: today, days, maxDocs });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -6400,7 +6181,6 @@ __extraBootTasks.push(async () => {
     console.error("Portal module scope DB init error:", e.message || String(e));
   }
 });
-
 
 /* =========================================================
    ✅ START
@@ -8441,858 +8221,6 @@ app.post("/api/admin/invoices/sync/recent", verifyAdmin, async (req, res) => {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
-
-
-/* =========================================================
-   Portal central compartido · permisos por módulo/área
-   Usa el mismo username + PIN de la intranet (portal_users)
-========================================================= */
-const PORTAL_ALL_AREAS = ["CONS", "RCI"];
-const PORTAL_MODULE_KEYS = new Set(["admin-clientes", "estratificacion", "produccion"]);
-
-function normalizePortalModuleKey(v) {
-  const s = String(v || "").trim().toLowerCase();
-  return s;
-}
-
-function normalizePortalAreaCode(v) {
-  const s = String(v || "").trim().toUpperCase();
-  if (!s || s === "__ALL__" || s === "ALL" || s === "*") return "__ALL__";
-  if (s === "CONS" || s === "CONSUMIDOR") return "CONS";
-  if (s === "RCI") return "RCI";
-  return "";
-}
-
-function normalizePortalAreaList(arr) {
-  const out = [];
-  const seen = new Set();
-  for (const raw of Array.isArray(arr) ? arr : []) {
-    const code = normalizePortalAreaCode(raw);
-    if (!code || code === "__ALL__") continue;
-    if (!PORTAL_ALL_AREAS.includes(code)) continue;
-    if (seen.has(code)) continue;
-    seen.add(code);
-    out.push(code);
-  }
-  return out;
-}
-
-async function ensurePortalModuleScopeDb() {
-  if (!hasDb()) return;
-
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS portal_user_module_areas (
-      id BIGSERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES portal_users(id) ON DELETE CASCADE,
-      module_key TEXT NOT NULL,
-      area_code TEXT NOT NULL,
-      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-      UNIQUE(user_id, module_key, area_code)
-    );
-  `);
-
-  await dbQuery(`
-    CREATE INDEX IF NOT EXISTS idx_portal_user_module_areas_user_module
-    ON portal_user_module_areas(user_id, module_key);
-  `);
-
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS app_audit_log (
-      id BIGSERIAL PRIMARY KEY,
-      user_id INTEGER,
-      module_key TEXT NOT NULL,
-      action_type TEXT NOT NULL,
-      entity_type TEXT NOT NULL DEFAULT '',
-      entity_code TEXT NOT NULL DEFAULT '',
-      entity_name TEXT NOT NULL DEFAULT '',
-      area_code TEXT NOT NULL DEFAULT '',
-      request_id TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'ok',
-      message TEXT NOT NULL DEFAULT '',
-      filters_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-      payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at TIMESTAMP NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await dbQuery(`
-    CREATE INDEX IF NOT EXISTS idx_app_audit_log_user_module_created
-    ON app_audit_log(user_id, module_key, created_at DESC);
-  `);
-
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS app_user_memory (
-      user_id INTEGER NOT NULL REFERENCES portal_users(id) ON DELETE CASCADE,
-      module_key TEXT NOT NULL,
-      memory_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (user_id, module_key)
-    );
-  `);
-}
-
-async function portalLoadUserById(userId) {
-  if (!hasDb()) return null;
-  const id = Number(userId || 0);
-  if (!Number.isFinite(id) || id <= 0) return null;
-
-  const r = await dbQuery(
-    `SELECT id, username, full_name, role, is_active, permissions_json
-     FROM portal_users
-     WHERE id=$1
-     LIMIT 1`,
-    [id]
-  );
-  return r.rows?.[0] || null;
-}
-
-function portalPermissionsFromRow(row) {
-  return Array.isArray(row?.permissions_json)
-    ? row.permissions_json.map((x) => String(x || "").trim()).filter(Boolean)
-    : [];
-}
-
-function portalUserIsAdminByRow(row) {
-  return String(row?.role || "").trim().toLowerCase() === "admin";
-}
-
-function portalUserHasModulePermission(row, moduleKey) {
-  if (portalUserIsAdminByRow(row)) return true;
-  const perms = portalPermissionsFromRow(row);
-  return perms.includes("*") || perms.includes(moduleKey);
-}
-
-async function portalGetModuleAreasForUser(userId, moduleKey) {
-  if (!hasDb()) return PORTAL_ALL_AREAS.slice();
-  const id = Number(userId || 0);
-  if (!Number.isFinite(id) || id <= 0) return PORTAL_ALL_AREAS.slice();
-
-  const mk = normalizePortalModuleKey(moduleKey);
-  const r = await dbQuery(
-    `SELECT area_code
-     FROM portal_user_module_areas
-     WHERE user_id=$1 AND module_key=$2
-     ORDER BY area_code`,
-    [id, mk]
-  );
-
-  const areas = normalizePortalAreaList((r.rows || []).map((x) => x.area_code));
-  return areas.length ? areas : PORTAL_ALL_AREAS.slice();
-}
-
-function portalResolveEffectiveArea(access, requestedArea = "__ALL__") {
-  const allowed = normalizePortalAreaList(access?.areas || []);
-  const req = normalizePortalAreaCode(requestedArea);
-  if (!allowed.length || allowed.length >= 2) {
-    return req || "__ALL__";
-  }
-  return allowed[0];
-}
-
-function portalAvailableAreasForAccess(access) {
-  const allowed = normalizePortalAreaList(access?.areas || []);
-  if (!allowed.length || allowed.length >= 2) return ["__ALL__", ...PORTAL_ALL_AREAS];
-  return allowed.slice();
-}
-
-async function portalGetModuleAccessContext(authUser, moduleKey) {
-  const mk = normalizePortalModuleKey(moduleKey);
-  if (!PORTAL_MODULE_KEYS.has(mk)) {
-    return {
-      ok: false,
-      canAccess: false,
-      isAdmin: false,
-      moduleKey: mk,
-      areas: [],
-      availableAreas: [],
-      permissions: [],
-      user: authUser || null,
-    };
-  }
-
-  if (Number(authUser?.id || 0) === 0 && String(authUser?.role || "").toLowerCase() === "admin") {
-    return {
-      ok: true,
-      canAccess: true,
-      isAdmin: true,
-      moduleKey: mk,
-      areas: PORTAL_ALL_AREAS.slice(),
-      availableAreas: ["__ALL__", ...PORTAL_ALL_AREAS],
-      permissions: ["*"],
-      user: authUser,
-    };
-  }
-
-  const row = await portalLoadUserById(authUser?.id);
-  if (!row || !row.is_active) {
-    return {
-      ok: false,
-      canAccess: false,
-      isAdmin: false,
-      moduleKey: mk,
-      areas: [],
-      availableAreas: [],
-      permissions: [],
-      user: authUser || null,
-    };
-  }
-
-  const permissions = portalPermissionsFromRow(row);
-  const isAdmin = portalUserIsAdminByRow(row) || permissions.includes("*");
-  const canAccess = isAdmin || permissions.includes(mk);
-  const areas = canAccess ? await portalGetModuleAreasForUser(row.id, mk) : [];
-  return {
-    ok: true,
-    canAccess,
-    isAdmin,
-    moduleKey: mk,
-    areas,
-    availableAreas: canAccess ? portalAvailableAreasForAccess({ areas }) : [],
-    permissions,
-    user: {
-      id: row.id,
-      username: row.username,
-      full_name: row.full_name || "",
-      role: row.role || "user",
-    },
-  };
-}
-
-function verifyPortalModule(moduleKey, opts = {}) {
-  return async (req, res, next) => {
-    try {
-      const access = await portalGetModuleAccessContext(req.user, moduleKey);
-      if (!access?.canAccess) {
-        return safeJson(res, 403, { ok: false, message: `Sin acceso al módulo ${moduleKey}` });
-      }
-      if (opts.adminOnly && !access.isAdmin) {
-        return safeJson(res, 403, { ok: false, message: "Permiso de administrador requerido" });
-      }
-      req.moduleAccess = access;
-      return next();
-    } catch (e) {
-      return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-    }
-  };
-}
-
-async function writePortalAudit({
-  userId = null,
-  moduleKey = "",
-  actionType = "",
-  entityType = "",
-  entityCode = "",
-  entityName = "",
-  areaCode = "",
-  requestId = "",
-  status = "ok",
-  message = "",
-  filters = {},
-  payload = {},
-} = {}) {
-  try {
-    if (!hasDb()) return;
-    await dbQuery(
-      `INSERT INTO app_audit_log(
-        user_id, module_key, action_type, entity_type, entity_code, entity_name,
-        area_code, request_id, status, message, filters_json, payload_json
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb)`,
-      [
-        Number.isFinite(Number(userId)) ? Number(userId) : null,
-        String(moduleKey || ""),
-        String(actionType || ""),
-        String(entityType || ""),
-        String(entityCode || ""),
-        String(entityName || ""),
-        String(areaCode || ""),
-        String(requestId || ""),
-        String(status || "ok"),
-        truncate(message || "", 240),
-        JSON.stringify(filters || {}),
-        JSON.stringify(payload || {}),
-      ]
-    );
-  } catch {}
-}
-
-async function savePortalUserMemory(userId, moduleKey, memory = {}) {
-  try {
-    if (!hasDb()) return;
-    const id = Number(userId || 0);
-    if (!Number.isFinite(id) || id <= 0) return;
-
-    await dbQuery(
-      `INSERT INTO app_user_memory(user_id, module_key, memory_json, updated_at)
-       VALUES ($1,$2,$3::jsonb,NOW())
-       ON CONFLICT (user_id, module_key)
-       DO UPDATE SET memory_json = EXCLUDED.memory_json, updated_at = NOW()`,
-      [id, String(moduleKey || ""), JSON.stringify(memory || {})]
-    );
-  } catch {}
-}
-
-async function loadPortalUserMemory(userId, moduleKey) {
-  try {
-    if (!hasDb()) return {};
-    const id = Number(userId || 0);
-    if (!Number.isFinite(id) || id <= 0) return {};
-    const r = await dbQuery(
-      `SELECT memory_json
-       FROM app_user_memory
-       WHERE user_id=$1 AND module_key=$2
-       LIMIT 1`,
-      [id, String(moduleKey || "")]
-    );
-    const raw = r.rows?.[0]?.memory_json;
-    return raw && typeof raw === "object" ? raw : {};
-  } catch {
-    return {};
-  }
-}
-
-app.get("/api/portal/modules/:moduleKey/access", verifyPortalAuth, async (req, res) => {
-  try {
-    const moduleKey = normalizePortalModuleKey(req.params.moduleKey);
-    if (!PORTAL_MODULE_KEYS.has(moduleKey)) {
-      return safeJson(res, 400, { ok: false, message: "moduleKey inválido" });
-    }
-    const access = await portalGetModuleAccessContext(req.user, moduleKey);
-    const memory = access?.canAccess ? await loadPortalUserMemory(req.user?.id, moduleKey) : {};
-    return safeJson(res, 200, {
-      ok: true,
-      moduleKey,
-      canAccess: !!access?.canAccess,
-      isAdmin: !!access?.isAdmin,
-      areas: access?.areas || [],
-      availableAreas: access?.availableAreas || [],
-      permissions: access?.permissions || [],
-      memory,
-      user: access?.user || req.user || null,
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-app.get("/api/portal/admin/modules/:moduleKey/users", verifyPortalAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
-    const moduleKey = normalizePortalModuleKey(req.params.moduleKey);
-    if (!PORTAL_MODULE_KEYS.has(moduleKey)) {
-      return safeJson(res, 400, { ok: false, message: "moduleKey inválido" });
-    }
-
-    const usersR = await dbQuery(
-      `SELECT id, username, full_name, role, is_active, permissions_json, created_at
-       FROM portal_users
-       ORDER BY id DESC`
-    );
-
-    const areaR = await dbQuery(
-      `SELECT user_id, module_key, area_code
-       FROM portal_user_module_areas
-       WHERE module_key=$1`,
-      [moduleKey]
-    );
-
-    const areaMap = new Map();
-    for (const row of areaR.rows || []) {
-      const key = `${row.user_id}::${row.module_key}`;
-      const cur = areaMap.get(key) || [];
-      cur.push(row.area_code);
-      areaMap.set(key, cur);
-    }
-
-    const users = (usersR.rows || []).map((u) => {
-      const perms = Array.isArray(u.permissions_json) ? u.permissions_json : [];
-      const isAdmin = String(u.role || "").toLowerCase() === "admin" || perms.includes("*");
-      const moduleEnabled = isAdmin || perms.includes(moduleKey);
-      const areas = moduleEnabled
-        ? normalizePortalAreaList(areaMap.get(`${u.id}::${moduleKey}`) || []).concat()
-        : [];
-      return {
-        id: u.id,
-        username: u.username,
-        full_name: u.full_name || "",
-        role: u.role || "user",
-        is_active: !!u.is_active,
-        created_at: u.created_at,
-        module_enabled: moduleEnabled,
-        areas: moduleEnabled ? (areas.length ? areas : PORTAL_ALL_AREAS.slice()) : [],
-      };
-    });
-
-    return safeJson(res, 200, { ok: true, moduleKey, users });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-app.patch("/api/portal/admin/modules/:moduleKey/users/:id/access", verifyPortalAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
-
-    const moduleKey = normalizePortalModuleKey(req.params.moduleKey);
-    const userId = Number(req.params.id || 0);
-    if (!PORTAL_MODULE_KEYS.has(moduleKey)) {
-      return safeJson(res, 400, { ok: false, message: "moduleKey inválido" });
-    }
-    if (!Number.isFinite(userId) || userId <= 0) {
-      return safeJson(res, 400, { ok: false, message: "ID inválido" });
-    }
-
-    const moduleEnabled = !!req.body?.module_enabled;
-    const desiredAreas = normalizePortalAreaList(req.body?.areas || []);
-
-    const u = await portalLoadUserById(userId);
-    if (!u) return safeJson(res, 404, { ok: false, message: "Usuario no encontrado" });
-
-    const isTargetAdmin = portalUserIsAdminByRow(u) || portalPermissionsFromRow(u).includes("*");
-    let perms = portalPermissionsFromRow(u);
-
-    if (!isTargetAdmin) {
-      if (moduleEnabled && !perms.includes(moduleKey)) perms.push(moduleKey);
-      if (!moduleEnabled) perms = perms.filter((x) => x !== moduleKey);
-      await dbQuery(
-        `UPDATE portal_users
-         SET permissions_json=$2::jsonb
-         WHERE id=$1`,
-        [userId, JSON.stringify(perms)]
-      );
-    }
-
-    await dbQuery(
-      `DELETE FROM portal_user_module_areas
-       WHERE user_id=$1 AND module_key=$2`,
-      [userId, moduleKey]
-    );
-
-    if (moduleEnabled) {
-      const areasToStore = desiredAreas.length ? desiredAreas : PORTAL_ALL_AREAS.slice();
-      for (const areaCode of areasToStore) {
-        await dbQuery(
-          `INSERT INTO portal_user_module_areas(user_id, module_key, area_code)
-           VALUES ($1,$2,$3)
-           ON CONFLICT (user_id, module_key, area_code) DO NOTHING`,
-          [userId, moduleKey, areaCode]
-        );
-      }
-    }
-
-    const access = await portalGetModuleAccessContext({ id: userId }, moduleKey);
-    return safeJson(res, 200, {
-      ok: true,
-      moduleKey,
-      user: {
-        id: userId,
-        username: u.username,
-        full_name: u.full_name || "",
-        role: u.role || "user",
-        module_enabled: !!access?.canAccess,
-        areas: access?.areas || [],
-      },
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-app.get("/api/portal/admin-clientes/dashboard", verifyPortalAuth, verifyPortalModule("admin-clientes"), async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
-    const to = isISO(req.query?.to) ? String(req.query.to) : today;
-    const area = portalResolveEffectiveArea(req.moduleAccess, req.query?.area || "__ALL__");
-    const grupo = String(req.query?.grupo || "__ALL__");
-    const q = String(req.query?.q || "");
-
-    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
-    data.lastSyncAt = await getState("last_sync_at");
-    data.access = {
-      moduleKey: "admin-clientes",
-      isAdmin: !!req.moduleAccess?.isAdmin,
-      areas: req.moduleAccess?.areas || [],
-      availableAreas: portalAvailableAreasForAccess(req.moduleAccess),
-      effectiveArea: area,
-    };
-
-    await savePortalUserMemory(req.user?.id, "admin-clientes", {
-      lastRange: { from, to },
-      lastFilters: { area, grupo, q },
-      updatedAt: new Date().toISOString(),
-    });
-    await writePortalAudit({
-      userId: req.user?.id,
-      moduleKey: "admin-clientes",
-      actionType: "dashboard_load",
-      areaCode: area === "__ALL__" ? "" : area,
-      filters: { from, to, area, grupo, q },
-    });
-
-    return safeJson(res, 200, data);
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-app.get("/api/portal/admin-clientes/details", verifyPortalAuth, verifyPortalModule("admin-clientes"), async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
-    const to = isISO(req.query?.to) ? String(req.query.to) : today;
-    const cardCode = String(req.query?.cardCode || "").trim();
-    const warehouse = String(req.query?.warehouse || "").trim();
-    const area = portalResolveEffectiveArea(req.moduleAccess, req.query?.area || "__ALL__");
-    const grupo = String(req.query?.grupo || "__ALL__");
-
-    if (!cardCode || !warehouse) {
-      return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
-    }
-
-    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
-    data.access = {
-      moduleKey: "admin-clientes",
-      isAdmin: !!req.moduleAccess?.isAdmin,
-      areas: req.moduleAccess?.areas || [],
-      availableAreas: portalAvailableAreasForAccess(req.moduleAccess),
-      effectiveArea: area,
-    };
-
-    await savePortalUserMemory(req.user?.id, "admin-clientes", {
-      lastRange: { from, to },
-      lastFilters: { area, grupo },
-      lastFocus: { cardCode, warehouse },
-      updatedAt: new Date().toISOString(),
-    });
-    await writePortalAudit({
-      userId: req.user?.id,
-      moduleKey: "admin-clientes",
-      actionType: "open_detail",
-      entityType: "customer_warehouse",
-      entityCode: `${cardCode}|${warehouse}`,
-      entityName: `${cardCode} @ ${warehouse}`,
-      areaCode: area === "__ALL__" ? "" : area,
-      filters: { from, to, area, grupo },
-    });
-
-    return safeJson(res, 200, data);
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-app.get("/api/portal/admin-clientes/top-products", verifyPortalAuth, verifyPortalModule("admin-clientes"), async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
-    const to = isISO(req.query?.to) ? String(req.query.to) : today;
-    const warehouse = String(req.query?.warehouse || "").trim();
-    const cardCode = String(req.query?.cardCode || "").trim();
-    const area = portalResolveEffectiveArea(req.moduleAccess, req.query?.area || "__ALL__");
-    const grupo = String(req.query?.grupo || "__ALL__");
-    const limit = Math.max(1, Math.min(200, Number(req.query?.limit || 10)));
-
-    const data = await topProductsFromDb({ from, to, warehouse, cardCode, area, grupo, limit });
-    data.access = {
-      moduleKey: "admin-clientes",
-      isAdmin: !!req.moduleAccess?.isAdmin,
-      areas: req.moduleAccess?.areas || [],
-      availableAreas: portalAvailableAreasForAccess(req.moduleAccess),
-      effectiveArea: area,
-    };
-    return safeJson(res, 200, data);
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-app.get("/api/portal/admin-clientes/export", verifyPortalAuth, verifyPortalModule("admin-clientes"), async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
-    const to = isISO(req.query?.to) ? String(req.query.to) : today;
-    const area = portalResolveEffectiveArea(req.moduleAccess, req.query?.area || "__ALL__");
-    const grupo = String(req.query?.grupo || "__ALL__");
-    const q = String(req.query?.q || "");
-
-    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
-
-    const wb = XLSX.utils.book_new();
-    const rows = (data.table || []).map((r) => ({
-      "Código cliente": r.cardCode,
-      "Cliente": r.cardName,
-      "Cliente label": r.customer,
-      "Bodega": r.warehouse,
-      "Ventas netas $": r.dollars,
-      "Ganancia bruta $": r.grossProfit,
-      "% GP": r.grossPct,
-      "Facturas": r.invoices,
-      "Notas de crédito": r.creditNotes,
-    }));
-    const ws = XLSX.utils.json_to_sheet(rows);
-    XLSX.utils.book_append_sheet(wb, ws, "Resumen");
-
-    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-    await writePortalAudit({
-      userId: req.user?.id,
-      moduleKey: "admin-clientes",
-      actionType: "export_excel",
-      areaCode: area === "__ALL__" ? "" : area,
-      filters: { from, to, area, grupo, q },
-      payload: { rows: rows.length },
-    });
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", `attachment; filename="admin-clientes_${from}_a_${to}.xlsx"`);
-    return res.end(buf);
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-app.get("/api/portal/admin-clientes/details/export", verifyPortalAuth, verifyPortalModule("admin-clientes"), async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
-    const to = isISO(req.query?.to) ? String(req.query.to) : today;
-    const cardCode = String(req.query?.cardCode || "").trim();
-    const warehouse = String(req.query?.warehouse || "").trim();
-    const area = portalResolveEffectiveArea(req.moduleAccess, req.query?.area || "__ALL__");
-    const grupo = String(req.query?.grupo || "__ALL__");
-
-    if (!cardCode || !warehouse) {
-      return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
-    }
-
-    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
-    const wb = XLSX.utils.book_new();
-
-    const rows = [];
-    for (const doc of (data.invoices || [])) {
-      for (const ln of (doc.lines || [])) {
-        rows.push({
-          "Tipo": doc.docTypeLabel,
-          "DocNum": doc.docNum,
-          "Fecha": doc.docDate,
-          "Código cliente": data.cardCode,
-          "Bodega": data.warehouse,
-          "Área": ln.area,
-          "Grupo": ln.grupo,
-          "ItemCode": ln.itemCode,
-          "Descripción": ln.itemDesc,
-          "Cantidad": ln.quantity,
-          "Ventas netas $": ln.dollars,
-          "Ganancia bruta $": ln.grossProfit,
-          "% GP": ln.grossPct,
-        });
-      }
-    }
-
-    const ws = XLSX.utils.json_to_sheet(rows);
-    XLSX.utils.book_append_sheet(wb, ws, "Detalle");
-    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-
-    await writePortalAudit({
-      userId: req.user?.id,
-      moduleKey: "admin-clientes",
-      actionType: "export_detail_excel",
-      entityType: "customer_warehouse",
-      entityCode: `${cardCode}|${warehouse}`,
-      areaCode: area === "__ALL__" ? "" : area,
-      filters: { from, to, area, grupo },
-      payload: { rows: rows.length },
-    });
-
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", `attachment; filename="detalle_${cardCode}_${warehouse}_${from}_a_${to}.xlsx"`);
-    return res.end(buf);
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-app.post("/api/portal/admin-clientes/ai-chat", verifyPortalAuth, verifyPortalModule("admin-clientes"), async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-
-    const question = String(req.body?.question || "").trim();
-    if (!question) return safeJson(res, 400, { ok: false, message: "question requerida" });
-
-    const fromQ = String(req.body?.from || req.query?.from || "");
-    const toQ = String(req.body?.to || req.query?.to || "");
-    const cardCode = String(req.body?.cardCode || "").trim();
-    const warehouse = String(req.body?.warehouse || "").trim();
-    const customerLabel = String(req.body?.customerLabel || "").trim();
-    const area = portalResolveEffectiveArea(req.moduleAccess, req.body?.area || req.query?.area || "__ALL__");
-    const grupo = String(req.body?.grupo || req.query?.grupo || "__ALL__");
-    const q = String(req.body?.q || req.query?.q || "").trim();
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const defaultFrom = addDaysISO(today, -30);
-    const from = isISO(fromQ) ? fromQ : defaultFrom;
-    const to = isISO(toQ) ? toQ : today;
-
-    const dashboard = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
-    const analytics = await buildAdminClientesAiAnalytics({ from, to, area, grupo, q });
-
-    const resolvedFocus = adminResolveDashboardFocus({
-      dashboard,
-      question,
-      q,
-      cardCode,
-      warehouse,
-      customerLabel,
-    });
-
-    const focusCardCode = String(resolvedFocus?.cardCode || cardCode || "").trim();
-    const focusWarehouse = String(resolvedFocus?.warehouse || warehouse || "").trim();
-    const focusLabel = String(resolvedFocus?.label || customerLabel || "").trim();
-
-    let detail = null;
-    if (focusCardCode && focusWarehouse) {
-      detail = await detailsFromDb({ from, to, cardCode: focusCardCode, warehouse: focusWarehouse, area, grupo });
-    }
-
-    const recommendationContext = await buildAdminClientesRecommendationAnalytics({
-      from,
-      to,
-      area,
-      grupo,
-      targetCardCode: focusCardCode,
-      customerLabel: focusLabel,
-      question,
-    });
-
-    const out = await openaiDbAnalystChat({
-      question,
-      dashboard,
-      analytics,
-      detail,
-      customerLabel: focusLabel,
-      recommendationContext,
-    });
-
-    await savePortalUserMemory(req.user?.id, "admin-clientes", {
-      lastRange: { from, to },
-      lastFilters: { area, grupo, q },
-      lastFocus: focusCardCode ? { cardCode: focusCardCode, warehouse: focusWarehouse, label: focusLabel } : null,
-      lastQuestion: question,
-      lastAnswerPreview: truncate(out.answer || "", 300),
-      updatedAt: new Date().toISOString(),
-    });
-
-    await writePortalAudit({
-      userId: req.user?.id,
-      moduleKey: "admin-clientes",
-      actionType: "ai_question",
-      entityType: focusCardCode ? "customer_warehouse" : "",
-      entityCode: focusCardCode ? `${focusCardCode}|${focusWarehouse}` : "",
-      entityName: focusLabel || "",
-      areaCode: area === "__ALL__" ? "" : area,
-      filters: { from, to, area, grupo, q },
-      payload: {
-        inferred_focus: !!resolvedFocus?.cardCode,
-        question: truncate(question, 400),
-      },
-    });
-
-    return safeJson(res, 200, {
-      ok: true,
-      answer: out.answer,
-      model: out.model,
-      source: "db",
-      range: { from, to },
-      filters: { area, grupo, q },
-      access: {
-        moduleKey: "admin-clientes",
-        isAdmin: !!req.moduleAccess?.isAdmin,
-        areas: req.moduleAccess?.areas || [],
-        availableAreas: portalAvailableAreasForAccess(req.moduleAccess),
-        effectiveArea: area,
-      },
-      focus: focusCardCode ? {
-        cardCode: focusCardCode,
-        warehouse: focusWarehouse,
-        customerLabel: focusLabel || `${focusCardCode}`,
-        label: focusLabel || `${focusCardCode}`,
-        inferred: !(cardCode && warehouse),
-        source: resolvedFocus?.source || (cardCode && warehouse ? "explicit" : "none"),
-      } : null,
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-app.post("/api/portal/admin-clientes/sync", verifyPortalAuth, verifyPortalModule("admin-clientes", { adminOnly: true }), async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-    if (missingSapEnv()) return safeJson(res, 500, { ok: false, message: "SAP env incompleto" });
-
-    const fromQ = String(req.query?.from || req.body?.from || "");
-    const toQ = String(req.query?.to || req.body?.to || "");
-    const maxDocs = Math.max(500, Math.min(50000, Number(req.query?.maxDocs || req.body?.maxDocs || 12000)));
-
-    if (!isISO(fromQ) || !isISO(toQ)) {
-      return safeJson(res, 400, { ok: false, message: "from y to deben ser YYYY-MM-DD" });
-    }
-
-    const out = await syncRangeToDb({ from: fromQ, to: toQ, maxDocs });
-    await writePortalAudit({
-      userId: req.user?.id,
-      moduleKey: "admin-clientes",
-      actionType: "sync_range",
-      filters: { from: fromQ, to: toQ, maxDocs },
-      payload: out,
-    });
-    return safeJson(res, 200, { ok: true, ...out, from: fromQ, to: toQ, maxDocs });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-app.post("/api/portal/admin-clientes/sync/recent", verifyPortalAuth, verifyPortalModule("admin-clientes", { adminOnly: true }), async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-    if (missingSapEnv()) return safeJson(res, 500, { ok: false, message: "SAP env incompleto" });
-
-    const days = Math.max(1, Math.min(90, Number(req.query?.days || req.body?.days || 10)));
-    const maxDocs = Math.max(500, Math.min(50000, Number(req.query?.maxDocs || req.body?.maxDocs || 12000)));
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = addDaysISO(today, -(days - 1));
-
-    const out = await syncRangeToDb({ from, to: today, maxDocs });
-    await writePortalAudit({
-      userId: req.user?.id,
-      moduleKey: "admin-clientes",
-      actionType: "sync_recent",
-      filters: { from, to: today, days, maxDocs },
-      payload: out,
-    });
-    return safeJson(res, 200, { ok: true, ...out, from, to: today, days, maxDocs });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-__extraBootTasks.push(async () => {
-  try {
-    await ensurePortalModuleScopeDb();
-  } catch (e) {
-    console.error("Portal module scope DB init error:", e.message || String(e));
-  }
-});
-
 
 /* =========================================================
    ✅ START
