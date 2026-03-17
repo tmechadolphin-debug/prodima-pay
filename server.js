@@ -8848,7 +8848,9 @@ async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
 function prodDemandQtyExpr(tableName) {
   const t = String(tableName || '').toLowerCase();
   if (t === 'production_demand_lines') {
-    return `COALESCE(quantity_base, CASE WHEN COALESCE(num_per_msr,0) > 0 THEN quantity * num_per_msr ELSE quantity END, quantity, 0)`;
+    // Para Producción trabajamos en la misma UDM visible de SAP (normalmente cajas),
+    // de modo que stock, min/max y demanda se comparen en la misma escala.
+    return `COALESCE(quantity,0)`;
   }
   return `COALESCE(quantity,0)`;
 }
@@ -8872,7 +8874,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
   const demandCount = Number(demandCountRes.rows?.[0]?.c || 0);
   const useDemandFallback = demandCount <= 0;
   const demandTable = useDemandFallback ? 'sales_item_lines' : 'production_demand_lines';
-  const demandSourceLabel = useDemandFallback ? 'Facturas (fallback temporal; ejecuta Sync para Pedidos)' : 'Pedidos';
+  const demandSourceLabel = useDemandFallback ? 'Facturas (fallback temporal; ejecuta Sync para Pedidos)' : 'Pedidos SAP (cajas/UDM venta)';
   const demandQtyExpr = prodDemandQtyExpr(demandTable);
 
   const rows = await dbQuery(
@@ -9025,6 +9027,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       coverageMonthsTarget: 1,
       coveragePolicyLabel: '',
       demandSource: demandSourceLabel,
+      demandUomLabel: 'Cajas / UDM venta SAP',
     };
   });
 
@@ -9125,6 +9128,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     horizonMonths: Math.max(1, Number(horizonMonths || 3)),
     lastSyncAt: await getState("production_last_sync_at"),
     demandSource: demandSourceLabel,
+      demandUomLabel: 'Cajas / UDM venta SAP',
     demandCount,
     useDemandFallback,
     availableGroups,
