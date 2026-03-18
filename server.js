@@ -8699,7 +8699,7 @@ function prodLooksLikeResource({ code, description = "", item = null, line = nul
   const codeTxt = String(code || "").trim().toLowerCase();
   const inventoryFlag = String(item?.InventoryItem || "").trim().toLowerCase();
   if (/(operari|supervisor|linea de produccion|línea de producción|mano de obra|recurso|resource|labor|overhead|gastos? de fabricaci|horas? hombre|maquina de limpieza|maquina de salsas|servicio interno)/i.test(txt)) return true;
-  if (/^(ogf|mli|mlim|mosup|m00\d|mo\d{2,}|res|momez)$/i.test(codeTxt)) return true;
+  if (/^(ogf|mli|mlim|mosup|m00\d|mo\d{2,}|res)/i.test(codeTxt) || codeTxt === 'momez') return true;
   if (["tno", "no", "n", "f"].includes(inventoryFlag) && /(operari|supervisor|linea|línea|gasto|recurso|labor|overhead|servicio)/i.test(txt)) return true;
   return false;
 }
@@ -8945,7 +8945,7 @@ async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }
       const isResource = componentType === "RESOURCE";
       const preferredWh = componentType === "RAW_MATERIAL" ? "03" : current.warehouse;
       const stockInfo = isResource ? { stockQty: 0, availableQty: 0 } : prodExtractComponentStockInfo(item, preferredWh);
-      const stockQty = isResource ? 0 : (stockInfo.availableQty > 0 ? stockInfo.availableQty : stockInfo.stockQty);
+      const stockQty = isResource ? 0 : stockInfo.stockQty;
       const shortage = isResource ? 0 : Math.max(0, requiredQty - stockQty);
       const coverage = isResource ? 1 : (requiredQty > 0 ? stockQty / requiredQty : 0);
       results.push({
@@ -9413,13 +9413,14 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const meta = local.formulas.products?.[it.itemCode] || null;
     const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
     const coverageMonthsTarget = prodCoverageMonthsByLabel(total.label);
-    const targetInventoryQty = prodNum(it.stockMax) > 0 ? prodNum(it.stockMax) * coverageMonthsTarget : it.projectedQty;
+    const horizonFactor = Math.max(1, Number(horizonMonths || 3));
+    const targetInventoryQty = prodNum(it.stockMax) > 0 ? prodNum(it.stockMax) * coverageMonthsTarget * horizonFactor : it.projectedQty;
 
-    // Neces. = política ABC sobre máximo SAP, sin descontar inventario
+    // Neces. = máximo SAP por política ABC, multiplicado por el horizonte seleccionado
     const productionNeeded = Math.max(0, targetInventoryQty);
 
-    // Ajustado = lo que falta producir para alcanzar el necesario según stock actual
-    const productionAdjusted = Math.max(0, productionNeeded - prodNum(it.stockTotal));
+    // Ajustado = faltante para alcanzar el necesario con el stock actual
+    const productionAdjusted = Math.max(0, targetInventoryQty - prodNum(it.stockTotal));
     const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
     const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
 
@@ -9663,14 +9664,15 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const dashRow = (dashForAbc.items || []).find((x) => String(x.itemCode || '') === code) || null;
   const coverageMonthsTarget = dashRow ? prodNum(dashRow.coverageMonthsTarget || 1, 1) : 1;
   const coveragePolicyLabel = prodCoverageLabel(coverageMonthsTarget);
-const targetInventoryQty = stockMax > 0 ? stockMax * coverageMonthsTarget : projectedQty;
+  const horizonFactor = Math.max(1, Number(horizonMonths || 3));
+const targetInventoryQty = stockMax > 0 ? stockMax * coverageMonthsTarget * horizonFactor : projectedQty;
 const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
 const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : targetInventoryQty;
 
-// Neces. = siempre el máximo
+// Neces. = máximo SAP por política ABC, multiplicado por el horizonte
 const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty);
 
-// Ajustado = faltante para llegar al máximo
+// Ajustado = faltante para llegar al necesario con el stock actual
 const mrpAdjustedQty = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty - stockTotal);
 const productionAdjusted = mrpAdjustedQty;
 
