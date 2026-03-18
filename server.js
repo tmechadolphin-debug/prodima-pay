@@ -7947,18 +7947,6 @@ async function ensureProductionDb() {
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_item_date ON production_demand_lines(item_code, doc_date DESC);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_date ON production_demand_lines(doc_date DESC);`);
 
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS production_supplier_cache (
-      item_code TEXT PRIMARY KEY,
-      supplier_name TEXT NOT NULL DEFAULT '',
-      supplier_code TEXT NOT NULL DEFAULT '',
-      doc_num BIGINT,
-      doc_date DATE,
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_supplier_updated ON production_supplier_cache(updated_at);`);
-
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_inv_wh_item ON production_inv_wh_cache(item_code);`);
 }
 __extraBootTasks.push(async () => {
@@ -7997,7 +7985,6 @@ function prodExtractMrpFromItem(it) {
 const PROD_ITEM_RUNTIME_CACHE = new Map();
 const PROD_ORDERS_RUNTIME_CACHE = new Map();
 const PROD_BOM_RUNTIME_CACHE = new Map();
-const PROD_SUPPLIER_RUNTIME_CACHE = new Map();
 const PROD_PLAN_RUNTIME_CACHE = new Map();
 const PROD_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const PROD_PLAN_TTL_MS = 2 * 60 * 1000;
@@ -8308,9 +8295,29 @@ function prodExtractInventorySnapshotFromItem(item) {
   };
 }
 
+function prodIsIsoDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || "").slice(0, 10));
+}
+function prodToIsoDate(value) {
+  if (!value) return "";
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().slice(0, 10);
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) return raw.slice(0, 10);
+  const sapTicks = raw.match(/\/Date\((\d+)(?:[+-]\d+)?\)\//i);
+  if (sapTicks) {
+    const d = new Date(Number(sapTicks[1] || 0));
+    if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  }
+  if (/^[A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}$/.test(raw)) return "";
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10);
+  return "";
+}
+
 function prodNormalizeProductionOrderRow(r) {
   const postDateRaw = r?.PostingDate ?? r?.PostDate ?? r?.StartDate ?? r?.DueDate ?? "";
-  const postDate = String(postDateRaw || "").slice(0, 10);
+  const postDate = prodToIsoDate(postDateRaw);
   return {
     docNum: Number(r?.DocumentNumber ?? r?.DocNum ?? r?.AbsoluteEntry ?? r?.Absoluteentry ?? 0) || null,
     absoluteEntry: Number(r?.AbsoluteEntry ?? r?.Absoluteentry ?? r?.DocEntry ?? 0) || null,
@@ -8393,11 +8400,12 @@ async function prodReadOrdersCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS, top = 
     plannedQty: prodRound(x.planned_qty || 0, 3),
     completedQty: prodRound(x.completed_qty || 0, 3),
     rejectedQty: prodRound(x.rejected_qty || 0, 3),
-    postDate: String(x.post_date || "").slice(0, 10),
+    postDate: prodToIsoDate(x.post_date),
     status: String(x.status || ""),
     warehouse: String(x.warehouse || ""),
     origin: String(x.origin || ""),
   }));
+  if (orders.length && orders.every((o) => !prodIsIsoDate(o.postDate))) return null;
   return prodOrdersToResponse(orders);
 }
 async function prodUpsertOrdersCacheDb(itemCode, orders) {
@@ -8428,7 +8436,7 @@ async function prodUpsertOrdersCacheDb(itemCode, orders) {
         prodNum(o.plannedQty),
         prodNum(o.completedQty),
         prodNum(o.rejectedQty),
-        String(o.postDate || "").slice(0, 10) || null,
+        prodToIsoDate(o.postDate) || null,
         String(o.status || ""),
         String(o.warehouse || ""),
         String(o.origin || ""),
@@ -8475,148 +8483,18 @@ function prodClassifyComponentType({ code, description = "", item = null, line =
 }
 
 function prodExtractSupplierFromItem(item) {
+  const candidates = [
+    item?.MainSupplier,
+    item?.PreferredVendor,
+    item?.SupplierCatalogNo,
+    item?.ForeignName,
+    item?.Manufacturer,
+  ];
+  for (const c of candidates) {
+    const v = String(c || "").trim();
+    if (v) return v;
+  }
   return "";
-}
-
-function prodLooksLikeInvalidSupplierName(v) {
-  const s = String(v || '').trim();
-  if (!s) return true;
-  if (s === '-1' || s === '0') return true;
-  if (/\/(?:\d|[a-z])/i.test(s) && /(?:gr|kg|lb|oz|gram|ml|lt|litro|saco|botella|unidad|caja)/i.test(s)) return true;
-  if (/^(mp\d+|fb\w+|q\w+|kc\w+|fgl\w+|ci\w+|tro\w+|er\w+|ef\w+|bb\w+)$/i.test(s)) return true;
-  return false;
-}
-
-async function prodReadLatestSupplierCacheDb(itemCode, ttlMs = 30 * 24 * 60 * 60 * 1000) {
-  if (!hasDb()) return null;
-  const r = await dbQuery(
-    `SELECT item_code, supplier_name, supplier_code, doc_num, doc_date, updated_at
-       FROM production_supplier_cache
-      WHERE item_code = $1
-      LIMIT 1`,
-    [itemCode]
-  );
-  const row = r.rows?.[0];
-  if (!row || !prodCacheFresh(row.updated_at, ttlMs)) return null;
-  return {
-    itemCode: String(row.item_code || ''),
-    supplierName: String(row.supplier_name || ''),
-    supplierCode: String(row.supplier_code || ''),
-    docNum: row.doc_num != null ? Number(row.doc_num) : null,
-    docDate: row.doc_date ? String(row.doc_date).slice(0, 10) : '',
-  };
-}
-
-async function prodUpsertLatestSupplierCacheDb(itemCode, data = {}) {
-  if (!hasDb() || !itemCode) return;
-  await dbQuery(
-    `INSERT INTO production_supplier_cache(item_code, supplier_name, supplier_code, doc_num, doc_date, updated_at)
-     VALUES($1,$2,$3,$4,$5,NOW())
-     ON CONFLICT (item_code) DO UPDATE SET
-       supplier_name = EXCLUDED.supplier_name,
-       supplier_code = EXCLUDED.supplier_code,
-       doc_num = EXCLUDED.doc_num,
-       doc_date = EXCLUDED.doc_date,
-       updated_at = NOW()`,
-    [
-      String(itemCode || '').trim(),
-      String(data?.supplierName || ''),
-      String(data?.supplierCode || ''),
-      data?.docNum != null ? Number(data.docNum) : null,
-      data?.docDate ? String(data.docDate).slice(0,10) : null,
-    ]
-  );
-}
-
-async function prodFetchLatestSupplierFromSap(itemCode) {
-  const code = String(itemCode || '').trim();
-  if (!code || missingSapEnv()) return null;
-  const batchTop = 40;
-  const maxPages = 8;
-
-  const tryEntity = async (entity) => {
-    let skip = 0;
-    for (let page = 0; page < maxPages; page++) {
-      let raw = null;
-      try {
-        raw = await slFetch(
-          `/${entity}?$select=DocEntry,DocNum,DocDate,CardCode,CardName` +
-          `&$expand=DocumentLines($select=ItemCode)` +
-          `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skip}`,
-          { timeoutMs: 120000 }
-        );
-      } catch {
-        return null;
-      }
-      const rows = Array.isArray(raw?.value) ? raw.value : [];
-      if (!rows.length) break;
-      skip += rows.length;
-
-      for (const row of rows) {
-        const lines = Array.isArray(row?.DocumentLines) ? row.DocumentLines : [];
-        const hasItem = lines.some((ln) => String(ln?.ItemCode || '').trim() === code);
-        if (hasItem) {
-          return {
-            itemCode: code,
-            supplierName: String(row?.CardName || '').trim(),
-            supplierCode: String(row?.CardCode || '').trim(),
-            docNum: row?.DocNum != null ? Number(row.DocNum) : null,
-            docDate: row?.DocDate ? String(row.DocDate).slice(0,10) : '',
-          };
-        }
-      }
-
-      for (const row of rows.slice(0, 10)) {
-        try {
-          const full = await slFetch(`/${entity}(${Number(row.DocEntry)})`, { timeoutMs: 120000 });
-          const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
-          const hasItem = lines.some((ln) => String(ln?.ItemCode || '').trim() === code);
-          if (hasItem) {
-            return {
-              itemCode: code,
-              supplierName: String(full?.CardName || row?.CardName || '').trim(),
-              supplierCode: String(full?.CardCode || row?.CardCode || '').trim(),
-              docNum: full?.DocNum != null ? Number(full.DocNum) : (row?.DocNum != null ? Number(row.DocNum) : null),
-              docDate: full?.DocDate ? String(full.DocDate).slice(0,10) : (row?.DocDate ? String(row.DocDate).slice(0,10) : ''),
-            };
-          }
-        } catch {}
-      }
-    }
-    return null;
-  };
-
-  let hit = await tryEntity('PurchaseInvoices');
-  if (hit) return hit;
-  return null;
-}
-
-async function prodGetLatestSupplierForItem(itemCode, item = null, { forceFresh = false, ttlMs = 30 * 24 * 60 * 60 * 1000 } = {}) {
-  const code = String(itemCode || '').trim();
-  if (!code) return '';
-  const runtimeKey = `supplier::${code}`;
-  if (!forceFresh) {
-    const hit = prodRuntimeGet(PROD_SUPPLIER_RUNTIME_CACHE, runtimeKey, ttlMs);
-    const hitName = String(hit?.supplierName || '').trim();
-    if (hitName && !prodLooksLikeInvalidSupplierName(hitName)) return hitName;
-
-    const dbHit = await prodReadLatestSupplierCacheDb(code, ttlMs).catch(() => null);
-    const dbName = String(dbHit?.supplierName || '').trim();
-    if (dbName && !prodLooksLikeInvalidSupplierName(dbName)) {
-      prodRuntimeSet(PROD_SUPPLIER_RUNTIME_CACHE, runtimeKey, dbHit);
-      return dbName;
-    }
-  }
-
-  const sapHit = await prodFetchLatestSupplierFromSap(code).catch(() => null);
-  const sapName = String(sapHit?.supplierName || '').trim();
-  if (sapName && !prodLooksLikeInvalidSupplierName(sapName)) {
-    prodRuntimeSet(PROD_SUPPLIER_RUNTIME_CACHE, runtimeKey, sapHit);
-    await prodUpsertLatestSupplierCacheDb(code, sapHit).catch(() => {});
-    return sapName;
-  }
-
-  return '';
 }
 
 function prodExtractComponentStockInfo(item, preferredWh = "") {
@@ -8825,7 +8703,6 @@ async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }
   }
 
   const results = [];
-  const supplierNameCache = new Map();
   let idx = 0;
   const workers = Array.from({ length: Math.min(6, Math.max(1, bomLines.length)) }, async () => {
     while (idx < bomLines.length) {
@@ -8847,7 +8724,7 @@ async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }
         stockQty: prodRound(stockQty, 3),
         shortageQty: prodRound(shortage, 3),
         coveragePct: prodRound(coverage * 100, 1),
-        supplier: isResource ? "Recurso interno" : (supplierNameCache.has(current.code) ? supplierNameCache.get(current.code) : await (async () => { const s = await prodGetLatestSupplierForItem(current.code, item).catch(() => prodExtractSupplierFromItem(item)); supplierNameCache.set(current.code, s || ""); return s || ""; })()),
+        supplier: isResource ? "Recurso interno" : prodExtractSupplierFromItem(item),
         cost: prodRound(prodExtractWeightedCostFromItem(item), 4),
         status: isResource ? "OK" : (shortage > 0 ? "FALTANTE" : "OK"),
         componentType,
@@ -9455,7 +9332,28 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   );
   const monthMap = new Map((monthlyRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
 
-  const weightedCost = prodExtractWeightedCostFromItem(sapItem);
+  let weightedCost = prodExtractWeightedCostFromItem(sapItem);
+  if (!(weightedCost > 0)) {
+    try {
+      const cachedItem = await prodReadItemCacheDb(code, 365 * 24 * 60 * 60 * 1000);
+      const cachedWeighted = prodExtractWeightedCostFromItem(cachedItem);
+      if (cachedWeighted > 0) weightedCost = cachedWeighted;
+    } catch {}
+  }
+  if (!(weightedCost > 0) && hasDb()) {
+    try {
+      const wcRes = await dbQuery(`SELECT weighted_cost FROM production_item_cache WHERE item_code = $1 LIMIT 1`, [code]);
+      const dbWeighted = prodNum(wcRes.rows?.[0]?.weighted_cost || 0);
+      if (dbWeighted > 0) weightedCost = dbWeighted;
+    } catch {}
+  }
+  if (!(weightedCost > 0)) {
+    try {
+      const freshItem = await prodGetFullItem(code, { forceFresh: true, ttlMs: 0 });
+      const freshWeighted = prodExtractWeightedCostFromItem(freshItem);
+      if (freshWeighted > 0) weightedCost = freshWeighted;
+    } catch {}
+  }
   const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map() }));
   const prodMonthMap = prodOrders?.monthly instanceof Map ? prodOrders.monthly : new Map();
 
