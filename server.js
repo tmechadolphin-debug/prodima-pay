@@ -9311,9 +9311,27 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   );
   const monthMap = new Map((monthlyRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
 
-  const weightedCost = prodExtractWeightedCostFromItem(sapItem);
+  let weightedCost = prodExtractWeightedCostFromItem(sapItem);
+  if (!(Number(weightedCost || 0) > 0) && hasDb()) {
+    try {
+      const wcRes = await dbQuery(`SELECT weighted_cost FROM production_item_cache WHERE item_code = $1 LIMIT 1`, [code]);
+      const wcDb = prodNum(wcRes.rows?.[0]?.weighted_cost || 0);
+      if (wcDb > 0) weightedCost = wcDb;
+    } catch {}
+  }
   const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map() }));
-  const prodMonthMap = prodOrders?.monthly instanceof Map ? prodOrders.monthly : new Map();
+  const prodMonthMap = new Map();
+  if (prodOrders?.monthly instanceof Map) {
+    for (const [k, v] of prodOrders.monthly.entries()) {
+      prodMonthMap.set(String(k || ''), prodNum(v));
+    }
+  }
+  for (const o of Array.isArray(prodOrders?.orders) ? prodOrders.orders : []) {
+    const ymOrder = prodYm(String(o?.postDate || '').slice(0, 10));
+    if (!ymOrder || ymOrder === 'NaN-NaN') continue;
+    const prev = prodNum(prodMonthMap.get(ymOrder) || 0);
+    prodMonthMap.set(ymOrder, prodRound(prev + prodNum(o?.completedQty || 0), 3));
+  }
 
   const salesHistory = [];
   for (let i = 11; i >= 0; i--) {
