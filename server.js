@@ -6,6 +6,7 @@ import crypto from "crypto";
 import XLSX from "xlsx";
 import fs from "fs";
 import path from "path";
+import zlib from "zlib";
 
 const { Pool } = pg;
 const app = express();
@@ -3008,11 +3009,315 @@ console.log("BOOT", "DOCS_MAIL_V11_BASE41_FAST_SEARCH");
 
 function sanitizeAttachmentName(name, fallback = "archivo") {
   const raw = String(name || fallback || "archivo")
-    .replace(/[\\/\r\n\t]+/g, " ")
+    .replace(/[\/
+	]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
   const clean = raw.replace(/[^A-Za-z0-9._()\- áéíóúÁÉÍÓÚñÑ]/g, "_");
   return (clean || fallback || "archivo").slice(0, 120);
+}
+
+function attachmentNameToPdf(name) {
+  const safe = sanitizeAttachmentName(name || "archivo");
+  return safe.replace(/\.[^.]+$/,'') + '.pdf';
+}
+
+function buildPdfFromJpegBuffer(jpegBuf) {
+  const dim = parseJpegSize(jpegBuf);
+  if (!dim?.width || !dim?.height) throw new Error('No se pudo leer tamaño JPEG');
+  return buildSingleImagePdf({
+    width: dim.width,
+    height: dim.height,
+    colorSpace: '/DeviceRGB',
+    bitsPerComponent: 8,
+    filter: '/DCTDecode',
+    imageData: jpegBuf,
+  });
+}
+
+function buildPdfFromPngBuffer(pngBuf) {
+  const parsed = parsePngToPdfImage(pngBuf);
+  return buildSingleImagePdf(parsed);
+}
+
+function parseJpegSize(buf) {
+  const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || []);
+  if (b.length < 4 || b[0] !== 0xff || b[1] !== 0xd8) return null;
+  let i = 2;
+  while (i + 9 < b.length) {
+    if (b[i] !== 0xff) { i += 1; continue; }
+    const marker = b[i + 1];
+    if (marker === 0xd8 || marker === 0xd9) { i += 2; continue; }
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+    const len = b.readUInt16BE(i + 2);
+    if (len < 2 || i + 2 + len > b.length) break;
+    const isSOF = [0xc0,0xc1,0xc2,0xc3,0xc5,0xc6,0xc7,0xc9,0xca,0xcb,0xcd,0xce,0xcf].includes(marker);
+    if (isSOF) {
+      const height = b.readUInt16BE(i + 5);
+      const width = b.readUInt16BE(i + 7);
+      return { width, height };
+    }
+    i += 2 + len;
+  }
+  return null;
+}
+
+function paethPredictor(a, b, c) {
+  const p = a + b - c;
+  const pa = Math.abs(p - a);
+  const pb = Math.abs(p - b);
+  const pc = Math.abs(p - c);
+  if (pa <= pb && pa <= pc) return a;
+  if (pb <= pc) return b;
+  return c;
+}
+
+function unfilterPngScanlines(data, width, height, bytesPerPixel, rowBytes) {
+  const out = Buffer.alloc(height * rowBytes);
+  let inPos = 0;
+  let outPos = 0;
+  for (let row = 0; row < height; row += 1) {
+    const filter = data[inPos++];
+    for (let col = 0; col < rowBytes; col += 1) {
+      const x = data[inPos++];
+      const left = col >= bytesPerPixel ? out[outPos + col - bytesPerPixel] : 0;
+      const up = row > 0 ? out[outPos + col - rowBytes] : 0;
+      const upLeft = row > 0 && col >= bytesPerPixel ? out[outPos + col - rowBytes - bytesPerPixel] : 0;
+      let val = 0;
+      switch (filter) {
+        case 0: val = x; break;
+        case 1: val = (x + left) & 0xff; break;
+        case 2: val = (x + up) & 0xff; break;
+        case 3: val = (x + Math.floor((left + up) / 2)) & 0xff; break;
+        case 4: val = (x + paethPredictor(left, up, upLeft)) & 0xff; break;
+        default: throw new Error('Filtro PNG no soportado');
+      }
+      out[outPos + col] = val;
+    }
+    outPos += rowBytes;
+  }
+  return out;
+}
+
+function parsePngToPdfImage(buf) {
+  const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || []);
+  const sig = '89504e470d0a1a0a';
+  if (b.length < 8 || b.subarray(0, 8).toString('hex') !== sig) throw new Error('PNG inválido');
+
+  let pos = 8;
+  let width = 0;
+  let height = 0;
+  let bitDepth = 0;
+  let colorType = 0;
+  let interlace = 0;
+  let palette = null;
+  let trns = null;
+  const idat = [];
+
+  while (pos + 8 <= b.length) {
+    const len = b.readUInt32BE(pos); pos += 4;
+    const type = b.toString('ascii', pos, pos + 4); pos += 4;
+    if (pos + len + 4 > b.length) break;
+    const chunk = b.subarray(pos, pos + len); pos += len;
+    pos += 4; // crc
+    if (type === 'IHDR') {
+      width = chunk.readUInt32BE(0);
+      height = chunk.readUInt32BE(4);
+      bitDepth = chunk[8];
+      colorType = chunk[9];
+      interlace = chunk[12];
+    } else if (type === 'PLTE') {
+      palette = chunk;
+    } else if (type === 'tRNS') {
+      trns = chunk;
+    } else if (type === 'IDAT') {
+      idat.push(chunk);
+    } else if (type === 'IEND') {
+      break;
+    }
+  }
+
+  if (!width || !height || !idat.length) throw new Error('PNG incompleto');
+  if (interlace !== 0) throw new Error('PNG interlaced no soportado');
+  if (bitDepth !== 8) throw new Error('PNG bitDepth no soportado');
+
+  let channels = 0;
+  if (colorType === 0) channels = 1;
+  else if (colorType === 2) channels = 3;
+  else if (colorType === 3) channels = 1;
+  else if (colorType === 4) channels = 2;
+  else if (colorType === 6) channels = 4;
+  else throw new Error('ColorType PNG no soportado');
+
+  const bytesPerPixel = channels;
+  const rowBytes = width * bytesPerPixel;
+  const inflated = zlib.inflateSync(Buffer.concat(idat));
+  const raw = unfilterPngScanlines(inflated, width, height, bytesPerPixel, rowBytes);
+
+  let colorRaw;
+  let alphaRaw = null;
+  let colorSpace = '/DeviceRGB';
+  let bitsPerComponent = 8;
+
+  if (colorType === 0) {
+    colorRaw = raw;
+    colorSpace = '/DeviceGray';
+  } else if (colorType === 2) {
+    colorRaw = raw;
+    colorSpace = '/DeviceRGB';
+  } else if (colorType === 4) {
+    colorRaw = Buffer.alloc(width * height);
+    alphaRaw = Buffer.alloc(width * height);
+    for (let i = 0, j = 0, k = 0; i < raw.length; i += 2, j += 1, k += 1) {
+      colorRaw[j] = raw[i];
+      alphaRaw[k] = raw[i + 1];
+    }
+    colorSpace = '/DeviceGray';
+  } else if (colorType === 6) {
+    colorRaw = Buffer.alloc(width * height * 3);
+    alphaRaw = Buffer.alloc(width * height);
+    for (let i = 0, j = 0, k = 0; i < raw.length; i += 4) {
+      colorRaw[j++] = raw[i];
+      colorRaw[j++] = raw[i + 1];
+      colorRaw[j++] = raw[i + 2];
+      alphaRaw[k++] = raw[i + 3];
+    }
+    colorSpace = '/DeviceRGB';
+  } else if (colorType === 3) {
+    if (!palette || palette.length % 3 !== 0) throw new Error('PNG palette inválida');
+    colorRaw = Buffer.alloc(width * height * 3);
+    const alphaDefault = 255;
+    const alphaNeeded = !!trns;
+    if (alphaNeeded) alphaRaw = Buffer.alloc(width * height);
+    for (let i = 0, j = 0; i < raw.length; i += 1, j += 3) {
+      const idx = raw[i];
+      const p = idx * 3;
+      colorRaw[j] = palette[p] ?? 0;
+      colorRaw[j + 1] = palette[p + 1] ?? 0;
+      colorRaw[j + 2] = palette[p + 2] ?? 0;
+      if (alphaNeeded) alphaRaw[i] = trns[idx] ?? alphaDefault;
+    }
+    colorSpace = '/DeviceRGB';
+  }
+
+  const imageData = zlib.deflateSync(colorRaw);
+  const smaskData = alphaRaw ? zlib.deflateSync(alphaRaw) : null;
+
+  return { width, height, colorSpace, bitsPerComponent, filter: '/FlateDecode', imageData, smaskData };
+}
+
+function buildSingleImagePdf({ width, height, colorSpace, bitsPerComponent, filter, imageData, smaskData = null }) {
+  const w = Math.max(1, Number(width || 1));
+  const h = Math.max(1, Number(height || 1));
+  const objects = [];
+  const pushObj = (buf) => objects.push(Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf), 'binary'));
+
+  const imageObjNum = 4;
+  const contentObjNum = 5;
+  const smaskObjNum = smaskData ? 6 : 0;
+
+  pushObj(`<< /Type /Catalog /Pages 2 0 R >>`);
+  pushObj(`<< /Type /Pages /Kids [3 0 R] /Count 1 >>`);
+  pushObj(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${w} ${h}] /Resources << /XObject << /Im0 ${imageObjNum} 0 R >> >> /Contents ${contentObjNum} 0 R >>`);
+
+  const imageHeader = [
+    `<< /Type /XObject /Subtype /Image /Width ${w} /Height ${h}`,
+    `/ColorSpace ${colorSpace}`,
+    `/BitsPerComponent ${bitsPerComponent}`,
+    `/Filter ${filter}`,
+  ];
+  if (smaskObjNum) imageHeader.push(`/SMask ${smaskObjNum} 0 R`);
+  imageHeader.push(`/Length ${imageData.length} >>`);
+  pushObj(Buffer.concat([
+    Buffer.from(imageHeader.join(' ') + `
+stream
+`, 'binary'),
+    imageData,
+    Buffer.from(`
+endstream`, 'binary'),
+  ]));
+
+  const content = Buffer.from(`q
+${w} 0 0 ${h} 0 0 cm
+/Im0 Do
+Q
+`, 'binary');
+  pushObj(Buffer.concat([
+    Buffer.from(`<< /Length ${content.length} >>
+stream
+`, 'binary'),
+    content,
+    Buffer.from(`endstream`, 'binary'),
+  ]));
+
+  if (smaskObjNum) {
+    pushObj(Buffer.concat([
+      Buffer.from(`<< /Type /XObject /Subtype /Image /Width ${w} /Height ${h} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length ${smaskData.length} >>
+stream
+`, 'binary'),
+      smaskData,
+      Buffer.from(`
+endstream`, 'binary'),
+    ]));
+  }
+
+  const parts = [Buffer.from('%PDF-1.4
+%âãÏÓ
+', 'binary')];
+  const offsets = [0];
+  let cursor = parts[0].length;
+  for (let i = 0; i < objects.length; i += 1) {
+    offsets.push(cursor);
+    const header = Buffer.from(`${i + 1} 0 obj
+`, 'binary');
+    const footer = Buffer.from(`
+endobj
+`, 'binary');
+    parts.push(header, objects[i], footer);
+    cursor += header.length + objects[i].length + footer.length;
+  }
+
+  const xrefStart = cursor;
+  const xref = [`xref
+0 ${objects.length + 1}
+`, `0000000000 65535 f 
+`];
+  for (let i = 1; i < offsets.length; i += 1) xref.push(`${String(offsets[i]).padStart(10,'0')} 00000 n 
+`);
+  const trailer = `trailer
+<< /Size ${objects.length + 1} /Root 1 0 R >>
+startxref
+${xrefStart}
+%%EOF`;
+  parts.push(Buffer.from(xref.join('') + trailer, 'binary'));
+  return Buffer.concat(parts);
+}
+
+function tryConvertAttachmentToPdf(file) {
+  const mimeType = String(file?.mimeType || '').trim().toLowerCase();
+  const base64 = String(file?.contentBase64 || '').trim();
+  if (!base64) return null;
+  let src;
+  try { src = Buffer.from(base64, 'base64'); } catch { return null; }
+  try {
+    let pdfBuf = null;
+    if (mimeType === 'image/jpeg' || mimeType === 'image/jpg') {
+      pdfBuf = buildPdfFromJpegBuffer(src);
+    } else if (mimeType === 'image/png') {
+      pdfBuf = buildPdfFromPngBuffer(src);
+    } else {
+      return null;
+    }
+    return {
+      filename: attachmentNameToPdf(file?.filename || file?.name || 'adjunto'),
+      mimeType: 'application/pdf',
+      contentBase64: pdfBuf.toString('base64'),
+      size: pdfBuf.length,
+    };
+  } catch (err) {
+    console.error('attachment pdf convert error:', err?.message || err);
+    return null;
+  }
 }
 
 function normalizeIncomingAttachments(list) {
@@ -3046,10 +3351,17 @@ function normalizeIncomingAttachments(list) {
     }
 
     if (!bytes || bytes > 8 * 1024 * 1024) continue;
-    if (totalBytes + bytes > 18 * 1024 * 1024) break;
-    totalBytes += bytes;
 
-    out.push({ filename, mimeType, contentBase64, size: bytes });
+    let normalized = { filename, mimeType, contentBase64, size: bytes };
+    if (mimeType.startsWith('image/')) {
+      const converted = tryConvertAttachmentToPdf({ filename, mimeType, contentBase64 });
+      if (converted) normalized = converted;
+    }
+
+    if (!normalized.size || normalized.size > 18 * 1024 * 1024) continue;
+    if (totalBytes + normalized.size > 18 * 1024 * 1024) break;
+    totalBytes += normalized.size;
+    out.push(normalized);
   }
 
   return out;
