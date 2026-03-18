@@ -3046,47 +3046,99 @@ function parseJpegMeta(buf) {
   return null;
 }
 
-function buildMinimalPdfFromJpeg(buf, filenameBase = "archivo") {
-  const meta = parseJpegMeta(buf);
-  if (!meta || !meta.width || !meta.height) {
-    throw new Error("JPEG inválido para PDF");
+function buildMinimalPdfFromJpegs(images, filenameBase = "archivo") {
+  const pages = (Array.isArray(images) ? images : [])
+    .map((img) => {
+      const buf = Buffer.isBuffer(img?.buf) ? img.buf : null;
+      const meta = buf ? parseJpegMeta(buf) : null;
+      if (!buf || !meta || !meta.width || !meta.height) return null;
+      const comps = Number(meta.components || 3);
+      const colorSpace = comps === 1 ? "/DeviceGray" : (comps === 4 ? "/DeviceCMYK" : "/DeviceRGB");
+      const width = meta.width;
+      const height = meta.height;
+      const contentText = `q\n${width} 0 0 ${height} 0 0 cm\n/Im0 Do\nQ\n`;
+      return {
+        buf,
+        width,
+        height,
+        colorSpace,
+        contentText,
+        contentBuf: Buffer.from(contentText, "ascii"),
+      };
+    })
+    .filter(Boolean);
+
+  if (!pages.length) {
+    throw new Error("No hay imágenes JPEG válidas para PDF");
   }
-  const width = meta.width;
-  const height = meta.height;
-  const comps = Number(meta.components || 3);
-  const colorSpace = comps === 1 ? "/DeviceGray" : (comps === 4 ? "/DeviceCMYK" : "/DeviceRGB");
-  const contentText = `q\n${width} 0 0 ${height} 0 0 cm\n/Im0 Do\nQ\n`;
-  const contentBuf = Buffer.from(contentText, "ascii");
-  const objects = [
-    Buffer.from(`1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n`, "ascii"),
-    Buffer.from(`2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n`, "ascii"),
-    Buffer.from(`3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>\nendobj\n`, "ascii"),
-    Buffer.concat([
-      Buffer.from(`4 0 obj\n<< /Type /XObject /Subtype /Image /Width ${width} /Height ${height} /ColorSpace ${colorSpace} /BitsPerComponent 8 /Filter /DCTDecode /Length ${buf.length} >>\nstream\n`, "ascii"),
-      buf,
+
+  const objects = [];
+  const kids = [];
+  let nextObjNum = 3;
+
+  for (const page of pages) {
+    const pageObjNum = nextObjNum++;
+    const imgObjNum = nextObjNum++;
+    const contentObjNum = nextObjNum++;
+    kids.push(`${pageObjNum} 0 R`);
+
+    objects.push(Buffer.from(
+      `${pageObjNum} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${page.width} ${page.height}] /Resources << /XObject << /Im0 ${imgObjNum} 0 R >> >> /Contents ${contentObjNum} 0 R >>\nendobj\n`,
+      "ascii"
+    ));
+
+    objects.push(Buffer.concat([
+      Buffer.from(
+        `${imgObjNum} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${page.width} /Height ${page.height} /ColorSpace ${page.colorSpace} /BitsPerComponent 8 /Filter /DCTDecode /Length ${page.buf.length} >>\nstream\n`,
+        "ascii"
+      ),
+      page.buf,
       Buffer.from(`\nendstream\nendobj\n`, "ascii"),
-    ]),
-    Buffer.from(`5 0 obj\n<< /Length ${contentBuf.length} >>\nstream\n${contentText}endstream\nendobj\n`, "ascii"),
-  ];
+    ]));
+
+    objects.push(Buffer.from(
+      `${contentObjNum} 0 obj\n<< /Length ${page.contentBuf.length} >>\nstream\n${page.contentText}endstream\nendobj\n`,
+      "ascii"
+    ));
+  }
+
+  const catalogObj = Buffer.from(`1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n`, "ascii");
+  const pagesObj = Buffer.from(`2 0 obj\n<< /Type /Pages /Kids [${kids.join(" ")}] /Count ${pages.length} >>\nendobj\n`, "ascii");
+  const allObjects = [catalogObj, pagesObj, ...objects];
 
   const header = Buffer.from("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n", "binary");
   const parts = [header];
   const offsets = [0];
   let offset = header.length;
-  for (const obj of objects) {
+
+  for (const obj of allObjects) {
     offsets.push(offset);
     parts.push(obj);
     offset += obj.length;
   }
+
   const xrefOffset = offset;
-  let xref = `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
-  for (let i = 1; i <= objects.length; i += 1) {
+  let xref = `xref\n0 ${allObjects.length + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i <= allObjects.length; i += 1) {
     xref += `${String(offsets[i]).padStart(10, "0")} 00000 n \n`;
   }
+
   const safeTitle = String(filenameBase || "archivo").replace(/[()\\]/g, "");
   parts.push(Buffer.from(xref, "ascii"));
-  parts.push(Buffer.from(`trailer\n<< /Size ${objects.length + 1} /Root 1 0 R /Info << /Title (${safeTitle}) >> >>\nstartxref\n${xrefOffset}\n%%EOF\n`, "ascii"));
+  parts.push(Buffer.from(
+    `trailer\n<< /Size ${allObjects.length + 1} /Root 1 0 R /Info << /Title (${safeTitle}) >> >>\nstartxref\n${xrefOffset}\n%%EOF\n`,
+    "ascii"
+  ));
   return Buffer.concat(parts);
+}
+
+function buildMinimalPdfFromJpeg(buf, filenameBase = "archivo") {
+  return buildMinimalPdfFromJpegs([{ buf }], filenameBase);
+}
+
+function isMergeableJpegAttachment(file) {
+  const lowerMime = String(file?.mimeType || file?.type || "").trim().toLowerCase();
+  return ["image/jpeg", "image/jpg"].includes(lowerMime);
 }
 
 function maybeConvertAttachmentToPdf({ filename, mimeType, contentBase64 }) {
@@ -3115,8 +3167,7 @@ function normalizeIncomingAttachments(list) {
   ]);
 
   const incoming = Array.isArray(list) ? list : [];
-  const out = [];
-  let totalBytes = 0;
+  const normalizedInputs = [];
 
   for (const file of incoming.slice(0, 5)) {
     const filename = sanitizeAttachmentName(file?.filename || file?.name || "archivo");
@@ -3126,11 +3177,24 @@ function normalizeIncomingAttachments(list) {
     if (!filename || !contentBase64) continue;
     if (!allowed.has(mimeType)) continue;
 
-    let normalized = { filename, mimeType, contentBase64 };
+    normalizedInputs.push({ filename, mimeType, contentBase64 });
+  }
+
+  const jpegImages = [];
+  const out = [];
+  let totalBytes = 0;
+
+  for (const file of normalizedInputs) {
+    if (isMergeableJpegAttachment(file)) {
+      jpegImages.push(file);
+      continue;
+    }
+
+    let normalized = { ...file };
     try {
       normalized = maybeConvertAttachmentToPdf(normalized);
     } catch {
-      normalized = { filename, mimeType, contentBase64 };
+      normalized = { ...file };
     }
 
     let bytes = 0;
@@ -3150,6 +3214,73 @@ function normalizeIncomingAttachments(list) {
       contentBase64: normalized.contentBase64,
       size: bytes,
     });
+  }
+
+  if (jpegImages.length) {
+    try {
+      const mergedPdf = buildMinimalPdfFromJpegs(
+        jpegImages.map((img) => ({ buf: Buffer.from(img.contentBase64, "base64") })),
+        attachmentBaseName(jpegImages[0]?.filename || "imagenes", "imagenes")
+      );
+      const mergedBytes = mergedPdf.length;
+      if (mergedBytes > 0 && mergedBytes <= 18 * 1024 * 1024 && totalBytes + mergedBytes <= 18 * 1024 * 1024) {
+        totalBytes += mergedBytes;
+        out.unshift({
+          filename: `${attachmentBaseName(jpegImages[0]?.filename || "imagenes", "imagenes")}_imagenes.pdf`,
+          mimeType: "application/pdf",
+          contentBase64: mergedPdf.toString("base64"),
+          size: mergedBytes,
+        });
+      } else {
+        for (const img of jpegImages) {
+          let normalized = { ...img };
+          try {
+            normalized = maybeConvertAttachmentToPdf(normalized);
+          } catch {
+            normalized = { ...img };
+          }
+          let bytes = 0;
+          try {
+            bytes = Buffer.byteLength(normalized.contentBase64, "base64");
+          } catch {
+            continue;
+          }
+          if (!bytes || bytes > 8 * 1024 * 1024) continue;
+          if (totalBytes + bytes > 18 * 1024 * 1024) break;
+          totalBytes += bytes;
+          out.push({
+            filename: normalized.filename,
+            mimeType: normalized.mimeType,
+            contentBase64: normalized.contentBase64,
+            size: bytes,
+          });
+        }
+      }
+    } catch {
+      for (const img of jpegImages) {
+        let normalized = { ...img };
+        try {
+          normalized = maybeConvertAttachmentToPdf(normalized);
+        } catch {
+          normalized = { ...img };
+        }
+        let bytes = 0;
+        try {
+          bytes = Buffer.byteLength(normalized.contentBase64, "base64");
+        } catch {
+          continue;
+        }
+        if (!bytes || bytes > 8 * 1024 * 1024) continue;
+        if (totalBytes + bytes > 18 * 1024 * 1024) break;
+        totalBytes += bytes;
+        out.push({
+          filename: normalized.filename,
+          mimeType: normalized.mimeType,
+          contentBase64: normalized.contentBase64,
+          size: bytes,
+        });
+      }
+    }
   }
 
   return out;
