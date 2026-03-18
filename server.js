@@ -9181,11 +9181,8 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const meta = local.formulas.products?.[it.itemCode] || null;
     const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
     const coverageMonthsTarget = prodCoverageMonthsByLabel(total.label);
-    const maxQty = prodNum(it.stockMax);
-    const stockQty = prodNum(it.stockTotal);
-    const targetInventoryQty = maxQty > 0 ? maxQty * coverageMonthsTarget : it.projectedQty;
-    const productionNeeded = Math.max(0, targetInventoryQty);
-    const productionAdjusted = maxQty > 0 ? Math.max(0, maxQty - stockQty) : Math.max(0, it.projectedQty - stockQty);
+    const targetInventoryQty = prodNum(it.stockMax) > 0 ? prodNum(it.stockMax) * coverageMonthsTarget : it.projectedQty;
+    const productionNeeded = Math.max(0, targetInventoryQty - prodNum(it.stockTotal));
     const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
     const hoursNeeded = rate > 0 ? productionNeeded / rate : 0;
 
@@ -9203,7 +9200,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       coveragePolicyLabel: prodCoverageLabel(coverageMonthsTarget),
       targetInventoryQty: prodRound(targetInventoryQty, 2),
       productionNeeded: prodRound(productionNeeded, 2),
-      productionAdjusted: prodRound(productionAdjusted, 2),
+      productionAdjusted: prodRound(productionNeeded, 2),
       unitsPerHour: rate,
       hoursNeeded: prodRound(hoursNeeded, 2),
       hasFormula: !!meta,
@@ -9433,7 +9430,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
   const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : targetInventoryQty;
   const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty);
-  const mrpAdjustedQty = stockMax > 0 ? Math.max(0, stockMax - stockTotal) : Math.max(0, projectedQty - stockTotal);
+  const mrpAdjustedQty = manualPlanQty > 0 ? manualPlanQty : Math.max(0, productionNeeded - stockTotal);
   const productionAdjusted = mrpAdjustedQty;
 
   const sapBom = await prodFetchSapBom(code).catch(() => ({ source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] }));
