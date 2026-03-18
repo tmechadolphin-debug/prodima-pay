@@ -8295,9 +8295,29 @@ function prodExtractInventorySnapshotFromItem(item) {
   };
 }
 
+function prodIsIsoDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || "").slice(0, 10));
+}
+function prodToIsoDate(value) {
+  if (!value) return "";
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().slice(0, 10);
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) return raw.slice(0, 10);
+  const sapTicks = raw.match(/\/Date\((\d+)(?:[+-]\d+)?\)\//i);
+  if (sapTicks) {
+    const d = new Date(Number(sapTicks[1] || 0));
+    if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  }
+  if (/^[A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}$/.test(raw)) return "";
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10);
+  return "";
+}
+
 function prodNormalizeProductionOrderRow(r) {
   const postDateRaw = r?.PostingDate ?? r?.PostDate ?? r?.StartDate ?? r?.DueDate ?? "";
-  const postDate = String(postDateRaw || "").slice(0, 10);
+  const postDate = prodToIsoDate(postDateRaw);
   return {
     docNum: Number(r?.DocumentNumber ?? r?.DocNum ?? r?.AbsoluteEntry ?? r?.Absoluteentry ?? 0) || null,
     absoluteEntry: Number(r?.AbsoluteEntry ?? r?.Absoluteentry ?? r?.DocEntry ?? 0) || null,
@@ -8380,11 +8400,12 @@ async function prodReadOrdersCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS, top = 
     plannedQty: prodRound(x.planned_qty || 0, 3),
     completedQty: prodRound(x.completed_qty || 0, 3),
     rejectedQty: prodRound(x.rejected_qty || 0, 3),
-    postDate: String(x.post_date || "").slice(0, 10),
+    postDate: prodToIsoDate(x.post_date),
     status: String(x.status || ""),
     warehouse: String(x.warehouse || ""),
     origin: String(x.origin || ""),
   }));
+  if (orders.length && orders.every((o) => !prodIsIsoDate(o.postDate))) return null;
   return prodOrdersToResponse(orders);
 }
 async function prodUpsertOrdersCacheDb(itemCode, orders) {
@@ -8415,7 +8436,7 @@ async function prodUpsertOrdersCacheDb(itemCode, orders) {
         prodNum(o.plannedQty),
         prodNum(o.completedQty),
         prodNum(o.rejectedQty),
-        String(o.postDate || "").slice(0, 10) || null,
+        prodToIsoDate(o.postDate) || null,
         String(o.status || ""),
         String(o.warehouse || ""),
         String(o.origin || ""),
@@ -9312,26 +9333,29 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const monthMap = new Map((monthlyRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
 
   let weightedCost = prodExtractWeightedCostFromItem(sapItem);
-  if (!(Number(weightedCost || 0) > 0) && hasDb()) {
+  if (!(weightedCost > 0)) {
+    try {
+      const cachedItem = await prodReadItemCacheDb(code, 365 * 24 * 60 * 60 * 1000);
+      const cachedWeighted = prodExtractWeightedCostFromItem(cachedItem);
+      if (cachedWeighted > 0) weightedCost = cachedWeighted;
+    } catch {}
+  }
+  if (!(weightedCost > 0) && hasDb()) {
     try {
       const wcRes = await dbQuery(`SELECT weighted_cost FROM production_item_cache WHERE item_code = $1 LIMIT 1`, [code]);
-      const wcDb = prodNum(wcRes.rows?.[0]?.weighted_cost || 0);
-      if (wcDb > 0) weightedCost = wcDb;
+      const dbWeighted = prodNum(wcRes.rows?.[0]?.weighted_cost || 0);
+      if (dbWeighted > 0) weightedCost = dbWeighted;
+    } catch {}
+  }
+  if (!(weightedCost > 0)) {
+    try {
+      const freshItem = await prodGetFullItem(code, { forceFresh: true, ttlMs: 0 });
+      const freshWeighted = prodExtractWeightedCostFromItem(freshItem);
+      if (freshWeighted > 0) weightedCost = freshWeighted;
     } catch {}
   }
   const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map() }));
-  const prodMonthMap = new Map();
-  if (prodOrders?.monthly instanceof Map) {
-    for (const [k, v] of prodOrders.monthly.entries()) {
-      prodMonthMap.set(String(k || ''), prodNum(v));
-    }
-  }
-  for (const o of Array.isArray(prodOrders?.orders) ? prodOrders.orders : []) {
-    const ymOrder = prodYm(String(o?.postDate || '').slice(0, 10));
-    if (!ymOrder || ymOrder === 'NaN-NaN') continue;
-    const prev = prodNum(prodMonthMap.get(ymOrder) || 0);
-    prodMonthMap.set(ymOrder, prodRound(prev + prodNum(o?.completedQty || 0), 3));
-  }
+  const prodMonthMap = prodOrders?.monthly instanceof Map ? prodOrders.monthly : new Map();
 
   const salesHistory = [];
   for (let i = 11; i >= 0; i--) {
