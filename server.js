@@ -8501,7 +8501,7 @@ function prodLineItemsPerUnit(line, itemMaster = null) {
 }
 
 function prodExtractInventorySnapshotFromItem(item) {
-  const byWh = { "01": 0, "03": 0, "200": 0, "300": 0, "500": 0 };
+  const byWh = { "01": 0, "03": 0, "12": 0, "200": 0, "300": 0, "500": 0 };
   const whRows = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
   let total = 0;
   let stockMin = 0;
@@ -8730,12 +8730,19 @@ function prodExtractSupplierFromItem(item) {
 
 function prodExtractComponentStockInfo(item, preferredWh = "") {
   const whRows = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
-  const preferred = String(preferredWh || "").trim();
+  const preferredList = Array.isArray(preferredWh)
+    ? preferredWh.map((x) => String(x || "").trim()).filter(Boolean)
+    : String(preferredWh || "")
+        .split(",")
+        .map((x) => String(x || "").trim())
+        .filter(Boolean);
+  const preferredSet = new Set(preferredList);
   let stockSpecific = 0;
   let availableSpecific = 0;
   let hasSpecific = false;
   let stockTotal = 0;
   let availableTotal = 0;
+  const byWarehouse = {};
 
   for (const r of whRows) {
     const wh = String(r?.WarehouseCode ?? r?.WhsCode ?? "").trim();
@@ -8746,8 +8753,9 @@ function prodExtractComponentStockInfo(item, preferredWh = "") {
 
     stockTotal += stock;
     availableTotal += available;
+    byWarehouse[wh] = prodRound(stock, 3);
 
-    if (preferred && wh === preferred) {
+    if (preferredSet.size && preferredSet.has(wh)) {
       stockSpecific += stock;
       availableSpecific += available;
       hasSpecific = true;
@@ -8758,6 +8766,8 @@ function prodExtractComponentStockInfo(item, preferredWh = "") {
     stockQty: prodRound(hasSpecific ? stockSpecific : stockTotal, 3),
     availableQty: prodRound(hasSpecific ? availableSpecific : availableTotal, 3),
     stockTotal: prodRound(stockTotal, 3),
+    availableTotal: prodRound(availableTotal, 3),
+    byWarehouse,
   };
 }
 
@@ -8943,9 +8953,9 @@ async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }
       const requiredQty = prodRound(perUnit * prodNum(adjustedQty), 3);
       const componentType = prodClassifyComponentType({ code: current.code, description: current.description, item, line: current.raw });
       const isResource = componentType === "RESOURCE";
-      const preferredWh = componentType === "RAW_MATERIAL" ? "03" : current.warehouse;
-      const stockInfo = isResource ? { stockQty: 0, availableQty: 0 } : prodExtractComponentStockInfo(item, preferredWh);
-      const stockQty = isResource ? 0 : (stockInfo.availableQty > 0 ? stockInfo.availableQty : stockInfo.stockQty);
+      const preferredWh = ["03", "12"];
+      const stockInfo = isResource ? { stockQty: 0, availableQty: 0, stockTotal: 0, byWarehouse: {} } : prodExtractComponentStockInfo(item, preferredWh);
+      const stockQty = isResource ? 0 : prodNum(stockInfo.stockTotal || stockInfo.stockQty || 0);
       const shortage = isResource ? 0 : Math.max(0, requiredQty - stockQty);
       const coverage = isResource ? 1 : (requiredQty > 0 ? stockQty / requiredQty : 0);
       results.push({
@@ -9669,7 +9679,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
      WHERE item_code = $1`,
     [code]
   );
-  const byWh = { "01": 0, "03": 0, "200": 0, "300": 0, "500": 0 };
+  const byWh = { "01": 0, "03": 0, "12": 0, "200": 0, "300": 0, "500": 0 };
   let stockTotal = 0;
   let stockMin = 0;
   let stockMax = 0;
