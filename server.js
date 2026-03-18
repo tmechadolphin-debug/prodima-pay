@@ -7918,17 +7918,6 @@ async function ensureProductionDb() {
   `);
 
   await dbQuery(`
-    CREATE TABLE IF NOT EXISTS production_supplier_cache (
-      item_code TEXT PRIMARY KEY,
-      supplier_name TEXT NOT NULL DEFAULT '',
-      supplier_code TEXT NOT NULL DEFAULT '',
-      doc_num BIGINT,
-      doc_date DATE,
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  await dbQuery(`
     CREATE TABLE IF NOT EXISTS production_demand_lines (
       doc_entry BIGINT NOT NULL,
       line_num INTEGER NOT NULL,
@@ -7955,9 +7944,20 @@ async function ensureProductionDb() {
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_item_cache_updated ON production_item_cache(updated_at);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_orders_item_date ON production_orders_cache(item_code, post_date DESC);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_bom_parent ON production_bom_cache(parent_item_code);`);
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_supplier_updated ON production_supplier_cache(updated_at);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_item_date ON production_demand_lines(item_code, doc_date DESC);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_date ON production_demand_lines(doc_date DESC);`);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_supplier_cache (
+      item_code TEXT PRIMARY KEY,
+      supplier_name TEXT NOT NULL DEFAULT '',
+      supplier_code TEXT NOT NULL DEFAULT '',
+      doc_num BIGINT,
+      doc_date DATE,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_supplier_updated ON production_supplier_cache(updated_at);`);
 
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_inv_wh_item ON production_inv_wh_cache(item_code);`);
 }
@@ -7997,8 +7997,8 @@ function prodExtractMrpFromItem(it) {
 const PROD_ITEM_RUNTIME_CACHE = new Map();
 const PROD_ORDERS_RUNTIME_CACHE = new Map();
 const PROD_BOM_RUNTIME_CACHE = new Map();
-const PROD_PLAN_RUNTIME_CACHE = new Map();
 const PROD_SUPPLIER_RUNTIME_CACHE = new Map();
+const PROD_PLAN_RUNTIME_CACHE = new Map();
 const PROD_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const PROD_PLAN_TTL_MS = 2 * 60 * 1000;
 
@@ -8531,7 +8531,6 @@ async function prodUpsertLatestSupplierCacheDb(itemCode, data = {}) {
 async function prodFetchLatestSupplierFromSap(itemCode) {
   const code = String(itemCode || '').trim();
   if (!code || missingSapEnv()) return null;
-  const safeCode = code.replace(/'/g, "''");
   const batchTop = 40;
   const maxPages = 8;
 
@@ -8567,7 +8566,6 @@ async function prodFetchLatestSupplierFromSap(itemCode) {
         }
       }
 
-      // fallback: inspect a small subset of freshest docs in full in case $expand omitted lines
       for (const row of rows.slice(0, 10)) {
         try {
           const full = await slFetch(`/${entity}(${Number(row.DocEntry)})`, { timeoutMs: 120000 });
@@ -8590,8 +8588,6 @@ async function prodFetchLatestSupplierFromSap(itemCode) {
 
   let hit = await tryEntity('PurchaseInvoices');
   if (hit) return hit;
-
-  // very narrow fallback through QueryService-style filter is not available everywhere; use item master fallback instead
   return null;
 }
 
@@ -8851,7 +8847,7 @@ async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }
         stockQty: prodRound(stockQty, 3),
         shortageQty: prodRound(shortage, 3),
         coveragePct: prodRound(coverage * 100, 1),
-        supplier: isResource ? "Recurso interno" : (supplierNameCache.has(current.code) ? supplierNameCache.get(current.code) : await (async () => { const s = await prodGetLatestSupplierForItem(current.code, item).catch(() => prodExtractSupplierFromItem(item)); supplierNameCache.set(current.code, s || ''); return s || ''; })()),
+        supplier: isResource ? "Recurso interno" : (supplierNameCache.has(current.code) ? supplierNameCache.get(current.code) : await (async () => { const s = await prodGetLatestSupplierForItem(current.code, item).catch(() => prodExtractSupplierFromItem(item)); supplierNameCache.set(current.code, s || ""); return s || ""; })()),
         cost: prodRound(prodExtractWeightedCostFromItem(item), 4),
         status: isResource ? "OK" : (shortage > 0 ? "FALTANTE" : "OK"),
         componentType,
