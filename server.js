@@ -8501,7 +8501,7 @@ function prodLineItemsPerUnit(line, itemMaster = null) {
 }
 
 function prodExtractInventorySnapshotFromItem(item) {
-  const byWh = { "01": 0, "200": 0, "300": 0, "500": 0 };
+  const byWh = { "01": 0, "03": 0, "200": 0, "300": 0, "500": 0 };
   const whRows = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
   let total = 0;
   let stockMin = 0;
@@ -8699,7 +8699,7 @@ function prodLooksLikeResource({ code, description = "", item = null, line = nul
   const codeTxt = String(code || "").trim().toLowerCase();
   const inventoryFlag = String(item?.InventoryItem || "").trim().toLowerCase();
   if (/(operari|supervisor|linea de produccion|línea de producción|mano de obra|recurso|resource|labor|overhead|gastos? de fabricaci|horas? hombre|maquina de limpieza|maquina de salsas|servicio interno)/i.test(txt)) return true;
-  if (/^(ogf|mli|mlim|mosup|m00\d|mo\d{2,}|res)/i.test(codeTxt) || codeTxt === 'momez') return true;
+  if (/^(ogf|mli|mlim|mosup|momez|m00\d|mo\d{2,}|res)/i.test(codeTxt)) return true;
   if (["tno", "no", "n", "f"].includes(inventoryFlag) && /(operari|supervisor|linea|línea|gasto|recurso|labor|overhead|servicio)/i.test(txt)) return true;
   return false;
 }
@@ -8945,7 +8945,7 @@ async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }
       const isResource = componentType === "RESOURCE";
       const preferredWh = componentType === "RAW_MATERIAL" ? "03" : current.warehouse;
       const stockInfo = isResource ? { stockQty: 0, availableQty: 0 } : prodExtractComponentStockInfo(item, preferredWh);
-      const stockQty = isResource ? 0 : stockInfo.stockQty;
+      const stockQty = isResource ? 0 : (stockInfo.availableQty > 0 ? stockInfo.availableQty : stockInfo.stockQty);
       const shortage = isResource ? 0 : Math.max(0, requiredQty - stockQty);
       const coverage = isResource ? 1 : (requiredQty > 0 ? stockQty / requiredQty : 0);
       results.push({
@@ -9135,8 +9135,52 @@ function prodCoverageLabel(months) {
   return `${prodRound(n,2)} mes(es) de inv`;
 }
 
+async function prodScanDocHeadersForOrders({ from, to, maxDocs = 4000 }) {
+  if (typeof scanDocHeaders === "function") {
+    try { return await scanDocHeaders("Orders", { from, to, maxDocs }); } catch {}
+    try { return await scanDocHeaders("Orders", { f: from, t: to, maxDocs }); } catch {}
+  }
+  const fromDate = String(from || "").slice(0,10);
+  const toDate = String(to || "").slice(0,10);
+  if (!fromDate || !toDate) throw new Error('prodScanDocHeadersForOrders requiere rango de fechas');
+  const top = Math.max(50, Math.min(20000, Number(maxDocs || 4000)));
+  const entity = "Orders";
+  const dayChunks = [];
+  let cur = fromDate;
+  while (cur <= toDate) {
+    const nxt = addDaysISO(cur, 29);
+    const end = nxt < toDate ? nxt : toDate;
+    dayChunks.push([cur, end]);
+    cur = addDaysISO(end, 1);
+  }
+  const headers = [];
+  const seen = new Set();
+  for (const [f, t] of dayChunks) {
+    let skip = 0;
+    while (skip < top) {
+      const filter = `DocDate ge '${f}' and DocDate le '${t}' and Cancelled eq 'tNO'`;
+      const path = `/${entity}?$select=DocEntry,DocNum,DocDate,CardCode,CardName&$filter=${encodeURIComponent(filter)}&$orderby=DocEntry asc&$top=200&$skip=${skip}`;
+      const res = await slFetch(path, { timeoutMs: 120000 });
+      const batch = prodNormalizeSlCollection(res);
+      if (!batch.length) break;
+      for (const row of batch) {
+        const key = String(row?.DocEntry ?? row?.DocNum ?? '').trim();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        headers.push(row);
+      }
+      if (batch.length < 200) break;
+      skip += batch.length;
+      if (headers.length >= top) break;
+    }
+    if (headers.length >= top) break;
+  }
+  headers.sort((a, b) => String(a?.DocDate || '').localeCompare(String(b?.DocDate || '')) || Number(a?.DocEntry || 0) - Number(b?.DocEntry || 0));
+  return headers.slice(0, top);
+}
+
 async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
-  const headers = await scanDocHeaders('Orders', { from, to, maxDocs });
+  const headers = await prodScanDocHeadersForOrders({ from, to, maxDocs });
   let saved = 0;
   const itemMasterCache = new Map();
   for (const h of headers) {
@@ -9413,16 +9457,15 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const meta = local.formulas.products?.[it.itemCode] || null;
     const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
     const coverageMonthsTarget = prodCoverageMonthsByLabel(total.label);
-    const horizonFactor = Math.max(1, Number(horizonMonths || 3));
-    const targetInventoryQty = prodNum(it.stockMax) > 0 ? prodNum(it.stockMax) * coverageMonthsTarget * horizonFactor : it.projectedQty;
+    const targetInventoryQty = prodNum(it.stockMax) > 0 ? prodNum(it.stockMax) * coverageMonthsTarget : it.projectedQty;
 
-    // Neces. = máximo SAP por política ABC, multiplicado por el horizonte seleccionado
+    // Neces. = siempre el máximo calculado
     const productionNeeded = Math.max(0, targetInventoryQty);
 
-    // Ajustado = faltante para alcanzar el necesario con el stock actual
+    // Ajustado = lo que falta para llegar al máximo
     const productionAdjusted = Math.max(0, targetInventoryQty - prodNum(it.stockTotal));
     const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
-    const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
+    const hoursNeeded = rate > 0 ? productionNeeded / rate : 0;
 
     return {
       ...it,
@@ -9626,7 +9669,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
      WHERE item_code = $1`,
     [code]
   );
-  const byWh = { "01": 0, "200": 0, "300": 0, "500": 0 };
+  const byWh = { "01": 0, "03": 0, "200": 0, "300": 0, "500": 0 };
   let stockTotal = 0;
   let stockMin = 0;
   let stockMax = 0;
@@ -9664,15 +9707,14 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const dashRow = (dashForAbc.items || []).find((x) => String(x.itemCode || '') === code) || null;
   const coverageMonthsTarget = dashRow ? prodNum(dashRow.coverageMonthsTarget || 1, 1) : 1;
   const coveragePolicyLabel = prodCoverageLabel(coverageMonthsTarget);
-  const horizonFactor = Math.max(1, Number(horizonMonths || 3));
-const targetInventoryQty = stockMax > 0 ? stockMax * coverageMonthsTarget * horizonFactor : projectedQty;
+const targetInventoryQty = stockMax > 0 ? stockMax * coverageMonthsTarget : projectedQty;
 const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
 const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : targetInventoryQty;
 
-// Neces. = máximo SAP por política ABC, multiplicado por el horizonte
+// Neces. = siempre el máximo
 const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty);
 
-// Ajustado = faltante para llegar al necesario con el stock actual
+// Ajustado = faltante para llegar al máximo
 const mrpAdjustedQty = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty - stockTotal);
 const productionAdjusted = mrpAdjustedQty;
 
@@ -10298,7 +10340,7 @@ async function handleProductionSync(req, res) {
     let to = String(req.body?.to || req.query?.to || today);
 
     if (mode === "recent") {
-      const days = Math.max(1, Math.min(120, prodNum(req.body?.days || req.query?.days, 30)));
+      const days = Math.max(1, Math.min(120, prodNum(req.body?.days || req.query?.days, 5)));
       from = addDaysISO(today, -days);
       to = today;
     }
