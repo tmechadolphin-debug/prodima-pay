@@ -8699,7 +8699,7 @@ function prodLooksLikeResource({ code, description = "", item = null, line = nul
   const codeTxt = String(code || "").trim().toLowerCase();
   const inventoryFlag = String(item?.InventoryItem || "").trim().toLowerCase();
   if (/(operari|supervisor|linea de produccion|línea de producción|mano de obra|recurso|resource|labor|overhead|gastos? de fabricaci|horas? hombre|maquina de limpieza|maquina de salsas|servicio interno)/i.test(txt)) return true;
-  if (/^(ogf|mli|mlim|mosup|m00\d|mo\d{2,}|res)/i.test(codeTxt)) return true;
+  if (/^(ogf|mli|mlim|mosup|momez|m00\d|mo\d{2,}|res)/i.test(codeTxt)) return true;
   if (["tno", "no", "n", "f"].includes(inventoryFlag) && /(operari|supervisor|linea|línea|gasto|recurso|labor|overhead|servicio)/i.test(txt)) return true;
   return false;
 }
@@ -8972,20 +8972,44 @@ async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }
   });
   await Promise.all(workers);
 
-  results.sort((a, b) => {
+  const resources = results.filter((x) => x.componentType === "RESOURCE");
+  const nonResourceMap = new Map();
+  for (const row of results) {
+    if (row.componentType === "RESOURCE") continue;
+    const key = String(row.code || "").trim().toUpperCase();
+    if (!key) continue;
+    const cur = nonResourceMap.get(key);
+    if (!cur) {
+      nonResourceMap.set(key, { ...row });
+      continue;
+    }
+    cur.requiredQty = prodRound(prodNum(cur.requiredQty) + prodNum(row.requiredQty), 3);
+    cur.bomQtyBase = prodRound(prodNum(cur.bomQtyBase) + prodNum(row.bomQtyBase), 6);
+    cur.perUnitQty = prodRound(prodNum(cur.perUnitQty) + prodNum(row.perUnitQty), 6);
+    cur.stockQty = Math.max(prodNum(cur.stockQty), prodNum(row.stockQty));
+    cur.shortageQty = prodRound(Math.max(0, prodNum(cur.requiredQty) - prodNum(cur.stockQty)), 3);
+    cur.coveragePct = cur.requiredQty > 0 ? prodRound((prodNum(cur.stockQty) / prodNum(cur.requiredQty)) * 100, 1) : 0;
+    cur.status = cur.shortageQty > 0 ? "FALTANTE" : "OK";
+    if (!cur.description && row.description) cur.description = row.description;
+    if (!cur.unit && row.unit) cur.unit = row.unit;
+    if (!cur.supplier && row.supplier) cur.supplier = row.supplier;
+    if (!cur.warehouse && row.warehouse) cur.warehouse = row.warehouse;
+    if (!cur.issueMethod && row.issueMethod) cur.issueMethod = row.issueMethod;
+  }
+  const nonResources = Array.from(nonResourceMap.values());
+  const all = [...nonResources, ...resources].sort((a, b) => {
     const aRes = a.componentType === "RESOURCE" ? 1 : 0;
     const bRes = b.componentType === "RESOURCE" ? 1 : 0;
     if (aRes !== bRes) return aRes - bRes;
-    return b.shortageQty - a.shortageQty || String(a.code).localeCompare(String(b.code));
+    return prodNum(b.shortageQty) - prodNum(a.shortageQty) || String(a.code).localeCompare(String(b.code));
   });
-  const rawMaterials = results.filter((x) => x.componentType === "RAW_MATERIAL");
-  const packaging = results.filter((x) => x.componentType === "PACKAGING");
-  const resources = results.filter((x) => x.componentType === "RESOURCE");
-  const bottlenecks = results.filter((x) => x.shortageQty > 0 && x.componentType !== "RESOURCE").slice(0, 10);
+  const rawMaterials = nonResources.filter((x) => x.componentType === "RAW_MATERIAL");
+  const packaging = nonResources.filter((x) => x.componentType === "PACKAGING");
+  const bottlenecks = nonResources.filter((x) => x.shortageQty > 0).slice(0, 10);
 
   return {
     source: sapBom?.source || "SAP ProductTrees",
-    all: results,
+    all,
     rawMaterials,
     packaging,
     resources,
@@ -9458,13 +9482,21 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
 
   const totals = items.reduce(
     (acc, x) => {
+      const summaryNeeded = Math.max(0, prodNum(x.projectedQty) - prodNum(x.stockTotal));
+      const summaryAdjusted = prodRecommendPracticalQty({
+        neededQty: summaryNeeded,
+        avgMonthlyQty: prodNum(x.avgMonthlyQty),
+        minOrderQty: prodNum(x.minOrderQty),
+        multipleQty: prodNum(x.multipleQty),
+      });
+      const summaryHours = prodNum(x.unitsPerHour) > 0 ? summaryAdjusted / prodNum(x.unitsPerHour) : 0;
       acc.revenue += prodNum(x.revenue);
       acc.projectedQty += prodNum(x.projectedQty);
       acc.stockTotal += prodNum(x.stockTotal);
-      acc.productionNeeded += prodNum(x.productionNeeded);
-      acc.productionAdjusted += prodNum(x.productionAdjusted);
-      acc.hoursNeeded += prodNum(x.hoursNeeded);
-      if (x.productionNeeded > 0) acc.riskCount += 1;
+      acc.productionNeeded += summaryNeeded;
+      acc.productionAdjusted += summaryAdjusted;
+      acc.hoursNeeded += summaryHours;
+      if (summaryNeeded > 0) acc.riskCount += 1;
       if (x.totalLabel === "AB Crítico") acc.abCount += 1;
       return acc;
     },
@@ -9473,10 +9505,18 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
 
   const machineAggMap = new Map();
   for (const it of items) {
+    const summaryNeeded = Math.max(0, prodNum(it.projectedQty) - prodNum(it.stockTotal));
+    const summaryAdjusted = prodRecommendPracticalQty({
+      neededQty: summaryNeeded,
+      avgMonthlyQty: prodNum(it.avgMonthlyQty),
+      minOrderQty: prodNum(it.minOrderQty),
+      multipleQty: prodNum(it.multipleQty),
+    });
+    const summaryHours = prodNum(it.unitsPerHour) > 0 ? summaryAdjusted / prodNum(it.unitsPerHour) : 0;
     const cur = machineAggMap.get(it.machine) || { machine: it.machine, items: 0, productionAdjusted: 0, hoursNeeded: 0 };
     cur.items += 1;
-    cur.productionAdjusted += prodNum(it.productionAdjusted);
-    cur.hoursNeeded += prodNum(it.hoursNeeded);
+    cur.productionAdjusted += summaryAdjusted;
+    cur.hoursNeeded += summaryHours;
     machineAggMap.set(it.machine, cur);
   }
 
@@ -10295,7 +10335,7 @@ async function handleProductionSync(req, res) {
     let to = String(req.body?.to || req.query?.to || today);
 
     if (mode === "recent") {
-      const days = Math.max(1, Math.min(120, prodNum(req.body?.days || req.query?.days, 30)));
+      const days = Math.max(1, Math.min(120, prodNum(req.body?.days || req.query?.days, 5)));
       from = addDaysISO(today, -days);
       to = today;
     }
