@@ -8475,18 +8475,16 @@ function prodClassifyComponentType({ code, description = "", item = null, line =
 }
 
 function prodExtractSupplierFromItem(item) {
-  const candidates = [
-    item?.MainSupplier,
-    item?.PreferredVendor,
-    item?.SupplierCatalogNo,
-    item?.ForeignName,
-    item?.Manufacturer,
-  ];
-  for (const c of candidates) {
-    const v = String(c || "").trim();
-    if (v) return v;
-  }
   return "";
+}
+
+function prodLooksLikeInvalidSupplierName(v) {
+  const s = String(v || '').trim();
+  if (!s) return true;
+  if (s === '-1' || s === '0') return true;
+  if (/\/(?:\d|[a-z])/i.test(s) && /(?:gr|kg|lb|oz|gram|ml|lt|litro|saco|botella|unidad|caja)/i.test(s)) return true;
+  if (/^(mp\d+|fb\w+|q\w+|kc\w+|fgl\w+|ci\w+|tro\w+|er\w+|ef\w+|bb\w+)$/i.test(s)) return true;
+  return false;
 }
 
 async function prodReadLatestSupplierCacheDb(itemCode, ttlMs = 30 * 24 * 60 * 60 * 1000) {
@@ -8603,20 +8601,26 @@ async function prodGetLatestSupplierForItem(itemCode, item = null, { forceFresh 
   const runtimeKey = `supplier::${code}`;
   if (!forceFresh) {
     const hit = prodRuntimeGet(PROD_SUPPLIER_RUNTIME_CACHE, runtimeKey, ttlMs);
-    if (hit && hit.supplierName) return String(hit.supplierName || '').trim();
+    const hitName = String(hit?.supplierName || '').trim();
+    if (hitName && !prodLooksLikeInvalidSupplierName(hitName)) return hitName;
+
     const dbHit = await prodReadLatestSupplierCacheDb(code, ttlMs).catch(() => null);
-    if (dbHit && dbHit.supplierName) {
+    const dbName = String(dbHit?.supplierName || '').trim();
+    if (dbName && !prodLooksLikeInvalidSupplierName(dbName)) {
       prodRuntimeSet(PROD_SUPPLIER_RUNTIME_CACHE, runtimeKey, dbHit);
-      return String(dbHit.supplierName || '').trim();
+      return dbName;
     }
   }
+
   const sapHit = await prodFetchLatestSupplierFromSap(code).catch(() => null);
-  if (sapHit && sapHit.supplierName) {
+  const sapName = String(sapHit?.supplierName || '').trim();
+  if (sapName && !prodLooksLikeInvalidSupplierName(sapName)) {
     prodRuntimeSet(PROD_SUPPLIER_RUNTIME_CACHE, runtimeKey, sapHit);
     await prodUpsertLatestSupplierCacheDb(code, sapHit).catch(() => {});
-    return String(sapHit.supplierName || '').trim();
+    return sapName;
   }
-  return prodExtractSupplierFromItem(item);
+
+  return '';
 }
 
 function prodExtractComponentStockInfo(item, preferredWh = "") {
