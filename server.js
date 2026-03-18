@@ -9273,9 +9273,9 @@ function prodMonthWindowEnd(dateIso) {
   return last.toISOString().slice(0,10);
 }
 
-async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 5, horizonMonths = 3 }) {
+async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 0, horizonMonths = 3 }) {
   const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN)).slice(0,10);
-  const maxMonthsWindow = Math.max(1, Number(avgMonths || 5), Number(horizonMonths || 3));
+  const maxMonthsWindow = Math.max(1, Number(avgMonths || horizonMonths || 5), Number(horizonMonths || 3));
   const monthBaseStart = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(maxMonthsWindow - 1));
   const monthRangeEnd = String(monthTo || '').slice(0,10);
 
@@ -9392,8 +9392,8 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const areaFinal = String(r.area || "") || prodInferAreaFromGroup(grupoTxt) || "CONS";
     const monthsMap = monthly.get(String(r.item_code || "")) || new Map();
 
-    const avgMonthsSafe = Math.max(1, Number(avgMonths || 5));
     const horizonSafe = Math.max(1, Number(horizonMonths || 3));
+    const avgMonthsSafe = Math.max(1, Number(avgMonths || horizonSafe || 5));
     let sumAvgMonths = 0;
     let sumHorizonMonths = 0;
     for (let i = avgMonthsSafe - 1; i >= 0; i--) {
@@ -9467,15 +9467,16 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const meta = local.formulas.products?.[it.itemCode] || null;
     const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
     const coverageMonthsTarget = prodCoverageMonthsByLabel(total.label);
-    const targetInventoryQty = prodNum(it.stockMax) > 0 ? prodNum(it.stockMax) * coverageMonthsTarget : it.projectedQty;
+    const horizonSafe = Math.max(1, Number(horizonMonths || 3));
+    const targetInventoryQty = prodNum(it.stockMax) > 0 ? prodNum(it.stockMax) * coverageMonthsTarget * horizonSafe : it.projectedQty;
 
-    // Neces. = siempre el máximo calculado
+    // Neces. = máximo SAP * política ABC * horizonte
     const productionNeeded = Math.max(0, targetInventoryQty);
 
-    // Ajustado = lo que falta para llegar al máximo
+    // Ajustado = faltante para llegar al objetivo del horizonte
     const productionAdjusted = Math.max(0, targetInventoryQty - prodNum(it.stockTotal));
     const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
-    const hoursNeeded = rate > 0 ? productionNeeded / rate : 0;
+    const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
 
     return {
       ...it,
@@ -9538,7 +9539,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
   return {
     ok: true,
     from, to, area: areaSel, grupo: grupoSel, q: qq,
-    avgMonths: Math.max(1, Number(avgMonths || 5)),
+    avgMonths: Math.max(1, Number(avgMonths || horizonMonths || 5)),
     horizonMonths: Math.max(1, Number(horizonMonths || 3)),
     lastSyncAt: await getState("production_last_sync_at"),
     demandSource: demandSourceLabel,
@@ -9661,12 +9662,13 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     });
   }
 
+  const avgMonthsSafe = Math.max(1, Number(avgMonths || horizonMonths || 5));
   let avgQty = 0;
-  for (let i = Math.max(1, Number(avgMonths || 5)) - 1; i >= 0; i--) {
+  for (let i = avgMonthsSafe - 1; i >= 0; i--) {
     const ym = prodYm(prodAddMonthsISO(monthStart, -i));
     avgQty += prodNum(monthMap.get(ym) || 0);
   }
-  avgQty = avgQty / Math.max(1, Number(avgMonths || 5));
+  avgQty = avgQty / avgMonthsSafe;
   let projectedQty = 0;
   for (let i = Math.max(1, Number(horizonMonths || 3)) - 1; i >= 0; i--) {
     const ym = prodYm(prodAddMonthsISO(monthStart, -i));
@@ -9717,14 +9719,15 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const dashRow = (dashForAbc.items || []).find((x) => String(x.itemCode || '') === code) || null;
   const coverageMonthsTarget = dashRow ? prodNum(dashRow.coverageMonthsTarget || 1, 1) : 1;
   const coveragePolicyLabel = prodCoverageLabel(coverageMonthsTarget);
-const targetInventoryQty = stockMax > 0 ? stockMax * coverageMonthsTarget : projectedQty;
+  const horizonSafe = Math.max(1, Number(horizonMonths || 3));
+const targetInventoryQty = stockMax > 0 ? stockMax * coverageMonthsTarget * horizonSafe : projectedQty;
 const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
 const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : targetInventoryQty;
 
-// Neces. = siempre el máximo
+// Neces. = máximo SAP * política ABC * horizonte
 const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty);
 
-// Ajustado = faltante para llegar al máximo
+// Ajustado = faltante para llegar al objetivo del horizonte
 const mrpAdjustedQty = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty - stockTotal);
 const productionAdjusted = mrpAdjustedQty;
 
@@ -9843,7 +9846,7 @@ const productionAdjusted = mrpAdjustedQty;
     abcHint: "",
     period: {
       endDate: end,
-      avgMonths: Math.max(1, Number(avgMonths || 5)),
+      avgMonths: Math.max(1, Number(avgMonths || horizonMonths || 5)),
       horizonMonths: Math.max(1, Number(horizonMonths || 3)),
       planStart,
       planEnd
