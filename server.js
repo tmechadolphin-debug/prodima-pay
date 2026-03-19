@@ -8309,10 +8309,11 @@ async function prodUpsertItemCacheDb(item) {
     ]
   );
 }
-async function prodFetchFullItemFromSap(code) {
+async function prodFetchFullItemFromSap(code, { timeoutMs = 120000 } = {}) {
   const itemCode = String(code || "").trim();
   if (!itemCode) return null;
   const safe = itemCode.replace(/'/g, "''");
+  const safeTimeout = Math.max(8000, Number(timeoutMs || 120000));
 
   let item = null;
   try {
@@ -8325,11 +8326,11 @@ async function prodFetchFullItemFromSap(code) {
         "AvgPrice","AveragePrice","AvgStdPrice","AvgStdPrc","LastPurPrc","LastPurchasePrice",
         "MainSupplier","SupplierCatalogNo","ForeignName"
       ].join(","),
-      { timeoutMs: 120000 }
+      { timeoutMs: safeTimeout }
     );
   } catch (e1) {
     try {
-      item = await slFetch(`/Items('${safe}')`, { timeoutMs: 120000 });
+      item = await slFetch(`/Items('${safe}')`, { timeoutMs: safeTimeout });
     } catch (e2) {
       item = { ItemCode: itemCode, ItemName: "", ItemWarehouseInfoCollection: [] };
     }
@@ -8343,7 +8344,7 @@ async function prodFetchFullItemFromSap(code) {
           "WarehouseCode","WhsCode","InStock","OnHand","Committed","IsCommited","Ordered","OnOrder",
           "MinimalStock","MinStock","MaximalStock","MaxStock","AvgPrice","AveragePrice","AvgStdPrc","AvgStdPrice","Price"
         ].join(","),
-        { timeoutMs: 120000 }
+        { timeoutMs: safeTimeout }
       );
       if (Array.isArray(whInfo?.value)) item.ItemWarehouseInfoCollection = whInfo.value;
       else if (Array.isArray(whInfo)) item.ItemWarehouseInfoCollection = whInfo;
@@ -8356,7 +8357,7 @@ async function prodFetchFullItemFromSap(code) {
 
   return item;
 }
-async function prodGetFullItem(code, { forceFresh = false, ttlMs = PROD_CACHE_TTL_MS } = {}) {
+async function prodGetFullItem(code, { forceFresh = false, ttlMs = PROD_CACHE_TTL_MS, timeoutMs = 120000 } = {}) {
   const itemCode = String(code || "").trim();
   if (!itemCode) return null;
   const runtimeKey = `item::${itemCode}`;
@@ -8370,7 +8371,7 @@ async function prodGetFullItem(code, { forceFresh = false, ttlMs = PROD_CACHE_TT
     }
   }
   if (missingSapEnv()) return null;
-  const item = await prodFetchFullItemFromSap(itemCode);
+  const item = await prodFetchFullItemFromSap(itemCode, { timeoutMs });
   if (item) {
     prodRuntimeSet(PROD_ITEM_RUNTIME_CACHE, runtimeKey, item);
     await prodUpsertItemCacheDb(item).catch(() => {});
@@ -9343,15 +9344,21 @@ function prodCalcProductionMetrics({ stockMax = 0, stockTotal = 0, avgMonthlyQty
   };
 }
 
-async function prodRefreshInventoryForCodes(itemCodes = []) {
-  const codes = Array.from(new Set((Array.isArray(itemCodes) ? itemCodes : []).map((x) => String(x || "").trim()).filter(Boolean)));
-  if (!codes.length) return { saved: 0, items: 0, errors: [] };
+async function prodRefreshInventoryForCodes(itemCodes = [], options = {}) {
+  const allCodes = Array.from(new Set((Array.isArray(itemCodes) ? itemCodes : []).map((x) => String(x || "").trim()).filter(Boolean)));
+  const maxItems = Math.max(1, Number(options?.maxItems || allCodes.length || 0));
+  const concurrency = Math.max(1, Math.min(12, Number(options?.concurrency || 6)));
+  const timeoutMs = Math.max(8000, Number(options?.timeoutMs || 25000));
+  const codes = allCodes.slice(0, maxItems);
+  if (!codes.length) return { saved: 0, items: 0, requestedItems: allCodes.length, refreshedItems: 0, errors: [] };
+
   let saved = 0;
+  let cursor = 0;
   const errors = [];
-  for (let i = 0; i < codes.length; i++) {
-    const itemCode = codes[i];
+
+  async function refreshOne(itemCode) {
     try {
-      const it = await prodGetFullItem(itemCode, { forceFresh: true, ttlMs: 0 });
+      const it = await prodGetFullItem(itemCode, { forceFresh: true, ttlMs: 0, timeoutMs });
       if (!it) throw new Error('SAP no devolvió item');
       const itemDesc = String(it?.ItemName || "").trim();
       const whRows = Array.isArray(it?.ItemWarehouseInfoCollection) ? it.ItemWarehouseInfoCollection : [];
@@ -9382,11 +9389,20 @@ async function prodRefreshInventoryForCodes(itemCodes = []) {
         saved++;
       }
     } catch (e) {
-      if (errors.length < 10) errors.push({ itemCode, message: e.message || String(e) });
+      if (errors.length < 25) errors.push({ itemCode, message: e.message || String(e) });
     }
-    if ((i + 1) % 20 === 0) await sleep(15);
   }
-  return { saved, items: codes.length, errors };
+
+  async function worker() {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= codes.length) return;
+      await refreshOne(codes[idx]);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, codes.length) }, () => worker()));
+  return { saved, items: codes.length, requestedItems: allCodes.length, refreshedItems: codes.length, errors };
 }
 
 async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 0, horizonMonths = 3 }) {
@@ -10480,8 +10496,14 @@ app.get("/api/admin/production/dashboard", verifyAdmin, async (req, res) => {
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
 
     const preload = await productionDashboardFromDb({ from, to, area, grupo, q, avgMonths, horizonMonths });
-    await prodRefreshInventoryForCodes((preload.items || []).map((x) => x.itemCode)).catch(() => {});
+    const refreshLimit = Math.max(40, Math.min(250, Number(req.query?.refreshLimit || 120)));
+    const refreshMeta = await prodRefreshInventoryForCodes(
+      (preload.items || []).map((x) => x.itemCode),
+      { maxItems: refreshLimit, concurrency: 8, timeoutMs: 20000 }
+    ).catch(() => ({ saved: 0, items: 0, requestedItems: (preload.items || []).length, refreshedItems: 0, errors: [] }));
     const out = await productionDashboardFromDb({ from, to, area, grupo, q, avgMonths, horizonMonths });
+    out.inventoryRefresh = refreshMeta;
+    out.inventoryRefreshNote = `Inventario SAP refrescado para ${refreshMeta.refreshedItems || 0} de ${refreshMeta.requestedItems || 0} artículos visibles.`;
     return safeJson(res, 200, out);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
