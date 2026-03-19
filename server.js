@@ -9334,7 +9334,7 @@ function prodCalcProductionMetrics({ stockMax = 0, stockTotal = 0, avgMonthlyQty
   const productionNeeded = Math.max(demandByHorizon, sapTargetByHorizon);
   const productionAdjusted = Math.max(0, productionNeeded - Math.max(0, Number(stockTotal || 0)));
   return {
-    horizonSafe,
+    horizonMonths: horizonSafe,
     monthlyDemand: prodRound(monthlyDemand, 2),
     demandByHorizon: prodRound(demandByHorizon, 2),
     sapTargetByHorizon: prodRound(sapTargetByHorizon, 2),
