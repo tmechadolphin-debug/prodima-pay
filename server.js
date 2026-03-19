@@ -9722,7 +9722,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '
       projectedQty: prodRound(totals.projectedQty, 2),
       stockTotal: prodRound(totals.stockTotal, 2),
       productionNeeded: prodRound(totals.productionNeeded, 2),
-      productionAdjusted: prodRound(totals.productionAdjusted, 2),
+      productionAdjusted: prodRound(prodNum(totals.stockTotal) - prodNum(totals.productionNeeded), 2),
       hoursNeeded: prodRound(totals.hoursNeeded, 2),
       riskCount: totals.riskCount,
       abCount: totals.abCount,
