@@ -9406,7 +9406,7 @@ async function prodRefreshInventoryForCodes(itemCodes = [], options = {}) {
   return { saved, items: codes.length, requestedItems: allCodes.length, refreshedItems: codes.length, errors };
 }
 
-async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '__ALL__', avgMonths = 0, horizonMonths = 3 }) {
+async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '__ALL__', abc = '__ALL__', avgMonths = 0, horizonMonths = 3 }) {
   const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN)).slice(0,10);
   const maxMonthsWindow = Math.max(1, Number(avgMonths || horizonMonths || 5), Number(horizonMonths || 3));
   const monthBaseStart = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(maxMonthsWindow - 1));
@@ -9657,15 +9657,19 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '
     };
   });
 
+  items = items.filter((x) => !/no se fabrica en planta/i.test(String(x.procurementMethodLabel || x.procurementMethod || "")));
+
   const availableSizes = Array.from(new Set(
     items
       .map((x) => String(x.sizeUom || "").trim())
       .filter(Boolean)
   )).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+  const availableAbc = ["AB Crítico", "C Importante", "D"];
 
   if (areaSel !== "__ALL__") items = items.filter((x) => x.area === areaSel);
   if (grupoSel !== "__ALL__") items = items.filter((x) => prodNormGroupName(x.grupo) === prodNormGroupName(grupoSel));
   if (sizeSel !== "__ALL__") items = items.filter((x) => String(x.sizeUom || "").trim() === sizeSel);
+  if (String(abc || "__ALL__") !== "__ALL__") items = items.filter((x) => String(x.totalLabel || "") === String(abc));
   if (qq) items = items.filter((x) => x.itemCode.toLowerCase().includes(qq) || x.itemDesc.toLowerCase().includes(qq));
 
   items.sort((a, b) => {
@@ -9702,7 +9706,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '
 
   return {
     ok: true,
-    from, to, area: areaSel, grupo: grupoSel, sizeUom: sizeSel, q: qq,
+    from, to, area: areaSel, grupo: grupoSel, sizeUom: sizeSel, abc: String(abc || "__ALL__"), q: qq,
     avgMonths: Math.max(1, Number(avgMonths || horizonMonths || 5)),
     horizonMonths: Math.max(1, Number(horizonMonths || 3)),
     lastSyncAt: await getState("production_last_sync_at"),
@@ -9712,6 +9716,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '
     useDemandFallback,
     availableGroups,
     availableSizes,
+    availableAbc,
     totals: {
       revenue: prodRound(totals.revenue, 2),
       projectedQty: prodRound(totals.projectedQty, 2),
@@ -9900,6 +9905,8 @@ const productionNeeded = manualPlanQty > 0 ? manualPlanQty : autoProdMetrics.pro
 const mrpAdjustedQty = manualPlanQty > 0 ? Math.max(0, manualPlanQty - stockTotal) : autoProdMetrics.productionAdjusted;
 const productionAdjusted = mrpAdjustedQty;
 const sapLotSize = Math.max(prodNum(mrp.multipleQty), prodNum(mrp.minOrderQty), 0);
+const lotBaseQty = sapLotSize > 0 ? sapLotSize : 2000;
+const recommendedLotQty = productionAdjusted > 0 ? Math.ceil(productionAdjusted / Math.max(1, lotBaseQty)) * Math.max(1, lotBaseQty) : 0;
 const sizeUom = prodExtractSizeUom(itemDesc, sapItem);
 
   const sapBom = await prodFetchSapBom(code).catch(() => ({ source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] }));
@@ -10051,6 +10058,8 @@ const sizeUom = prodExtractSizeUom(itemDesc, sapItem);
       neededQty: prodRound(productionNeeded, 2),
       mrpAdjustedQty: prodRound(mrpAdjustedQty, 2),
       adjustedQty: prodRound(productionAdjusted, 2),
+      lotBaseQty: prodRound(lotBaseQty, 2),
+      recommendedLotQty: prodRound(recommendedLotQty, 2),
       coverageMonthsTarget: prodRound(coverageMonthsTarget,2),
       coveragePolicyLabel,
       targetInventoryQty: prodRound(targetInventoryQty,2),
@@ -10503,16 +10512,17 @@ app.get("/api/admin/production/dashboard", verifyAdmin, async (req, res) => {
     const grupo = String(req.query?.grupo || "__ALL__");
     const q = String(req.query?.q || "");
     const sizeUom = String(req.query?.sizeUom || req.query?.size || "__ALL__");
+    const abc = String(req.query?.abc || "__ALL__");
     const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 3)));
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
 
-    const preload = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, q, avgMonths, horizonMonths });
+    const preload = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, abc, q, avgMonths, horizonMonths });
     const refreshLimit = Math.max(40, Math.min(250, Number(req.query?.refreshLimit || 120)));
     const refreshMeta = await prodRefreshInventoryForCodes(
       (preload.items || []).map((x) => x.itemCode),
       { maxItems: refreshLimit, concurrency: 8, timeoutMs: 20000 }
     ).catch(() => ({ saved: 0, items: 0, requestedItems: (preload.items || []).length, refreshedItems: 0, errors: [] }));
-    const out = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, q, avgMonths, horizonMonths });
+    const out = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, abc, q, avgMonths, horizonMonths });
     out.inventoryRefresh = refreshMeta;
     out.inventoryRefreshNote = `Inventario SAP refrescado para ${refreshMeta.refreshedItems || 0} de ${refreshMeta.requestedItems || 0} artículos visibles.`;
     return safeJson(res, 200, out);
@@ -10572,7 +10582,7 @@ app.post("/api/admin/production/ai-chat", verifyAdmin, async (req, res) => {
     const shiftHours = Math.max(1, Math.min(24, prodNum(req.body?.shiftHours, 8)));
     const itemCode = String(req.body?.itemCode || "").trim();
 
-    const dashboard = await productionDashboardFromDb({ from, to, area, grupo, q, avgMonths, horizonMonths });
+    const dashboard = await productionDashboardFromDb({ from, to, area, grupo, q, abc, avgMonths, horizonMonths });
     const requestedCodes = prodResolveRequestedCodes({ question, q, itemCode, dashboard });
     const questionMatches = requestedCodes.map((code) => prodFindDashboardItemByCode(dashboard?.items || [], code)).filter(Boolean);
 
