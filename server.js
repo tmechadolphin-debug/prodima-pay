@@ -8513,8 +8513,8 @@ function prodExtractInventorySnapshotFromItem(item) {
     const minStock = prodNum(r?.MinimalStock ?? r?.MinStock ?? 0);
     const maxStock = prodNum(r?.MaximalStock ?? r?.MaxStock ?? 0);
     total += stock;
-    stockMin = Math.max(stockMin, minStock);
-    stockMax = Math.max(stockMax, maxStock);
+    stockMin += minStock;
+    stockMax += maxStock;
     if (Object.prototype.hasOwnProperty.call(byWh, wh)) byWh[wh] = prodRound(stock, 3);
   }
 
@@ -9329,8 +9329,8 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
         SUM(CASE WHEN warehouse='300' THEN stock ELSE 0 END)::float AS wh_300,
         SUM(CASE WHEN warehouse='500' THEN stock ELSE 0 END)::float AS wh_500,
         SUM(stock)::float AS stock_total,
-        MAX(stock_min)::float AS stock_min,
-        MAX(stock_max)::float AS stock_max
+        SUM(stock_min)::float AS stock_min,
+        SUM(stock_max)::float AS stock_max
       FROM production_inv_wh_cache
       GROUP BY item_code
     )
@@ -9689,8 +9689,8 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     const wh = String(r.warehouse || "").trim();
     if (Object.prototype.hasOwnProperty.call(byWh, wh)) byWh[wh] = prodNum(r.stock);
     stockTotal += prodNum(r.stock);
-    stockMin = Math.max(stockMin, prodNum(r.stock_min));
-    stockMax = Math.max(stockMax, prodNum(r.stock_max));
+    stockMin += prodNum(r.stock_min);
+    stockMax += prodNum(r.stock_max);
   }
   if ((!invRows.rows || !invRows.rows.length) && sapItem) {
     const sapInv = prodExtractInventorySnapshotFromItem(sapItem);
