@@ -9566,6 +9566,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, grupos = [], q
     const meta = local.formulas.products?.[it.itemCode] || null;
     const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
     const coverageMonthsTarget = prodCoverageMonthsByLabel(total.label);
+    const horizonSafe = Math.max(1, Number(horizonMonths || 3));
     const targetInventoryQty = prodNum(it.stockMax) * horizonSafe;
 
     // Producción necesaria = máximo SAP consolidado por horizonte
@@ -9599,7 +9600,21 @@ async function productionDashboardFromDb({ from, to, area, grupo, grupos = [], q
   });
 
   if (areaSel !== "__ALL__") items = items.filter((x) => x.area === areaSel);
-  if (grupoSel !== "__ALL__") items = items.filter((x) => prodNormGroupName(x.grupo) === prodNormGroupName(grupoSel));
+  if (gruposSel.length) {
+    const gruposNorm = new Set(gruposSel.map((x) => prodNormGroupName(x)));
+    items = items.filter((x) => gruposNorm.has(prodNormGroupName(x.grupo)));
+  } else if (grupoSel !== "__ALL__") {
+    items = items.filter((x) => prodNormGroupName(x.grupo) === prodNormGroupName(grupoSel));
+  }
+  if (sizeSel.size) items = items.filter((x) => sizeSel.has(String(x.size || '').trim()));
+  if (classSel.size) {
+    items = items.filter((x) => {
+      const label = String(x.totalLabel || '').trim().toUpperCase();
+      const simple = label.startsWith('AB') ? 'AB' : label.startsWith('C') ? 'C' : label.startsWith('D') ? 'D' : label;
+      return classSel.has(label) || classSel.has(simple);
+    });
+  }
+  if (itemCodeSel.size) items = items.filter((x) => itemCodeSel.has(prodNormalizeItemCodeLoose(x.itemCode)));
   if (qq) items = items.filter((x) => x.itemCode.toLowerCase().includes(qq) || x.itemDesc.toLowerCase().includes(qq));
 
   items.sort((a, b) => {
@@ -10443,7 +10458,9 @@ app.get("/api/admin/production/dashboard", verifyAdmin, async (req, res) => {
     const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 3)));
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
 
-    await syncProductionInventoryWh({ from, to, maxItems: 5000 }).catch(() => {});
+    // No bloqueamos el dashboard refrescando miles de artículos desde SAP en cada carga.
+    // Se dispara un refresh liviano en segundo plano para evitar que la UI quede en "Cargando...".
+    Promise.resolve().then(() => syncProductionInventoryWh({ from, to, maxItems: 250 }).catch(() => {}));
     const out = await productionDashboardFromDb({ from, to, area, grupo, grupos, q, avgMonths, horizonMonths, sizes, classifications, itemCodes });
     return safeJson(res, 200, out);
   } catch (e) {
@@ -10505,7 +10522,7 @@ app.post("/api/admin/production/ai-chat", verifyAdmin, async (req, res) => {
     const shiftHours = Math.max(1, Math.min(24, prodNum(req.body?.shiftHours, 8)));
     const itemCode = String(req.body?.itemCode || "").trim();
 
-    await syncProductionInventoryWh({ from, to, maxItems: 5000 }).catch(() => {});
+    Promise.resolve().then(() => syncProductionInventoryWh({ from, to, maxItems: 250 }).catch(() => {}));
     const dashboard = await productionDashboardFromDb({ from, to, area, grupo, grupos, q, avgMonths, horizonMonths, sizes, classifications, itemCodes });
     const requestedCodes = prodResolveRequestedCodes({ question, q, itemCode, dashboard });
     const questionMatches = requestedCodes.map((code) => prodFindDashboardItemByCode(dashboard?.items || [], code)).filter(Boolean);
