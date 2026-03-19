@@ -10502,6 +10502,7 @@ app.get("/api/admin/production/dashboard", verifyAdmin, async (req, res) => {
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
     const q = String(req.query?.q || "");
+    const sizeUom = String(req.query?.sizeUom || req.query?.size || "__ALL__");
     const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 3)));
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
 
