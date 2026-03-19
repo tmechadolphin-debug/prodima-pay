@@ -9597,7 +9597,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       stockTotal: it.stockTotal,
       avgMonthlyQty: it.avgMonthlyQty,
       projectedQty: it.projectedQty,
-      horizonMonths: horizonSafe,
+      horizonMonths: Math.max(1, Number(horizonMonths || 3)),
     });
     const targetInventoryQty = prodMetrics.sapTargetByHorizon;
     const productionNeeded = prodMetrics.productionNeeded;
