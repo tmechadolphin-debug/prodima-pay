@@ -7875,7 +7875,8 @@ __extraBootTasks.push(async () => {
    /data/production/production_capacity_config.json
 ========================================================= */
 
-const PROD_FINISHED_WHS = ["01", "03", "12", "200", "300", "500"];
+const PROD_FINISHED_WHS = ["01", "03", "12", "200", "300", "500"]
+const PROD_FINISHED_WHS_SET = new Set(PROD_FINISHED_WHS);
 
 // Producción: helpers autosuficientes para no depender del scope de otros módulos
 const PROD_GROUPS_CONS = (globalThis.GROUPS_CONS && globalThis.GROUPS_CONS.size ? globalThis.GROUPS_CONS : new Set([
@@ -8509,14 +8510,14 @@ function prodExtractInventorySnapshotFromItem(item) {
 
   for (const r of whRows) {
     const wh = String(r?.WarehouseCode ?? r?.WhsCode ?? "").trim();
-    if (!Object.prototype.hasOwnProperty.call(byWh, wh)) continue;
     const stock = prodNum(r?.InStock ?? r?.OnHand ?? 0);
     const minStock = prodNum(r?.MinimalStock ?? r?.MinStock ?? 0);
     const maxStock = prodNum(r?.MaximalStock ?? r?.MaxStock ?? 0);
+    if (!PROD_FINISHED_WHS_SET.has(wh)) continue;
     total += stock;
     stockMin += minStock;
     stockMax += maxStock;
-    byWh[wh] = prodRound(stock, 3);
+    if (Object.prototype.hasOwnProperty.call(byWh, wh)) byWh[wh] = prodRound(stock, 3);
   }
 
   return {
@@ -9033,49 +9034,25 @@ function prodRecommendPracticalQty({ neededQty = 0, avgMonthlyQty = 0, minOrderQ
 }
 
 async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
-  const limit = Math.max(100, Math.min(8000, Number(maxItems || 2500)));
   const r = await dbQuery(
     `
-    WITH codes AS (
-      SELECT DISTINCT item_code
-      FROM sales_item_lines
-      WHERE item_code <> ''
-        AND doc_date >= LEAST($1::date, DATE '2025-01-01')
-        AND doc_date <= $2::date
-
+    WITH src AS (
+      SELECT item_code FROM production_demand_lines WHERE doc_date >= $1::date AND doc_date <= $2::date AND item_code <> ''
       UNION
-
-      SELECT DISTINCT item_code
-      FROM production_demand_lines
-      WHERE item_code <> ''
-        AND doc_date >= $1::date
-        AND doc_date <= $2::date
-
+      SELECT item_code FROM sales_item_lines WHERE doc_date >= $1::date AND doc_date <= $2::date AND item_code <> ''
       UNION
-
-      SELECT DISTINCT item_code
-      FROM production_inv_wh_cache
-      WHERE item_code <> ''
-
+      SELECT item_code FROM production_inv_wh_cache WHERE item_code <> ''
       UNION
-
-      SELECT DISTINCT item_code
-      FROM production_mrp_cache
-      WHERE item_code <> ''
-
+      SELECT item_code FROM production_mrp_cache WHERE item_code <> ''
       UNION
-
-      SELECT DISTINCT item_code
-      FROM item_group_cache
-      WHERE item_code <> ''
+      SELECT item_code FROM item_group_cache WHERE item_code <> ''
     )
-    SELECT item_code
-    FROM codes
+    SELECT DISTINCT item_code
+    FROM src
     WHERE item_code <> ''
-    ORDER BY item_code
     LIMIT $3
     `,
-    [from, to, limit]
+    [from, to, Math.max(100, Math.min(8000, Number(maxItems || 2500)))]
   );
   const codes = (r.rows || []).map((x) => String(x.item_code || "").trim()).filter(Boolean);
   let saved = 0;
@@ -9085,7 +9062,6 @@ async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
     try {
       const itemCode = codes[i];
       const it = await prodGetFullItem(itemCode, { forceFresh: true, ttlMs: 0 });
-      if (!it) throw new Error('SAP no devolvió item');
       const itemDesc = String(it?.ItemName || "").trim();
       const whRows = Array.isArray(it?.ItemWarehouseInfoCollection) ? it.ItemWarehouseInfoCollection : [];
 
@@ -9366,9 +9342,9 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
         SUM(CASE WHEN warehouse='200' THEN stock ELSE 0 END)::float AS wh_200,
         SUM(CASE WHEN warehouse='300' THEN stock ELSE 0 END)::float AS wh_300,
         SUM(CASE WHEN warehouse='500' THEN stock ELSE 0 END)::float AS wh_500,
-        SUM(CASE WHEN warehouse IN ('01','03','12','200','300','500') THEN stock ELSE 0 END)::float AS stock_total,
-        SUM(CASE WHEN warehouse IN ('01','03','12','200','300','500') THEN stock_min ELSE 0 END)::float AS stock_min,
-        SUM(CASE WHEN warehouse IN ('01','03','12','200','300','500') THEN stock_max ELSE 0 END)::float AS stock_max
+        SUM(stock)::float AS stock_total,
+        SUM(stock_min)::float AS stock_min,
+        SUM(stock_max)::float AS stock_max
       FROM production_inv_wh_cache
       GROUP BY item_code
     )
@@ -9509,12 +9485,13 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const meta = local.formulas.products?.[it.itemCode] || null;
     const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
     const coverageMonthsTarget = prodCoverageMonthsByLabel(total.label);
-    const targetInventoryQty = prodNum(it.stockMax);
+    const horizonSafe = Math.max(1, Number(horizonMonths || 3));
+    const targetInventoryQty = prodNum(it.stockMax) > 0 ? prodNum(it.stockMax) * coverageMonthsTarget * horizonSafe : it.projectedQty;
 
-    // Producción necesaria = máximo SAP consolidado
+    // Neces. = máximo SAP * política ABC * horizonte
     const productionNeeded = Math.max(0, targetInventoryQty);
 
-    // Ajustado = máximo SAP consolidado - stock actual
+    // Ajustado = faltante para llegar al objetivo del horizonte
     const productionAdjusted = Math.max(0, targetInventoryQty - prodNum(it.stockTotal));
     const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
     const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
@@ -9728,8 +9705,8 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   let stockMax = 0;
   for (const r of invRows.rows || []) {
     const wh = String(r.warehouse || "").trim();
-    if (!Object.prototype.hasOwnProperty.call(byWh, wh)) continue;
-    byWh[wh] = prodNum(r.stock);
+    if (!PROD_FINISHED_WHS_SET.has(wh)) continue;
+    if (Object.prototype.hasOwnProperty.call(byWh, wh)) byWh[wh] = prodNum(r.stock);
     stockTotal += prodNum(r.stock);
     stockMin += prodNum(r.stock_min);
     stockMax += prodNum(r.stock_max);
@@ -9761,14 +9738,15 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const dashRow = (dashForAbc.items || []).find((x) => String(x.itemCode || '') === code) || null;
   const coverageMonthsTarget = dashRow ? prodNum(dashRow.coverageMonthsTarget || 1, 1) : 1;
   const coveragePolicyLabel = prodCoverageLabel(coverageMonthsTarget);
-const targetInventoryQty = Math.max(0, stockMax);
+  const horizonSafe = Math.max(1, Number(horizonMonths || 3));
+const targetInventoryQty = stockMax > 0 ? stockMax * coverageMonthsTarget * horizonSafe : projectedQty;
 const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
 const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : targetInventoryQty;
 
-// Producción necesaria = máximo SAP consolidado
+// Neces. = máximo SAP * política ABC * horizonte
 const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty);
 
-// Ajustado = máximo SAP consolidado - stock actual
+// Ajustado = faltante para llegar al objetivo del horizonte
 const mrpAdjustedQty = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty - stockTotal);
 const productionAdjusted = mrpAdjustedQty;
 
