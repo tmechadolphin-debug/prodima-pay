@@ -9033,15 +9033,49 @@ function prodRecommendPracticalQty({ neededQty = 0, avgMonthlyQty = 0, minOrderQ
 }
 
 async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
+  const limit = Math.max(100, Math.min(8000, Number(maxItems || 2500)));
   const r = await dbQuery(
     `
-    SELECT DISTINCT item_code
-    FROM production_demand_lines
-    WHERE doc_date >= $1::date AND doc_date <= $2::date
-      AND item_code <> ''
+    WITH codes AS (
+      SELECT DISTINCT item_code
+      FROM sales_item_lines
+      WHERE item_code <> ''
+        AND doc_date >= LEAST($1::date, DATE '2025-01-01')
+        AND doc_date <= $2::date
+
+      UNION
+
+      SELECT DISTINCT item_code
+      FROM production_demand_lines
+      WHERE item_code <> ''
+        AND doc_date >= $1::date
+        AND doc_date <= $2::date
+
+      UNION
+
+      SELECT DISTINCT item_code
+      FROM production_inv_wh_cache
+      WHERE item_code <> ''
+
+      UNION
+
+      SELECT DISTINCT item_code
+      FROM production_mrp_cache
+      WHERE item_code <> ''
+
+      UNION
+
+      SELECT DISTINCT item_code
+      FROM item_group_cache
+      WHERE item_code <> ''
+    )
+    SELECT item_code
+    FROM codes
+    WHERE item_code <> ''
+    ORDER BY item_code
     LIMIT $3
     `,
-    [from, to, Math.max(100, Math.min(8000, Number(maxItems || 2500)))]
+    [from, to, limit]
   );
   const codes = (r.rows || []).map((x) => String(x.item_code || "").trim()).filter(Boolean);
   let saved = 0;
@@ -9050,7 +9084,8 @@ async function syncProductionInventoryWh({ from, to, maxItems = 2500 }) {
   for (let i = 0; i < codes.length; i++) {
     try {
       const itemCode = codes[i];
-      const it = await prodGetFullItem(itemCode);
+      const it = await prodGetFullItem(itemCode, { forceFresh: true, ttlMs: 0 });
+      if (!it) throw new Error('SAP no devolvió item');
       const itemDesc = String(it?.ItemName || "").trim();
       const whRows = Array.isArray(it?.ItemWarehouseInfoCollection) ? it.ItemWarehouseInfoCollection : [];
 
