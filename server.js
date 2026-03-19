@@ -7875,7 +7875,7 @@ __extraBootTasks.push(async () => {
    /data/production/production_capacity_config.json
 ========================================================= */
 
-const PROD_FINISHED_WHS = ["01", "03", "12", "200", "300", "500"];
+const PROD_FINISHED_WHS = ["01", "03", "10", "12", "200", "300", "500"];
 
 // Producción: helpers autosuficientes para no depender del scope de otros módulos
 const PROD_GROUPS_CONS = (globalThis.GROUPS_CONS && globalThis.GROUPS_CONS.size ? globalThis.GROUPS_CONS : new Set([
@@ -8501,7 +8501,7 @@ function prodLineItemsPerUnit(line, itemMaster = null) {
 }
 
 function prodExtractInventorySnapshotFromItem(item) {
-  const byWh = { "01": 0, "03": 0, "12": 0, "200": 0, "300": 0, "500": 0 };
+  const byWh = { "01": 0, "03": 0, "10": 0, "12": 0, "200": 0, "300": 0, "500": 0 };
   const whRows = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
   let total = 0;
   let stockMin = 0;
@@ -9309,6 +9309,86 @@ function prodMonthWindowEnd(dateIso) {
   return last.toISOString().slice(0,10);
 }
 
+
+function prodExtractSizeUom(description = "", item = null) {
+  const src = `${String(description || "")} ${String(item?.ItemName || "")} ${String(item?.SalesUnit || "")}`.trim();
+  const txt = prodNorm(src);
+  const patterns = [
+    /\b(5\.5|10\.5|12|16|20|24|29|32)\s*(?:oz|onz|onz\.|onzas?)\b/i,
+    /\b(355|473|591|710|800|946|1000|3785)\s*ml\b/i,
+    /\b(1)\s*gal\b/i,
+  ];
+  for (const rx of patterns) {
+    const m = src.match(rx);
+    if (m) return String(m[1] || "").trim();
+  }
+  const loose = txt.match(/\b(5\.5|10\.5|12|16|20|24|29|32|355|473|591|710|800|946|1000|3785)\b/);
+  return loose ? String(loose[1] || "").trim() : "";
+}
+
+function prodCalcProductionMetrics({ stockMax = 0, stockTotal = 0, avgMonthlyQty = 0, projectedQty = 0, horizonMonths = 1 }) {
+  const horizonSafe = Math.max(1, Number(horizonMonths || 1));
+  const monthlyDemand = projectedQty > 0 ? (projectedQty / horizonSafe) : Number(avgMonthlyQty || 0);
+  const demandByHorizon = projectedQty > 0 ? Number(projectedQty || 0) : (monthlyDemand * horizonSafe);
+  const sapTargetByHorizon = Math.max(0, Number(stockMax || 0)) * horizonSafe;
+  const productionNeeded = Math.max(demandByHorizon, sapTargetByHorizon);
+  const productionAdjusted = Math.max(0, productionNeeded - Math.max(0, Number(stockTotal || 0)));
+  return {
+    horizonSafe,
+    monthlyDemand: prodRound(monthlyDemand, 2),
+    demandByHorizon: prodRound(demandByHorizon, 2),
+    sapTargetByHorizon: prodRound(sapTargetByHorizon, 2),
+    productionNeeded: prodRound(productionNeeded, 2),
+    productionAdjusted: prodRound(productionAdjusted, 2),
+  };
+}
+
+async function prodRefreshInventoryForCodes(itemCodes = []) {
+  const codes = Array.from(new Set((Array.isArray(itemCodes) ? itemCodes : []).map((x) => String(x || "").trim()).filter(Boolean)));
+  if (!codes.length) return { saved: 0, items: 0, errors: [] };
+  let saved = 0;
+  const errors = [];
+  for (let i = 0; i < codes.length; i++) {
+    const itemCode = codes[i];
+    try {
+      const it = await prodGetFullItem(itemCode, { forceFresh: true, ttlMs: 0 });
+      if (!it) throw new Error('SAP no devolvió item');
+      const itemDesc = String(it?.ItemName || "").trim();
+      const whRows = Array.isArray(it?.ItemWarehouseInfoCollection) ? it.ItemWarehouseInfoCollection : [];
+      for (const wh of PROD_FINISHED_WHS) {
+        const w = whRows.find((x) => String(x?.WarehouseCode ?? x?.WhsCode ?? "").trim() === wh) || {};
+        const stock = prodNum(w?.InStock ?? w?.OnHand ?? 0);
+        const committed = prodNum(w?.Committed ?? w?.IsCommited ?? 0);
+        const ordered = prodNum(w?.Ordered ?? w?.OnOrder ?? 0);
+        const stockMin = prodNum(w?.MinimalStock ?? w?.MinStock ?? 0);
+        const stockMax = prodNum(w?.MaximalStock ?? w?.MaxStock ?? 0);
+        const available = stock - committed + ordered;
+        await dbQuery(
+          `
+          INSERT INTO production_inv_wh_cache(item_code,item_desc,warehouse,stock,stock_min,stock_max,committed,ordered,available,updated_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+          ON CONFLICT(item_code,warehouse) DO UPDATE SET
+            item_desc=EXCLUDED.item_desc,
+            stock=EXCLUDED.stock,
+            stock_min=EXCLUDED.stock_min,
+            stock_max=EXCLUDED.stock_max,
+            committed=EXCLUDED.committed,
+            ordered=EXCLUDED.ordered,
+            available=EXCLUDED.available,
+            updated_at=NOW()
+          `,
+          [itemCode, itemDesc, wh, stock, stockMin, stockMax, committed, ordered, available]
+        );
+        saved++;
+      }
+    } catch (e) {
+      if (errors.length < 10) errors.push({ itemCode, message: e.message || String(e) });
+    }
+    if ((i + 1) % 20 === 0) await sleep(15);
+  }
+  return { saved, items: codes.length, errors };
+}
+
 async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 0, horizonMonths = 3 }) {
   const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN)).slice(0,10);
   const maxMonthsWindow = Math.max(1, Number(avgMonths || horizonMonths || 5), Number(horizonMonths || 3));
@@ -9362,13 +9442,14 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
         item_code,
         SUM(CASE WHEN warehouse='01'  THEN stock ELSE 0 END)::float AS wh_01,
         SUM(CASE WHEN warehouse='03'  THEN stock ELSE 0 END)::float AS wh_03,
+        SUM(CASE WHEN warehouse='10'  THEN stock ELSE 0 END)::float AS wh_10,
         SUM(CASE WHEN warehouse='12'  THEN stock ELSE 0 END)::float AS wh_12,
         SUM(CASE WHEN warehouse='200' THEN stock ELSE 0 END)::float AS wh_200,
         SUM(CASE WHEN warehouse='300' THEN stock ELSE 0 END)::float AS wh_300,
         SUM(CASE WHEN warehouse='500' THEN stock ELSE 0 END)::float AS wh_500,
-        SUM(CASE WHEN warehouse IN ('01','03','12','200','300','500') THEN stock ELSE 0 END)::float AS stock_total,
-        SUM(CASE WHEN warehouse IN ('01','03','12','200','300','500') THEN stock_min ELSE 0 END)::float AS stock_min,
-        SUM(CASE WHEN warehouse IN ('01','03','12','200','300','500') THEN stock_max ELSE 0 END)::float AS stock_max
+        SUM(CASE WHEN warehouse IN ('01','03','10','12','200','300','500') THEN stock ELSE 0 END)::float AS stock_total,
+        SUM(CASE WHEN warehouse IN ('01','03','10','12','200','300','500') THEN stock_min ELSE 0 END)::float AS stock_min,
+        SUM(CASE WHEN warehouse IN ('01','03','10','12','200','300','500') THEN stock_max ELSE 0 END)::float AS stock_max
       FROM production_inv_wh_cache
       GROUP BY item_code
     )
@@ -9383,6 +9464,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       COALESCE(demand.demand_qty,0) AS demand_qty,
       COALESCE(inv.wh_01,0) AS wh_01,
       COALESCE(inv.wh_03,0) AS wh_03,
+      COALESCE(inv.wh_10,0) AS wh_10,
       COALESCE(inv.wh_12,0) AS wh_12,
       COALESCE(inv.wh_200,0) AS wh_200,
       COALESCE(inv.wh_300,0) AS wh_300,
@@ -9462,6 +9544,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       stockTotal,
       wh01: prodNum(r.wh_01),
       wh03: prodNum(r.wh_03),
+      wh10: prodNum(r.wh_10),
       wh12: prodNum(r.wh_12),
       wh200: prodNum(r.wh_200),
       wh300: prodNum(r.wh_300),
@@ -9509,13 +9592,21 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const meta = local.formulas.products?.[it.itemCode] || null;
     const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
     const coverageMonthsTarget = prodCoverageMonthsByLabel(total.label);
-    const targetInventoryQty = prodNum(it.stockMax);
+    const prodMetrics = prodCalcProductionMetrics({
+      stockMax: it.stockMax,
+      stockTotal: it.stockTotal,
+      avgMonthlyQty: it.avgMonthlyQty,
+      projectedQty: it.projectedQty,
+      horizonMonths: horizonSafe,
+    });
+    const targetInventoryQty = prodMetrics.sapTargetByHorizon;
+    const productionNeeded = prodMetrics.productionNeeded;
+    const productionAdjusted = prodMetrics.productionAdjusted;
 
-    // Producción necesaria = máximo SAP consolidado
-    const productionNeeded = Math.max(0, targetInventoryQty);
+    const sapItemForMeta = null;
+    const sizeUom = prodExtractSizeUom(it.itemDesc, sapItemForMeta);
+    const sapLotSize = Math.max(prodNum(it.multipleQty), prodNum(it.minOrderQty), 0);
 
-    // Ajustado = máximo SAP consolidado - stock actual
-    const productionAdjusted = Math.max(0, targetInventoryQty - prodNum(it.stockTotal));
     const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
     const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
 
@@ -9534,8 +9625,15 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
       targetInventoryQty: prodRound(targetInventoryQty, 2),
       productionNeeded: prodRound(productionNeeded, 2),
       productionAdjusted: prodRound(productionAdjusted, 2),
+      sizeUom,
+      sapLotSize: prodRound(sapLotSize, 2),
+      productionBasis: {
+        demandByHorizon: prodMetrics.demandByHorizon,
+        sapTargetByHorizon: prodMetrics.sapTargetByHorizon,
+      },
       unitsPerHour: rate,
       hoursNeeded: prodRound(hoursNeeded, 2),
+      hoursSource: rate > 0 ? "config_local_fallback" : "sin_fuente_sap",
       hasFormula: !!meta,
       baseLiquidCode: meta?.baseLiquidCode || "",
     };
@@ -9722,7 +9820,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
      WHERE item_code = $1`,
     [code]
   );
-  const byWh = { "01": 0, "03": 0, "12": 0, "200": 0, "300": 0, "500": 0 };
+  const byWh = { "01": 0, "03": 0, "10": 0, "12": 0, "200": 0, "300": 0, "500": 0 };
   let stockTotal = 0;
   let stockMin = 0;
   let stockMax = 0;
@@ -9761,16 +9859,22 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const dashRow = (dashForAbc.items || []).find((x) => String(x.itemCode || '') === code) || null;
   const coverageMonthsTarget = dashRow ? prodNum(dashRow.coverageMonthsTarget || 1, 1) : 1;
   const coveragePolicyLabel = prodCoverageLabel(coverageMonthsTarget);
-const targetInventoryQty = Math.max(0, stockMax);
+const horizonSafePlan = Math.max(1, Number(horizonMonths || 3));
+const targetInventoryQty = Math.max(0, stockMax) * horizonSafePlan;
 const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
-const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : targetInventoryQty;
-
-// Producción necesaria = máximo SAP consolidado
-const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty);
-
-// Ajustado = máximo SAP consolidado - stock actual
-const mrpAdjustedQty = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty - stockTotal);
+const autoProdMetrics = prodCalcProductionMetrics({
+  stockMax,
+  stockTotal,
+  avgMonthlyQty: avgQty,
+  projectedQty,
+  horizonMonths: horizonSafePlan,
+});
+const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : autoProdMetrics.productionNeeded;
+const productionNeeded = manualPlanQty > 0 ? manualPlanQty : autoProdMetrics.productionNeeded;
+const mrpAdjustedQty = manualPlanQty > 0 ? Math.max(0, manualPlanQty - stockTotal) : autoProdMetrics.productionAdjusted;
 const productionAdjusted = mrpAdjustedQty;
+const sapLotSize = Math.max(prodNum(mrp.multipleQty), prodNum(mrp.minOrderQty), 0);
+const sizeUom = prodExtractSizeUom(itemDesc, sapItem);
 
   const sapBom = await prodFetchSapBom(code).catch(() => ({ source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] }));
   let requirementPack = await prodBuildRequirementsFromSapBom({ itemCode: code, adjustedQty: productionAdjusted, sapBom }).catch(() => null);
@@ -9897,7 +10001,7 @@ const productionAdjusted = mrpAdjustedQty;
     recentProductionOrders: (prodOrders?.orders || []).slice(0, 20),
     costing,
     avgMonthlyQty: prodRound(avgQty, 2),
-    projectedQty: prodRound(targetInventoryQty, 2),
+    projectedQty: prodRound(autoProdMetrics ? autoProdMetrics.demandByHorizon : targetInventoryQty, 2),
     inventory: {
       total: prodRound(stockTotal, 2),
       byWarehouse: byWh,
@@ -9911,6 +10015,8 @@ const productionAdjusted = mrpAdjustedQty;
       leadTimeDays: prodNum(mrp.leadTimeDays),
       minOrderQty: prodNum(mrp.minOrderQty),
       multipleQty: prodNum(mrp.multipleQty),
+      sapLotSize: prodRound(sapLotSize, 2),
+      sizeUom,
     },
     production: {
       litersPerUnit: prodRound(litersPerUnit, 6),
@@ -9925,11 +10031,12 @@ const productionAdjusted = mrpAdjustedQty;
       manualPlanQty: prodRound(manualPlanQty, 3),
       planBasis: manualPlanQty > 0 ? "SUBPLAN_COMPONENTE" : "DEMANDA_PROYECTADA",
       maxUnitsToday,
-      practicalRule: `Política vigente: ${coveragePolicyLabel} según clasificación ABC, usando el máximo de SAP como base de inventario.`,
+      practicalRule: `Política vigente: ${coveragePolicyLabel}; producción necesaria = mayor entre demanda del horizonte y máximo SAP multiplicado por horizonte.`,
     },
     capacity: {
       unitsPerHour: prodRound(rate, 2),
       hoursNeeded: prodRound(hoursNeeded, 2),
+      hoursSource: rate > 0 ? "config_local_fallback" : "sin_fuente_sap",
       shiftHours: shiftHoursSafe,
       businessDays,
       saturdays,
@@ -10372,6 +10479,8 @@ app.get("/api/admin/production/dashboard", verifyAdmin, async (req, res) => {
     const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 3)));
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
 
+    const preload = await productionDashboardFromDb({ from, to, area, grupo, q, avgMonths, horizonMonths });
+    await prodRefreshInventoryForCodes((preload.items || []).map((x) => x.itemCode)).catch(() => {});
     const out = await productionDashboardFromDb({ from, to, area, grupo, q, avgMonths, horizonMonths });
     return safeJson(res, 200, out);
   } catch (e) {
@@ -10392,6 +10501,7 @@ app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
     const shiftHours = Math.max(1, Math.min(24, prodNum(req.query?.shiftHours, 8)));
     const plannedQty = Math.max(0, prodNum(req.query?.plannedQty, 0));
 
+    await prodRefreshInventoryForCodes([itemCode]).catch(() => {});
     const plan = await productionBuildItemPlanCached({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty });
 
     const dash = await productionDashboardFromDb({
