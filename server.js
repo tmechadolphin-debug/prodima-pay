@@ -5391,6 +5391,7 @@ app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) =>
     const toQ = String(req.query?.to || "");
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
+    const sizeUom = String(req.query?.sizeUom || req.query?.size || "__ALL__");
     const q = String(req.query?.q || "");
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
@@ -9405,7 +9406,7 @@ async function prodRefreshInventoryForCodes(itemCodes = [], options = {}) {
   return { saved, items: codes.length, requestedItems: allCodes.length, refreshedItems: codes.length, errors };
 }
 
-async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 0, horizonMonths = 3 }) {
+async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '__ALL__', avgMonths = 0, horizonMonths = 3 }) {
   const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN)).slice(0,10);
   const maxMonthsWindow = Math.max(1, Number(avgMonths || horizonMonths || 5), Number(horizonMonths || 3));
   const monthBaseStart = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(maxMonthsWindow - 1));
@@ -9583,6 +9584,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
 
   const areaSel = String(area || "__ALL__");
   const grupoSel = String(grupo || "__ALL__");
+  const sizeSel = String(sizeUom || "__ALL__").trim();
   const qq = String(q || "").trim().toLowerCase();
 
   let availableGroups = [];
@@ -9655,8 +9657,15 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     };
   });
 
+  const availableSizes = Array.from(new Set(
+    items
+      .map((x) => String(x.sizeUom || "").trim())
+      .filter(Boolean)
+  )).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+
   if (areaSel !== "__ALL__") items = items.filter((x) => x.area === areaSel);
   if (grupoSel !== "__ALL__") items = items.filter((x) => prodNormGroupName(x.grupo) === prodNormGroupName(grupoSel));
+  if (sizeSel !== "__ALL__") items = items.filter((x) => String(x.sizeUom || "").trim() === sizeSel);
   if (qq) items = items.filter((x) => x.itemCode.toLowerCase().includes(qq) || x.itemDesc.toLowerCase().includes(qq));
 
   items.sort((a, b) => {
@@ -9693,7 +9702,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
 
   return {
     ok: true,
-    from, to, area: areaSel, grupo: grupoSel, q: qq,
+    from, to, area: areaSel, grupo: grupoSel, sizeUom: sizeSel, q: qq,
     avgMonths: Math.max(1, Number(avgMonths || horizonMonths || 5)),
     horizonMonths: Math.max(1, Number(horizonMonths || 3)),
     lastSyncAt: await getState("production_last_sync_at"),
@@ -9702,6 +9711,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     demandCount,
     useDemandFallback,
     availableGroups,
+    availableSizes,
     totals: {
       revenue: prodRound(totals.revenue, 2),
       projectedQty: prodRound(totals.projectedQty, 2),
@@ -10495,13 +10505,13 @@ app.get("/api/admin/production/dashboard", verifyAdmin, async (req, res) => {
     const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 3)));
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
 
-    const preload = await productionDashboardFromDb({ from, to, area, grupo, q, avgMonths, horizonMonths });
+    const preload = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, q, avgMonths, horizonMonths });
     const refreshLimit = Math.max(40, Math.min(250, Number(req.query?.refreshLimit || 120)));
     const refreshMeta = await prodRefreshInventoryForCodes(
       (preload.items || []).map((x) => x.itemCode),
       { maxItems: refreshLimit, concurrency: 8, timeoutMs: 20000 }
     ).catch(() => ({ saved: 0, items: 0, requestedItems: (preload.items || []).length, refreshedItems: 0, errors: [] }));
-    const out = await productionDashboardFromDb({ from, to, area, grupo, q, avgMonths, horizonMonths });
+    const out = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, q, avgMonths, horizonMonths });
     out.inventoryRefresh = refreshMeta;
     out.inventoryRefreshNote = `Inventario SAP refrescado para ${refreshMeta.refreshedItems || 0} de ${refreshMeta.requestedItems || 0} artículos visibles.`;
     return safeJson(res, 200, out);
