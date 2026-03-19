@@ -8501,7 +8501,7 @@ function prodLineItemsPerUnit(line, itemMaster = null) {
 }
 
 function prodExtractInventorySnapshotFromItem(item) {
-  const byWh = { "01": 0, "03": 0, "12": 0, "200": 0, "300": 0, "500": 0 };
+  const byWh = { "01": 0, "200": 0, "300": 0, "500": 0 };
   const whRows = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
   let total = 0;
   let stockMin = 0;
@@ -8699,7 +8699,7 @@ function prodLooksLikeResource({ code, description = "", item = null, line = nul
   const codeTxt = String(code || "").trim().toLowerCase();
   const inventoryFlag = String(item?.InventoryItem || "").trim().toLowerCase();
   if (/(operari|supervisor|linea de produccion|línea de producción|mano de obra|recurso|resource|labor|overhead|gastos? de fabricaci|horas? hombre|maquina de limpieza|maquina de salsas|servicio interno)/i.test(txt)) return true;
-  if (/^(ogf|mli|mlim|mosup|momez|m00\d|mo\d{2,}|res)/i.test(codeTxt)) return true;
+  if (/^(ogf|mli|mlim|mosup|m00\d|mo\d{2,}|res)/i.test(codeTxt)) return true;
   if (["tno", "no", "n", "f"].includes(inventoryFlag) && /(operari|supervisor|linea|línea|gasto|recurso|labor|overhead|servicio)/i.test(txt)) return true;
   return false;
 }
@@ -8730,19 +8730,12 @@ function prodExtractSupplierFromItem(item) {
 
 function prodExtractComponentStockInfo(item, preferredWh = "") {
   const whRows = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
-  const preferredList = Array.isArray(preferredWh)
-    ? preferredWh.map((x) => String(x || "").trim()).filter(Boolean)
-    : String(preferredWh || "")
-        .split(",")
-        .map((x) => String(x || "").trim())
-        .filter(Boolean);
-  const preferredSet = new Set(preferredList);
+  const preferred = String(preferredWh || "").trim();
   let stockSpecific = 0;
   let availableSpecific = 0;
   let hasSpecific = false;
   let stockTotal = 0;
   let availableTotal = 0;
-  const byWarehouse = {};
 
   for (const r of whRows) {
     const wh = String(r?.WarehouseCode ?? r?.WhsCode ?? "").trim();
@@ -8753,9 +8746,8 @@ function prodExtractComponentStockInfo(item, preferredWh = "") {
 
     stockTotal += stock;
     availableTotal += available;
-    byWarehouse[wh] = prodRound(stock, 3);
 
-    if (preferredSet.size && preferredSet.has(wh)) {
+    if (preferred && wh === preferred) {
       stockSpecific += stock;
       availableSpecific += available;
       hasSpecific = true;
@@ -8766,8 +8758,6 @@ function prodExtractComponentStockInfo(item, preferredWh = "") {
     stockQty: prodRound(hasSpecific ? stockSpecific : stockTotal, 3),
     availableQty: prodRound(hasSpecific ? availableSpecific : availableTotal, 3),
     stockTotal: prodRound(stockTotal, 3),
-    availableTotal: prodRound(availableTotal, 3),
-    byWarehouse,
   };
 }
 
@@ -8953,9 +8943,8 @@ async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }
       const requiredQty = prodRound(perUnit * prodNum(adjustedQty), 3);
       const componentType = prodClassifyComponentType({ code: current.code, description: current.description, item, line: current.raw });
       const isResource = componentType === "RESOURCE";
-      const preferredWh = ["03", "12"];
-      const stockInfo = isResource ? { stockQty: 0, availableQty: 0, stockTotal: 0, byWarehouse: {} } : prodExtractComponentStockInfo(item, preferredWh);
-      const stockQty = isResource ? 0 : prodNum(stockInfo.stockTotal || stockInfo.stockQty || 0);
+      const stockInfo = isResource ? { stockQty: 0, availableQty: 0 } : prodExtractComponentStockInfo(item, current.warehouse);
+      const stockQty = isResource ? 0 : (stockInfo.availableQty > 0 ? stockInfo.availableQty : stockInfo.stockQty);
       const shortage = isResource ? 0 : Math.max(0, requiredQty - stockQty);
       const coverage = isResource ? 1 : (requiredQty > 0 ? stockQty / requiredQty : 0);
       results.push({
@@ -9145,52 +9134,8 @@ function prodCoverageLabel(months) {
   return `${prodRound(n,2)} mes(es) de inv`;
 }
 
-async function prodScanDocHeadersForOrders({ from, to, maxDocs = 4000 }) {
-  if (typeof scanDocHeaders === "function") {
-    try { return await scanDocHeaders("Orders", { from, to, maxDocs }); } catch {}
-    try { return await scanDocHeaders("Orders", { f: from, t: to, maxDocs }); } catch {}
-  }
-  const fromDate = String(from || "").slice(0,10);
-  const toDate = String(to || "").slice(0,10);
-  if (!fromDate || !toDate) throw new Error('prodScanDocHeadersForOrders requiere rango de fechas');
-  const top = Math.max(50, Math.min(20000, Number(maxDocs || 4000)));
-  const entity = "Orders";
-  const dayChunks = [];
-  let cur = fromDate;
-  while (cur <= toDate) {
-    const nxt = addDaysISO(cur, 29);
-    const end = nxt < toDate ? nxt : toDate;
-    dayChunks.push([cur, end]);
-    cur = addDaysISO(end, 1);
-  }
-  const headers = [];
-  const seen = new Set();
-  for (const [f, t] of dayChunks) {
-    let skip = 0;
-    while (skip < top) {
-      const filter = `DocDate ge '${f}' and DocDate le '${t}' and Cancelled eq 'tNO'`;
-      const path = `/${entity}?$select=DocEntry,DocNum,DocDate,CardCode,CardName&$filter=${encodeURIComponent(filter)}&$orderby=DocEntry asc&$top=200&$skip=${skip}`;
-      const res = await slFetch(path, { timeoutMs: 120000 });
-      const batch = prodNormalizeSlCollection(res);
-      if (!batch.length) break;
-      for (const row of batch) {
-        const key = String(row?.DocEntry ?? row?.DocNum ?? '').trim();
-        if (!key || seen.has(key)) continue;
-        seen.add(key);
-        headers.push(row);
-      }
-      if (batch.length < 200) break;
-      skip += batch.length;
-      if (headers.length >= top) break;
-    }
-    if (headers.length >= top) break;
-  }
-  headers.sort((a, b) => String(a?.DocDate || '').localeCompare(String(b?.DocDate || '')) || Number(a?.DocEntry || 0) - Number(b?.DocEntry || 0));
-  return headers.slice(0, top);
-}
-
 async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
-  const headers = await prodScanDocHeadersForOrders({ from, to, maxDocs });
+  const headers = await scanDocHeaders('Orders', { from, to, maxDocs });
   let saved = 0;
   const itemMasterCache = new Map();
   for (const h of headers) {
@@ -9273,9 +9218,9 @@ function prodMonthWindowEnd(dateIso) {
   return last.toISOString().slice(0,10);
 }
 
-async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 0, horizonMonths = 3 }) {
+async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 5, horizonMonths = 3 }) {
   const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN)).slice(0,10);
-  const maxMonthsWindow = Math.max(1, Number(avgMonths || horizonMonths || 5), Number(horizonMonths || 3));
+  const maxMonthsWindow = Math.max(1, Number(avgMonths || 5), Number(horizonMonths || 3));
   const monthBaseStart = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(maxMonthsWindow - 1));
   const monthRangeEnd = String(monthTo || '').slice(0,10);
 
@@ -9392,8 +9337,8 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const areaFinal = String(r.area || "") || prodInferAreaFromGroup(grupoTxt) || "CONS";
     const monthsMap = monthly.get(String(r.item_code || "")) || new Map();
 
+    const avgMonthsSafe = Math.max(1, Number(avgMonths || 5));
     const horizonSafe = Math.max(1, Number(horizonMonths || 3));
-    const avgMonthsSafe = Math.max(1, Number(avgMonths || horizonSafe || 5));
     let sumAvgMonths = 0;
     let sumHorizonMonths = 0;
     for (let i = avgMonthsSafe - 1; i >= 0; i--) {
@@ -9467,16 +9412,15 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
     const meta = local.formulas.products?.[it.itemCode] || null;
     const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
     const coverageMonthsTarget = prodCoverageMonthsByLabel(total.label);
-    const horizonSafe = Math.max(1, Number(horizonMonths || 3));
-    const targetInventoryQty = prodNum(it.stockMax) > 0 ? prodNum(it.stockMax) * coverageMonthsTarget * horizonSafe : it.projectedQty;
+    const targetInventoryQty = prodNum(it.stockMax) > 0 ? prodNum(it.stockMax) * coverageMonthsTarget : it.projectedQty;
 
-    // Neces. = máximo SAP * política ABC * horizonte
+    // Neces. = siempre el máximo calculado
     const productionNeeded = Math.max(0, targetInventoryQty);
 
-    // Ajustado = faltante para llegar al objetivo del horizonte
+    // Ajustado = lo que falta para llegar al máximo
     const productionAdjusted = Math.max(0, targetInventoryQty - prodNum(it.stockTotal));
     const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
-    const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
+    const hoursNeeded = rate > 0 ? productionNeeded / rate : 0;
 
     return {
       ...it,
@@ -9539,7 +9483,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths =
   return {
     ok: true,
     from, to, area: areaSel, grupo: grupoSel, q: qq,
-    avgMonths: Math.max(1, Number(avgMonths || horizonMonths || 5)),
+    avgMonths: Math.max(1, Number(avgMonths || 5)),
     horizonMonths: Math.max(1, Number(horizonMonths || 3)),
     lastSyncAt: await getState("production_last_sync_at"),
     demandSource: demandSourceLabel,
@@ -9662,13 +9606,12 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     });
   }
 
-  const avgMonthsSafe = Math.max(1, Number(avgMonths || horizonMonths || 5));
   let avgQty = 0;
-  for (let i = avgMonthsSafe - 1; i >= 0; i--) {
+  for (let i = Math.max(1, Number(avgMonths || 5)) - 1; i >= 0; i--) {
     const ym = prodYm(prodAddMonthsISO(monthStart, -i));
     avgQty += prodNum(monthMap.get(ym) || 0);
   }
-  avgQty = avgQty / avgMonthsSafe;
+  avgQty = avgQty / Math.max(1, Number(avgMonths || 5));
   let projectedQty = 0;
   for (let i = Math.max(1, Number(horizonMonths || 3)) - 1; i >= 0; i--) {
     const ym = prodYm(prodAddMonthsISO(monthStart, -i));
@@ -9681,7 +9624,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
      WHERE item_code = $1`,
     [code]
   );
-  const byWh = { "01": 0, "03": 0, "12": 0, "200": 0, "300": 0, "500": 0 };
+  const byWh = { "01": 0, "200": 0, "300": 0, "500": 0 };
   let stockTotal = 0;
   let stockMin = 0;
   let stockMax = 0;
@@ -9719,15 +9662,14 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const dashRow = (dashForAbc.items || []).find((x) => String(x.itemCode || '') === code) || null;
   const coverageMonthsTarget = dashRow ? prodNum(dashRow.coverageMonthsTarget || 1, 1) : 1;
   const coveragePolicyLabel = prodCoverageLabel(coverageMonthsTarget);
-  const horizonSafe = Math.max(1, Number(horizonMonths || 3));
-const targetInventoryQty = stockMax > 0 ? stockMax * coverageMonthsTarget * horizonSafe : projectedQty;
+const targetInventoryQty = stockMax > 0 ? stockMax * coverageMonthsTarget : projectedQty;
 const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
 const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : targetInventoryQty;
 
-// Neces. = máximo SAP * política ABC * horizonte
+// Neces. = siempre el máximo
 const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty);
 
-// Ajustado = faltante para llegar al objetivo del horizonte
+// Ajustado = faltante para llegar al máximo
 const mrpAdjustedQty = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty - stockTotal);
 const productionAdjusted = mrpAdjustedQty;
 
@@ -9846,7 +9788,7 @@ const productionAdjusted = mrpAdjustedQty;
     abcHint: "",
     period: {
       endDate: end,
-      avgMonths: Math.max(1, Number(avgMonths || horizonMonths || 5)),
+      avgMonths: Math.max(1, Number(avgMonths || 5)),
       horizonMonths: Math.max(1, Number(horizonMonths || 3)),
       planStart,
       planEnd
@@ -9996,6 +9938,8 @@ function prodCompactItemForAi(x) {
   const stockMin = prodNum(x?.stockMin);
   const stockMax = prodNum(x?.stockMax);
   const productionNeeded = prodNum(x?.productionNeeded);
+  const productionAdjusted = prodNum(x?.productionAdjusted);
+  const revenue = prodNum(x?.revenue);
   const gapToMin = stockMin > stockTotal ? prodRound(stockMin - stockTotal, 2) : 0;
   return {
     itemCode: x?.itemCode || "",
@@ -10003,21 +9947,40 @@ function prodCompactItemForAi(x) {
     grupo: x?.grupo || "",
     area: x?.area || "",
     totalLabel: x?.totalLabel || "",
+    revenue,
+    gp: prodNum(x?.gp),
+    gpPct: prodNum(x?.gpPct),
+    soldQty: prodNum(x?.soldQty),
     avgMonthlyQty: prodNum(x?.avgMonthlyQty),
     projectedQty: prodNum(x?.projectedQty),
     stockTotal,
+    wh01: prodNum(x?.wh01),
+    wh03: prodNum(x?.wh03),
+    wh12: prodNum(x?.wh12),
+    wh200: prodNum(x?.wh200),
+    wh300: prodNum(x?.wh300),
+    wh500: prodNum(x?.wh500),
     stockMin,
     stockMax,
     gapToMin,
     productionNeeded,
-    productionAdjusted: prodNum(x?.productionAdjusted),
+    productionAdjusted,
+    coverageMonthsTarget: prodNum(x?.coverageMonthsTarget),
+    coveragePolicyLabel: x?.coveragePolicyLabel || "",
+    procurementMethodLabel: x?.procurementMethodLabel || "",
     machine: x?.machine || "",
     hoursNeeded: prodNum(x?.hoursNeeded),
     leadTimeDays: prodNum(x?.leadTimeDays),
+    minOrderQty: prodNum(x?.minOrderQty),
+    multipleQty: prodNum(x?.multipleQty),
+    demandSource: x?.demandSource || "",
+    demandUomLabel: x?.demandUomLabel || "",
     belowMin: stockMin > 0 ? stockTotal < stockMin : productionNeeded > 0,
     aboveMax: stockMax > 0 ? stockTotal > stockMax : false,
+    urgencyPctVsMin: stockMin > 0 ? prodRound((Math.max(stockMin - stockTotal, 0) / Math.max(stockMin, 1)) * 100, 1) : 0,
   };
 }
+
 
 
 async function productionBuildItemPlanCached(params = {}) {
@@ -10054,8 +10017,20 @@ function prodBuildUrgentAbStockItems(items) {
 
 function prodAiCompactDashboard(data) {
   const items = Array.isArray(data?.items) ? data.items : [];
-  const compactItems = items.slice(0, 160).map(prodCompactItemForAi);
-  const urgentAbStockRiskItems = prodBuildUrgentAbStockItems(items).slice(0, 80);
+  const compactItems = items.slice(0, 600).map(prodCompactItemForAi);
+  const urgentAbStockRiskItems = prodBuildUrgentAbStockItems(items).slice(0, 120);
+  const topByRevenue = [...items]
+    .sort((a, b) => prodNum(b?.revenue) - prodNum(a?.revenue))
+    .slice(0, 80)
+    .map(prodCompactItemForAi);
+  const topByHours = [...items]
+    .sort((a, b) => prodNum(b?.hoursNeeded) - prodNum(a?.hoursNeeded))
+    .slice(0, 80)
+    .map(prodCompactItemForAi);
+  const topByNeeded = [...items]
+    .sort((a, b) => prodNum(b?.productionNeeded) - prodNum(a?.productionNeeded))
+    .slice(0, 80)
+    .map(prodCompactItemForAi);
   return {
     filters: {
       from: data?.from || "",
@@ -10071,8 +10046,12 @@ function prodAiCompactDashboard(data) {
     filteredItemsCount: items.length,
     filteredItems: compactItems,
     urgentAbStockRiskItems,
+    topByRevenue,
+    topByHours,
+    topByNeeded,
   };
 }
+
 function prodAiCompactPlan(plan) {
   if (!plan) return null;
 
@@ -10167,6 +10146,35 @@ function prodExtractResponseText(obj) {
   }
   return out.join("\n\n").trim();
 }
+function prodAiPromptLibrary() {
+  return [
+    "Identifica los productos AB críticos con mayor riesgo de quiebre en los próximos 15 días considerando demanda promedio, stock actual, lead time y producción disponible. Propón un ranking optimizado y explica el impacto si no se producen.",
+    "Si solo tengo capacidad de producir 80 horas esta semana, ¿cómo debería distribuir la producción entre los productos críticos para minimizar quiebres de stock?",
+    "Simula un escenario donde la demanda aumenta un 20% en productos CONS. ¿Qué productos entrarían en estado crítico y cuáles requieren producción inmediata?",
+    "Analiza el GapToMin vs ProductionNeeded y determina si la capacidad actual cubre la demanda. Identifica los cuellos de botella.",
+    "Sugiere una redistribución óptima de inventario entre productos similares o grupos para reducir urgencia de producción.",
+    "Genera un plan de producción priorizado considerando simultáneamente: urgencia, horas requeridas, lead time y clasificación ABC.",
+    "¿Qué pasa si la máquina CLEANING se detiene 2 días? Identifica los productos afectados y recalcula prioridades.",
+    "Optimiza el uso de cada máquina (CLEANING, SAUCES, etc.) para maximizar cobertura de stock en el menor tiempo posible.",
+    "Proyecta el stock de cada producto a 30 días usando AvgMonthlyQty y producción actual. Identifica futuros quiebres.",
+    "Identifica productos donde ProductionAdjusted supera significativamente el StockMax o la demanda esperada.",
+    "Si necesito reducir costos de producción en 15%, ¿qué productos debería posponer sin afectar significativamente el servicio?",
+    "Identifica productos cuya falta impacta indirectamente a otros (ej: combos, packs, líneas relacionadas).",
+    "Genera un sistema de alertas basado en UrgencyPctVsMin y LeadTimeDays para anticipar crisis de inventario.",
+    "Recalcula la clasificación ABC considerando rotación (AvgMonthlyQty) y urgencia actual, no solo clasificación histórica.",
+    "Crea un plan de producción semanal detallado con orden de ejecución, horas por producto y justificación.",
+    "Evalúa si la producción actual está alineada con la demanda real o si hay desbalance estructural.",
+    "Identifica productos con alta carga de horas pero bajo impacto en reducción de urgencia.",
+    "Sugiere cambios en políticas de stock mínimo y máximo para reducir urgencias recurrentes.",
+    "Simula una interrupción total de producción por 5 días y calcula qué productos quedarían en cero stock primero.",
+    "Ordena los productos no solo por urgencia, sino por impacto total en el negocio (demanda + riesgo + tiempo de producción).",
+    "Ordena por revenue los productos críticos y cruza revenue con horas requeridas para priorizar rentabilidad por hora.",
+    "Compara producción necesaria vs producción ajustada y explica cuándo conviene producir todo el necesario y cuándo solo el ajustado.",
+    "Haz un ranking por revenue, horas, lead time y urgencia para encontrar quick wins de producción.",
+    "Resume qué materiales, empaques, recursos y cuellos de botella impiden ejecutar hoy el plan óptimo."
+  ];
+}
+
 async function prodOpenAiChat({ question, dashboard, plan, plans = [], requestedCodes = [], questionMatches = [] }) {
   const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
   const model = String(process.env.OPENAI_MODEL || "gpt-5-mini").trim();
@@ -10178,31 +10186,34 @@ async function prodOpenAiChat({ question, dashboard, plan, plans = [], requested
     questionMatches: (Array.isArray(questionMatches) ? questionMatches : []).map(prodCompactItemForAi),
     selectedPlan: prodAiCompactPlan(plan),
     requestedPlans: (Array.isArray(plans) ? plans : []).map((x) => prodAiCompactPlan(x)).filter(Boolean).slice(0, 8),
+    promptLibrary: prodAiPromptLibrary(),
   };
 
   const system = [
-    "Eres un planificador de producción interno de PRODIMA.",
-    "Usa exclusivamente el JSON entregado como fuente de verdad.",
-    "La fuente combina base de datos sincronizada (ventas, inventario terminado, MRP) con SAP producción (ProductTrees y órdenes de fabricación).",
-    "Solo si el JSON lo indica explícitamente, puedes mencionar que hubo respaldo desde catálogo local.",
-    "No inventes datos que no estén en el JSON.",
-    "Responde en español.",
+    "Eres un planificador de producción interno de PRODIMA, experto en análisis operativo, capacidad, inventarios, MRP, SAP Producción, revenue y priorización de lotes.",
+    "Usa exclusivamente el JSON entregado como fuente de verdad. No inventes datos ni columnas.",
+    "La fuente combina base de datos sincronizada (ventas, revenue, inventario terminado, MRP, capacidad, horas, clasificación ABC y dashboard) con SAP producción (ProductTrees y órdenes de fabricación).",
+    "Responde en español, con tono ejecutivo, claro y accionable.",
+    "Tu objetivo es dar respuestas seguras, útiles y completas. Si algo no está en el JSON, dilo claramente y explica qué sí se puede concluir.",
     "IMPORTANTE: las cantidades de producto terminado siempre se expresan en UNIDADES, nunca en cajas.",
-    "IMPORTANTE: cuando exista sapProduction.source, menciónalo para dejar claro si los materiales vienen directo de SAP producción.",
+    "IMPORTANTE: en dashboard.filteredItems, dashboard.urgentAbStockRiskItems, dashboard.topByRevenue, dashboard.topByHours y dashboard.topByNeeded sí existen métricas operativas y de negocio. Úsalas sin omitir campos: revenue, gp, gpPct, avgMonthlyQty, projectedQty, stockTotal, stockMin, stockMax, productionNeeded, productionAdjusted, hoursNeeded, leadTimeDays, machine, wh01, wh03, wh12, wh200, wh300, wh500, demandSource, demandUomLabel, totalLabel, grupo y área.",
+    "IMPORTANTE: si el usuario pide ordenar por revenue, por horas, por lead time, por producción necesaria, por ajustado, por max, por stock, por urgencia, por rentabilidad o por impacto, debes hacerlo usando esos campos del JSON. No digas que revenue no existe si viene en dashboard.filteredItems o dashboard.topByRevenue.",
+    "IMPORTANTE: selectedPlan y requestedPlans contienen el plan detallado del artículo. Debes revisar inventory, mrp, production, capacity, costing, formula, sapProduction, recentProductionOrders, salesHistory y requirements. No se te puede escapar ninguna de esas secciones cuando existan.",
+    "IMPORTANTE: cuando exista costing.weightedCost, úsalo como costo ponderado unitario y analiza también stockValue, projectedDemandCost y adjustedProductionCost.",
     "IMPORTANTE: cuando existan salesHistory.producedQty o recentProductionOrders, esos son los datos válidos para responder cuánto se produjo el artículo por mes o en órdenes recientes.",
-    "IMPORTANTE: cuando exista costing.weightedCost, úsalo como costo ponderado unitario del artículo y analiza también stockValue, projectedDemandCost y adjustedProductionCost.",
-    "IMPORTANTE: toma production.neededQty como la cantidad principal a producir. La política vigente usa el máximo de SAP como base de inventario: AB Crítico = 2 meses, C Importante = 1 mes, D = 0.5 mes.",
-    "IMPORTANTE: si requirements.rawMaterials, requirements.packaging, requirements.resources o requirements.bottlenecks existen, debes analizarlos y mencionarlos explícitamente.",
-    "IMPORTANTE: los registros en requirements.resources son RECURSOS internos (operarios, supervisoras, líneas, gastos de fabricación) y no deben tratarse como faltantes de inventario.",
+    "IMPORTANTE: toma production.neededQty como producción necesaria del plan detallado y production.adjustedQty o adjustedQty como producción ajustada. La política vigente usa el máximo de SAP como base de inventario: AB Crítico = 2 meses, C Importante = 1 mes, D = 0.5 mes. Si el usuario pide horizonte, capacidad o escenarios, debes recalcular o explicar usando ese marco y los datos disponibles.",
+    "IMPORTANTE: si requirements.rawMaterials, requirements.packaging, requirements.resources o requirements.bottlenecks existen, debes analizarlos explícitamente y separarlos bien.",
+    "IMPORTANTE: los registros en requirements.resources son RECURSOS internos (operarios, supervisoras, líneas, gastos de fabricación, mezcladores, etc.) y no deben tratarse como faltantes de inventario.",
     "IMPORTANTE: usa procurementMethodLabel para explicar el método con lenguaje humano: 'Se fabrica en planta' o 'No se fabrica en planta'.",
-    "IMPORTANTE: si el usuario compara varios planes, identifica si los mismos resources aparecen en más de un lote y advierte posibles choques de capacidad.",
-    "IMPORTANTE: para riesgo de stock urgente usa SOLO dashboard.urgentAbStockRiskItems o el criterio estricto stockTotal < stockMin. No incluyas ítems en o por encima del stock mínimo, y nunca marques como urgentes artículos por encima del máximo.",
-    "IMPORTANTE: aunque no haya artículo seleccionado, si la pregunta menciona códigos o el buscador coincide, debes usar requestedCodes, questionMatches y requestedPlans. No digas que un código no aparece en el JSON si existe en requestedPlans, questionMatches o filteredItems.",
+    "IMPORTANTE: si el usuario compara varios planes, identifica choques de máquina, recursos repetidos, faltantes compartidos y competencia por capacidad.",
+    "IMPORTANTE: para riesgo de stock urgente usa SOLO dashboard.urgentAbStockRiskItems o el criterio estricto stockTotal < stockMin. No incluyas ítems en o por encima del stock mínimo y nunca marques como urgentes artículos por encima del máximo.",
+    "IMPORTANTE: aunque no haya artículo seleccionado, si la pregunta menciona códigos o el buscador coincide, debes usar requestedCodes, questionMatches y requestedPlans. No digas que un código no aparece en el JSON si existe en requestedPlans, questionMatches o dashboard.filteredItems.",
     "IMPORTANTE: selectedPlan es el artículo seleccionado. requestedPlans puede traer varios planes completos sin selección manual; úsalo cuando el usuario pida varios productos o un código escrito en la pregunta.",
-    "Si el usuario pide tabla, excel, ranking, lista, columnas o detalle por mes/material/orden, responde con una tabla markdown completa con encabezados claros y datos exactos.",
-    "Evita responder con slash (/), listas planas o pseudo-tablas.",
-    "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo con: 1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria y política de inventario 4) Materias primas 5) Empaques 6) Cuellos de botella 7) Capacidad y turnos 8) Conclusión con acciones.",
-    "Si realmente falta información en el JSON, dilo claramente.",
+    "IMPORTANTE: si el usuario pide tabla, excel, ranking, lista, columnas, top, detalle por mes, materiales, órdenes, revenue, horas o capacidad, responde con una tabla markdown completa con encabezados claros y datos exactos.",
+    "Evita slash (/), listas planas o pseudo-tablas. Siempre prioriza tablas y conclusiones accionables.",
+    "Cuando el usuario pregunte por un plan de producción, responde como dashboard ejecutivo con: 1) Demanda y proyección 2) Inventario y cobertura 3) Producción necesaria, ajustada y política 4) Revenue e impacto comercial si existe 5) Materias primas 6) Empaques 7) Cuellos de botella 8) Recursos y capacidad 9) Órdenes recientes y producción histórica 10) Conclusión con acciones.",
+    "Para preguntas avanzadas, puedes apoyarte en este playbook interno: priorización estratégica, optimización por horas, escenarios de demanda, gap vs capacidad, rebalanceo, simulaciones de paros, forecast, sobreproducción, reducción de costos, dependencias críticas, alertas tempranas, reclasificación ABC, plan semanal, desbalance demanda vs producción, productos ineficientes, cambios de políticas, escenarios extremos e impacto total en el negocio.",
+    "Si realmente falta información en el JSON, dilo claramente, sin negar campos que sí vienen en el contexto.",
   ].join(" ");
 
   const payload = {
@@ -10353,7 +10364,7 @@ async function handleProductionSync(req, res) {
     let to = String(req.body?.to || req.query?.to || today);
 
     if (mode === "recent") {
-      const days = Math.max(1, Math.min(120, prodNum(req.body?.days || req.query?.days, 5)));
+      const days = Math.max(1, Math.min(120, prodNum(req.body?.days || req.query?.days, 30)));
       from = addDaysISO(today, -days);
       to = today;
     }
