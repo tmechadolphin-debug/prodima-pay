@@ -9991,6 +9991,34 @@ function prodQuestionNeedsPlanDetails(question) {
   return /(plan de producci[oó]n|materia prima|materias primas|empaque|empaques|cuello|botella|orden(?:es)? de producci[oó]n|costo ponderado|fabricar)/.test(q);
 }
 
+function prodQuestionNeedsMaterialInventory(question) {
+  const q = String(question || "").toLowerCase();
+  return /(inventario|insumos|materia prima|materias primas|empaque|empaques|fabricar|se pueden fabricar|puede fabricarse|producci[oó]n posible|seg[uú]n el inventario|con el inventario)/.test(q);
+}
+
+function prodBuildFallbackPlanCodes(question, dashboard) {
+  const items = Array.isArray(dashboard?.items) ? dashboard.items : [];
+  const urgent = prodBuildUrgentAbStockItems(items).map((x) => x.codigo || x.itemCode || x.code).filter(Boolean);
+  const filtered = items
+    .filter((x) => {
+      const stockTotal = prodNum(x?.stockTotal);
+      const stockMin = prodNum(x?.stockMin);
+      return prodNum(x?.productionNeeded) > 0 || (stockMin > 0 && stockTotal < stockMin);
+    })
+    .sort((a, b) => prodNum(b?.revenue) - prodNum(a?.revenue) || prodNum(b?.productionNeeded) - prodNum(a?.productionNeeded))
+    .map((x) => String(x?.itemCode || '').trim())
+    .filter(Boolean);
+  const out = [];
+  const seen = new Set();
+  for (const code of [...urgent, ...filtered]) {
+    const key = prodNormalizeItemCodeLoose(code);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(code);
+    if (out.length >= 8) break;
+  }
+  return out;
+}
 
 function prodMachineAiLabel(code) {
   const c = String(code || '').trim().toUpperCase();
@@ -10121,6 +10149,25 @@ function prodAiCompactPlan(plan) {
   const cost = plan.costing || {};
   const cap = plan.capacity || {};
 
+  const materialRows = [...rawMaterials, ...packaging]
+    .map((x) => ({
+      codigo: String(x?.code || ''),
+      descripcion: String(x?.description || ''),
+      tipo: String(x?.componentType === 'PACKAGING' ? 'EMPAQUE' : 'MATERIA PRIMA'),
+      requerido: prodNum(x?.requiredQty),
+      stockActual: prodNum(x?.stockQty),
+      faltante: prodNum(x?.shortageQty),
+      unidad: String(x?.unit || ''),
+      proveedor: prodCleanText(x?.supplier || ''),
+      estado: String(x?.status || ''),
+    }))
+    .sort((a, b) => prodNum(b.faltante) - prodNum(a.faltante) || prodNum(b.requerido) - prodNum(a.requerido))
+    .slice(0, 40);
+
+  const totalFaltanteMateriales = materialRows.reduce((acc, x) => acc + prodNum(x.faltante), 0);
+  const componentesConFaltante = materialRows.filter((x) => prodNum(x.faltante) > 0).length;
+  const puedeFabricarseConInventario = componentesConFaltante === 0;
+
   return {
     codigo: plan.itemCode,
     descripcion: plan.itemDesc,
@@ -10177,6 +10224,13 @@ function prodAiCompactPlan(plan) {
       horasPorTurno: prodNum(cap.shiftHours),
       unidadesPorHora: prodNum(cap.unitsPerHour),
     },
+    inventarioMateriales: {
+      puedeFabricarseConInventario,
+      componentesConFaltante,
+      totalFaltante: prodRound(totalFaltanteMateriales, 3),
+      materialesEvaluados: materialRows.length,
+    },
+    materialesResumen: materialRows,
     materiales: rawMaterials,
     empaques: packaging,
     cuellosBotella: bottlenecks,
@@ -10217,17 +10271,19 @@ async function prodOpenAiChat({ question, dashboard, plan, plans = [], requested
     "Responde siempre en español claro y ejecutivo.",
     "Usa solo la información entregada por el sistema.",
     "Nunca menciones nombres internos de campos, estructuras técnicas, variables, fórmulas con símbolos, código, ni palabras como JSON.",
+    "El inventario de materias primas y empaques es prioritario. Si la información del plan incluye materiales, debes usarla como base principal para decidir si un producto se puede fabricar o no.",
     "No uses términos técnicos como avgMonthlyQty, stockMin, productionAdjusted, hoursNeeded, belowMin, source o similares.",
     "Cuando hables de líneas de producción usa siempre SALSAS y LIMPIEZA. Nunca uses SAUCES ni CLEANING.",
     "Habla como usuario de negocio: ventas, stock, mínimo, máximo, producción necesaria, producción ajustada, horas, costo, materiales, empaques, cuellos de botella y recursos.",
     "Las cantidades de producto terminado siempre se expresan en UNIDADES.",
     "Si el usuario pide ranking, tabla, lista, top, columnas, comparación o detalle, responde con tabla markdown completa y encabezados claros en español.",
     "No inventes datos. Si algo no viene en la información, dilo de forma simple y breve.",
+    "Nunca digas que solo hay inventario de producto terminado si el contexto incluye materiales, empaques, cuellos de botella o inventario de componentes.",
     "Cuando el usuario pregunte por un plan de producción, responde con este enfoque: 1) demanda y proyección 2) inventario y cobertura 3) producción necesaria y producción ajustada 4) materiales y empaques 5) cuellos de botella y recursos 6) capacidad y turnos 7) conclusión con acciones.",
     "Para productos en riesgo urgente, usa criterio estricto: stock actual por debajo del mínimo.",
     "Si hay varios códigos pedidos por el usuario, compáralos y priorízalos.",
     "Usa revenue como ingreso, gp como ganancia y gpPct como margen cuando estén disponibles, pero exprésalo con palabras de negocio.",
-    "Ten en cuenta todo el sistema: ingreso, ganancia, margen, promedio mensual, producción necesaria, producción ajustada, horas, stock, mínimo, máximo, lead time, múltiplos, materiales, empaques, recursos, cuellos de botella, órdenes recientes, costo ponderado y capacidad.",
+    "Ten en cuenta todo el sistema: ingreso, ganancia, margen, promedio mensual, producción necesaria, producción ajustada, horas, stock, mínimo, máximo, lead time, múltiplos, materiales, empaques, recursos, cuellos de botella, órdenes recientes, costo ponderado y capacidad. El inventario de materiales y empaques debe ser lo principal cuando el usuario pregunte qué se puede fabricar según el inventario.",
     "Preguntas frecuentes que debes resolver bien: priorización por riesgo, optimización de horas, simulación de demanda, brecha contra capacidad, redistribución, comparación por línea, forecast, sobreproducción, reducción de costos, alertas tempranas, recalculo de ABC, plan semanal, desbalance demanda vs producción, productos ineficientes, cambios de política de inventario, escenarios extremos e impacto total en el negocio.",
   ].join(" ");
 
@@ -10347,8 +10403,9 @@ app.post("/api/admin/production/ai-chat", verifyAdmin, async (req, res) => {
       } catch {}
     }
 
-    if (!plans.length && prodQuestionNeedsPlanDetails(question) && prodQuestionNeedsUrgentAbList(question)) {
-      const fallbackCodes = prodBuildUrgentAbStockItems(dashboard?.items || []).slice(0, 5).map((x) => x.itemCode);
+    const needsMaterialView = prodQuestionNeedsMaterialInventory(question);
+    if ((!plans.length && prodQuestionNeedsPlanDetails(question) && prodQuestionNeedsUrgentAbList(question)) || (needsMaterialView && !plans.length)) {
+      const fallbackCodes = prodBuildFallbackPlanCodes(question, dashboard);
       for (const code of fallbackCodes) {
         try {
           const built = await productionBuildItemPlan({ itemCode: code, toDate: to, avgMonths, horizonMonths, shiftHours });
