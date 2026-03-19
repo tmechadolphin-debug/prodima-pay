@@ -5146,10 +5146,6 @@ async function dashboardFromDbEstratificacion({ from, to, area, grupo, q }) {
 
   const areaSel = String(area || "__ALL__");
   const grupoSel = String(grupo || "__ALL__");
-  const gruposSel = prodParseMultiValue(grupos).length ? prodParseMultiValue(grupos) : (grupoSel !== '__ALL__' ? [grupoSel] : []);
-  const sizeSel = new Set(prodParseMultiValue(sizes).map((x) => String(x || '').trim()));
-  const classSel = new Set(prodParseMultiValue(classifications).map((x) => String(x || '').trim().toUpperCase()));
-  const itemCodeSel = new Set(prodParseMultiValue(itemCodes).map((x) => prodNormalizeItemCodeLoose(x)));
   const qq = String(q || "").trim().toLowerCase();
 
   // availableGroups (según filtro área)
@@ -5395,10 +5391,6 @@ app.get("/api/admin/estratificacion/dashboard", verifyAdmin, async (req, res) =>
     const toQ = String(req.query?.to || "");
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
-    const grupos = prodParseMultiValue(req.query?.grupos || req.query?.grupo || '');
-    const sizes = prodParseMultiValue(req.query?.sizes || req.query?.size || '');
-    const classifications = prodParseMultiValue(req.query?.classifications || req.query?.classification || '');
-    const itemCodes = prodParseMultiValue(req.query?.itemCodes || '');
     const q = String(req.query?.q || "");
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
@@ -7883,7 +7875,7 @@ __extraBootTasks.push(async () => {
    /data/production/production_capacity_config.json
 ========================================================= */
 
-const PROD_FINISHED_WHS = ["01", "03", "10", "12", "200", "300", "500"];
+const PROD_FINISHED_WHS = ["01", "03", "12", "200", "300", "500"];
 
 // Producción: helpers autosuficientes para no depender del scope de otros módulos
 const PROD_GROUPS_CONS = (globalThis.GROUPS_CONS && globalThis.GROUPS_CONS.size ? globalThis.GROUPS_CONS : new Set([
@@ -8509,7 +8501,7 @@ function prodLineItemsPerUnit(line, itemMaster = null) {
 }
 
 function prodExtractInventorySnapshotFromItem(item) {
-  const byWh = { "01": 0, "03": 0, "10": 0, "12": 0, "200": 0, "300": 0, "500": 0 };
+  const byWh = { "01": 0, "03": 0, "12": 0, "200": 0, "300": 0, "500": 0 };
   const whRows = Array.isArray(item?.ItemWarehouseInfoCollection) ? item.ItemWarehouseInfoCollection : [];
   let total = 0;
   let stockMin = 0;
@@ -9317,45 +9309,7 @@ function prodMonthWindowEnd(dateIso) {
   return last.toISOString().slice(0,10);
 }
 
-
-function prodParseMultiValue(value) {
-  if (Array.isArray(value)) return value.map((x) => String(x || '').trim()).filter(Boolean);
-  return String(value || '')
-    .split(',')
-    .map((x) => String(x || '').trim())
-    .filter(Boolean);
-}
-
-function prodExtractSizeFromText(text) {
-  const src = String(text || '').toLowerCase();
-  if (!src) return '';
-  const patterns = [
-    /(\d+(?:\.\d+)?)\s*(?:oz|onz|onz\.|onzas?)/i,
-    /(\d+(?:\.\d+)?)\s*(?:ml|ml\.|lt|l|litros?)/i,
-    /(\d+(?:\.\d+)?)/i,
-  ];
-  for (const rx of patterns) {
-    const m = src.match(rx);
-    if (m && m[1]) return String(m[1]).trim();
-  }
-  return '';
-}
-
-function prodExtractLotFromItem(item = {}, mrp = {}, recentOrders = []) {
-  const directKeys = Object.keys(item || {}).filter((k) => /lote|lot/i.test(k));
-  for (const k of directKeys) {
-    const v = item?.[k];
-    if (v != null && String(v).trim()) return String(v).trim();
-  }
-  const multiple = prodNum(mrp?.multipleQty || 0);
-  if (multiple > 0) return prodRound(multiple, 2);
-  const minOrder = prodNum(mrp?.minOrderQty || 0);
-  if (minOrder > 0) return prodRound(minOrder, 2);
-  const firstPlanned = prodNum((Array.isArray(recentOrders) ? recentOrders[0]?.plannedQty : 0) || 0);
-  return firstPlanned > 0 ? prodRound(firstPlanned, 2) : 0;
-}
-
-async function productionDashboardFromDb({ from, to, area, grupo, grupos = [], q, avgMonths = 0, horizonMonths = 3, sizes = [], classifications = [], itemCodes = [] }) {
+async function productionDashboardFromDb({ from, to, area, grupo, q, avgMonths = 0, horizonMonths = 3 }) {
   const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN)).slice(0,10);
   const maxMonthsWindow = Math.max(1, Number(avgMonths || horizonMonths || 5), Number(horizonMonths || 3));
   const monthBaseStart = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(maxMonthsWindow - 1));
@@ -9408,14 +9362,13 @@ async function productionDashboardFromDb({ from, to, area, grupo, grupos = [], q
         item_code,
         SUM(CASE WHEN warehouse='01'  THEN stock ELSE 0 END)::float AS wh_01,
         SUM(CASE WHEN warehouse='03'  THEN stock ELSE 0 END)::float AS wh_03,
-        SUM(CASE WHEN warehouse='10'  THEN stock ELSE 0 END)::float AS wh_10,
         SUM(CASE WHEN warehouse='12'  THEN stock ELSE 0 END)::float AS wh_12,
         SUM(CASE WHEN warehouse='200' THEN stock ELSE 0 END)::float AS wh_200,
         SUM(CASE WHEN warehouse='300' THEN stock ELSE 0 END)::float AS wh_300,
         SUM(CASE WHEN warehouse='500' THEN stock ELSE 0 END)::float AS wh_500,
-        SUM(CASE WHEN warehouse IN ('01','03','10','12','200','300','500') THEN stock ELSE 0 END)::float AS stock_total,
-        SUM(CASE WHEN warehouse IN ('01','03','10','12','200','300','500') THEN stock_min ELSE 0 END)::float AS stock_min,
-        SUM(CASE WHEN warehouse IN ('01','03','10','12','200','300','500') THEN stock_max ELSE 0 END)::float AS stock_max
+        SUM(CASE WHEN warehouse IN ('01','03','12','200','300','500') THEN stock ELSE 0 END)::float AS stock_total,
+        SUM(CASE WHEN warehouse IN ('01','03','12','200','300','500') THEN stock_min ELSE 0 END)::float AS stock_min,
+        SUM(CASE WHEN warehouse IN ('01','03','12','200','300','500') THEN stock_max ELSE 0 END)::float AS stock_max
       FROM production_inv_wh_cache
       GROUP BY item_code
     )
@@ -9430,7 +9383,6 @@ async function productionDashboardFromDb({ from, to, area, grupo, grupos = [], q
       COALESCE(demand.demand_qty,0) AS demand_qty,
       COALESCE(inv.wh_01,0) AS wh_01,
       COALESCE(inv.wh_03,0) AS wh_03,
-      COALESCE(inv.wh_10,0) AS wh_10,
       COALESCE(inv.wh_12,0) AS wh_12,
       COALESCE(inv.wh_200,0) AS wh_200,
       COALESCE(inv.wh_300,0) AS wh_300,
@@ -9510,14 +9462,12 @@ async function productionDashboardFromDb({ from, to, area, grupo, grupos = [], q
       stockTotal,
       wh01: prodNum(r.wh_01),
       wh03: prodNum(r.wh_03),
-      wh10: prodNum(r.wh_10),
       wh12: prodNum(r.wh_12),
       wh200: prodNum(r.wh_200),
       wh300: prodNum(r.wh_300),
       wh500: prodNum(r.wh_500),
       stockMin: prodNum(r.stock_min),
       stockMax: prodNum(r.stock_max),
-      size: prodExtractSizeFromText(String(r.item_desc || '')),
       procurementMethod: String(r.procurement_method || ""),
       procurementMethodLabel: prodProcurementMethodLabel(String(r.procurement_method || "")),
       leadTimeDays: prodNum(r.lead_time_days),
@@ -9534,10 +9484,6 @@ async function productionDashboardFromDb({ from, to, area, grupo, grupos = [], q
 
   const areaSel = String(area || "__ALL__");
   const grupoSel = String(grupo || "__ALL__");
-  const gruposSel = prodParseMultiValue(grupos).length ? prodParseMultiValue(grupos) : (grupoSel !== '__ALL__' ? [grupoSel] : []);
-  const sizeSel = new Set(prodParseMultiValue(sizes).map((x) => String(x || '').trim()));
-  const classSel = new Set(prodParseMultiValue(classifications).map((x) => String(x || '').trim().toUpperCase()));
-  const itemCodeSel = new Set(prodParseMultiValue(itemCodes).map((x) => prodNormalizeItemCodeLoose(x)));
   const qq = String(q || "").trim().toLowerCase();
 
   let availableGroups = [];
@@ -9548,10 +9494,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, grupos = [], q
 
   let universe = items.slice();
   if (areaSel !== "__ALL__") universe = universe.filter((x) => x.area === areaSel);
-  if (gruposSel.length) {
-    const gruposNorm = new Set(gruposSel.map((x) => prodNormGroupName(x)));
-    universe = universe.filter((x) => gruposNorm.has(prodNormGroupName(x.grupo)));
-  } else if (grupoSel !== "__ALL__") universe = universe.filter((x) => prodNormGroupName(x.grupo) === prodNormGroupName(grupoSel));
+  if (grupoSel !== "__ALL__") universe = universe.filter((x) => prodNormGroupName(x.grupo) === prodNormGroupName(grupoSel));
 
   const abcRev = prodAbcByMetric(universe, "revenue");
   const abcGP = prodAbcByMetric(universe, "gp");
@@ -9566,14 +9509,13 @@ async function productionDashboardFromDb({ from, to, area, grupo, grupos = [], q
     const meta = local.formulas.products?.[it.itemCode] || null;
     const machine = prodMachineFromAreaOrGroup(it.area, it.grupo, meta);
     const coverageMonthsTarget = prodCoverageMonthsByLabel(total.label);
-    const horizonSafe = Math.max(1, Number(horizonMonths || 3));
-    const targetInventoryQty = prodNum(it.stockMax) * horizonSafe;
+    const targetInventoryQty = prodNum(it.stockMax);
 
-    // Producción necesaria = máximo SAP consolidado por horizonte
+    // Producción necesaria = máximo SAP consolidado
     const productionNeeded = Math.max(0, targetInventoryQty);
 
-    // Ajustado = producción necesaria - stock actual
-    const productionAdjusted = Math.max(0, productionNeeded - prodNum(it.stockTotal));
+    // Ajustado = máximo SAP consolidado - stock actual
+    const productionAdjusted = Math.max(0, targetInventoryQty - prodNum(it.stockTotal));
     const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
     const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
 
@@ -9600,21 +9542,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, grupos = [], q
   });
 
   if (areaSel !== "__ALL__") items = items.filter((x) => x.area === areaSel);
-  if (gruposSel.length) {
-    const gruposNorm = new Set(gruposSel.map((x) => prodNormGroupName(x)));
-    items = items.filter((x) => gruposNorm.has(prodNormGroupName(x.grupo)));
-  } else if (grupoSel !== "__ALL__") {
-    items = items.filter((x) => prodNormGroupName(x.grupo) === prodNormGroupName(grupoSel));
-  }
-  if (sizeSel.size) items = items.filter((x) => sizeSel.has(String(x.size || '').trim()));
-  if (classSel.size) {
-    items = items.filter((x) => {
-      const label = String(x.totalLabel || '').trim().toUpperCase();
-      const simple = label.startsWith('AB') ? 'AB' : label.startsWith('C') ? 'C' : label.startsWith('D') ? 'D' : label;
-      return classSel.has(label) || classSel.has(simple);
-    });
-  }
-  if (itemCodeSel.size) items = items.filter((x) => itemCodeSel.has(prodNormalizeItemCodeLoose(x.itemCode)));
+  if (grupoSel !== "__ALL__") items = items.filter((x) => prodNormGroupName(x.grupo) === prodNormGroupName(grupoSel));
   if (qq) items = items.filter((x) => x.itemCode.toLowerCase().includes(qq) || x.itemDesc.toLowerCase().includes(qq));
 
   items.sort((a, b) => {
@@ -9715,7 +9643,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   );
   const row0 = itemMaster.rows?.[0] || {};
 
-  const sapItem = await prodGetFullItem(code, { forceFresh: true, ttlMs: 0 }).catch(() => null);
+  const sapItem = await prodGetFullItem(code).catch(() => null);
   const itemDesc = String(row0.item_desc || sapItem?.ItemName || meta?.description || "");
   const grupo = prodNormalizeGrupoFinal(String(row0.grupo || ""));
   const area = String(row0.area || "") || prodInferAreaFromGroup(grupo) || "";
@@ -9759,7 +9687,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       if (freshWeighted > 0) weightedCost = freshWeighted;
     } catch {}
   }
-  const prodOrders = await prodFetchProductionOrders(code, 120, { forceFresh: true, ttlMs: 0 }).catch(() => ({ orders: [], monthly: new Map() }));
+  const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map() }));
   const prodMonthMap = prodOrders?.monthly instanceof Map ? prodOrders.monthly : new Map();
 
   const salesHistory = [];
@@ -9794,7 +9722,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
      WHERE item_code = $1`,
     [code]
   );
-  const byWh = { "01": 0, "03": 0, "10": 0, "12": 0, "200": 0, "300": 0, "500": 0 };
+  const byWh = { "01": 0, "03": 0, "12": 0, "200": 0, "300": 0, "500": 0 };
   let stockTotal = 0;
   let stockMin = 0;
   let stockMax = 0;
@@ -9833,15 +9761,15 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const dashRow = (dashForAbc.items || []).find((x) => String(x.itemCode || '') === code) || null;
   const coverageMonthsTarget = dashRow ? prodNum(dashRow.coverageMonthsTarget || 1, 1) : 1;
   const coveragePolicyLabel = prodCoverageLabel(coverageMonthsTarget);
-const targetInventoryQty = Math.max(0, stockMax) * Math.max(1, Number(horizonMonths || 3));
+const targetInventoryQty = Math.max(0, stockMax);
 const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
 const effectiveProjectedQty = manualPlanQty > 0 ? manualPlanQty : targetInventoryQty;
 
-// Producción necesaria = máximo SAP consolidado por horizonte
+// Producción necesaria = máximo SAP consolidado
 const productionNeeded = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty);
 
-// Ajustado = producción necesaria - stock actual
-const mrpAdjustedQty = manualPlanQty > 0 ? manualPlanQty : Math.max(0, productionNeeded - stockTotal);
+// Ajustado = máximo SAP consolidado - stock actual
+const mrpAdjustedQty = manualPlanQty > 0 ? manualPlanQty : Math.max(0, targetInventoryQty - stockTotal);
 const productionAdjusted = mrpAdjustedQty;
 
   const sapBom = await prodFetchSapBom(code).catch(() => ({ source: "SAP ProductTrees", tree: null, headerQty: 1, lines: [] }));
@@ -9973,18 +9901,10 @@ const productionAdjusted = mrpAdjustedQty;
     inventory: {
       total: prodRound(stockTotal, 2),
       byWarehouse: byWh,
-      wh01: prodNum(byWh["01"]),
-      wh03: prodNum(byWh["03"]),
-      wh10: prodNum(byWh["10"]),
-      wh12: prodNum(byWh["12"]),
-      wh200: prodNum(byWh["200"]),
-      wh300: prodNum(byWh["300"]),
-      wh500: prodNum(byWh["500"]),
       stockMin: prodRound(stockMin, 2),
       stockMax: prodRound(stockMax, 2),
     },
     mrp: {
-      lotFromSap: prodExtractLotFromItem(sapItem || {}, mrp, prodOrders?.orders || []),
       procurementMethod: mrp.procurementMethod,
       procurementMethodLabel: prodProcurementMethodLabel(mrp.procurementMethod),
       planningSystem: mrp.planningSystem,
@@ -10321,7 +10241,6 @@ function prodAiCompactPlan(plan) {
     inventario: {
       bodega01: prodNum(inv.wh01),
       bodega03: prodNum(inv.wh03),
-      bodega10: prodNum(inv.wh10),
       bodega12: prodNum(inv.wh12),
       bodega200: prodNum(inv.wh200),
       bodega300: prodNum(inv.wh300),
@@ -10338,7 +10257,6 @@ function prodAiCompactPlan(plan) {
     },
     produccion: {
       politicaInventario: prod.coveragePolicyLabel || '',
-      loteSap: prodNum(plan.mrp?.lotFromSap || 0),
       objetivoInventario: prodNum(prod.targetInventoryQty),
       produccionNecesaria: prodNum(prod.neededQty),
       produccionAjustada: prodNum(prod.adjustedQty),
@@ -10450,18 +10368,11 @@ app.get("/api/admin/production/dashboard", verifyAdmin, async (req, res) => {
     const to = String(req.query?.to || today);
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
-    const grupos = prodParseMultiValue(req.query?.grupos || req.query?.grupo || '');
-    const sizes = prodParseMultiValue(req.query?.sizes || req.query?.size || '');
-    const classifications = prodParseMultiValue(req.query?.classifications || req.query?.classification || '');
-    const itemCodes = prodParseMultiValue(req.query?.itemCodes || '');
     const q = String(req.query?.q || "");
     const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 3)));
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
 
-    // No bloqueamos el dashboard refrescando miles de artículos desde SAP en cada carga.
-    // Se dispara un refresh liviano en segundo plano para evitar que la UI quede en "Cargando...".
-    Promise.resolve().then(() => syncProductionInventoryWh({ from, to, maxItems: 250 }).catch(() => {}));
-    const out = await productionDashboardFromDb({ from, to, area, grupo, grupos, q, avgMonths, horizonMonths, sizes, classifications, itemCodes });
+    const out = await productionDashboardFromDb({ from, to, area, grupo, q, avgMonths, horizonMonths });
     return safeJson(res, 200, out);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -10512,18 +10423,13 @@ app.post("/api/admin/production/ai-chat", verifyAdmin, async (req, res) => {
     const to = String(req.body?.to || today);
     const area = String(req.body?.area || "__ALL__");
     const grupo = String(req.body?.grupo || "__ALL__");
-    const grupos = prodParseMultiValue(req.body?.grupos || req.body?.grupo || '');
-    const sizes = prodParseMultiValue(req.body?.sizes || req.body?.size || '');
-    const classifications = prodParseMultiValue(req.body?.classifications || req.body?.classification || '');
-    const itemCodes = prodParseMultiValue(req.body?.itemCodes || '');
     const q = String(req.body?.q || "");
     const horizonMonths = Math.max(1, Math.min(12, prodNum(req.body?.horizonMonths, 3)));
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.body?.avgMonths, horizonMonths)));
     const shiftHours = Math.max(1, Math.min(24, prodNum(req.body?.shiftHours, 8)));
     const itemCode = String(req.body?.itemCode || "").trim();
 
-    Promise.resolve().then(() => syncProductionInventoryWh({ from, to, maxItems: 250 }).catch(() => {}));
-    const dashboard = await productionDashboardFromDb({ from, to, area, grupo, grupos, q, avgMonths, horizonMonths, sizes, classifications, itemCodes });
+    const dashboard = await productionDashboardFromDb({ from, to, area, grupo, q, avgMonths, horizonMonths });
     const requestedCodes = prodResolveRequestedCodes({ question, q, itemCode, dashboard });
     const questionMatches = requestedCodes.map((code) => prodFindDashboardItemByCode(dashboard?.items || [], code)).filter(Boolean);
 
