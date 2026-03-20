@@ -7998,7 +7998,7 @@ function prodDashboardCacheKey(params) {
     horizonMonths: Math.max(1, Number(params?.horizonMonths || 3)),
   });
 }
-function prodClone(value) {
+function prodDashboardClone(value) {
   return (typeof structuredClone === "function")
     ? structuredClone(value)
     : JSON.parse(JSON.stringify(value));
@@ -8011,11 +8011,11 @@ function prodGetDashboardCached(params) {
     PROD_DASHBOARD_CACHE.delete(key);
     return null;
   }
-  return prodClone(row.data);
+  return prodDashboardClone(row.data);
 }
 function prodSetDashboardCached(params, data) {
   const key = prodDashboardCacheKey(params);
-  PROD_DASHBOARD_CACHE.set(key, { ts: Date.now(), data: prodClone(data) });
+  PROD_DASHBOARD_CACHE.set(key, { ts: Date.now(), data: prodDashboardClone(data) });
 }
 function prodClearDashboardCache() {
   PROD_DASHBOARD_CACHE.clear();
