@@ -8021,6 +8021,53 @@ function prodClearDashboardCache() {
   PROD_DASHBOARD_CACHE.clear();
 }
 
+const PROD_SIMULATION_CACHE = new Map();
+const PROD_SIMULATION_CACHE_TTL_MS = Math.max(30000, Number(process.env.PROD_SIMULATION_CACHE_TTL_MS || 300000));
+
+function prodSimulationClone(value) {
+  return (typeof structuredClone === "function")
+    ? structuredClone(value)
+    : JSON.parse(JSON.stringify(value));
+}
+function prodSimulationCacheKey(params) {
+  return JSON.stringify({
+    from: String(params?.from || ""),
+    to: String(params?.to || ""),
+    area: String(params?.area || "__ALL__"),
+    grupo: prodParseMultiValue(params?.grupo),
+    sizeUom: String(params?.sizeUom || "__ALL__"),
+    abc: String(params?.abc || "__ALL__"),
+    type: prodNormalizeTypeFilter(params?.typeFilter || params?.type || "Se fabrica en planta"),
+    q: String(params?.q || "").trim().toLowerCase(),
+    avgMonths: Math.max(1, Number(params?.avgMonths || params?.horizonMonths || 3)),
+    horizonMonths: Math.max(1, Number(params?.horizonMonths || 3)),
+    shiftHours: Math.max(1, Number(params?.shiftHours || 8)),
+    itemCodes: Array.from(new Set((Array.isArray(params?.itemCodes) ? params.itemCodes : [])
+      .map((x) => String(x || "").trim())
+      .filter(Boolean)
+      .map((x) => prodNormalizeItemCodeLoose(x))
+    )).sort(),
+    maxDepth: Math.max(1, Number(params?.maxDepth || 3)),
+  });
+}
+function prodGetSimulationCached(params) {
+  const key = prodSimulationCacheKey(params);
+  const row = PROD_SIMULATION_CACHE.get(key);
+  if (!row) return null;
+  if ((Date.now() - row.ts) > PROD_SIMULATION_CACHE_TTL_MS) {
+    PROD_SIMULATION_CACHE.delete(key);
+    return null;
+  }
+  return prodSimulationClone(row.data);
+}
+function prodSetSimulationCached(params, data) {
+  const key = prodSimulationCacheKey(params);
+  PROD_SIMULATION_CACHE.set(key, { ts: Date.now(), data: prodSimulationClone(data) });
+}
+function prodClearSimulationCache() {
+  PROD_SIMULATION_CACHE.clear();
+}
+
 function prodNum(v, def = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
@@ -10332,6 +10379,309 @@ async function productionBuildItemPlanCached(params = {}) {
   return plan;
 }
 
+
+async function prodBuildSimulationNode({
+  itemCode,
+  plannedQty = 0,
+  toDate,
+  avgMonths = 5,
+  horizonMonths = 3,
+  shiftHours = 8,
+  depth = 0,
+  maxDepth = 3,
+  trail = [],
+}) {
+  const code = String(itemCode || "").trim();
+  if (!code) throw new Error("Falta itemCode en simulación");
+
+  const qtyToPlan = Math.max(0, prodNum(plannedQty));
+  const plan = await productionBuildItemPlanCached({
+    itemCode: code,
+    toDate,
+    avgMonths,
+    horizonMonths,
+    shiftHours,
+    plannedQtyOverride: qtyToPlan,
+  });
+
+  const pathKeys = new Set((Array.isArray(trail) ? trail : []).map((x) => prodNormalizeItemCodeLoose(x)).filter(Boolean));
+  pathKeys.add(prodNormalizeItemCodeLoose(code));
+
+  const baseMaterials = [
+    ...(Array.isArray(plan?.requirements?.rawMaterials) ? plan.requirements.rawMaterials : []),
+    ...(Array.isArray(plan?.requirements?.packaging) ? plan.requirements.packaging : []),
+  ]
+    .map((x) => ({ ...x }))
+    .sort((a, b) =>
+      prodNum(b?.shortageQty) - prodNum(a?.shortageQty) ||
+      prodNum(b?.requiredQty) - prodNum(a?.requiredQty) ||
+      String(a?.description || "").localeCompare(String(b?.description || ""))
+    );
+
+  const resources = (Array.isArray(plan?.requirements?.resources) ? plan.requirements.resources : [])
+    .map((x) => ({
+      code: String(x?.code || "").trim(),
+      description: String(x?.description || "").trim(),
+      requiredQty: prodRound(x?.requiredQty, 3),
+      unit: String(x?.unit || "").trim(),
+      status: String(x?.status || "OK"),
+      componentType: String(x?.componentType || "RESOURCE"),
+      isResource: true,
+    }))
+    .sort((a, b) => prodNum(b?.requiredQty) - prodNum(a?.requiredQty));
+
+  const materials = [];
+  for (const row of baseMaterials) {
+    const componentCode = String(row?.code || "").trim();
+    const subPlanQty = Math.max(
+      prodNum(row?.shortageQty),
+      prodNum(row?.subPlanQty),
+      prodNum(row?.requiredQty)
+    );
+
+    const materialNode = {
+      code: componentCode,
+      description: String(row?.description || "").trim(),
+      requiredQty: prodRound(row?.requiredQty, 3),
+      stockQty: prodRound(row?.stockQty, 3),
+      shortageQty: prodRound(row?.shortageQty, 3),
+      unit: String(row?.unit || "").trim(),
+      supplier: String(row?.supplier || "").trim(),
+      status: String(row?.status || (prodNum(row?.shortageQty) > 0 ? "FALTANTE" : "OK")),
+      componentType: String(row?.componentType || ""),
+      procurementMethodLabel: "",
+      canExpand: false,
+      child: null,
+      cycleBlocked: false,
+      plannedQtyForChild: prodRound(subPlanQty, 3),
+    };
+
+    const cycleKey = prodNormalizeItemCodeLoose(componentCode);
+    const shouldTryExpand =
+      depth < Math.max(1, Number(maxDepth || 3)) &&
+      !!componentCode &&
+      subPlanQty > 0 &&
+      !pathKeys.has(cycleKey) &&
+      String(materialNode.componentType || "").toUpperCase() !== "RESOURCE";
+
+    if (shouldTryExpand) {
+      try {
+        const subPlan = await productionBuildItemPlanCached({
+          itemCode: componentCode,
+          toDate,
+          avgMonths,
+          horizonMonths,
+          shiftHours,
+          plannedQtyOverride: subPlanQty,
+        });
+
+        const procurementMethodLabel =
+          String(subPlan?.mrp?.procurementMethodLabel || "") ||
+          prodProcurementMethodLabel(String(subPlan?.mrp?.procurementMethod || ""));
+        materialNode.procurementMethodLabel = procurementMethodLabel;
+
+        const hasNestedRequirements = (
+          Array.isArray(subPlan?.requirements?.rawMaterials) && subPlan.requirements.rawMaterials.length
+        ) || (
+          Array.isArray(subPlan?.requirements?.packaging) && subPlan.requirements.packaging.length
+        ) || (
+          Array.isArray(subPlan?.requirements?.resources) && subPlan.requirements.resources.length
+        );
+
+        if (procurementMethodLabel === "Se fabrica en planta" && hasNestedRequirements) {
+          materialNode.canExpand = true;
+          materialNode.child = await prodBuildSimulationNode({
+            itemCode: componentCode,
+            plannedQty: subPlanQty,
+            toDate,
+            avgMonths,
+            horizonMonths,
+            shiftHours,
+            depth: depth + 1,
+            maxDepth,
+            trail: [...trail, code],
+          });
+        }
+      } catch (_err) {}
+    } else if (componentCode && pathKeys.has(cycleKey)) {
+      materialNode.cycleBlocked = true;
+    }
+
+    materials.push(materialNode);
+  }
+
+  const shortageMaterials = materials.filter((x) => prodNum(x?.shortageQty) > 0);
+  const totalShortageQty = shortageMaterials.reduce((acc, x) => acc + prodNum(x?.shortageQty), 0);
+
+  return {
+    nodeType: "ITEM",
+    depth,
+    itemCode: plan.itemCode,
+    itemDesc: plan.itemDesc,
+    grupo: plan.grupo,
+    area: plan.area,
+    machine: plan.machine,
+    machineLabel: plan?.capacity?.machineLabel || plan.machine,
+    procurementMethodLabel: String(plan?.mrp?.procurementMethodLabel || plan?.procurementMethodLabel || ""),
+    plannedQty: prodRound(qtyToPlan > 0 ? qtyToPlan : (plan?.production?.adjustedQty || plan?.production?.neededQty || 0), 3),
+    stockTotal: prodRound(plan?.inventory?.total || 0, 3),
+    neededQty: prodRound(plan?.production?.neededQty || 0, 3),
+    adjustedQty: prodRound(plan?.production?.adjustedQty || 0, 3),
+    recommendedLotQty: prodRound(plan?.production?.recommendedLotQty || 0, 3),
+    hoursNeeded: prodRound(plan?.capacity?.hoursNeeded || 0, 3),
+    unitsPerHour: prodRound(plan?.capacity?.unitsPerHour || 0, 3),
+    materials,
+    resources,
+    summary: {
+      materialsCount: materials.length,
+      shortageMaterialsCount: shortageMaterials.length,
+      totalShortageQty: prodRound(totalShortageQty, 3),
+      resourcesCount: resources.length,
+    },
+  };
+}
+
+function prodAccumulateSimulationSummaryNode(node, acc) {
+  if (!node || typeof node !== "object") return;
+  acc.totalHours += prodNum(node?.hoursNeeded);
+  acc.totalPlannedQty += prodNum(node?.plannedQty);
+
+  for (const res of Array.isArray(node?.resources) ? node.resources : []) {
+    const key = String(res?.code || res?.description || "").trim();
+    if (key) acc.resourceSet.add(key);
+  }
+
+  for (const mat of Array.isArray(node?.materials) ? node.materials : []) {
+    const key = String(mat?.code || mat?.description || "").trim();
+    if (key) acc.materialSet.add(key);
+    if (prodNum(mat?.shortageQty) > 0) {
+      acc.shortageMaterialsCount += 1;
+      acc.totalShortageQty += prodNum(mat?.shortageQty);
+      if (key) acc.shortageMaterialSet.add(key);
+    }
+    if (mat?.child) prodAccumulateSimulationSummaryNode(mat.child, acc);
+  }
+}
+
+async function productionBuildSimulationTree({
+  from,
+  to,
+  area,
+  grupo,
+  sizeUom = "__ALL__",
+  abc = "__ALL__",
+  typeFilter = "Se fabrica en planta",
+  q = "",
+  avgMonths = 3,
+  horizonMonths = 3,
+  shiftHours = 8,
+  itemCodes = [],
+  maxDepth = 3,
+}) {
+  const normalizedCodes = Array.from(new Set((Array.isArray(itemCodes) ? itemCodes : [])
+    .map((x) => String(x || "").trim())
+    .filter(Boolean)
+    .map((x) => prodNormalizeItemCodeLoose(x))
+  ));
+
+  if (!normalizedCodes.length) {
+    throw new Error("Selecciona al menos un artículo para simular");
+  }
+
+  const dash = await productionDashboardFromDb({
+    from,
+    to,
+    area,
+    grupo,
+    sizeUom,
+    abc,
+    typeFilter,
+    q,
+    avgMonths,
+    horizonMonths,
+  });
+
+  const itemMap = new Map(
+    (Array.isArray(dash?.items) ? dash.items : []).map((x) => [prodNormalizeItemCodeLoose(x?.itemCode), x])
+  );
+
+  const selectedItems = normalizedCodes
+    .map((code) => itemMap.get(code))
+    .filter(Boolean)
+    .slice(0, 15);
+
+  if (!selectedItems.length) {
+    throw new Error("Los artículos seleccionados no están dentro del filtro actual del dashboard");
+  }
+
+  const tree = [];
+  for (const row of selectedItems) {
+    const plannedQty = Math.max(prodNum(row?.productionAdjusted), prodNum(row?.productionNeeded));
+    const node = await prodBuildSimulationNode({
+      itemCode: row.itemCode,
+      plannedQty,
+      toDate: to,
+      avgMonths,
+      horizonMonths,
+      shiftHours,
+      depth: 0,
+      maxDepth: Math.max(1, Number(maxDepth || 3)),
+      trail: [],
+    });
+    tree.push(node);
+  }
+
+  const acc = {
+    totalHours: 0,
+    totalPlannedQty: 0,
+    shortageMaterialsCount: 0,
+    totalShortageQty: 0,
+    materialSet: new Set(),
+    shortageMaterialSet: new Set(),
+    resourceSet: new Set(),
+  };
+  for (const node of tree) prodAccumulateSimulationSummaryNode(node, acc);
+
+  return {
+    ok: true,
+    generatedAt: new Date().toISOString(),
+    lastSyncAt: await getState("production_last_sync_at"),
+    filters: {
+      from, to, area: String(area || "__ALL__"), grupo: String(grupo || "__ALL__"),
+      sizeUom: String(sizeUom || "__ALL__"), abc: String(abc || "__ALL__"),
+      type: prodNormalizeTypeFilter(typeFilter || "Se fabrica en planta"),
+      q: String(q || ""),
+      avgMonths: Math.max(1, Number(avgMonths || horizonMonths || 3)),
+      horizonMonths: Math.max(1, Number(horizonMonths || 3)),
+      shiftHours: Math.max(1, Number(shiftHours || 8)),
+      maxDepth: Math.max(1, Number(maxDepth || 3)),
+    },
+    selectedItems: selectedItems.map((x) => ({
+      itemCode: x.itemCode,
+      itemDesc: x.itemDesc,
+      grupo: x.grupo,
+      area: x.area,
+      productionNeeded: prodRound(x.productionNeeded, 3),
+      productionAdjusted: prodRound(x.productionAdjusted, 3),
+      stockTotal: prodRound(x.stockTotal, 3),
+      hoursNeeded: prodRound(x.hoursNeeded, 3),
+      machine: x.machine,
+    })),
+    summary: {
+      selectedItems: tree.length,
+      totalPlannedQty: prodRound(acc.totalPlannedQty, 3),
+      totalHours: prodRound(acc.totalHours, 3),
+      uniqueMaterials: acc.materialSet.size,
+      uniqueMissingMaterials: acc.shortageMaterialSet.size,
+      shortageMaterialsCount: acc.shortageMaterialsCount,
+      totalShortageQty: prodRound(acc.totalShortageQty, 3),
+      uniqueResources: acc.resourceSet.size,
+    },
+    tree,
+  };
+}
+
+
 function prodBuildUrgentAbStockItems(items) {
   return (Array.isArray(items) ? items : [])
     .filter((x) => String(x?.totalLabel || "").startsWith("AB") && prodNum(x?.stockMin) > 0 && prodNum(x?.stockTotal) < prodNum(x?.stockMin))
@@ -10636,6 +10986,46 @@ app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
   }
 });
 
+
+app.post("/api/admin/production/simulate", verifyAdmin, async (req, res) => {
+  try {
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = String(req.body?.from || req.query?.from || "2025-01-01");
+    const to = String(req.body?.to || req.query?.to || today);
+    const area = String(req.body?.area || req.query?.area || "__ALL__");
+    const grupo = String(req.body?.grupo || req.query?.grupo || "__ALL__");
+    const sizeUom = String(req.body?.sizeUom || req.query?.sizeUom || "__ALL__");
+    const abc = String(req.body?.abc || req.query?.abc || "__ALL__");
+    const typeFilter = String(req.body?.type || req.query?.type || "Se fabrica en planta");
+    const q = String(req.body?.q || req.query?.q || "");
+    const avgMonths = Math.max(1, Math.min(24, prodNum(req.body?.avgMonths || req.query?.avgMonths, 3)));
+    const horizonMonths = Math.max(1, Math.min(12, prodNum(req.body?.horizonMonths || req.query?.horizonMonths, 3)));
+    const shiftHours = Math.max(1, Math.min(24, prodNum(req.body?.shiftHours || req.query?.shiftHours, 8)));
+    const maxDepth = Math.max(1, Math.min(5, prodNum(req.body?.maxDepth || req.query?.maxDepth, 3)));
+    const itemCodes = Array.from(new Set((Array.isArray(req.body?.itemCodes) ? req.body.itemCodes : [])
+      .map((x) => String(x || "").trim())
+      .filter(Boolean)));
+
+    if (!itemCodes.length) {
+      return safeJson(res, 400, { ok: false, message: "Selecciona al menos un artículo para simular" });
+    }
+
+    const cacheParams = { from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths, shiftHours, itemCodes, maxDepth };
+    const cached = prodGetSimulationCached(cacheParams);
+    if (cached) {
+      cached.fromCache = true;
+      return safeJson(res, 200, cached);
+    }
+
+    const out = await productionBuildSimulationTree(cacheParams);
+    out.fromCache = false;
+    prodSetSimulationCached(cacheParams, out);
+    return safeJson(res, 200, out);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 app.post("/api/admin/production/ai-chat", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
@@ -10750,6 +11140,7 @@ async function handleProductionSync(req, res) {
 
     await setState("production_last_sync_at", new Date().toISOString());
     prodClearDashboardCache();
+    prodClearSimulationCache();
 
     return safeJson(res, 200, {
       ok: true,
