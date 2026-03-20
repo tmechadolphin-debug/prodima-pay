@@ -10568,7 +10568,7 @@ function prodAccumulateSimulationSummaryNode(node, acc, depth = 0) {
   }
 }
 
-async function productionBuildSimulationTree(async function productionBuildSimulationTree({
+async function productionBuildSimulationTree({
   from,
   to,
   area,
@@ -11409,7 +11409,7 @@ async function productionBuildGanttPlan({ from, to, area, grupo, sizeUom = '__AL
   };
 }
 
-app.get("/api/admin/production/dashboard",app.get("/api/admin/production/dashboard", verifyAdmin, async (req, res) => {
+app.get("/api/admin/production/dashboard", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
 
