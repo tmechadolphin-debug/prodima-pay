@@ -7957,6 +7957,70 @@ const PROD_CAPACITY_JSON = process.env.PROD_CAPACITY_JSON || path.join(PROD_DATA
 
 let __prodLocalCache = { loadedAt: 0, formulas: { products: {}, liquids: {} }, materials: { materials: {} }, capacity: {} };
 
+const PROD_DASHBOARD_CACHE = new Map();
+const PROD_DASHBOARD_CACHE_TTL_MS = Math.max(30000, Number(process.env.PROD_DASHBOARD_CACHE_TTL_MS || 300000));
+
+function prodParseMultiValue(raw) {
+  const src = Array.isArray(raw) ? raw.join("|") : String(raw || "").trim();
+  if (!src || src === "__ALL__") return [];
+  return Array.from(new Set(
+    src
+      .split(/[|,]/g)
+      .map((x) => String(x || "").trim())
+      .filter(Boolean)
+  ));
+}
+function prodNormalizeTypeFilter(value) {
+  const v = String(value || "").trim();
+  const n = prodNorm(v);
+  if (!v || v === "__ALL__") return "__ALL__";
+  if (n.includes("no se fabrica")) return "No se fabrica en planta";
+  if (n.includes("se fabrica")) return "Se fabrica en planta";
+  return v;
+}
+function prodMatchesType(item, typeFilter) {
+  const sel = prodNormalizeTypeFilter(typeFilter);
+  if (sel === "__ALL__") return true;
+  const label = prodProcurementMethodLabel(String(item?.procurementMethodLabel || item?.procurementMethod || ""));
+  return label === sel;
+}
+function prodDashboardCacheKey(params) {
+  return JSON.stringify({
+    from: String(params?.from || ""),
+    to: String(params?.to || ""),
+    area: String(params?.area || "__ALL__"),
+    grupo: prodParseMultiValue(params?.grupo),
+    sizeUom: String(params?.sizeUom || "__ALL__"),
+    abc: String(params?.abc || "__ALL__"),
+    type: prodNormalizeTypeFilter(params?.typeFilter || params?.type || "Se fabrica en planta"),
+    q: String(params?.q || "").trim().toLowerCase(),
+    avgMonths: Math.max(1, Number(params?.avgMonths || params?.horizonMonths || 3)),
+    horizonMonths: Math.max(1, Number(params?.horizonMonths || 3)),
+  });
+}
+function prodClone(value) {
+  return (typeof structuredClone === "function")
+    ? structuredClone(value)
+    : JSON.parse(JSON.stringify(value));
+}
+function prodGetDashboardCached(params) {
+  const key = prodDashboardCacheKey(params);
+  const row = PROD_DASHBOARD_CACHE.get(key);
+  if (!row) return null;
+  if ((Date.now() - row.ts) > PROD_DASHBOARD_CACHE_TTL_MS) {
+    PROD_DASHBOARD_CACHE.delete(key);
+    return null;
+  }
+  return prodClone(row.data);
+}
+function prodSetDashboardCached(params, data) {
+  const key = prodDashboardCacheKey(params);
+  PROD_DASHBOARD_CACHE.set(key, { ts: Date.now(), data: prodClone(data) });
+}
+function prodClearDashboardCache() {
+  PROD_DASHBOARD_CACHE.clear();
+}
+
 function prodNum(v, def = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
@@ -9406,7 +9470,7 @@ async function prodRefreshInventoryForCodes(itemCodes = [], options = {}) {
   return { saved, items: codes.length, requestedItems: allCodes.length, refreshedItems: codes.length, errors };
 }
 
-async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '__ALL__', abc = '__ALL__', avgMonths = 0, horizonMonths = 3 }) {
+async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '__ALL__', abc = '__ALL__', typeFilter = 'Se fabrica en planta', avgMonths = 0, horizonMonths = 3 }) {
   const monthTo = String(to || getDateISOInOffset(TZ_OFFSET_MIN)).slice(0,10);
   const maxMonthsWindow = Math.max(1, Number(avgMonths || horizonMonths || 5), Number(horizonMonths || 3));
   const monthBaseStart = prodAddMonthsISO(`${String(monthTo).slice(0,7)}-01`, -(maxMonthsWindow - 1));
@@ -9583,8 +9647,11 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '
   });
 
   const areaSel = String(area || "__ALL__");
-  const grupoSel = String(grupo || "__ALL__");
+  const grupoValues = prodParseMultiValue(grupo);
+  const grupoNormSet = new Set(grupoValues.map((x) => prodNormGroupName(x)));
+  const grupoSel = grupoValues.length ? grupoValues.join("|") : "__ALL__";
   const sizeSel = String(sizeUom || "__ALL__").trim();
+  const typeSel = prodNormalizeTypeFilter(typeFilter || "Se fabrica en planta");
   const qq = String(q || "").trim().toLowerCase();
 
   let availableGroups = [];
@@ -9595,7 +9662,8 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '
 
   let universe = items.slice();
   if (areaSel !== "__ALL__") universe = universe.filter((x) => x.area === areaSel);
-  if (grupoSel !== "__ALL__") universe = universe.filter((x) => prodNormGroupName(x.grupo) === prodNormGroupName(grupoSel));
+  if (grupoNormSet.size) universe = universe.filter((x) => grupoNormSet.has(prodNormGroupName(x.grupo)));
+  if (typeSel !== "__ALL__") universe = universe.filter((x) => prodMatchesType(x, typeSel));
 
   const abcRev = prodAbcByMetric(universe, "revenue");
   const abcGP = prodAbcByMetric(universe, "gp");
@@ -9657,17 +9725,17 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '
     };
   });
 
-  items = items.filter((x) => !/no se fabrica en planta/i.test(String(x.procurementMethodLabel || x.procurementMethod || "")));
-
   const availableSizes = Array.from(new Set(
     items
       .map((x) => String(x.sizeUom || "").trim())
       .filter(Boolean)
   )).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
   const availableAbc = ["AB Crítico", "C Importante", "D"];
+  const availableTypes = ["Se fabrica en planta", "No se fabrica en planta"];
 
   if (areaSel !== "__ALL__") items = items.filter((x) => x.area === areaSel);
-  if (grupoSel !== "__ALL__") items = items.filter((x) => prodNormGroupName(x.grupo) === prodNormGroupName(grupoSel));
+  if (grupoNormSet.size) items = items.filter((x) => grupoNormSet.has(prodNormGroupName(x.grupo)));
+  if (typeSel !== "__ALL__") items = items.filter((x) => prodMatchesType(x, typeSel));
   if (sizeSel !== "__ALL__") items = items.filter((x) => String(x.sizeUom || "").trim() === sizeSel);
   if (String(abc || "__ALL__") !== "__ALL__") items = items.filter((x) => String(x.totalLabel || "") === String(abc));
   if (qq) items = items.filter((x) => x.itemCode.toLowerCase().includes(qq) || x.itemDesc.toLowerCase().includes(qq));
@@ -9706,7 +9774,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '
 
   return {
     ok: true,
-    from, to, area: areaSel, grupo: grupoSel, sizeUom: sizeSel, abc: String(abc || "__ALL__"), q: qq,
+    from, to, area: areaSel, grupo: grupoSel, grupos: grupoValues, sizeUom: sizeSel, abc: String(abc || "__ALL__"), type: typeSel, q: qq,
     avgMonths: Math.max(1, Number(avgMonths || horizonMonths || 5)),
     horizonMonths: Math.max(1, Number(horizonMonths || 3)),
     lastSyncAt: await getState("production_last_sync_at"),
@@ -9717,6 +9785,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '
     availableGroups,
     availableSizes,
     availableAbc,
+    availableTypes,
     totals: {
       revenue: prodRound(totals.revenue, 2),
       projectedQty: prodRound(totals.projectedQty, 2),
@@ -10513,18 +10582,20 @@ app.get("/api/admin/production/dashboard", verifyAdmin, async (req, res) => {
     const q = String(req.query?.q || "");
     const sizeUom = String(req.query?.sizeUom || req.query?.size || "__ALL__");
     const abc = String(req.query?.abc || "__ALL__");
+    const typeFilter = String(req.query?.type || req.query?.tipo || "Se fabrica en planta");
     const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 3)));
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
 
-    const preload = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, abc, q, avgMonths, horizonMonths });
-    const refreshLimit = Math.max(40, Math.min(250, Number(req.query?.refreshLimit || 120)));
-    const refreshMeta = await prodRefreshInventoryForCodes(
-      (preload.items || []).map((x) => x.itemCode),
-      { maxItems: refreshLimit, concurrency: 8, timeoutMs: 20000 }
-    ).catch(() => ({ saved: 0, items: 0, requestedItems: (preload.items || []).length, refreshedItems: 0, errors: [] }));
-    const out = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, abc, q, avgMonths, horizonMonths });
-    out.inventoryRefresh = refreshMeta;
-    out.inventoryRefreshNote = `Inventario SAP refrescado para ${refreshMeta.refreshedItems || 0} de ${refreshMeta.requestedItems || 0} artículos visibles.`;
+    const cacheParams = { from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths };
+    const cached = prodGetDashboardCached(cacheParams);
+    if (cached) {
+      cached.fromCache = true;
+      return safeJson(res, 200, cached);
+    }
+
+    const out = await productionDashboardFromDb(cacheParams);
+    out.fromCache = false;
+    prodSetDashboardCached(cacheParams, out);
     return safeJson(res, 200, out);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -10577,12 +10648,15 @@ app.post("/api/admin/production/ai-chat", verifyAdmin, async (req, res) => {
     const area = String(req.body?.area || "__ALL__");
     const grupo = String(req.body?.grupo || "__ALL__");
     const q = String(req.body?.q || "");
+    const sizeUom = String(req.body?.sizeUom || req.body?.size || "__ALL__");
+    const abc = String(req.body?.abc || "__ALL__");
+    const typeFilter = String(req.body?.type || req.body?.tipo || "Se fabrica en planta");
     const horizonMonths = Math.max(1, Math.min(12, prodNum(req.body?.horizonMonths, 3)));
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.body?.avgMonths, horizonMonths)));
     const shiftHours = Math.max(1, Math.min(24, prodNum(req.body?.shiftHours, 8)));
     const itemCode = String(req.body?.itemCode || "").trim();
 
-    const dashboard = await productionDashboardFromDb({ from, to, area, grupo, q, abc, avgMonths, horizonMonths });
+    const dashboard = await productionDashboardFromDb({ from, to, area, grupo, q, sizeUom, abc, typeFilter, avgMonths, horizonMonths });
     const requestedCodes = prodResolveRequestedCodes({ question, q, itemCode, dashboard });
     const questionMatches = requestedCodes.map((code) => prodFindDashboardItemByCode(dashboard?.items || [], code)).filter(Boolean);
 
@@ -10675,6 +10749,7 @@ async function handleProductionSync(req, res) {
     }
 
     await setState("production_last_sync_at", new Date().toISOString());
+    prodClearDashboardCache();
 
     return safeJson(res, 200, {
       ok: true,
