@@ -11259,6 +11259,7 @@ async function productionBuildGanttPlan({ from, to, area, grupo, sizeUom = '__AL
     const possibleInfo = await prodPlanPossibleQtyFromPoolDeep(plan, finishedQtyNeeded, materialPool, 0, [prodNormalizeItemCodeLoose(row.itemCode)]);
     let possibleQty = prodNum(possibleInfo?.possibleQty);
     const mainConstraint = String(possibleInfo?.mainConstraint || '');
+    const semiAlert = await prodPlanSemiAlert(candidate, finishedQtyNeeded, materialPool, false);
 
     if (minBatchQty > 0) {
       possibleQty = possibleQty >= minBatchQty ? Math.floor(possibleQty / minBatchQty) * minBatchQty : 0;
@@ -12933,7 +12934,8 @@ app.get('/api/admin/production/gantt-plan-v18', verifyAdmin, async (req, res) =>
     const fullMaterials = ['1','true','yes','si'].includes(String(req.query?.fullMaterials || req.query?.incomingMp || '').trim().toLowerCase());
     let out = await productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths, shiftHours, startDate, fullMaterials });
     const noRows = !(Array.isArray(out?.items) && out.items.some((row) => Array.isArray(row?.tasks) && row.tasks.length));
-    if (noRows && prodNum(out?.summary?.totalPossibleQty, 0) > 0) {
+    const shouldTryLegacy = noRows || (prodNum(out?.summary?.itemsPlanned, 0) <= 0 && prodNum(out?.summary?.totalPossibleQty, 0) > 0);
+    if (shouldTryLegacy && prodNum(out?.summary?.totalPossibleQty, 0) > 0) {
       try {
         const legacy = await productionBuildGanttPlan({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths, shiftHours, startDate });
         if (Array.isArray(legacy?.items) && legacy.items.some((row) => Array.isArray(row?.tasks) && row.tasks.length)) {
