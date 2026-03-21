@@ -12435,6 +12435,510 @@ app.post("/api/admin/estratificacion/ai-chat", verifyAdmin, async (req, res) => 
 });
 
 
+
+/* =========================================================
+   Producción — Plan persistente + cierre diario SAP (v18)
+========================================================= */
+const PROD_PLAN_PERSIST_FILE = path.join(PROD_DATA_DIR, 'production_saved_plans_v18.json');
+
+function prodEnsureProductionDir() {
+  try { fs.mkdirSync(PROD_DATA_DIR, { recursive: true }); } catch {}
+}
+function prodSavedPlanEmptyStore() {
+  return { records: [], activeByUser: {} };
+}
+function prodReadSavedPlanFile() {
+  prodEnsureProductionDir();
+  try {
+    const raw = fs.readFileSync(PROD_PLAN_PERSIST_FILE, 'utf8');
+    const data = JSON.parse(raw || '{}');
+    if (!data || typeof data !== 'object') return prodSavedPlanEmptyStore();
+    if (!Array.isArray(data.records)) data.records = [];
+    if (!data.activeByUser || typeof data.activeByUser !== 'object') data.activeByUser = {};
+    return data;
+  } catch {
+    return prodSavedPlanEmptyStore();
+  }
+}
+function prodWriteSavedPlanFile(data) {
+  prodEnsureProductionDir();
+  fs.writeFileSync(PROD_PLAN_PERSIST_FILE, JSON.stringify(data || prodSavedPlanEmptyStore(), null, 2), 'utf8');
+}
+async function prodEnsureSavedPlanTable() {
+  if (!hasDb()) return;
+  await dbQuery(`
+    create table if not exists admin_production_saved_plans_v18 (
+      id text primary key,
+      admin_user text not null,
+      is_active boolean not null default true,
+      payload jsonb not null,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    )
+  `);
+  await dbQuery(`create index if not exists idx_admin_production_saved_plans_v18_active on admin_production_saved_plans_v18(admin_user, is_active, updated_at desc)`);
+}
+__extraBootTasks.push(prodEnsureSavedPlanTable);
+
+function prodSavedPlanUser(req) {
+  return String(req?.admin?.user || req?.admin?.sub || 'admin').trim().toLowerCase() || 'admin';
+}
+function prodSavedPlanId() {
+  return `plan_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+}
+function prodNormalizeSavedPlanPayload(payload, meta = {}) {
+  const base = prodClone(payload || {}) || {};
+  base.planRecordId = String(base.planRecordId || meta.id || prodSavedPlanId());
+  base.persistedAt = String(meta.persistedAt || new Date().toISOString());
+  base.persistedBy = String(meta.adminUser || base.persistedBy || 'admin');
+  if (!Array.isArray(base.dayClosures)) base.dayClosures = [];
+  if (!base._serverMeta || typeof base._serverMeta !== 'object') base._serverMeta = {};
+  base._serverMeta.active = true;
+  return base;
+}
+async function prodSavedPlanSetCurrent(adminUser, payload) {
+  const normalized = prodNormalizeSavedPlanPayload(payload, { adminUser, persistedAt: new Date().toISOString(), id: payload?.planRecordId });
+  const id = String(normalized.planRecordId);
+  if (hasDb()) {
+    await dbQuery(`update admin_production_saved_plans_v18 set is_active=false, updated_at=now() where admin_user=$1`, [adminUser]);
+    await dbQuery(`
+      insert into admin_production_saved_plans_v18(id, admin_user, is_active, payload, created_at, updated_at)
+      values ($1,$2,true,$3::jsonb,now(),now())
+      on conflict (id) do update set admin_user=excluded.admin_user, is_active=true, payload=excluded.payload, updated_at=now()
+    `, [id, adminUser, JSON.stringify(normalized)]);
+    return normalized;
+  }
+  const store = prodReadSavedPlanFile();
+  store.records = (store.records || []).filter((x) => String(x?.id || '') !== id);
+  store.records.push({ id, adminUser, isActive: true, updatedAt: new Date().toISOString(), payload: normalized });
+  store.activeByUser[adminUser] = id;
+  prodWriteSavedPlanFile(store);
+  return normalized;
+}
+async function prodSavedPlanGetCurrent(adminUser) {
+  if (hasDb()) {
+    const q = await dbQuery(`
+      select id, admin_user, payload, created_at, updated_at
+      from admin_production_saved_plans_v18
+      where admin_user=$1 and is_active=true
+      order by updated_at desc
+      limit 1
+    `, [adminUser]);
+    const row = q.rows?.[0];
+    if (!row) return null;
+    return prodNormalizeSavedPlanPayload(row.payload || {}, { adminUser, persistedAt: row.updated_at, id: row.id });
+  }
+  const store = prodReadSavedPlanFile();
+  const activeId = String(store.activeByUser?.[adminUser] || '');
+  const row = (store.records || []).find((x) => String(x?.id || '') === activeId && String(x?.adminUser || '') === adminUser) || null;
+  if (!row) return null;
+  return prodNormalizeSavedPlanPayload(row.payload || {}, { adminUser, persistedAt: row.updatedAt, id: row.id });
+}
+async function prodSavedPlanUpdateById(adminUser, planId, updater) {
+  const current = await prodSavedPlanGetCurrent(adminUser);
+  if (!current) return null;
+  if (planId && String(current.planRecordId || '') !== String(planId || '')) return null;
+  const nextPayload = typeof updater === 'function' ? await updater(prodClone(current)) : prodClone(updater);
+  if (!nextPayload) return null;
+  nextPayload.planRecordId = current.planRecordId;
+  return await prodSavedPlanSetCurrent(adminUser, nextPayload);
+}
+function prodOrdersActualQtyForDate(orders, date) {
+  return prodRound((Array.isArray(orders) ? orders : []).filter((x) => String(x?.postDate || '').slice(0,10) === String(date || '').slice(0,10)).reduce((acc, x) => acc + prodNum(x?.completedQty || 0), 0), 2);
+}
+async function prodBuildPlanDayCloseSummary(planPayload, date, { forceFresh = true } = {}) {
+  const day = String(date || '').slice(0,10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error('Fecha inválida para cierre del día');
+  const plan = prodClone(planPayload || {}) || {};
+  const rows = Array.isArray(plan?.items) ? plan.items : [];
+  const rowsForDay = rows.map((row) => {
+    const tasks = (Array.isArray(row?.tasks) ? row.tasks : []).filter((task) => String(task?.date || '') === day);
+    return { ...row, tasks };
+  }).filter((row) => row.tasks.length);
+  if (!rowsForDay.length) throw new Error('No hay producción programada para esa fecha');
+
+  const codes = Array.from(new Set(rowsForDay.map((x) => String(x?.itemCode || '').trim()).filter(Boolean)));
+  if (forceFresh) {
+    await prodRefreshInventoryForCodes(codes, { forceFresh: true, ttlMs: 0, timeoutMs: 120000 }).catch(() => {});
+  }
+
+  let plannedQty = 0;
+  let actualQtySap = 0;
+  let totalNeededContext = 0;
+  let totalPossibleContext = 0;
+  const items = [];
+
+  for (const row of rowsForDay) {
+    const itemCode = String(row?.itemCode || '').trim();
+    const plannedDayQty = prodRound((Array.isArray(row?.tasks) ? row.tasks : []).reduce((acc, task) => acc + prodNum(task?.qty || 0), 0), 2);
+    const orders = await prodFetchProductionOrders(itemCode, 120, { forceFresh: true, ttlMs: 0 }).catch(() => ({ orders: [] }));
+    const actualDayQty = prodOrdersActualQtyForDate(orders?.orders || [], day);
+    const fullItem = await prodGetFullItem(itemCode, { forceFresh: true, ttlMs: 0 }).catch(() => null);
+    const inv = prodExtractInventorySnapshotFromItem(fullItem);
+
+    plannedQty += plannedDayQty;
+    actualQtySap += actualDayQty;
+    totalNeededContext += prodNum(row?.neededQty || 0);
+    totalPossibleContext += prodNum(row?.possibleQty || 0);
+
+    items.push({
+      itemCode,
+      itemDesc: String(row?.itemDesc || ''),
+      familyLabel: String(row?.familyLabel || 'Producción'),
+      plannedDayQty: prodRound(plannedDayQty, 2),
+      neededQtyContext: prodRound(row?.neededQty || 0, 2),
+      possibleQtyContext: prodRound(row?.possibleQty || 0, 2),
+      actualQtySap: prodRound(actualDayQty, 2),
+      compliancePct: plannedDayQty > 0 ? prodRound((actualDayQty / plannedDayQty) * 100, 1) : 0,
+      stockActualQty: prodRound(inv?.stockTotal || row?.currentStockQty || 0, 2),
+      materials: (Array.isArray(row?.materials) ? row.materials : []).slice(0, 8),
+    });
+  }
+
+  const compliancePct = plannedQty > 0 ? prodRound((actualQtySap / plannedQty) * 100, 1) : 0;
+  return {
+    date: day,
+    closedAt: new Date().toISOString(),
+    plannedQty: prodRound(plannedQty, 2),
+    neededQtyContext: prodRound(totalNeededContext, 2),
+    possibleQtyContext: prodRound(totalPossibleContext, 2),
+    actualQtySap: prodRound(actualQtySap, 2),
+    compliancePct,
+    status: compliancePct >= 98 ? 'ok' : compliancePct >= 85 ? 'warn' : 'bad',
+    message: `Producción concluida para ${day}. Planificadas ${prodRound(plannedQty,2)} u, SAP registró ${prodRound(actualQtySap,2)} u. Cumplimiento: ${compliancePct}%.`,
+    items,
+  };
+}
+
+async function productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom = '__ALL__', abc = '__ALL__', typeFilter = 'Se fabrica en planta', q = '', avgMonths = 0, horizonMonths = 1, shiftHours = 8, startDate = '', fullMaterials = false }) {
+  const dash = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths });
+  const effectiveDayHours = Math.max(0.5, prodRound(prodNum(shiftHours || 8) - 0.75, 2));
+  const dayStartHour = 7;
+  const start = prodPlanNextWorkday(startDate || getDateISOInOffset(TZ_OFFSET_MIN));
+  const materialPool = new Map();
+  const blockedItems = [];
+  const rows = [];
+  const calendarSet = new Set();
+  let totalNeededQty = 0;
+  let totalPossibleQty = 0;
+  let totalBlockedQty = 0;
+  let totalScheduledHours = 0;
+
+  const baseItems = (Array.isArray(dash?.items) ? dash.items : [])
+    .filter((x) => prodNum(x?.productionAdjusted) > 0 && prodIsFinishedGoodCode(x?.itemCode, x?.itemDesc, x?.sizeUom))
+    .slice(0, 40);
+
+  const candidates = [];
+  for (const row of baseItems) {
+    const plan = await productionBuildItemPlanCached({ itemCode: row.itemCode, toDate: to, avgMonths, horizonMonths, shiftHours });
+    prodPlanMaterialPoolSeed(materialPool, plan?.requirements?.all || [], row.productionAdjusted);
+
+    const familyKey = prodPlanFamilyKey(row, plan);
+    const familyMeta = prodPlanFamilyMeta(familyKey);
+    const litersPerUnit = prodNum(plan?.production?.litersPerUnit);
+    const semiRate = String(row.itemCode || '') === '68243' ? 728 : (litersPerUnit > 0 ? 946.353 / litersPerUnit : 0);
+    let unitsPerHour = Math.max(0, prodNum(plan?.capacity?.unitsPerHour || row?.unitsPerHour));
+    if (semiRate > 0) unitsPerHour = unitsPerHour > 0 ? Math.min(unitsPerHour, semiRate) : semiRate;
+    if (!(unitsPerHour > 0)) unitsPerHour = 1;
+
+    const finishedQtyNeeded = Math.max(0, Math.floor(prodNum(row?.productionAdjusted)));
+    const minBatchQty = Math.max(
+      prodNum(plan?.production?.lotBaseQty || 0),
+      prodNum(plan?.mrp?.sapLotSize || 0),
+      familyKey === 'SAZONADORES' ? 1200 : 0
+    );
+
+    const directMaterials = [
+      ...(Array.isArray(plan?.requirements?.rawMaterials) ? plan.requirements.rawMaterials : []),
+      ...(Array.isArray(plan?.requirements?.packaging) ? plan.requirements.packaging : [])
+    ]
+      .map((x) => ({
+        code: String(x?.code || '').trim(),
+        description: String(x?.description || '').trim(),
+        requiredQty: prodRound(x?.requiredQty, 3),
+        stockQty: prodRound(x?.stockQty, 3),
+        shortageQty: prodRound(x?.shortageQty, 3),
+        unit: String(x?.unit || '').trim(),
+        supplier: String(x?.supplier || '').trim(),
+        procurementMethodLabel: String(x?.procurementMethodLabel || ''),
+        componentType: String(x?.componentType || ''),
+      }))
+      .sort((a, b) => prodNum(b?.shortageQty) - prodNum(a?.shortageQty) || prodNum(b?.requiredQty) - prodNum(a?.requiredQty))
+      .slice(0, 14);
+
+    candidates.push({
+      row,
+      plan,
+      familyKey,
+      familyMeta,
+      unitsPerHour,
+      finishedQtyNeeded,
+      minBatchQty,
+      directMaterials,
+      sharedSemiCode: String((Array.isArray(plan?.requirements?.all) ? plan.requirements.all : []).find((x) => String(x?.procurementMethodLabel || '') === 'Se fabrica en planta')?.code || '').trim(),
+    });
+  }
+
+  candidates.sort((a, b) => {
+    const fam = prodNum(b?.familyMeta?.priority) - prodNum(a?.familyMeta?.priority);
+    if (fam) return fam;
+    const s = prodSizeSortValue(b?.row?.sizeUom) - prodSizeSortValue(a?.row?.sizeUom);
+    if (s) return s;
+    const ab = prodAbcPriority(b?.row?.totalLabel) - prodAbcPriority(a?.row?.totalLabel);
+    if (ab) return ab;
+    const p = prodNum(b?.finishedQtyNeeded) - prodNum(a?.finishedQtyNeeded);
+    if (p) return p;
+    return prodNum(b?.row?.revenue) - prodNum(a?.row?.revenue);
+  });
+
+  let currentDate = start;
+  let currentHourOffset = 0;
+  let currentFamilyKey = '';
+  let currentFamilyMeta = null;
+  let familyDatesUsed = new Set();
+
+  const finalizeFamilyBlock = () => {
+    if (!currentFamilyMeta) return;
+    if (currentHourOffset > 0.0001) {
+      currentDate = prodMoveToNextWorkday(currentDate);
+      currentHourOffset = 0;
+    }
+    while (familyDatesUsed.size < prodNum(currentFamilyMeta.minDays)) {
+      calendarSet.add(currentDate);
+      familyDatesUsed.add(currentDate);
+      currentDate = prodMoveToNextWorkday(currentDate);
+      currentHourOffset = 0;
+    }
+  };
+
+  for (const candidate of candidates) {
+    const { row, plan, familyKey, familyMeta, unitsPerHour, finishedQtyNeeded, minBatchQty, directMaterials } = candidate;
+    if (!(finishedQtyNeeded > 0)) continue;
+
+    if (currentFamilyKey && familyKey !== currentFamilyKey) {
+      finalizeFamilyBlock();
+      familyDatesUsed = new Set();
+    }
+    if (familyKey !== currentFamilyKey) {
+      currentFamilyKey = familyKey;
+      currentFamilyMeta = familyMeta;
+    }
+
+    const possibleInfo = fullMaterials
+      ? { possibleQty: finishedQtyNeeded, mainConstraint: '', assumedFullMaterials: true }
+      : await prodPlanPossibleQtyFromPoolDeep(plan, finishedQtyNeeded, materialPool, 0, [prodNormalizeItemCodeLoose(row.itemCode)]);
+    let possibleQty = prodNum(possibleInfo?.possibleQty);
+    const mainConstraint = String(possibleInfo?.mainConstraint || '');
+
+    if (minBatchQty > 0) {
+      possibleQty = possibleQty >= minBatchQty ? Math.floor(possibleQty / minBatchQty) * minBatchQty : 0;
+    }
+    possibleQty = Math.max(0, Math.min(finishedQtyNeeded, Math.floor(possibleQty)));
+
+    totalNeededQty += finishedQtyNeeded;
+    totalPossibleQty += possibleQty;
+    totalBlockedQty += Math.max(0, finishedQtyNeeded - possibleQty);
+
+    if (!(possibleQty > 0)) {
+      blockedItems.push({
+        itemCode: row.itemCode,
+        itemDesc: row.itemDesc,
+        sizeUom: row.sizeUom,
+        abc: row.totalLabel,
+        familyKey,
+        familyLabel: familyMeta.label,
+        neededQty: finishedQtyNeeded,
+        possibleQty: 0,
+        pendingQty: finishedQtyNeeded,
+        mainConstraint: mainConstraint || 'Materia prima insuficiente',
+        currentStockQty: prodRound(row?.stockTotal || 0, 3),
+        materials: directMaterials,
+      });
+      continue;
+    }
+
+    const tasks = [];
+    let qtyRemaining = possibleQty;
+    let hoursRemaining = possibleQty / unitsPerHour;
+    let cumulativeProduced = 0;
+
+    while (hoursRemaining > 0.0001) {
+      if (currentHourOffset >= effectiveDayHours - 0.0001) {
+        currentDate = prodMoveToNextWorkday(currentDate);
+        currentHourOffset = 0;
+      }
+      const availableHours = Math.max(0, effectiveDayHours - currentHourOffset);
+      const takeHours = Math.min(availableHours, hoursRemaining);
+      const qtySlice = Math.min(qtyRemaining, takeHours * unitsPerHour);
+      const startOffset = currentHourOffset;
+      const startStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
+      cumulativeProduced += qtySlice;
+      const endStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
+      const taskDate = currentDate;
+      familyDatesUsed.add(taskDate);
+      calendarSet.add(taskDate);
+
+      const task = {
+        taskId: `${row.itemCode}_${taskDate}_${tasks.length + 1}`,
+        date: taskDate,
+        weekLabel: prodWeekLabelFromDate(taskDate),
+        monthLabel: prodMonthLabelFromDate(taskDate),
+        qty: prodRound(qtySlice, 2),
+        hours: prodRound(takeHours, 2),
+        startAt: prodIsoDateTime(taskDate, startOffset, dayStartHour),
+        endAt: prodIsoDateTime(taskDate, startOffset + takeHours, dayStartHour),
+        timeLabel: `${String(dayStartHour + Math.floor(startOffset)).padStart(2,'0')}:${String(Math.round((startOffset % 1) * 60)).padStart(2,'0')} → ${String(dayStartHour + Math.floor(startOffset + takeHours)).padStart(2,'0')}:${String(Math.round(((startOffset + takeHours) % 1) * 60)).padStart(2,'0')}`,
+        fillPct: prodRound((takeHours / effectiveDayHours) * 100, 1),
+        stockStartQty: startStockQty,
+        stockEndQty: endStockQty,
+      };
+      tasks.push(task);
+
+      qtyRemaining = Math.max(0, qtyRemaining - qtySlice);
+      hoursRemaining = Math.max(0, hoursRemaining - takeHours);
+      currentHourOffset += takeHours;
+      if (currentHourOffset >= effectiveDayHours - 0.0001) {
+        currentDate = prodMoveToNextWorkday(currentDate);
+        currentHourOffset = 0;
+      }
+    }
+
+    totalScheduledHours += possibleQty / unitsPerHour;
+    if (!fullMaterials) await prodPlanConsumePoolDeep(plan, possibleQty, materialPool, 0, [prodNormalizeItemCodeLoose(row.itemCode)]);
+
+    const blockedQty = Math.max(0, finishedQtyNeeded - possibleQty);
+    rows.push({
+      itemCode: row.itemCode,
+      itemDesc: row.itemDesc,
+      sizeUom: row.sizeUom,
+      abc: row.totalLabel,
+      machine: row.machine,
+      familyKey,
+      familyLabel: familyMeta.label,
+      neededQty: finishedQtyNeeded,
+      possibleQty,
+      blockedQty,
+      currentStockQty: prodRound(row?.stockTotal || 0, 3),
+      targetStockQty: prodRound(prodNum(row?.stockTotal) + finishedQtyNeeded, 3),
+      unitsPerHour: prodRound(unitsPerHour, 2),
+      minBatchQty: prodRound(minBatchQty, 2),
+      sharedSemiCode: candidate.sharedSemiCode,
+      materials: directMaterials,
+      tasks,
+    });
+
+    if (blockedQty > 0) {
+      blockedItems.push({
+        itemCode: row.itemCode,
+        itemDesc: row.itemDesc,
+        sizeUom: row.sizeUom,
+        abc: row.totalLabel,
+        familyKey,
+        familyLabel: familyMeta.label,
+        neededQty: finishedQtyNeeded,
+        possibleQty,
+        pendingQty: blockedQty,
+        mainConstraint: mainConstraint || 'Materia prima insuficiente',
+        currentStockQty: prodRound(row?.stockTotal || 0, 3),
+        materials: directMaterials,
+      });
+    }
+  }
+
+  finalizeFamilyBlock();
+
+  const calendarDays = Array.from(calendarSet).sort().map((date) => ({
+    date,
+    label: prodHumanDateShort(date),
+    weekLabel: prodWeekLabelFromDate(date),
+    monthLabel: prodMonthLabelFromDate(date),
+  }));
+
+  return {
+    ok: true,
+    generatedAt: new Date().toISOString(),
+    lastSyncAt: await getState('production_last_sync_at'),
+    scenario: { fullMaterials: !!fullMaterials },
+    filters: { from, to, area, grupo, sizeUom, abc, type: typeFilter, q, horizonMonths, shiftHours },
+    workRule: {
+      shiftHours: prodRound(prodNum(shiftHours), 2),
+      breakfastHours: 0.25,
+      lunchHours: 0.5,
+      effectiveHours: prodRound(effectiveDayHours, 2),
+      label: `Turno ${prodRound(prodNum(shiftHours),2)} h - 45 min de pausas = ${prodRound(effectiveDayHours,2)} h efectivas`,
+    },
+    calendarDays,
+    items: rows,
+    blockedItems,
+    summary: {
+      itemsPlanned: rows.length,
+      totalNeededQty: prodRound(totalNeededQty, 2),
+      totalPossibleQty: prodRound(totalPossibleQty, 2),
+      totalBlockedQty: prodRound(totalBlockedQty, 2),
+      totalScheduledHours: prodRound(totalScheduledHours, 2),
+      fullMaterialsScenario: !!fullMaterials,
+    },
+  };
+}
+
+app.get('/api/admin/production/gantt-plan-v18', verifyAdmin, async (req, res) => {
+  try {
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = String(req.query?.from || '2025-01-01');
+    const to = String(req.query?.to || today);
+    const area = String(req.query?.area || '__ALL__');
+    const grupo = String(req.query?.grupo || '__ALL__');
+    const sizeUom = String(req.query?.sizeUom || req.query?.size || '__ALL__');
+    const abc = String(req.query?.abc || '__ALL__');
+    const typeFilter = String(req.query?.type || req.query?.tipo || 'Se fabrica en planta');
+    const q = String(req.query?.q || '');
+    const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 1)));
+    const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
+    const shiftHours = Math.max(1, Math.min(24, prodNum(req.query?.shiftHours, 8)));
+    const startDate = String(req.query?.startDate || today).slice(0,10);
+    const fullMaterials = ['1','true','yes','si'].includes(String(req.query?.fullMaterials || req.query?.incomingMp || '').trim().toLowerCase());
+    const out = await productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths, shiftHours, startDate, fullMaterials });
+    out.scenario = { ...(out.scenario || {}), fullMaterials };
+    const saved = await prodSavedPlanSetCurrent(prodSavedPlanUser(req), out);
+    return safeJson(res, 200, saved);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/production/plans/current', verifyAdmin, async (req, res) => {
+  try {
+    const payload = await prodSavedPlanGetCurrent(prodSavedPlanUser(req));
+    if (!payload) return safeJson(res, 404, { ok: false, message: 'No hay un plan guardado todavía' });
+    return safeJson(res, 200, payload);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production/plans/day-close', verifyAdmin, async (req, res) => {
+  try {
+    const adminUser = prodSavedPlanUser(req);
+    const planId = String(req.body?.planId || '').trim();
+    const date = String(req.body?.date || req.query?.date || '').slice(0,10);
+    const payload = await prodSavedPlanGetCurrent(adminUser);
+    if (!payload) return safeJson(res, 404, { ok: false, message: 'No hay plan guardado' });
+    if (planId && String(payload.planRecordId || '') !== planId) return safeJson(res, 409, { ok: false, message: 'El plan cambió; vuelve a cargar el plan actual' });
+    const summary = await prodBuildPlanDayCloseSummary(payload, date, { forceFresh: true });
+    const updated = await prodSavedPlanUpdateById(adminUser, payload.planRecordId, (plan) => {
+      const list = Array.isArray(plan?.dayClosures) ? plan.dayClosures.filter((x) => String(x?.date || '') !== date) : [];
+      list.unshift(summary);
+      plan.dayClosures = list.slice(0, 30);
+      plan.lastSapSyncAt = new Date().toISOString();
+      plan.latestDaySummary = summary;
+      return plan;
+    });
+    return safeJson(res, 200, { ok: true, summary, plan: updated });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 /* =========================================================
    Start
 ========================================================= */
