@@ -11280,7 +11280,7 @@ async function productionBuildGanttPlan({ from, to, area, grupo, sizeUom = '__AL
         neededQty: finishedQtyNeeded,
         possibleQty: 0,
         pendingQty: finishedQtyNeeded,
-        mainConstraint: mainConstraint || 'Materia prima insuficiente',
+        mainConstraint: semiAlert || mainConstraint || 'Materia prima insuficiente',
         currentStockQty: prodRound(row?.stockTotal || 0, 3),
         materials: directMaterials,
       });
@@ -11368,7 +11368,7 @@ async function productionBuildGanttPlan({ from, to, area, grupo, sizeUom = '__AL
         neededQty: finishedQtyNeeded,
         possibleQty,
         pendingQty: blockedQty,
-        mainConstraint: mainConstraint || 'Materia prima insuficiente',
+        mainConstraint: semiAlert || mainConstraint || 'Materia prima insuficiente',
         currentStockQty: prodRound(row?.stockTotal || 0, 3),
         materials: directMaterials,
       });
@@ -12610,6 +12610,39 @@ async function prodBuildPlanDayCloseSummary(planPayload, date, { forceFresh = tr
   };
 }
 
+async function prodPlanSemiAlert(candidate, finishedQtyNeeded, materialPool, fullMaterials = false) {
+  const sharedSemiCode = String(candidate?.sharedSemiCode || '').trim();
+  if (!sharedSemiCode) return '';
+  const plan = candidate?.plan || {};
+  const req = (Array.isArray(plan?.requirements?.all) ? plan.requirements.all : []).find((x) => String(x?.code || '').trim() === sharedSemiCode);
+  if (!req || String(req?.procurementMethodLabel || '') !== 'Se fabrica en planta') return '';
+  try {
+    const baseQty = Math.max(1, prodNum(plan?.production?.adjustedQty || plan?.production?.neededQty || finishedQtyNeeded || 1));
+    const perFinished = prodNum(req?.requiredQty) / baseQty;
+    const childNeedQty = Math.max(prodNum(req?.requiredQty || 0), prodNum(req?.subPlanQty || 0), perFinished * Math.max(1, prodNum(finishedQtyNeeded)));
+    if (!(childNeedQty > 0)) return '';
+    const childPlan = await productionBuildItemPlanCached({
+      itemCode: sharedSemiCode,
+      toDate: plan?.period?.endDate || getDateISOInOffset(TZ_OFFSET_MIN),
+      avgMonths: plan?.period?.avgMonths || 3,
+      horizonMonths: plan?.period?.horizonMonths || 1,
+      shiftHours: plan?.capacity?.shiftHours || 8,
+      plannedQtyOverride: childNeedQty,
+    });
+    const childPool = new Map(materialPool || new Map());
+    prodPlanMaterialPoolSeed(childPool, childPlan?.requirements?.all || [], childNeedQty);
+    const childInfo = fullMaterials
+      ? { possibleQty: childNeedQty, mainConstraint: '' }
+      : await prodPlanPossibleQtyFromPoolDeep(childPlan, childNeedQty, childPool, 1, [prodNormalizeItemCodeLoose(candidate?.row?.itemCode), prodNormalizeItemCodeLoose(sharedSemiCode)]);
+    const childPossibleQty = prodNum(childInfo?.possibleQty || 0);
+    if (childPossibleQty > 0) {
+      const childDesc = String(childPlan?.item?.itemName || req?.description || sharedSemiCode).trim();
+      return `No hay ${sharedSemiCode} en stock, pero sí hay materia prima para fabricar ${childDesc} (${prodRound(childPossibleQty, 2)} u aprox).`;
+    }
+  } catch {}
+  return '';
+}
+
 async function productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom = '__ALL__', abc = '__ALL__', typeFilter = 'Se fabrica en planta', q = '', avgMonths = 0, horizonMonths = 1, shiftHours = 8, startDate = '', fullMaterials = false }) {
   const dash = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths });
   const effectiveDayHours = Math.max(0.5, prodRound(prodNum(shiftHours || 8) - 0.75, 2));
@@ -12729,6 +12762,7 @@ async function productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom = '_
       : await prodPlanPossibleQtyFromPoolDeep(plan, finishedQtyNeeded, materialPool, 0, [prodNormalizeItemCodeLoose(row.itemCode)]);
     let possibleQty = prodNum(possibleInfo?.possibleQty);
     const mainConstraint = String(possibleInfo?.mainConstraint || '');
+    const semiAlert = await prodPlanSemiAlert(candidate, finishedQtyNeeded, materialPool, fullMaterials);
 
     if (minBatchQty > 0) {
       possibleQty = possibleQty >= minBatchQty ? Math.floor(possibleQty / minBatchQty) * minBatchQty : 0;
@@ -12897,7 +12931,28 @@ app.get('/api/admin/production/gantt-plan-v18', verifyAdmin, async (req, res) =>
     const shiftHours = Math.max(1, Math.min(24, prodNum(req.query?.shiftHours, 8)));
     const startDate = String(req.query?.startDate || today).slice(0,10);
     const fullMaterials = ['1','true','yes','si'].includes(String(req.query?.fullMaterials || req.query?.incomingMp || '').trim().toLowerCase());
-    const out = await productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths, shiftHours, startDate, fullMaterials });
+    let out = await productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths, shiftHours, startDate, fullMaterials });
+    const noRows = !(Array.isArray(out?.items) && out.items.some((row) => Array.isArray(row?.tasks) && row.tasks.length));
+    if (noRows && prodNum(out?.summary?.totalPossibleQty, 0) > 0) {
+      try {
+        const legacy = await productionBuildGanttPlan({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths, shiftHours, startDate });
+        if (Array.isArray(legacy?.items) && legacy.items.some((row) => Array.isArray(row?.tasks) && row.tasks.length)) {
+          out.items = legacy.items;
+          out.calendarDays = legacy.calendarDays;
+          out.workRule = out.workRule || legacy.workRule;
+          out.summary = {
+            ...(out.summary || {}),
+            itemsPlanned: prodNum(legacy?.summary?.itemsPlanned, prodNum(out?.summary?.itemsPlanned, 0)),
+            totalScheduledHours: prodRound(prodNum(legacy?.summary?.totalScheduledHours, out?.summary?.totalScheduledHours || 0), 2),
+            totalPossibleQty: prodRound(Math.max(prodNum(out?.summary?.totalPossibleQty, 0), prodNum(legacy?.summary?.totalPossibleQty, 0)), 2),
+            totalNeededQty: prodRound(Math.max(prodNum(out?.summary?.totalNeededQty, 0), prodNum(legacy?.summary?.totalNeededQty, 0)), 2),
+            totalBlockedQty: prodRound(Math.max(prodNum(out?.summary?.totalBlockedQty, 0), prodNum(legacy?.summary?.totalBlockedQty, 0)), 2),
+          };
+          out.blockedItems = Array.isArray(out?.blockedItems) && out.blockedItems.length ? out.blockedItems : (Array.isArray(legacy?.blockedItems) ? legacy.blockedItems : []);
+          out._serverFallback = 'legacy-gantt';
+        }
+      } catch {}
+    }
     out.scenario = { ...(out.scenario || {}), fullMaterials };
     const saved = await prodSavedPlanSetCurrent(prodSavedPlanUser(req), out);
     return safeJson(res, 200, saved);
