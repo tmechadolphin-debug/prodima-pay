@@ -10770,7 +10770,7 @@ function prodAiCompactPlan(plan) {
       estado: String(x?.status || ''),
     }))
     .sort((a, b) => prodNum(b.faltante) - prodNum(a.faltante) || prodNum(b.requerido) - prodNum(a.requerido))
-    .slice(0, 40);
+    .slice(0, 120);
 
   const totalFaltanteMateriales = materialRows.reduce((acc, x) => acc + prodNum(x.faltante), 0);
   const componentesConFaltante = materialRows.filter((x) => prodNum(x.faltante) > 0).length;
@@ -11158,7 +11158,7 @@ async function productionBuildGanttPlan({ from, to, area, grupo, sizeUom = '__AL
 
   const baseItems = (Array.isArray(dash?.items) ? dash.items : [])
     .filter((x) => prodNum(x?.productionAdjusted) > 0 && prodIsFinishedGoodCode(x?.itemCode, x?.itemDesc, x?.sizeUom))
-    .slice(0, 40);
+    .slice(0, 120);
 
   const candidates = [];
   for (const row of baseItems) {
@@ -11173,12 +11173,15 @@ async function productionBuildGanttPlan({ from, to, area, grupo, sizeUom = '__AL
     if (semiRate > 0) unitsPerHour = unitsPerHour > 0 ? Math.min(unitsPerHour, semiRate) : semiRate;
     if (!(unitsPerHour > 0)) unitsPerHour = 1;
 
-    const finishedQtyNeeded = Math.max(0, Math.floor(prodNum(row?.productionAdjusted)));
+    const rawFinishedQtyNeeded = Math.max(0, Math.ceil(prodNum(row?.productionAdjusted)));
     const minBatchQty = Math.max(
       prodNum(plan?.production?.lotBaseQty || 0),
       prodNum(plan?.mrp?.sapLotSize || 0),
       familyKey === 'SAZONADORES' ? 1200 : 0
     );
+    const finishedQtyNeeded = minBatchQty > 0 && rawFinishedQtyNeeded > 0
+      ? Math.ceil(rawFinishedQtyNeeded / minBatchQty) * minBatchQty
+      : rawFinishedQtyNeeded;
 
     const directMaterials = [
       ...(Array.isArray(plan?.requirements?.rawMaterials) ? plan.requirements.rawMaterials : []),
@@ -11235,12 +11238,6 @@ async function productionBuildGanttPlan({ from, to, area, grupo, sizeUom = '__AL
       currentDate = prodMoveToNextWorkday(currentDate);
       currentHourOffset = 0;
     }
-    while (familyDatesUsed.size < prodNum(currentFamilyMeta.minDays)) {
-      calendarSet.add(currentDate);
-      familyDatesUsed.add(currentDate);
-      currentDate = prodMoveToNextWorkday(currentDate);
-      currentHourOffset = 0;
-    }
   };
 
   for (const candidate of candidates) {
@@ -11278,6 +11275,7 @@ async function productionBuildGanttPlan({ from, to, area, grupo, sizeUom = '__AL
         familyKey,
         familyLabel: familyMeta.label,
         neededQty: finishedQtyNeeded,
+        objectiveQty: rawFinishedQtyNeeded,
         possibleQty: 0,
         pendingQty: finishedQtyNeeded,
         mainConstraint: mainConstraint || 'Materia prima insuficiente',
@@ -11346,10 +11344,12 @@ async function productionBuildGanttPlan({ from, to, area, grupo, sizeUom = '__AL
       familyKey,
       familyLabel: familyMeta.label,
       neededQty: finishedQtyNeeded,
+      objectiveQty: rawFinishedQtyNeeded,
       possibleQty,
       blockedQty,
       currentStockQty: prodRound(row?.stockTotal || 0, 3),
       targetStockQty: prodRound(prodNum(row?.stockTotal) + finishedQtyNeeded, 3),
+      targetStockPolicyQty: prodRound(prodNum(row?.stockTotal) + rawFinishedQtyNeeded, 3),
       unitsPerHour: prodRound(unitsPerHour, 2),
       minBatchQty: prodRound(minBatchQty, 2),
       sharedSemiCode: candidate.sharedSemiCode,
@@ -11366,6 +11366,7 @@ async function productionBuildGanttPlan({ from, to, area, grupo, sizeUom = '__AL
         familyKey,
         familyLabel: familyMeta.label,
         neededQty: finishedQtyNeeded,
+        objectiveQty: rawFinishedQtyNeeded,
         possibleQty,
         pendingQty: blockedQty,
         mainConstraint: mainConstraint || 'Materia prima insuficiente',
@@ -12626,7 +12627,7 @@ async function productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom = '_
 
   const baseItems = (Array.isArray(dash?.items) ? dash.items : [])
     .filter((x) => prodNum(x?.productionAdjusted) > 0 && prodIsFinishedGoodCode(x?.itemCode, x?.itemDesc, x?.sizeUom))
-    .slice(0, 40);
+    .slice(0, 120);
 
   const candidates = [];
   for (const row of baseItems) {
@@ -12641,12 +12642,15 @@ async function productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom = '_
     if (semiRate > 0) unitsPerHour = unitsPerHour > 0 ? Math.min(unitsPerHour, semiRate) : semiRate;
     if (!(unitsPerHour > 0)) unitsPerHour = 1;
 
-    const finishedQtyNeeded = Math.max(0, Math.floor(prodNum(row?.productionAdjusted)));
+    const rawFinishedQtyNeeded = Math.max(0, Math.ceil(prodNum(row?.productionAdjusted)));
     const minBatchQty = Math.max(
       prodNum(plan?.production?.lotBaseQty || 0),
       prodNum(plan?.mrp?.sapLotSize || 0),
       familyKey === 'SAZONADORES' ? 1200 : 0
     );
+    const finishedQtyNeeded = minBatchQty > 0 && rawFinishedQtyNeeded > 0
+      ? Math.ceil(rawFinishedQtyNeeded / minBatchQty) * minBatchQty
+      : rawFinishedQtyNeeded;
 
     const directMaterials = [
       ...(Array.isArray(plan?.requirements?.rawMaterials) ? plan.requirements.rawMaterials : []),
@@ -12703,12 +12707,6 @@ async function productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom = '_
       currentDate = prodMoveToNextWorkday(currentDate);
       currentHourOffset = 0;
     }
-    while (familyDatesUsed.size < prodNum(currentFamilyMeta.minDays)) {
-      calendarSet.add(currentDate);
-      familyDatesUsed.add(currentDate);
-      currentDate = prodMoveToNextWorkday(currentDate);
-      currentHourOffset = 0;
-    }
   };
 
   for (const candidate of candidates) {
@@ -12748,6 +12746,7 @@ async function productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom = '_
         familyKey,
         familyLabel: familyMeta.label,
         neededQty: finishedQtyNeeded,
+        objectiveQty: rawFinishedQtyNeeded,
         possibleQty: 0,
         pendingQty: finishedQtyNeeded,
         mainConstraint: mainConstraint || 'Materia prima insuficiente',
@@ -12816,10 +12815,12 @@ async function productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom = '_
       familyKey,
       familyLabel: familyMeta.label,
       neededQty: finishedQtyNeeded,
+      objectiveQty: rawFinishedQtyNeeded,
       possibleQty,
       blockedQty,
       currentStockQty: prodRound(row?.stockTotal || 0, 3),
       targetStockQty: prodRound(prodNum(row?.stockTotal) + finishedQtyNeeded, 3),
+      targetStockPolicyQty: prodRound(prodNum(row?.stockTotal) + rawFinishedQtyNeeded, 3),
       unitsPerHour: prodRound(unitsPerHour, 2),
       minBatchQty: prodRound(minBatchQty, 2),
       sharedSemiCode: candidate.sharedSemiCode,
@@ -12836,6 +12837,7 @@ async function productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom = '_
         familyKey,
         familyLabel: familyMeta.label,
         neededQty: finishedQtyNeeded,
+        objectiveQty: rawFinishedQtyNeeded,
         possibleQty,
         pendingQty: blockedQty,
         mainConstraint: mainConstraint || 'Materia prima insuficiente',
