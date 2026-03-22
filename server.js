@@ -11207,6 +11207,7 @@ async function productionBuildGanttPlan({ from, to, area, grupo, sizeUom = '__AL
       familyKey,
       familyMeta,
       unitsPerHour,
+      rawFinishedQtyNeeded,
       finishedQtyNeeded,
       minBatchQty,
       directMaterials,
@@ -11241,7 +11242,7 @@ async function productionBuildGanttPlan({ from, to, area, grupo, sizeUom = '__AL
   };
 
   for (const candidate of candidates) {
-    const { row, plan, familyKey, familyMeta, unitsPerHour, finishedQtyNeeded, minBatchQty, directMaterials } = candidate;
+    const { row, plan, familyKey, familyMeta, unitsPerHour, rawFinishedQtyNeeded, finishedQtyNeeded, minBatchQty, directMaterials } = candidate;
     if (!(finishedQtyNeeded > 0)) continue;
 
     if (currentFamilyKey && familyKey !== currentFamilyKey) {
@@ -12676,6 +12677,7 @@ async function productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom = '_
       familyKey,
       familyMeta,
       unitsPerHour,
+      rawFinishedQtyNeeded,
       finishedQtyNeeded,
       minBatchQty,
       directMaterials,
@@ -12710,7 +12712,7 @@ async function productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom = '_
   };
 
   for (const candidate of candidates) {
-    const { row, plan, familyKey, familyMeta, unitsPerHour, finishedQtyNeeded, minBatchQty, directMaterials } = candidate;
+    const { row, plan, familyKey, familyMeta, unitsPerHour, rawFinishedQtyNeeded, finishedQtyNeeded, minBatchQty, directMaterials } = candidate;
     if (!(finishedQtyNeeded > 0)) continue;
 
     if (currentFamilyKey && familyKey !== currentFamilyKey) {
