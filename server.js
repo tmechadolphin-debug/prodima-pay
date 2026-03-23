@@ -11148,6 +11148,8 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
   const dayStartHour = PROD_PLAN_DAY_START_HOUR;
   const dayEndHour = PROD_PLAN_DAY_END_HOUR;
   const start = prodPlanNextWorkday(startDate || getDateISOInOffset(TZ_OFFSET_MIN));
+  const planningHorizonDays = Math.max(1, Math.round(planningHorizonMonths * 30));
+  const planEnd = addDaysISO(start, Math.max(0, planningHorizonDays - 1));
   const materialPool = new Map();
   const blockedItems = [];
   const rows = [];
@@ -11399,19 +11401,38 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     }
   }
 
-  const calendarDays = Array.from(calendarSet).sort().map((date) => ({
-    date,
-    label: prodHumanDateShort(date),
-    weekLabel: prodWeekLabelFromDate(date),
-    monthLabel: prodMonthLabelFromDate(date),
-  }));
+  rows.sort((a, b) => {
+    const aTask = Array.isArray(a?.tasks) && a.tasks.length ? a.tasks[0] : null;
+    const bTask = Array.isArray(b?.tasks) && b.tasks.length ? b.tasks[0] : null;
+    const aDate = String(aTask?.date || '9999-12-31');
+    const bDate = String(bTask?.date || '9999-12-31');
+    if (aDate !== bDate) return aDate.localeCompare(bDate);
+    const aStart = String(aTask?.startAt || aTask?.timeLabel || '');
+    const bStart = String(bTask?.startAt || bTask?.timeLabel || '');
+    if (aStart !== bStart) return aStart.localeCompare(bStart);
+    const aLane = String(a?.laneLabel || a?.machineLabel || '');
+    const bLane = String(b?.laneLabel || b?.machineLabel || '');
+    if (aLane !== bLane) return aLane.localeCompare(bLane);
+    return String(a?.itemCode || '').localeCompare(String(b?.itemCode || ''));
+  });
+
+  const calendarDays = [];
+  for (let i = 0; i < planningHorizonDays; i += 1) {
+    const date = addDaysISO(start, i);
+    calendarDays.push({
+      date,
+      label: prodHumanDateShort(date),
+      weekLabel: prodWeekLabelFromDate(date),
+      monthLabel: prodMonthLabelFromDate(date),
+    });
+  }
 
   return {
     ok: true,
     generatedAt: new Date().toISOString(),
     lastSyncAt: await getState('production_last_sync_at'),
-    scenario: { fullMaterials: !!fullMaterials },
-    filters: { from, to, area, grupo, sizeUom, abc, type: typeFilter, q, requestedHorizonMonths: horizonMonths, horizonMonths: planningHorizonMonths, avgMonths: planningAvgMonths, shiftHours: effectiveDayHours },
+    scenario: { fullMaterials: !!fullMaterials, planStart: start, planEnd, planningHorizonDays },
+    filters: { from, to, area, grupo, sizeUom, abc, type: typeFilter, q, requestedHorizonMonths: horizonMonths, horizonMonths: planningHorizonMonths, avgMonths: planningAvgMonths, shiftHours: effectiveDayHours, planningHorizonDays, planStart: start, planEnd },
     workRule: {
       shiftHours: prodRound(effectiveDayHours, 2),
       effectiveHours: prodRound(effectiveDayHours, 2),
