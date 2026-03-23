@@ -9539,14 +9539,16 @@ function prodCalcProductionMetrics({ stockMax = 0, stockTotal = 0, avgMonthlyQty
   const horizonSafe = Math.max(1, Number(horizonMonths || 1));
   const monthlyDemand = projectedQty > 0 ? (projectedQty / horizonSafe) : Number(avgMonthlyQty || 0);
   const demandByHorizon = projectedQty > 0 ? Number(projectedQty || 0) : (monthlyDemand * horizonSafe);
-  const sapTargetByHorizon = Math.max(0, Number(stockMax || 0)) * horizonSafe;
-  const productionNeeded = Math.max(demandByHorizon, sapTargetByHorizon);
+  const endStockTargetQty = Math.max(0, Number(stockMax || 0));
+  const sapTargetByHorizon = endStockTargetQty;
+  const productionNeeded = Math.max(0, demandByHorizon + endStockTargetQty);
   const productionAdjusted = Math.max(0, productionNeeded - Math.max(0, Number(stockTotal || 0)));
   return {
     horizonMonths: horizonSafe,
     monthlyDemand: prodRound(monthlyDemand, 2),
     demandByHorizon: prodRound(demandByHorizon, 2),
     sapTargetByHorizon: prodRound(sapTargetByHorizon, 2),
+    endStockTargetQty: prodRound(endStockTargetQty, 2),
     productionNeeded: prodRound(productionNeeded, 2),
     productionAdjusted: prodRound(productionAdjusted, 2),
   };
@@ -10104,7 +10106,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const coverageMonthsTarget = dashRow ? prodNum(dashRow.coverageMonthsTarget || 1, 1) : 1;
   const coveragePolicyLabel = prodCoverageLabel(coverageMonthsTarget);
 const horizonSafePlan = Math.max(1, Number(horizonMonths || 3));
-const targetInventoryQty = Math.max(0, stockMax) * horizonSafePlan;
+const targetInventoryQty = Math.max(0, stockMax);
 const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
 const autoProdMetrics = prodCalcProductionMetrics({
   stockMax,
@@ -10280,7 +10282,7 @@ const sizeUom = prodExtractSizeUom(itemDesc, sapItem);
       manualPlanQty: prodRound(manualPlanQty, 3),
       planBasis: manualPlanQty > 0 ? "SUBPLAN_COMPONENTE" : "DEMANDA_PROYECTADA",
       maxUnitsToday,
-      practicalRule: `Política vigente: ${coveragePolicyLabel}; producción necesaria = mayor entre demanda del horizonte y máximo SAP multiplicado por horizonte.`,
+      practicalRule: `Política vigente: ${coveragePolicyLabel}; producción necesaria = demanda del horizonte + inventario objetivo para cerrar en stock máximo SAP.`,
     },
     capacity: {
       unitsPerHour: prodRound(rate, 2),
@@ -11138,7 +11140,9 @@ function prodTimeRangeLabelFromProductiveOffsets(startProd = 0, endProd = 0, bas
   return `${prodClockLabelFromOffset(prodClockOffsetFromProductiveOffset(startProd, 'start'), baseHour)} → ${prodClockLabelFromOffset(prodClockOffsetFromProductiveOffset(endProd, 'end'), baseHour)}`;
 }
 async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '__ALL__', abc = '__ALL__', typeFilter = 'Se fabrica en planta', q = '', avgMonths = 0, horizonMonths = 1, shiftHours = 8, startDate = '', fullMaterials = false }) {
-  const dash = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths });
+  const planningHorizonMonths = Math.max(2, Number(horizonMonths || 1));
+  const planningAvgMonths = Math.max(1, Number(avgMonths || planningHorizonMonths || 2));
+  const dash = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths: planningAvgMonths, horizonMonths: planningHorizonMonths });
   const effectiveDayHours = prodPlanEffectiveDayHours(shiftHours);
   const dayStartHour = PROD_PLAN_DAY_START_HOUR;
   const dayEndHour = PROD_PLAN_DAY_END_HOUR;
@@ -11159,7 +11163,7 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
 
   const candidates = [];
   for (const row of baseItems) {
-    const plan = await productionBuildItemPlanCached({ itemCode: row.itemCode, toDate: to, avgMonths, horizonMonths, shiftHours: effectiveDayHours });
+    const plan = await productionBuildItemPlanCached({ itemCode: row.itemCode, toDate: to, avgMonths: planningAvgMonths, horizonMonths: planningHorizonMonths, shiftHours: effectiveDayHours });
     prodPlanMaterialPoolSeed(materialPool, plan?.requirements?.all || [], row.productionAdjusted);
 
     const familyKey = prodPlanFamilyKey(row, plan);
@@ -11406,7 +11410,7 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     generatedAt: new Date().toISOString(),
     lastSyncAt: await getState('production_last_sync_at'),
     scenario: { fullMaterials: !!fullMaterials },
-    filters: { from, to, area, grupo, sizeUom, abc, type: typeFilter, q, horizonMonths, shiftHours: effectiveDayHours },
+    filters: { from, to, area, grupo, sizeUom, abc, type: typeFilter, q, requestedHorizonMonths: horizonMonths, horizonMonths: planningHorizonMonths, avgMonths: planningAvgMonths, shiftHours: effectiveDayHours },
     workRule: {
       shiftHours: prodRound(effectiveDayHours, 2),
       effectiveHours: prodRound(effectiveDayHours, 2),
@@ -11707,7 +11711,7 @@ app.get("/api/admin/production/gantt-plan", verifyAdmin, async (req, res) => {
     const abc = String(req.query?.abc || "__ALL__");
     const typeFilter = String(req.query?.type || req.query?.tipo || "Se fabrica en planta");
     const q = String(req.query?.q || "");
-    const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 1)));
+    const horizonMonths = Math.max(2, Math.min(12, prodNum(req.query?.horizonMonths, 2)));
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
     const shiftHours = Math.max(1, Math.min(24, prodNum(req.query?.shiftHours, 8)));
     const startDate = String(req.query?.startDate || today).slice(0,10);
