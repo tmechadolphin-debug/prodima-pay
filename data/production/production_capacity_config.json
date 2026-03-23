@@ -43,6 +43,7 @@
     }
   },
   "preferredCleaningSource": "FASTEST_AVAILABLE",
+  "minimumRunQty": 600,
   "machineNames": {
     "SAUCES": "Máquina de salsas",
     "CLEANING": "Máquina de limpieza"
