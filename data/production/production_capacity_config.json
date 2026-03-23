@@ -47,5 +47,7 @@
   "machineNames": {
     "SAUCES": "Máquina de salsas",
     "CLEANING": "Máquina de limpieza"
-  }
+  },
+  "ratesMode": "PER_SHIFT",
+  "familyChangeoverHours": 0.25
 }
