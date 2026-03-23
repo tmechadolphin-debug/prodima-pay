@@ -8141,6 +8141,7 @@ function loadProductionLocalData(force = false) {
       }
     },
     preferredCleaningSource: "FASTEST_AVAILABLE",
+    minimumRunQty: 600,
     machineNames: { SAUCES: "Máquina de salsas", CLEANING: "Máquina de limpieza" },
   });
 
@@ -10126,7 +10127,8 @@ const productionNeeded = manualPlanQty > 0 ? manualPlanQty : autoProdMetrics.pro
 const mrpAdjustedQty = manualPlanQty > 0 ? Math.max(0, manualPlanQty - stockTotal) : autoProdMetrics.productionAdjusted;
 const productionAdjusted = mrpAdjustedQty;
 const sapLotSize = Math.max(prodNum(mrp.multipleQty), prodNum(mrp.minOrderQty), 0);
-const lotBaseQty = sapLotSize > 0 ? sapLotSize : 2000;
+const operationalMinRunQty = Math.max(600, prodNum(local?.capacity?.minimumRunQty || local?.capacity?.minimumBatchQty || local?.capacity?.minRunQty || 0));
+const lotBaseQty = sapLotSize > 0 ? sapLotSize : operationalMinRunQty;
 const recommendedLotQty = productionAdjusted > 0 ? Math.ceil(productionAdjusted / Math.max(1, lotBaseQty)) * Math.max(1, lotBaseQty) : 0;
 const sizeUom = prodExtractSizeUom(itemDesc, sapItem);
 
@@ -11113,14 +11115,13 @@ function prodMoveToNextWorkday(dateStr) {
 
 const PROD_PLAN_DAY_START_HOUR = 7;
 const PROD_PLAN_DAY_END_HOUR = 16;
-const PROD_PLAN_FIXED_PRODUCTIVE_HOURS = 8;
-const PROD_PLAN_FAMILY_CHANGEOVER_HOURS = 0.25;
 const PROD_PLAN_BREAKS = [
   { code: 'breakfast', thresholdHours: 2, durationHours: 0.25, label: 'desayuno' },
   { code: 'lunch', thresholdHours: 5, durationHours: 0.75, label: 'almuerzo' },
 ];
 function prodPlanEffectiveDayHours(requestedHours = 8) {
-  return PROD_PLAN_FIXED_PRODUCTIVE_HOURS;
+  const hours = prodRound(prodNum(requestedHours || 8), 2);
+  return Math.max(0.5, Math.min(8, hours || 8));
 }
 function prodPlanLaneKey(familyKey = '', row = {}, plan = null) {
   const fam = String(familyKey || '').toUpperCase();
@@ -11134,6 +11135,20 @@ function prodPlanLaneMeta(laneKey = '') {
     return { key: 'LINEA_LIMPIEZA', label: 'Máquina de productos de limpieza', shortLabel: 'Limpieza', priority: 2 };
   }
   return { key: 'LINEA_SALSAS', label: 'Máquina de salsas', shortLabel: 'Salsas', priority: 3 };
+}
+function prodPlanOperationalMinQty(local = null, plan = null) {
+  const cap = local?.capacity || loadProductionLocalData().capacity || {};
+  const cfgMin = Math.max(0, prodNum(cap?.minimumRunQty || cap?.minimumBatchQty || cap?.minRunQty || 600));
+  const planMin = Math.max(0, prodNum(plan?.production?.lotBaseQty || 0), prodNum(plan?.mrp?.sapLotSize || 0));
+  return Math.max(600, cfgMin, planMin);
+}
+function prodPlanShouldDeferSmallTopUp({ row = {}, plan = null, minBatchQty = 600 }) {
+  const stockTotal = Math.max(0, prodNum(row?.stockTotal || row?.currentStockQty || plan?.inventory?.total || 0));
+  const stockMin = Math.max(0, prodNum(row?.stockMin || plan?.inventory?.stockMin || 0));
+  const rawNeed = Math.max(0, Math.ceil(prodNum(row?.productionAdjusted || plan?.production?.mrpAdjustedQty || plan?.production?.adjustedQty || 0)));
+  const isBelowMin = stockTotal + 0.0001 < stockMin;
+  const isZeroStock = stockTotal <= 0.0001;
+  return !isBelowMin && !isZeroStock && rawNeed > 0 && rawNeed < Math.max(1, prodNum(minBatchQty || 600));
 }
 function prodClockOffsetFromProductiveOffset(productiveHours = 0, edge = 'end') {
   const hours = Math.max(0, prodNum(productiveHours));
@@ -11161,8 +11176,10 @@ function prodTimeRangeLabelFromProductiveOffsets(startProd = 0, endProd = 0, bas
 async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '__ALL__', abc = '__ALL__', typeFilter = 'Se fabrica en planta', q = '', avgMonths = 0, horizonMonths = 1, shiftHours = 8, startDate = '', fullMaterials = false }) {
   const planningHorizonMonths = Math.max(1, Number(horizonMonths || 1));
   const planningAvgMonths = Math.max(1, Number(avgMonths || planningHorizonMonths || 2));
+  const localPlanData = loadProductionLocalData();
+  const configuredShiftHours = prodNum(localPlanData?.capacity?.shiftHours || 8, 8);
   const dash = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths: planningAvgMonths, horizonMonths: planningHorizonMonths });
-  const effectiveDayHours = prodPlanEffectiveDayHours(shiftHours);
+  const effectiveDayHours = prodPlanEffectiveDayHours(configuredShiftHours || shiftHours);
   const dayStartHour = PROD_PLAN_DAY_START_HOUR;
   const dayEndHour = PROD_PLAN_DAY_END_HOUR;
   const start = prodPlanNextWorkday(startDate || getDateISOInOffset(TZ_OFFSET_MIN));
@@ -11198,11 +11215,10 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     if (!(unitsPerHour > 0)) unitsPerHour = 1;
 
     const rawFinishedQtyNeeded = Math.max(0, Math.ceil(prodNum(row?.productionAdjusted)));
-    const minBatchQty = Math.max(
-      prodNum(plan?.production?.lotBaseQty || 0),
-      prodNum(plan?.mrp?.sapLotSize || 0),
-      familyKey === 'SAZONADORES' ? 1200 : 0
-    );
+    const minBatchQty = prodPlanOperationalMinQty(localPlanData, plan);
+    if (prodPlanShouldDeferSmallTopUp({ row, plan, minBatchQty })) {
+      continue;
+    }
     const finishedQtyNeeded = minBatchQty > 0 && rawFinishedQtyNeeded > 0
       ? Math.ceil(rawFinishedQtyNeeded / minBatchQty) * minBatchQty
       : rawFinishedQtyNeeded;
@@ -11278,16 +11294,9 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     if (!(finishedQtyNeeded > 0)) continue;
 
     const laneState = getLaneState(laneKey, laneMeta);
-    if (laneState.currentFamilyKey && familyKey !== laneState.currentFamilyKey) {
-      const changeoverHours = PROD_PLAN_FAMILY_CHANGEOVER_HOURS;
-      if (changeoverHours > 0) {
-        if (laneState.currentHourOffset + changeoverHours > effectiveDayHours - 0.0001) {
-          laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
-          laneState.currentHourOffset = 0;
-        } else {
-          laneState.currentHourOffset = prodRound(laneState.currentHourOffset + changeoverHours, 4);
-        }
-      }
+    if (laneState.currentFamilyKey && familyKey !== laneState.currentFamilyKey && laneState.currentHourOffset > 0.0001) {
+      laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
+      laneState.currentHourOffset = 0;
     }
     if (familyKey !== laneState.currentFamilyKey) {
       laneState.currentFamilyKey = familyKey;
@@ -11332,19 +11341,12 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
 
     const tasks = [];
     let qtyRemaining = possibleQty;
-    let hoursRemaining = possibleQty / unitsPerHour;
     let cumulativeProduced = 0;
+    const dayRunQty = Math.max(minBatchQty, Math.floor(unitsPerHour * effectiveDayHours));
 
-    while (hoursRemaining > 0.0001) {
-      if (laneState.currentHourOffset >= effectiveDayHours - 0.0001) {
-        laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
-        laneState.currentHourOffset = 0;
-      }
-      const availableHours = Math.max(0, effectiveDayHours - laneState.currentHourOffset);
-      const takeHours = Math.min(availableHours, hoursRemaining);
-      const qtySlice = Math.min(qtyRemaining, takeHours * unitsPerHour);
-      const startOffset = laneState.currentHourOffset;
-      const endOffset = laneState.currentHourOffset + takeHours;
+    while (qtyRemaining > 0.0001 && String(laneState.currentDate || '') <= String(planEnd || '9999-12-31')) {
+      const qtySlice = Math.min(qtyRemaining, dayRunQty);
+      const productiveHoursUsed = Math.max(0.01, Math.min(effectiveDayHours, qtySlice / unitsPerHour));
       const startStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
       cumulativeProduced += qtySlice;
       const endStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
@@ -11357,11 +11359,12 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
         weekLabel: prodWeekLabelFromDate(taskDate),
         monthLabel: prodMonthLabelFromDate(taskDate),
         qty: prodRound(qtySlice, 2),
-        hours: prodRound(takeHours, 2),
-        startAt: prodIsoDateTimeByProductiveOffset(taskDate, startOffset, dayStartHour, 'start'),
-        endAt: prodIsoDateTimeByProductiveOffset(taskDate, endOffset, dayStartHour, 'end'),
-        timeLabel: prodTimeRangeLabelFromProductiveOffsets(startOffset, endOffset, dayStartHour),
-        fillPct: prodRound((takeHours / effectiveDayHours) * 100, 1),
+        hours: prodRound(effectiveDayHours, 2),
+        productiveHours: prodRound(productiveHoursUsed, 2),
+        startAt: `${String(taskDate).slice(0,10)}T07:00:00`,
+        endAt: `${String(taskDate).slice(0,10)}T16:00:00`,
+        timeLabel: '07:00 → 16:00',
+        fillPct: 100,
         stockStartQty: startStockQty,
         stockEndQty: endStockQty,
         laneKey,
@@ -11370,20 +11373,16 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
       tasks.push(task);
 
       qtyRemaining = Math.max(0, qtyRemaining - qtySlice);
-      hoursRemaining = Math.max(0, hoursRemaining - takeHours);
-      laneState.currentHourOffset += takeHours;
-      if (laneState.currentHourOffset >= effectiveDayHours - 0.0001) {
-        laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
-        laneState.currentHourOffset = 0;
-      }
+      laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
+      laneState.currentHourOffset = 0;
     }
 
-    totalScheduledHours += possibleQty / unitsPerHour;
+    totalScheduledHours += tasks.length * effectiveDayHours;
     if (!fullMaterials) {
       await prodPlanConsumePoolDeep(plan, possibleQty, materialPool, 0, [prodNormalizeItemCodeLoose(row.itemCode)]);
     }
 
-    const blockedQty = Math.max(0, finishedQtyNeeded - possibleQty);
+    const blockedQty = Math.max(0, finishedQtyNeeded - possibleQty + Math.max(0, qtyRemaining || 0));
     rows.push({
       itemCode: row.itemCode,
       itemDesc: row.itemDesc,
@@ -11471,7 +11470,7 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
       breakfastHours: 0.25,
       lunchHours: 0.75,
       label: `Jornada fija 07:00–16:00 · ${prodRound(effectiveDayHours,2)} h productivas`,
-      breaksLabel: '15 min de desayuno + 45 min de almuerzo · cambio de familia 15 min cuando aplique',
+      breaksLabel: '15 min de desayuno + 45 min de almuerzo',
       lanes: [
         prodPlanLaneMeta('LINEA_SALSAS'),
         prodPlanLaneMeta('LINEA_LIMPIEZA'),
