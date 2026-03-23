@@ -8105,8 +8105,36 @@ function loadProductionLocalData(force = false) {
     shiftHours: 8,
     workdays: [1, 2, 3, 4, 5],
     allowSaturday: true,
-    defaultRates: { SAUCES: 700, CLEANING: 650 },
+    defaultRates: { SAUCES: 2160, CLEANING: 1800 },
     itemRates: { "68328": 666.67 },
+    sizeRates: {
+      SAUCES: {
+        "24": 2160,
+        "10.5": 4800,
+        "5.5": 9600,
+        "8": 6600,
+        "16": 3360,
+        "32": 1680,
+        "TETRAPACK": 848
+      },
+      CLEANING_400: {
+        "16": 3240,
+        "29": 1800,
+        "20": 2640,
+        "500ML": 2760,
+        "500G": 48
+      },
+      CLEANING_BATH_250: {
+        "29": 1140,
+        "20": 1728
+      },
+      CLEANING_REFILL: {
+        "800ML": 2640,
+        "450ML": 4800,
+        "3.1L": 720
+      }
+    },
+    preferredCleaningSource: "FASTEST_AVAILABLE",
     machineNames: { SAUCES: "Máquina de salsas", CLEANING: "Máquina de limpieza" },
   });
 
@@ -8121,6 +8149,70 @@ function prodMachineFromAreaOrGroup(area, grupo, itemMeta = null) {
   if (a === "RCI") return "CLEANING";
   if (g.includes("sazon") || g.includes("vinagr") || g.includes("especial") || g.includes("gmt")) return "SAUCES";
   return "CLEANING";
+}
+function prodNormalizeCapacityKey(sizeUom = "", description = "") {
+  const sizeRaw = String(sizeUom || "").trim().toUpperCase().replace(/\s+/g, "");
+  const desc = prodNorm(description);
+  if (/(tetrapack|tetra pak|tetra)/i.test(String(description || "")) || desc.includes('tetrapack')) return 'TETRAPACK';
+  if (sizeRaw === '3.1' || sizeRaw === '3.1L' || sizeRaw === '3100' || sizeRaw === '3100ML') return '3.1L';
+  if (sizeRaw in {'24':1,'10.5':1,'5.5':1,'8':1,'16':1,'20':1,'29':1,'32':1}) return sizeRaw;
+  if (sizeRaw in {'450':1,'450ML':1}) return '450ML';
+  if (sizeRaw in {'500':1,'500ML':1}) {
+    if (/(\b500\s*g\b|500 g|gram)/i.test(String(description || ''))) return '500G';
+    return '500ML';
+  }
+  if (sizeRaw in {'800':1,'800ML':1}) return '800ML';
+  if (sizeRaw in {'1GAL':1,'1':1}) return '1GAL';
+  if (/\b450\s*ml\b/i.test(String(description || ''))) return '450ML';
+  if (/\b500\s*ml\b/i.test(String(description || ''))) return '500ML';
+  if (/\b500\s*g\b/i.test(String(description || ''))) return '500G';
+  if (/\b800\s*ml\b/i.test(String(description || ''))) return '800ML';
+  if (/\b3(?:[\.,]1)?\s*l\b/i.test(String(description || ''))) return '3.1L';
+  return sizeRaw || '';
+}
+function prodResolveUnitsPerHour({ machine = '', itemCode = '', itemDesc = '', sizeUom = '', capacity = null }) {
+  const cap = capacity || loadProductionLocalData().capacity || {};
+  const itemRates = cap?.itemRates || {};
+  const defaultRates = cap?.defaultRates || {};
+  const sizeRates = cap?.sizeRates || {};
+  const code = String(itemCode || '').trim();
+  if (code && prodNum(itemRates[code]) > 0) {
+    return { rate: prodNum(itemRates[code]), source: `item:${code}` };
+  }
+
+  const key = prodNormalizeCapacityKey(sizeUom, itemDesc);
+  const desc = prodNorm(itemDesc);
+  const machineKey = String(machine || '').toUpperCase();
+
+  if (machineKey === 'SAUCES') {
+    const rate = prodNum(sizeRates?.SAUCES?.[key] || defaultRates?.SAUCES || 0);
+    return { rate, source: sizeRates?.SAUCES?.[key] ? `SAUCES:${key}` : 'SAUCES:DEFAULT' };
+  }
+
+  if (machineKey === 'CLEANING') {
+    const isRefill = /(refil|refill)/i.test(itemDesc || '') || desc.includes('refil') || desc.includes('refill');
+    const isBath = /(bano|baño)/i.test(itemDesc || '') || desc.includes('bano');
+    const candidates = [];
+    const pushCandidate = (source, value) => {
+      const rate = prodNum(value);
+      if (rate > 0) candidates.push({ source, rate });
+    };
+
+    if (isRefill) pushCandidate(`CLEANING_REFILL:${key}`, sizeRates?.CLEANING_REFILL?.[key]);
+    if (isBath) pushCandidate(`CLEANING_BATH_250:${key}`, sizeRates?.CLEANING_BATH_250?.[key]);
+    pushCandidate(`CLEANING_400:${key}`, sizeRates?.CLEANING_400?.[key]);
+
+    if (candidates.length) {
+      const best = candidates.sort((a, b) => b.rate - a.rate)[0];
+      return best;
+    }
+
+    const rate = prodNum(defaultRates?.CLEANING || 0);
+    return { rate, source: 'CLEANING:DEFAULT' };
+  }
+
+  const rate = prodNum(defaultRates?.[machineKey] || 0);
+  return { rate, source: `${machineKey || 'UNKNOWN'}:DEFAULT` };
 }
 function prodApplyMrp(need, minOrder, multiple) {
   let out = Math.max(0, prodNum(need));
@@ -9430,14 +9522,16 @@ function prodExtractSizeUom(description = "", item = null) {
   const txt = prodNorm(src);
   const patterns = [
     /\b(5\.5|10\.5|12|16|20|24|29|32)\s*(?:oz|onz|onz\.|onzas?)\b/i,
-    /\b(355|473|591|710|800|946|1000|3785)\s*ml\b/i,
+    /\b(450|500|355|473|591|710|800|946|1000|3785)\s*ml\b/i,
+    /\b(3(?:[\.,]1)?)\s*l\b/i,
     /\b(1)\s*gal\b/i,
   ];
   for (const rx of patterns) {
     const m = src.match(rx);
-    if (m) return String(m[1] || "").trim();
+    if (m) return String(m[1] || "").replace(',', '.').trim();
   }
-  const loose = txt.match(/\b(5\.5|10\.5|12|16|20|24|29|32|355|473|591|710|800|946|1000|3785)\b/);
+  if (/tetrapack|tetra pak|tetra/i.test(src)) return 'TETRAPACK';
+  const loose = txt.match(/\b(5\.5|10\.5|12|16|20|24|29|32|450|500|355|473|591|710|800|946|1000|3785|3\.1)\b/);
   return loose ? String(loose[1] || "").trim() : "";
 }
 
@@ -9742,7 +9836,8 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '
     const sizeUom = prodExtractSizeUom(it.itemDesc, sapItemForMeta);
     const sapLotSize = Math.max(prodNum(it.multipleQty), prodNum(it.minOrderQty), 0);
 
-    const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
+    const rateInfo = prodResolveUnitsPerHour({ machine, itemCode: it.itemCode, itemDesc: it.itemDesc, sizeUom, capacity: local.capacity });
+    const rate = prodNum(rateInfo?.rate || 0);
     const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
 
     return {
@@ -10099,7 +10194,8 @@ const sizeUom = prodExtractSizeUom(itemDesc, sapItem);
   const resources = Array.isArray(requirementPack?.resources) ? requirementPack.resources : [];
   const bottlenecks = Array.isArray(requirementPack?.bottlenecks) ? requirementPack.bottlenecks : [];
 
-  const rate = prodNum(local.capacity?.itemRates?.[code] || local.capacity?.defaultRates?.[machine] || 0);
+  const rateInfo = prodResolveUnitsPerHour({ machine, itemCode: code, itemDesc, sizeUom, capacity: local.capacity });
+  const rate = prodNum(rateInfo?.rate || 0);
   const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
   const planStart = addDaysISO(end, 1);
   const planEnd = addDaysISO(prodAddMonthsISO(planStart, Math.max(1, Number(horizonMonths || 3))), -1);
@@ -10188,6 +10284,7 @@ const sizeUom = prodExtractSizeUom(itemDesc, sapItem);
     },
     capacity: {
       unitsPerHour: prodRound(rate, 2),
+      rateSource: String(rateInfo?.source || ''),
       hoursNeeded: prodRound(hoursNeeded, 2),
       hoursSource: rate > 0 ? "config_local_fallback" : "sin_fuente_sap",
       shiftHours: shiftHoursSafe,
