@@ -11113,13 +11113,14 @@ function prodMoveToNextWorkday(dateStr) {
 
 const PROD_PLAN_DAY_START_HOUR = 7;
 const PROD_PLAN_DAY_END_HOUR = 16;
+const PROD_PLAN_FIXED_PRODUCTIVE_HOURS = 8;
+const PROD_PLAN_FAMILY_CHANGEOVER_HOURS = 0.25;
 const PROD_PLAN_BREAKS = [
   { code: 'breakfast', thresholdHours: 2, durationHours: 0.25, label: 'desayuno' },
   { code: 'lunch', thresholdHours: 5, durationHours: 0.75, label: 'almuerzo' },
 ];
 function prodPlanEffectiveDayHours(requestedHours = 8) {
-  const hours = prodRound(prodNum(requestedHours || 8), 2);
-  return Math.max(0.5, Math.min(8, hours || 8));
+  return PROD_PLAN_FIXED_PRODUCTIVE_HOURS;
 }
 function prodPlanLaneKey(familyKey = '', row = {}, plan = null) {
   const fam = String(familyKey || '').toUpperCase();
@@ -11277,9 +11278,16 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     if (!(finishedQtyNeeded > 0)) continue;
 
     const laneState = getLaneState(laneKey, laneMeta);
-    if (laneState.currentFamilyKey && familyKey !== laneState.currentFamilyKey && laneState.currentHourOffset > 0.0001) {
-      laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
-      laneState.currentHourOffset = 0;
+    if (laneState.currentFamilyKey && familyKey !== laneState.currentFamilyKey) {
+      const changeoverHours = PROD_PLAN_FAMILY_CHANGEOVER_HOURS;
+      if (changeoverHours > 0) {
+        if (laneState.currentHourOffset + changeoverHours > effectiveDayHours - 0.0001) {
+          laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
+          laneState.currentHourOffset = 0;
+        } else {
+          laneState.currentHourOffset = prodRound(laneState.currentHourOffset + changeoverHours, 4);
+        }
+      }
     }
     if (familyKey !== laneState.currentFamilyKey) {
       laneState.currentFamilyKey = familyKey;
@@ -11462,8 +11470,8 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
       breaksHours: 1,
       breakfastHours: 0.25,
       lunchHours: 0.75,
-      label: `Jornada 07:00–16:00 · ${prodRound(effectiveDayHours,2)} h productivas`,
-      breaksLabel: '15 min de desayuno + 45 min de almuerzo',
+      label: `Jornada fija 07:00–16:00 · ${prodRound(effectiveDayHours,2)} h productivas`,
+      breaksLabel: '15 min de desayuno + 45 min de almuerzo · cambio de familia 15 min cuando aplique',
       lanes: [
         prodPlanLaneMeta('LINEA_SALSAS'),
         prodPlanLaneMeta('LINEA_LIMPIEZA'),
