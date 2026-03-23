@@ -9,18 +9,42 @@
   ],
   "allowSaturday": true,
   "defaultRates": {
-    "SAUCES": 700,
-    "CLEANING": 650
+    "SAUCES": 2160,
+    "CLEANING": 1800
   },
   "itemRates": {
     "68328": 666.67
   },
+  "sizeRates": {
+    "SAUCES": {
+      "24": 2160,
+      "10.5": 4800,
+      "5.5": 9600,
+      "8": 6600,
+      "16": 3360,
+      "32": 1680,
+      "TETRAPACK": 848
+    },
+    "CLEANING_400": {
+      "16": 3240,
+      "29": 1800,
+      "20": 2640,
+      "500ML": 2760,
+      "500G": 48
+    },
+    "CLEANING_BATH_250": {
+      "29": 1140,
+      "20": 1728
+    },
+    "CLEANING_REFILL": {
+      "800ML": 2640,
+      "450ML": 4800,
+      "3.1L": 720
+    }
+  },
+  "preferredCleaningSource": "FASTEST_AVAILABLE",
   "machineNames": {
     "SAUCES": "Máquina de salsas",
     "CLEANING": "Máquina de limpieza"
-  },
-  "notes": {
-    "68328": "Ejemplo entregado por el usuario: 2000 unidades en 3 horas",
-    "_general": "Ajusta este archivo con tus velocidades reales por código para planes más precisos."
   }
 }
