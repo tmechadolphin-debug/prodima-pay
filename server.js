@@ -8067,6 +8067,12 @@ function prodSetSimulationCached(params, data) {
 function prodClearSimulationCache() {
   PROD_SIMULATION_CACHE.clear();
 }
+function prodClearProductionRuntimeCaches() {
+  PROD_ITEM_RUNTIME_CACHE.clear();
+  PROD_ORDERS_RUNTIME_CACHE.clear();
+  PROD_BOM_RUNTIME_CACHE.clear();
+  PROD_PLAN_RUNTIME_CACHE.clear();
+}
 
 function prodNum(v, def = 0) {
   const n = Number(v);
@@ -11038,6 +11044,17 @@ function prodAbcPriority(v = "") {
   if (t.startsWith("C")) return 2;
   return 1;
 }
+function prodUrgentFinishedPriority(row = {}) {
+  const abc = prodAbcPriority(row?.totalLabel || row?.abc || '');
+  const stockTotal = Math.max(0, prodNum(row?.stockTotal || row?.currentStockQty || 0));
+  const stockMin = Math.max(0, prodNum(row?.stockMin || 0));
+  const productionAdjusted = Math.max(0, prodNum(row?.productionAdjusted || row?.neededQty || 0));
+  const gapVsMin = Math.max(0, stockMin - stockTotal);
+  const gapVsDemand = Math.max(0, productionAdjusted - stockTotal);
+  const zeroStockBoost = stockTotal <= 0.0001 ? 250000 : 0;
+  const abBoost = abc >= 3 ? 120000 : abc >= 2 ? 40000 : 0;
+  return zeroStockBoost + abBoost + (gapVsMin * 100) + gapVsDemand;
+}
 function prodIsFinishedGoodCode(code = "", desc = "", sizeUom = "") {
   const c = String(code || "").trim().toUpperCase();
   const d = String(desc || "").toLowerCase();
@@ -11148,7 +11165,7 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
   const dayStartHour = PROD_PLAN_DAY_START_HOUR;
   const dayEndHour = PROD_PLAN_DAY_END_HOUR;
   const start = prodPlanNextWorkday(startDate || getDateISOInOffset(TZ_OFFSET_MIN));
-  const planningHorizonDays = Math.max(1, Math.round(planningHorizonMonths * 30));
+  const planningHorizonDays = Math.max(30, Math.round(planningHorizonMonths * 30));
   const planEnd = addDaysISO(start, Math.max(0, planningHorizonDays - 1));
   const materialPool = new Map();
   const blockedItems = [];
@@ -11226,12 +11243,16 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
   candidates.sort((a, b) => {
     const lane = prodNum(b?.laneMeta?.priority) - prodNum(a?.laneMeta?.priority);
     if (lane) return lane;
-    const fam = prodNum(b?.familyMeta?.priority) - prodNum(a?.familyMeta?.priority);
-    if (fam) return fam;
-    const s = prodSizeSortValue(b?.row?.sizeUom) - prodSizeSortValue(a?.row?.sizeUom);
-    if (s) return s;
+    const urgent = prodUrgentFinishedPriority(b?.row) - prodUrgentFinishedPriority(a?.row);
+    if (urgent) return urgent;
     const ab = prodAbcPriority(b?.row?.totalLabel) - prodAbcPriority(a?.row?.totalLabel);
     if (ab) return ab;
+    const fam = prodNum(b?.familyMeta?.priority) - prodNum(a?.familyMeta?.priority);
+    if (fam) return fam;
+    const deficit = prodNum(b?.row?.productionAdjusted) - prodNum(a?.row?.productionAdjusted);
+    if (deficit) return deficit;
+    const s = prodSizeSortValue(b?.row?.sizeUom) - prodSizeSortValue(a?.row?.sizeUom);
+    if (s) return s;
     const p = prodNum(b?.finishedQtyNeeded) - prodNum(a?.finishedQtyNeeded);
     if (p) return p;
     return prodNum(b?.row?.revenue) - prodNum(a?.row?.revenue);
@@ -11859,6 +11880,7 @@ async function handleProductionSync(req, res) {
     await setState("production_last_sync_at", new Date().toISOString());
     prodClearDashboardCache();
     prodClearSimulationCache();
+    prodClearProductionRuntimeCaches();
 
     return safeJson(res, 200, {
       ok: true,
