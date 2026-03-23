@@ -8021,53 +8021,6 @@ function prodClearDashboardCache() {
   PROD_DASHBOARD_CACHE.clear();
 }
 
-const PROD_SIMULATION_CACHE = new Map();
-const PROD_SIMULATION_CACHE_TTL_MS = Math.max(30000, Number(process.env.PROD_SIMULATION_CACHE_TTL_MS || 300000));
-
-function prodSimulationClone(value) {
-  return (typeof structuredClone === "function")
-    ? structuredClone(value)
-    : JSON.parse(JSON.stringify(value));
-}
-function prodSimulationCacheKey(params) {
-  return JSON.stringify({
-    from: String(params?.from || ""),
-    to: String(params?.to || ""),
-    area: String(params?.area || "__ALL__"),
-    grupo: prodParseMultiValue(params?.grupo),
-    sizeUom: String(params?.sizeUom || "__ALL__"),
-    abc: String(params?.abc || "__ALL__"),
-    type: prodNormalizeTypeFilter(params?.typeFilter || params?.type || "Se fabrica en planta"),
-    q: String(params?.q || "").trim().toLowerCase(),
-    avgMonths: Math.max(1, Number(params?.avgMonths || params?.horizonMonths || 3)),
-    horizonMonths: Math.max(1, Number(params?.horizonMonths || 3)),
-    shiftHours: Math.max(1, Number(params?.shiftHours || 8)),
-    itemCodes: Array.from(new Set((Array.isArray(params?.itemCodes) ? params.itemCodes : [])
-      .map((x) => String(x || "").trim())
-      .filter(Boolean)
-      .map((x) => prodNormalizeItemCodeLoose(x))
-    )).sort(),
-    maxDepth: Math.max(1, Number(params?.maxDepth || 3)),
-  });
-}
-function prodGetSimulationCached(params) {
-  const key = prodSimulationCacheKey(params);
-  const row = PROD_SIMULATION_CACHE.get(key);
-  if (!row) return null;
-  if ((Date.now() - row.ts) > PROD_SIMULATION_CACHE_TTL_MS) {
-    PROD_SIMULATION_CACHE.delete(key);
-    return null;
-  }
-  return prodSimulationClone(row.data);
-}
-function prodSetSimulationCached(params, data) {
-  const key = prodSimulationCacheKey(params);
-  PROD_SIMULATION_CACHE.set(key, { ts: Date.now(), data: prodSimulationClone(data) });
-}
-function prodClearSimulationCache() {
-  PROD_SIMULATION_CACHE.clear();
-}
-
 function prodNum(v, def = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
@@ -8105,36 +8058,8 @@ function loadProductionLocalData(force = false) {
     shiftHours: 8,
     workdays: [1, 2, 3, 4, 5],
     allowSaturday: true,
-    defaultRates: { SAUCES: 2160, CLEANING: 1800 },
+    defaultRates: { SAUCES: 700, CLEANING: 650 },
     itemRates: { "68328": 666.67 },
-    sizeRates: {
-      SAUCES: {
-        "24": 2160,
-        "10.5": 4800,
-        "5.5": 9600,
-        "8": 6600,
-        "16": 3360,
-        "32": 1680,
-        "TETRAPACK": 848
-      },
-      CLEANING_400: {
-        "16": 3240,
-        "29": 1800,
-        "20": 2640,
-        "500ML": 2760,
-        "500G": 48
-      },
-      CLEANING_BATH_250: {
-        "29": 1140,
-        "20": 1728
-      },
-      CLEANING_REFILL: {
-        "800ML": 2640,
-        "450ML": 4800,
-        "3.1L": 720
-      }
-    },
-    preferredCleaningSource: "FASTEST_AVAILABLE",
     machineNames: { SAUCES: "Máquina de salsas", CLEANING: "Máquina de limpieza" },
   });
 
@@ -8149,70 +8074,6 @@ function prodMachineFromAreaOrGroup(area, grupo, itemMeta = null) {
   if (a === "RCI") return "CLEANING";
   if (g.includes("sazon") || g.includes("vinagr") || g.includes("especial") || g.includes("gmt")) return "SAUCES";
   return "CLEANING";
-}
-function prodNormalizeCapacityKey(sizeUom = "", description = "") {
-  const sizeRaw = String(sizeUom || "").trim().toUpperCase().replace(/\s+/g, "");
-  const desc = prodNorm(description);
-  if (/(tetrapack|tetra pak|tetra)/i.test(String(description || "")) || desc.includes('tetrapack')) return 'TETRAPACK';
-  if (sizeRaw === '3.1' || sizeRaw === '3.1L' || sizeRaw === '3100' || sizeRaw === '3100ML') return '3.1L';
-  if (sizeRaw in {'24':1,'10.5':1,'5.5':1,'8':1,'16':1,'20':1,'29':1,'32':1}) return sizeRaw;
-  if (sizeRaw in {'450':1,'450ML':1}) return '450ML';
-  if (sizeRaw in {'500':1,'500ML':1}) {
-    if (/(\b500\s*g\b|500 g|gram)/i.test(String(description || ''))) return '500G';
-    return '500ML';
-  }
-  if (sizeRaw in {'800':1,'800ML':1}) return '800ML';
-  if (sizeRaw in {'1GAL':1,'1':1}) return '1GAL';
-  if (/\b450\s*ml\b/i.test(String(description || ''))) return '450ML';
-  if (/\b500\s*ml\b/i.test(String(description || ''))) return '500ML';
-  if (/\b500\s*g\b/i.test(String(description || ''))) return '500G';
-  if (/\b800\s*ml\b/i.test(String(description || ''))) return '800ML';
-  if (/\b3(?:[\.,]1)?\s*l\b/i.test(String(description || ''))) return '3.1L';
-  return sizeRaw || '';
-}
-function prodResolveUnitsPerHour({ machine = '', itemCode = '', itemDesc = '', sizeUom = '', capacity = null }) {
-  const cap = capacity || loadProductionLocalData().capacity || {};
-  const itemRates = cap?.itemRates || {};
-  const defaultRates = cap?.defaultRates || {};
-  const sizeRates = cap?.sizeRates || {};
-  const code = String(itemCode || '').trim();
-  if (code && prodNum(itemRates[code]) > 0) {
-    return { rate: prodNum(itemRates[code]), source: `item:${code}` };
-  }
-
-  const key = prodNormalizeCapacityKey(sizeUom, itemDesc);
-  const desc = prodNorm(itemDesc);
-  const machineKey = String(machine || '').toUpperCase();
-
-  if (machineKey === 'SAUCES') {
-    const rate = prodNum(sizeRates?.SAUCES?.[key] || defaultRates?.SAUCES || 0);
-    return { rate, source: sizeRates?.SAUCES?.[key] ? `SAUCES:${key}` : 'SAUCES:DEFAULT' };
-  }
-
-  if (machineKey === 'CLEANING') {
-    const isRefill = /(refil|refill)/i.test(itemDesc || '') || desc.includes('refil') || desc.includes('refill');
-    const isBath = /(bano|baño)/i.test(itemDesc || '') || desc.includes('bano');
-    const candidates = [];
-    const pushCandidate = (source, value) => {
-      const rate = prodNum(value);
-      if (rate > 0) candidates.push({ source, rate });
-    };
-
-    if (isRefill) pushCandidate(`CLEANING_REFILL:${key}`, sizeRates?.CLEANING_REFILL?.[key]);
-    if (isBath) pushCandidate(`CLEANING_BATH_250:${key}`, sizeRates?.CLEANING_BATH_250?.[key]);
-    pushCandidate(`CLEANING_400:${key}`, sizeRates?.CLEANING_400?.[key]);
-
-    if (candidates.length) {
-      const best = candidates.sort((a, b) => b.rate - a.rate)[0];
-      return best;
-    }
-
-    const rate = prodNum(defaultRates?.CLEANING || 0);
-    return { rate, source: 'CLEANING:DEFAULT' };
-  }
-
-  const rate = prodNum(defaultRates?.[machineKey] || 0);
-  return { rate, source: `${machineKey || 'UNKNOWN'}:DEFAULT` };
 }
 function prodApplyMrp(need, minOrder, multiple) {
   let out = Math.max(0, prodNum(need));
@@ -9176,8 +9037,6 @@ async function prodBuildRequirementsFromSapBom({ itemCode, adjustedQty, sapBom }
         cost: prodRound(prodExtractWeightedCostFromItem(item), 4),
         status: isResource ? "OK" : (shortage > 0 ? "FALTANTE" : "OK"),
         componentType,
-        procurementMethod: String(item?.ProcurementMethod || item?.IssueMethod || "").trim(),
-        procurementMethodLabel: prodProcurementMethodLabel(String(item?.ProcurementMethod || item?.IssueMethod || "").trim()),
         warehouse: current.warehouse || "",
         bomQtyBase: prodRound(current.quantity, 6),
         perUnitQty: prodRound(perUnit, 6),
@@ -9522,16 +9381,14 @@ function prodExtractSizeUom(description = "", item = null) {
   const txt = prodNorm(src);
   const patterns = [
     /\b(5\.5|10\.5|12|16|20|24|29|32)\s*(?:oz|onz|onz\.|onzas?)\b/i,
-    /\b(450|500|355|473|591|710|800|946|1000|3785)\s*ml\b/i,
-    /\b(3(?:[\.,]1)?)\s*l\b/i,
+    /\b(355|473|591|710|800|946|1000|3785)\s*ml\b/i,
     /\b(1)\s*gal\b/i,
   ];
   for (const rx of patterns) {
     const m = src.match(rx);
-    if (m) return String(m[1] || "").replace(',', '.').trim();
+    if (m) return String(m[1] || "").trim();
   }
-  if (/tetrapack|tetra pak|tetra/i.test(src)) return 'TETRAPACK';
-  const loose = txt.match(/\b(5\.5|10\.5|12|16|20|24|29|32|450|500|355|473|591|710|800|946|1000|3785|3\.1)\b/);
+  const loose = txt.match(/\b(5\.5|10\.5|12|16|20|24|29|32|355|473|591|710|800|946|1000|3785)\b/);
   return loose ? String(loose[1] || "").trim() : "";
 }
 
@@ -9539,16 +9396,14 @@ function prodCalcProductionMetrics({ stockMax = 0, stockTotal = 0, avgMonthlyQty
   const horizonSafe = Math.max(1, Number(horizonMonths || 1));
   const monthlyDemand = projectedQty > 0 ? (projectedQty / horizonSafe) : Number(avgMonthlyQty || 0);
   const demandByHorizon = projectedQty > 0 ? Number(projectedQty || 0) : (monthlyDemand * horizonSafe);
-  const endStockTargetQty = Math.max(0, Number(stockMax || 0));
-  const sapTargetByHorizon = endStockTargetQty;
-  const productionNeeded = Math.max(0, demandByHorizon + endStockTargetQty);
+  const sapTargetByHorizon = Math.max(0, Number(stockMax || 0)) * horizonSafe;
+  const productionNeeded = Math.max(demandByHorizon, sapTargetByHorizon);
   const productionAdjusted = Math.max(0, productionNeeded - Math.max(0, Number(stockTotal || 0)));
   return {
     horizonMonths: horizonSafe,
     monthlyDemand: prodRound(monthlyDemand, 2),
     demandByHorizon: prodRound(demandByHorizon, 2),
     sapTargetByHorizon: prodRound(sapTargetByHorizon, 2),
-    endStockTargetQty: prodRound(endStockTargetQty, 2),
     productionNeeded: prodRound(productionNeeded, 2),
     productionAdjusted: prodRound(productionAdjusted, 2),
   };
@@ -9838,8 +9693,7 @@ async function productionDashboardFromDb({ from, to, area, grupo, q, sizeUom = '
     const sizeUom = prodExtractSizeUom(it.itemDesc, sapItemForMeta);
     const sapLotSize = Math.max(prodNum(it.multipleQty), prodNum(it.minOrderQty), 0);
 
-    const rateInfo = prodResolveUnitsPerHour({ machine, itemCode: it.itemCode, itemDesc: it.itemDesc, sizeUom, capacity: local.capacity });
-    const rate = prodNum(rateInfo?.rate || 0);
+    const rate = prodNum(local.capacity?.itemRates?.[it.itemCode] || local.capacity?.defaultRates?.[machine] || 0);
     const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
 
     return {
@@ -10106,7 +9960,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const coverageMonthsTarget = dashRow ? prodNum(dashRow.coverageMonthsTarget || 1, 1) : 1;
   const coveragePolicyLabel = prodCoverageLabel(coverageMonthsTarget);
 const horizonSafePlan = Math.max(1, Number(horizonMonths || 3));
-const targetInventoryQty = Math.max(0, stockMax);
+const targetInventoryQty = Math.max(0, stockMax) * horizonSafePlan;
 const manualPlanQty = Math.max(0, prodNum(plannedQtyOverride));
 const autoProdMetrics = prodCalcProductionMetrics({
   stockMax,
@@ -10196,11 +10050,12 @@ const sizeUom = prodExtractSizeUom(itemDesc, sapItem);
   const resources = Array.isArray(requirementPack?.resources) ? requirementPack.resources : [];
   const bottlenecks = Array.isArray(requirementPack?.bottlenecks) ? requirementPack.bottlenecks : [];
 
-  const rateInfo = prodResolveUnitsPerHour({ machine, itemCode: code, itemDesc, sizeUom, capacity: local.capacity });
-  const rate = prodNum(rateInfo?.rate || 0);
+  const rate = prodNum(local.capacity?.itemRates?.[code] || local.capacity?.defaultRates?.[machine] || 0);
   const hoursNeeded = rate > 0 ? productionAdjusted / rate : 0;
   const planStart = addDaysISO(end, 1);
-  const planEnd = addDaysISO(prodAddMonthsISO(planStart, Math.max(1, Number(horizonMonths || 3))), -1);
+  const horizonPlanDays = Math.max(1, Math.round(Math.max(1, Number(horizonMonths || 3)) * 30));
+  const planEnd = addDaysISO(planStart, Math.max(0, horizonPlanDays - 1));
+  const calendarDays = horizonPlanDays;
   const businessDays = prodCountDays(planStart, planEnd, local.capacity?.workdays || [1, 2, 3, 4, 5]);
   const saturdays = prodCountSaturdays(planStart, planEnd);
   const shiftHoursSafe = prodNum(shiftHours || local.capacity?.shiftHours || 8, 8);
@@ -10242,6 +10097,7 @@ const sizeUom = prodExtractSizeUom(itemDesc, sapItem);
       endDate: end,
       avgMonths: Math.max(1, Number(avgMonths || horizonMonths || 5)),
       horizonMonths: Math.max(1, Number(horizonMonths || 3)),
+      planDays: calendarDays,
       planStart,
       planEnd
     },
@@ -10282,14 +10138,14 @@ const sizeUom = prodExtractSizeUom(itemDesc, sapItem);
       manualPlanQty: prodRound(manualPlanQty, 3),
       planBasis: manualPlanQty > 0 ? "SUBPLAN_COMPONENTE" : "DEMANDA_PROYECTADA",
       maxUnitsToday,
-      practicalRule: `Política vigente: ${coveragePolicyLabel}; producción necesaria = demanda del horizonte + inventario objetivo para cerrar en stock máximo SAP.`,
+      practicalRule: `Política vigente: ${coveragePolicyLabel}; producción necesaria = mayor entre demanda del horizonte y máximo SAP multiplicado por horizonte.`,
     },
     capacity: {
       unitsPerHour: prodRound(rate, 2),
-      rateSource: String(rateInfo?.source || ''),
       hoursNeeded: prodRound(hoursNeeded, 2),
       hoursSource: rate > 0 ? "config_local_fallback" : "sin_fuente_sap",
       shiftHours: shiftHoursSafe,
+      calendarDays,
       businessDays,
       saturdays,
       singleCapHours: prodRound(singleCapHours, 2),
@@ -10480,313 +10336,6 @@ async function productionBuildItemPlanCached(params = {}) {
   return plan;
 }
 
-
-async function prodBuildSimulationNode({
-  itemCode,
-  plannedQty = 0,
-  toDate,
-  avgMonths = 5,
-  horizonMonths = 3,
-  shiftHours = 8,
-  depth = 0,
-  maxDepth = 3,
-  trail = [],
-}) {
-  const code = String(itemCode || "").trim();
-  if (!code) throw new Error("Falta itemCode en simulación");
-
-  const qtyToPlan = Math.max(0, prodNum(plannedQty));
-  const plan = await productionBuildItemPlanCached({
-    itemCode: code,
-    toDate,
-    avgMonths,
-    horizonMonths,
-    shiftHours,
-    plannedQtyOverride: qtyToPlan,
-  });
-
-  const pathKeys = new Set((Array.isArray(trail) ? trail : []).map((x) => prodNormalizeItemCodeLoose(x)).filter(Boolean));
-  pathKeys.add(prodNormalizeItemCodeLoose(code));
-
-  const baseMaterials = [
-    ...(Array.isArray(plan?.requirements?.rawMaterials) ? plan.requirements.rawMaterials : []),
-    ...(Array.isArray(plan?.requirements?.packaging) ? plan.requirements.packaging : []),
-  ]
-    .map((x) => ({ ...x }))
-    .sort((a, b) =>
-      prodNum(b?.shortageQty) - prodNum(a?.shortageQty) ||
-      prodNum(b?.requiredQty) - prodNum(a?.requiredQty) ||
-      String(a?.description || "").localeCompare(String(b?.description || ""))
-    );
-
-  const resources = (Array.isArray(plan?.requirements?.resources) ? plan.requirements.resources : [])
-    .map((x) => ({
-      code: String(x?.code || "").trim(),
-      description: String(x?.description || "").trim(),
-      requiredQty: prodRound(x?.requiredQty, 3),
-      unit: String(x?.unit || "").trim(),
-      status: String(x?.status || "OK"),
-      componentType: String(x?.componentType || "RESOURCE"),
-      isResource: true,
-    }))
-    .sort((a, b) => prodNum(b?.requiredQty) - prodNum(a?.requiredQty));
-
-  const materials = [];
-  for (const row of baseMaterials) {
-    const componentCode = String(row?.code || "").trim();
-    const subPlanQty = Math.max(
-      prodNum(row?.shortageQty),
-      prodNum(row?.subPlanQty),
-      prodNum(row?.requiredQty)
-    );
-
-    const materialNode = {
-      code: componentCode,
-      description: String(row?.description || "").trim(),
-      requiredQty: prodRound(row?.requiredQty, 3),
-      stockQty: prodRound(row?.stockQty, 3),
-      shortageQty: prodRound(row?.shortageQty, 3),
-      unit: String(row?.unit || "").trim(),
-      supplier: String(row?.supplier || "").trim(),
-      status: String(row?.status || (prodNum(row?.shortageQty) > 0 ? "FALTANTE" : "OK")),
-      componentType: String(row?.componentType || ""),
-      procurementMethodLabel: "",
-      canExpand: false,
-      child: null,
-      cycleBlocked: false,
-      plannedQtyForChild: prodRound(subPlanQty, 3),
-    };
-
-    const cycleKey = prodNormalizeItemCodeLoose(componentCode);
-    const shouldTryExpand =
-      depth < Math.max(1, Number(maxDepth || 3)) &&
-      !!componentCode &&
-      subPlanQty > 0 &&
-      !pathKeys.has(cycleKey) &&
-      String(materialNode.componentType || "").toUpperCase() !== "RESOURCE";
-
-    if (shouldTryExpand) {
-      try {
-        const subPlan = await productionBuildItemPlanCached({
-          itemCode: componentCode,
-          toDate,
-          avgMonths,
-          horizonMonths,
-          shiftHours,
-          plannedQtyOverride: subPlanQty,
-        });
-
-        const procurementMethodLabel =
-          String(subPlan?.mrp?.procurementMethodLabel || "") ||
-          prodProcurementMethodLabel(String(subPlan?.mrp?.procurementMethod || ""));
-        materialNode.procurementMethodLabel = procurementMethodLabel;
-
-        const hasNestedRequirements = (
-          Array.isArray(subPlan?.requirements?.rawMaterials) && subPlan.requirements.rawMaterials.length
-        ) || (
-          Array.isArray(subPlan?.requirements?.packaging) && subPlan.requirements.packaging.length
-        ) || (
-          Array.isArray(subPlan?.requirements?.resources) && subPlan.requirements.resources.length
-        );
-
-        if (procurementMethodLabel === "Se fabrica en planta" && hasNestedRequirements) {
-          materialNode.canExpand = true;
-          materialNode.child = await prodBuildSimulationNode({
-            itemCode: componentCode,
-            plannedQty: subPlanQty,
-            toDate,
-            avgMonths,
-            horizonMonths,
-            shiftHours,
-            depth: depth + 1,
-            maxDepth,
-            trail: [...trail, code],
-          });
-        }
-      } catch (_err) {}
-    } else if (componentCode && pathKeys.has(cycleKey)) {
-      materialNode.cycleBlocked = true;
-    }
-
-    materials.push(materialNode);
-  }
-
-  const shortageMaterials = materials.filter((x) => prodNum(x?.shortageQty) > 0);
-  const totalShortageQty = shortageMaterials.reduce((acc, x) => acc + prodNum(x?.shortageQty), 0);
-
-  return {
-    nodeType: "ITEM",
-    depth,
-    itemCode: plan.itemCode,
-    itemDesc: plan.itemDesc,
-    grupo: plan.grupo,
-    area: plan.area,
-    machine: plan.machine,
-    machineLabel: plan?.capacity?.machineLabel || plan.machine,
-    procurementMethodLabel: String(plan?.mrp?.procurementMethodLabel || plan?.procurementMethodLabel || ""),
-    plannedQty: prodRound(qtyToPlan > 0 ? qtyToPlan : (plan?.production?.adjustedQty || plan?.production?.neededQty || 0), 3),
-    stockTotal: prodRound(plan?.inventory?.total || 0, 3),
-    neededQty: prodRound(plan?.production?.neededQty || 0, 3),
-    adjustedQty: prodRound(plan?.production?.adjustedQty || 0, 3),
-    recommendedLotQty: prodRound(plan?.production?.recommendedLotQty || 0, 3),
-    hoursNeeded: prodRound(plan?.capacity?.hoursNeeded || 0, 3),
-    unitsPerHour: prodRound(plan?.capacity?.unitsPerHour || 0, 3),
-    materials,
-    resources,
-    summary: {
-      materialsCount: materials.length,
-      shortageMaterialsCount: shortageMaterials.length,
-      totalShortageQty: prodRound(totalShortageQty, 3),
-      resourcesCount: resources.length,
-    },
-  };
-}
-
-function prodAccumulateSimulationSummaryNode(node, acc, depth = 0) {
-  if (!node || typeof node !== "object") return;
-  const countsAsFinished = depth === 0 && prodIsFinishedGoodCode(node?.itemCode, node?.itemDesc, node?.sizeUom || "");
-  if (countsAsFinished) {
-    acc.totalHours += prodNum(node?.hoursNeeded);
-    acc.totalPlannedQty += prodNum(node?.plannedQty);
-    acc.finishedItemsCount += 1;
-    for (const res of Array.isArray(node?.resources) ? node.resources : []) {
-      const key = String(res?.code || res?.description || "").trim();
-      if (key) acc.resourceSet.add(key);
-    }
-  }
-
-  for (const mat of Array.isArray(node?.materials) ? node.materials : []) {
-    const key = String(mat?.code || mat?.description || "").trim();
-    if (key) acc.materialSet.add(key);
-    if (prodNum(mat?.shortageQty) > 0) {
-      acc.shortageMaterialsCount += 1;
-      acc.totalShortageQty += prodNum(mat?.shortageQty);
-      if (key) acc.shortageMaterialSet.add(key);
-    }
-    if (mat?.child) prodAccumulateSimulationSummaryNode(mat.child, acc, depth + 1);
-  }
-}
-
-async function productionBuildSimulationTree({
-  from,
-  to,
-  area,
-  grupo,
-  sizeUom = "__ALL__",
-  abc = "__ALL__",
-  typeFilter = "Se fabrica en planta",
-  q = "",
-  avgMonths = 3,
-  horizonMonths = 3,
-  shiftHours = 8,
-  itemCodes = [],
-  maxDepth = 3,
-}) {
-  const normalizedCodes = Array.from(new Set((Array.isArray(itemCodes) ? itemCodes : [])
-    .map((x) => String(x || "").trim())
-    .filter(Boolean)
-    .map((x) => prodNormalizeItemCodeLoose(x))
-  ));
-
-  if (!normalizedCodes.length) {
-    throw new Error("Selecciona al menos un artículo para simular");
-  }
-
-  const dash = await productionDashboardFromDb({
-    from,
-    to,
-    area,
-    grupo,
-    sizeUom,
-    abc,
-    typeFilter,
-    q,
-    avgMonths,
-    horizonMonths,
-  });
-
-  const itemMap = new Map(
-    (Array.isArray(dash?.items) ? dash.items : []).map((x) => [prodNormalizeItemCodeLoose(x?.itemCode), x])
-  );
-
-  const selectedItems = normalizedCodes
-    .map((code) => itemMap.get(code))
-    .filter(Boolean)
-    .slice(0, 15);
-
-  if (!selectedItems.length) {
-    throw new Error("Los artículos seleccionados no están dentro del filtro actual del dashboard");
-  }
-
-  const tree = [];
-  for (const row of selectedItems) {
-    const plannedQty = Math.max(prodNum(row?.productionAdjusted), prodNum(row?.productionNeeded));
-    const node = await prodBuildSimulationNode({
-      itemCode: row.itemCode,
-      plannedQty,
-      toDate: to,
-      avgMonths,
-      horizonMonths,
-      shiftHours,
-      depth: 0,
-      maxDepth: Math.max(1, Number(maxDepth || 3)),
-      trail: [],
-    });
-    tree.push(node);
-  }
-
-  const acc = {
-    totalHours: 0,
-    totalPlannedQty: 0,
-    finishedItemsCount: 0,
-    shortageMaterialsCount: 0,
-    totalShortageQty: 0,
-    materialSet: new Set(),
-    shortageMaterialSet: new Set(),
-    resourceSet: new Set(),
-  };
-  for (const node of tree) prodAccumulateSimulationSummaryNode(node, acc);
-
-  return {
-    ok: true,
-    generatedAt: new Date().toISOString(),
-    lastSyncAt: await getState("production_last_sync_at"),
-    filters: {
-      from, to, area: String(area || "__ALL__"), grupo: String(grupo || "__ALL__"),
-      sizeUom: String(sizeUom || "__ALL__"), abc: String(abc || "__ALL__"),
-      type: prodNormalizeTypeFilter(typeFilter || "Se fabrica en planta"),
-      q: String(q || ""),
-      avgMonths: Math.max(1, Number(avgMonths || horizonMonths || 3)),
-      horizonMonths: Math.max(1, Number(horizonMonths || 3)),
-      shiftHours: Math.max(1, Number(shiftHours || 8)),
-      maxDepth: Math.max(1, Number(maxDepth || 3)),
-    },
-    selectedItems: selectedItems.map((x) => ({
-      itemCode: x.itemCode,
-      itemDesc: x.itemDesc,
-      grupo: x.grupo,
-      area: x.area,
-      productionNeeded: prodRound(x.productionNeeded, 3),
-      productionAdjusted: prodRound(x.productionAdjusted, 3),
-      stockTotal: prodRound(x.stockTotal, 3),
-      hoursNeeded: prodRound(x.hoursNeeded, 3),
-      machine: x.machine,
-    })),
-    summary: {
-      selectedItems: acc.finishedItemsCount || tree.length,
-      totalPlannedQty: prodRound(acc.totalPlannedQty, 3),
-      totalHours: prodRound(acc.totalHours, 3),
-      uniqueMaterials: acc.materialSet.size,
-      uniqueMissingMaterials: acc.shortageMaterialSet.size,
-      shortageMaterialsCount: acc.shortageMaterialsCount,
-      totalShortageQty: prodRound(acc.totalShortageQty, 3),
-      uniqueResources: acc.resourceSet.size,
-    },
-    tree,
-  };
-}
-
-
 function prodBuildUrgentAbStockItems(items) {
   return (Array.isArray(items) ? items : [])
     .filter((x) => String(x?.totalLabel || "").startsWith("AB") && prodNum(x?.stockMin) > 0 && prodNum(x?.stockTotal) < prodNum(x?.stockMin))
@@ -10869,7 +10418,7 @@ function prodAiCompactPlan(plan) {
       estado: String(x?.status || ''),
     }))
     .sort((a, b) => prodNum(b.faltante) - prodNum(a.faltante) || prodNum(b.requerido) - prodNum(a.requerido))
-    .slice(0, 120);
+    .slice(0, 40);
 
   const totalFaltanteMateriales = materialRows.reduce((acc, x) => acc + prodNum(x.faltante), 0);
   const componentesConFaltante = materialRows.filter((x) => prodNum(x.faltante) > 0).length;
@@ -11025,574 +10574,6 @@ ${JSON.stringify(input)}` }],
   return { answer, model };
 }
 
-
-function prodSizeSortValue(v = "") {
-  const txt = String(v == null ? "" : v).replace(',', '.').trim();
-  const n = Number.parseFloat(txt);
-  return Number.isFinite(n) ? n : -1;
-}
-function prodAbcPriority(v = "") {
-  const t = String(v || "");
-  if (t.startsWith("AB")) return 3;
-  if (t.startsWith("C")) return 2;
-  return 1;
-}
-function prodIsFinishedGoodCode(code = "", desc = "", sizeUom = "") {
-  const c = String(code || "").trim().toUpperCase();
-  const d = String(desc || "").toLowerCase();
-  const s = String(sizeUom || "").trim();
-  if (/^\d{3,6}(?:-[A-Z0-9]+)?$/.test(c)) return true;
-  if (s && s !== "__ALL__" && s !== "S/Tamaño" && /^\d+(?:[.,]\d+)?(?:\s?[a-zA-Z]+)?$/.test(s)) return true;
-  if (/\b\d+(?:[.,]\d+)?\s?(oz|onz|ml|lt|l|gal)\b/i.test(d) && !/(semi|semielab|liquido base|líquido base|granel)/i.test(d)) return true;
-  return false;
-}
-function prodMonthLabelFromDate(dateStr) {
-  const d = new Date(`${String(dateStr || "").slice(0,10)}T00:00:00`);
-  if (Number.isNaN(d.getTime())) return "Mes";
-  return d.toLocaleDateString("es-PA", { month: "short", year: "numeric" });
-}
-function prodPlanFamilyKey(row = {}, plan = null) {
-  const src = `${row?.area || ""} ${row?.grupo || ""} ${row?.machine || ""} ${row?.itemDesc || ""} ${plan?.itemDesc || ""}`.toLowerCase();
-  if (/(pisc|pool|cloro|hipoclor|algic|alguic)/i.test(src)) return "PISCINA";
-  if (/(limp|multi cleaner|deterg|lavanda|suavizante|planchado|bano|baño|bath|clean)/i.test(src)) return "LIMPIEZA";
-  return "SAZONADORES";
-}
-function prodPlanFamilyMeta(key = "") {
-  const k = String(key || "").toUpperCase();
-  if (k === "LIMPIEZA") return { key: "LIMPIEZA", label: "Productos de limpieza", minDays: 3, priority: 2 };
-  if (k === "PISCINA") return { key: "PISCINA", label: "Químicos de piscina", minDays: 3, priority: 1 };
-  return { key: "SAZONADORES", label: "Sazonadores y salsas", minDays: 2, priority: 3 };
-}
-function prodWeekLabelFromDate(dateStr) {
-  const d = new Date(`${String(dateStr || '').slice(0,10)}T00:00:00`);
-  if (Number.isNaN(d.getTime())) return "Semana";
-  const start = new Date(d);
-  const day = start.getDay() || 7;
-  start.setDate(start.getDate() - day + 1);
-  const end = new Date(start);
-  end.setDate(end.getDate() + 4);
-  const fmt = (x) => `${String(x.getDate()).padStart(2,'0')}/${String(x.getMonth()+1).padStart(2,'0')}`;
-  return `Sem ${fmt(start)}-${fmt(end)}`;
-}
-function prodPlanNextWorkday(dateStr) {
-  let d = new Date(`${String(dateStr || getDateISOInOffset(TZ_OFFSET_MIN)).slice(0,10)}T00:00:00`);
-  if (Number.isNaN(d.getTime())) d = new Date(`${getDateISOInOffset(TZ_OFFSET_MIN)}T00:00:00`);
-  while ([0,6].includes(d.getDay())) d.setDate(d.getDate() + 1);
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-}
-function prodIsoDateTime(dateStr, hoursFloat, baseHour = 7) {
-  const totalMinutes = Math.round((Number(hoursFloat || 0) + baseHour) * 60);
-  const hh = Math.floor(totalMinutes / 60);
-  const mm = totalMinutes % 60;
-  return `${String(dateStr || '').slice(0,10)}T${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:00`;
-}
-function prodMoveToNextWorkday(dateStr) {
-  const d = new Date(`${String(dateStr || '').slice(0,10)}T00:00:00`);
-  d.setDate(d.getDate() + 1);
-  while ([0,6].includes(d.getDay())) d.setDate(d.getDate() + 1);
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-}
-
-const PROD_PLAN_DAY_START_HOUR = 7;
-const PROD_PLAN_DAY_END_HOUR = 16;
-const PROD_PLAN_BREAKS = [
-  { code: 'breakfast', thresholdHours: 2, durationHours: 0.25, label: 'desayuno' },
-  { code: 'lunch', thresholdHours: 5, durationHours: 0.75, label: 'almuerzo' },
-];
-function prodPlanEffectiveDayHours(requestedHours = 8) {
-  const hours = prodRound(prodNum(requestedHours || 8), 2);
-  return Math.max(0.5, Math.min(8, hours || 8));
-}
-function prodPlanLaneKey(familyKey = '', row = {}, plan = null) {
-  const fam = String(familyKey || '').toUpperCase();
-  const src = `${row?.machine || ''} ${row?.area || ''} ${row?.grupo || ''} ${row?.itemDesc || ''} ${plan?.itemDesc || ''}`.toLowerCase();
-  if (fam === 'SAZONADORES' || /(salsa|sazon|vinagre|condiment|food|alimento)/i.test(src)) return 'LINEA_SALSAS';
-  return 'LINEA_LIMPIEZA';
-}
-function prodPlanLaneMeta(laneKey = '') {
-  const k = String(laneKey || '').toUpperCase();
-  if (k === 'LINEA_LIMPIEZA') {
-    return { key: 'LINEA_LIMPIEZA', label: 'Máquina de productos de limpieza', shortLabel: 'Limpieza', priority: 2 };
-  }
-  return { key: 'LINEA_SALSAS', label: 'Máquina de salsas', shortLabel: 'Salsas', priority: 3 };
-}
-function prodClockOffsetFromProductiveOffset(productiveHours = 0, edge = 'end') {
-  const hours = Math.max(0, prodNum(productiveHours));
-  let offset = hours;
-  for (const br of PROD_PLAN_BREAKS) {
-    const threshold = prodNum(br?.thresholdHours);
-    const duration = Math.max(0, prodNum(br?.durationHours));
-    const shouldApply = edge === 'start' ? hours >= threshold - 0.0001 : hours > threshold + 0.0001;
-    if (shouldApply) offset += duration;
-  }
-  return prodRound(offset, 4);
-}
-function prodClockLabelFromOffset(clockOffset = 0, baseHour = PROD_PLAN_DAY_START_HOUR) {
-  const totalMinutes = Math.round((prodNum(baseHour) + prodNum(clockOffset)) * 60);
-  const hh = Math.floor(totalMinutes / 60);
-  const mm = totalMinutes % 60;
-  return `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
-}
-function prodIsoDateTimeByProductiveOffset(dateStr, productiveOffset = 0, baseHour = PROD_PLAN_DAY_START_HOUR, edge = 'end') {
-  return prodIsoDateTime(dateStr, prodClockOffsetFromProductiveOffset(productiveOffset, edge), baseHour);
-}
-function prodTimeRangeLabelFromProductiveOffsets(startProd = 0, endProd = 0, baseHour = PROD_PLAN_DAY_START_HOUR) {
-  return `${prodClockLabelFromOffset(prodClockOffsetFromProductiveOffset(startProd, 'start'), baseHour)} → ${prodClockLabelFromOffset(prodClockOffsetFromProductiveOffset(endProd, 'end'), baseHour)}`;
-}
-async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '__ALL__', abc = '__ALL__', typeFilter = 'Se fabrica en planta', q = '', avgMonths = 0, horizonMonths = 1, shiftHours = 8, startDate = '', fullMaterials = false }) {
-  const planningHorizonMonths = Math.max(2, Number(horizonMonths || 1));
-  const planningAvgMonths = Math.max(1, Number(avgMonths || planningHorizonMonths || 2));
-  const dash = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths: planningAvgMonths, horizonMonths: planningHorizonMonths });
-  const effectiveDayHours = prodPlanEffectiveDayHours(shiftHours);
-  const dayStartHour = PROD_PLAN_DAY_START_HOUR;
-  const dayEndHour = PROD_PLAN_DAY_END_HOUR;
-  const start = prodPlanNextWorkday(startDate || getDateISOInOffset(TZ_OFFSET_MIN));
-  const materialPool = new Map();
-  const blockedItems = [];
-  const rows = [];
-  const calendarSet = new Set();
-  const laneStates = new Map();
-  let totalNeededQty = 0;
-  let totalPossibleQty = 0;
-  let totalBlockedQty = 0;
-  let totalScheduledHours = 0;
-
-  const baseItems = (Array.isArray(dash?.items) ? dash.items : [])
-    .filter((x) => prodNum(x?.productionAdjusted) > 0 && prodIsFinishedGoodCode(x?.itemCode, x?.itemDesc, x?.sizeUom))
-    .slice(0, 180);
-
-  const candidates = [];
-  for (const row of baseItems) {
-    const plan = await productionBuildItemPlanCached({ itemCode: row.itemCode, toDate: to, avgMonths: planningAvgMonths, horizonMonths: planningHorizonMonths, shiftHours: effectiveDayHours });
-    prodPlanMaterialPoolSeed(materialPool, plan?.requirements?.all || [], row.productionAdjusted);
-
-    const familyKey = prodPlanFamilyKey(row, plan);
-    const familyMeta = prodPlanFamilyMeta(familyKey);
-    const laneKey = prodPlanLaneKey(familyKey, row, plan);
-    const laneMeta = prodPlanLaneMeta(laneKey);
-    const litersPerUnit = prodNum(plan?.production?.litersPerUnit);
-    const semiRate = String(row.itemCode || '') === '68243' ? 728 : (litersPerUnit > 0 ? 946.353 / litersPerUnit : 0);
-    let unitsPerHour = Math.max(0, prodNum(plan?.capacity?.unitsPerHour || row?.unitsPerHour));
-    if (semiRate > 0) unitsPerHour = unitsPerHour > 0 ? Math.min(unitsPerHour, semiRate) : semiRate;
-    if (!(unitsPerHour > 0)) unitsPerHour = 1;
-
-    const rawFinishedQtyNeeded = Math.max(0, Math.ceil(prodNum(row?.productionAdjusted)));
-    const minBatchQty = Math.max(
-      prodNum(plan?.production?.lotBaseQty || 0),
-      prodNum(plan?.mrp?.sapLotSize || 0),
-      familyKey === 'SAZONADORES' ? 1200 : 0
-    );
-    const finishedQtyNeeded = minBatchQty > 0 && rawFinishedQtyNeeded > 0
-      ? Math.ceil(rawFinishedQtyNeeded / minBatchQty) * minBatchQty
-      : rawFinishedQtyNeeded;
-
-    const directMaterials = [
-      ...(Array.isArray(plan?.requirements?.rawMaterials) ? plan.requirements.rawMaterials : []),
-      ...(Array.isArray(plan?.requirements?.packaging) ? plan.requirements.packaging : [])
-    ]
-      .map((x) => ({
-        code: String(x?.code || '').trim(),
-        description: String(x?.description || '').trim(),
-        requiredQty: prodRound(x?.requiredQty, 3),
-        stockQty: prodRound(x?.stockQty, 3),
-        shortageQty: prodRound(x?.shortageQty, 3),
-        unit: String(x?.unit || '').trim(),
-        supplier: String(x?.supplier || '').trim(),
-        procurementMethodLabel: String(x?.procurementMethodLabel || ''),
-        componentType: String(x?.componentType || ''),
-      }))
-      .sort((a, b) => prodNum(b?.shortageQty) - prodNum(a?.shortageQty) || prodNum(b?.requiredQty) - prodNum(a?.requiredQty))
-      .slice(0, 14);
-
-    candidates.push({
-      row,
-      plan,
-      familyKey,
-      familyMeta,
-      laneKey,
-      laneMeta,
-      unitsPerHour,
-      rawFinishedQtyNeeded,
-      finishedQtyNeeded,
-      minBatchQty,
-      directMaterials,
-      sharedSemiCode: String((Array.isArray(plan?.requirements?.all) ? plan.requirements.all : []).find((x) => String(x?.procurementMethodLabel || '') === 'Se fabrica en planta')?.code || '').trim(),
-    });
-  }
-
-  candidates.sort((a, b) => {
-    const lane = prodNum(b?.laneMeta?.priority) - prodNum(a?.laneMeta?.priority);
-    if (lane) return lane;
-    const fam = prodNum(b?.familyMeta?.priority) - prodNum(a?.familyMeta?.priority);
-    if (fam) return fam;
-    const s = prodSizeSortValue(b?.row?.sizeUom) - prodSizeSortValue(a?.row?.sizeUom);
-    if (s) return s;
-    const ab = prodAbcPriority(b?.row?.totalLabel) - prodAbcPriority(a?.row?.totalLabel);
-    if (ab) return ab;
-    const p = prodNum(b?.finishedQtyNeeded) - prodNum(a?.finishedQtyNeeded);
-    if (p) return p;
-    return prodNum(b?.row?.revenue) - prodNum(a?.row?.revenue);
-  });
-
-  const getLaneState = (laneKey, laneMeta) => {
-    if (!laneStates.has(laneKey)) {
-      laneStates.set(laneKey, {
-        laneKey,
-        laneMeta,
-        currentDate: start,
-        currentHourOffset: 0,
-        currentFamilyKey: '',
-        currentFamilyMeta: null,
-      });
-    }
-    return laneStates.get(laneKey);
-  };
-
-  for (const candidate of candidates) {
-    const { row, plan, familyKey, familyMeta, laneKey, laneMeta, unitsPerHour, rawFinishedQtyNeeded, finishedQtyNeeded, minBatchQty, directMaterials } = candidate;
-    if (!(finishedQtyNeeded > 0)) continue;
-
-    const laneState = getLaneState(laneKey, laneMeta);
-    if (laneState.currentFamilyKey && familyKey !== laneState.currentFamilyKey && laneState.currentHourOffset > 0.0001) {
-      laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
-      laneState.currentHourOffset = 0;
-    }
-    if (familyKey !== laneState.currentFamilyKey) {
-      laneState.currentFamilyKey = familyKey;
-      laneState.currentFamilyMeta = familyMeta;
-    }
-
-    const possibleInfo = fullMaterials
-      ? { possibleQty: finishedQtyNeeded, mainConstraint: '', assumedFullMaterials: true }
-      : await prodPlanPossibleQtyFromPoolDeep(plan, finishedQtyNeeded, materialPool, 0, [prodNormalizeItemCodeLoose(row.itemCode)]);
-    let possibleQty = prodNum(possibleInfo?.possibleQty);
-    const mainConstraint = String(possibleInfo?.mainConstraint || '');
-
-    if (minBatchQty > 0) {
-      possibleQty = possibleQty >= minBatchQty ? Math.floor(possibleQty / minBatchQty) * minBatchQty : 0;
-    }
-    possibleQty = Math.max(0, Math.min(finishedQtyNeeded, Math.floor(possibleQty)));
-
-    totalNeededQty += finishedQtyNeeded;
-    totalPossibleQty += possibleQty;
-    totalBlockedQty += Math.max(0, finishedQtyNeeded - possibleQty);
-
-    if (!(possibleQty > 0)) {
-      blockedItems.push({
-        itemCode: row.itemCode,
-        itemDesc: row.itemDesc,
-        sizeUom: row.sizeUom,
-        abc: row.totalLabel,
-        familyKey,
-        familyLabel: familyMeta.label,
-        laneKey,
-        laneLabel: laneMeta.label,
-        neededQty: finishedQtyNeeded,
-        objectiveQty: rawFinishedQtyNeeded,
-        possibleQty: 0,
-        pendingQty: finishedQtyNeeded,
-        mainConstraint: mainConstraint || 'Materia prima insuficiente',
-        currentStockQty: prodRound(row?.stockTotal || 0, 3),
-        materials: directMaterials,
-      });
-      continue;
-    }
-
-    const tasks = [];
-    let qtyRemaining = possibleQty;
-    let hoursRemaining = possibleQty / unitsPerHour;
-    let cumulativeProduced = 0;
-
-    while (hoursRemaining > 0.0001) {
-      if (laneState.currentHourOffset >= effectiveDayHours - 0.0001) {
-        laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
-        laneState.currentHourOffset = 0;
-      }
-      const availableHours = Math.max(0, effectiveDayHours - laneState.currentHourOffset);
-      const takeHours = Math.min(availableHours, hoursRemaining);
-      const qtySlice = Math.min(qtyRemaining, takeHours * unitsPerHour);
-      const startOffset = laneState.currentHourOffset;
-      const endOffset = laneState.currentHourOffset + takeHours;
-      const startStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
-      cumulativeProduced += qtySlice;
-      const endStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
-      const taskDate = laneState.currentDate;
-      calendarSet.add(taskDate);
-
-      const task = {
-        taskId: `${row.itemCode}_${laneKey}_${taskDate}_${tasks.length + 1}`,
-        date: taskDate,
-        weekLabel: prodWeekLabelFromDate(taskDate),
-        monthLabel: prodMonthLabelFromDate(taskDate),
-        qty: prodRound(qtySlice, 2),
-        hours: prodRound(takeHours, 2),
-        startAt: prodIsoDateTimeByProductiveOffset(taskDate, startOffset, dayStartHour, 'start'),
-        endAt: prodIsoDateTimeByProductiveOffset(taskDate, endOffset, dayStartHour, 'end'),
-        timeLabel: prodTimeRangeLabelFromProductiveOffsets(startOffset, endOffset, dayStartHour),
-        fillPct: prodRound((takeHours / effectiveDayHours) * 100, 1),
-        stockStartQty: startStockQty,
-        stockEndQty: endStockQty,
-        laneKey,
-        laneLabel: laneMeta.label,
-      };
-      tasks.push(task);
-
-      qtyRemaining = Math.max(0, qtyRemaining - qtySlice);
-      hoursRemaining = Math.max(0, hoursRemaining - takeHours);
-      laneState.currentHourOffset += takeHours;
-      if (laneState.currentHourOffset >= effectiveDayHours - 0.0001) {
-        laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
-        laneState.currentHourOffset = 0;
-      }
-    }
-
-    totalScheduledHours += possibleQty / unitsPerHour;
-    if (!fullMaterials) {
-      await prodPlanConsumePoolDeep(plan, possibleQty, materialPool, 0, [prodNormalizeItemCodeLoose(row.itemCode)]);
-    }
-
-    const blockedQty = Math.max(0, finishedQtyNeeded - possibleQty);
-    rows.push({
-      itemCode: row.itemCode,
-      itemDesc: row.itemDesc,
-      sizeUom: row.sizeUom,
-      abc: row.totalLabel,
-      machine: row.machine,
-      machineLabel: laneMeta.label,
-      familyKey,
-      familyLabel: familyMeta.label,
-      laneKey,
-      laneLabel: laneMeta.label,
-      neededQty: finishedQtyNeeded,
-      objectiveQty: rawFinishedQtyNeeded,
-      possibleQty,
-      blockedQty,
-      currentStockQty: prodRound(row?.stockTotal || 0, 3),
-      targetStockQty: prodRound(prodNum(row?.stockTotal) + finishedQtyNeeded, 3),
-      targetStockPolicyQty: prodRound(prodNum(row?.stockTotal) + rawFinishedQtyNeeded, 3),
-      unitsPerHour: prodRound(unitsPerHour, 2),
-      minBatchQty: prodRound(minBatchQty, 2),
-      sharedSemiCode: candidate.sharedSemiCode,
-      materials: directMaterials,
-      tasks,
-    });
-
-    if (blockedQty > 0) {
-      blockedItems.push({
-        itemCode: row.itemCode,
-        itemDesc: row.itemDesc,
-        sizeUom: row.sizeUom,
-        abc: row.totalLabel,
-        familyKey,
-        familyLabel: familyMeta.label,
-        laneKey,
-        laneLabel: laneMeta.label,
-        neededQty: finishedQtyNeeded,
-        objectiveQty: rawFinishedQtyNeeded,
-        possibleQty,
-        pendingQty: blockedQty,
-        mainConstraint: mainConstraint || 'Materia prima insuficiente',
-        currentStockQty: prodRound(row?.stockTotal || 0, 3),
-        materials: directMaterials,
-      });
-    }
-  }
-
-  const calendarDays = Array.from(calendarSet).sort().map((date) => ({
-    date,
-    label: prodHumanDateShort(date),
-    weekLabel: prodWeekLabelFromDate(date),
-    monthLabel: prodMonthLabelFromDate(date),
-  }));
-
-  return {
-    ok: true,
-    generatedAt: new Date().toISOString(),
-    lastSyncAt: await getState('production_last_sync_at'),
-    scenario: { fullMaterials: !!fullMaterials },
-    filters: { from, to, area, grupo, sizeUom, abc, type: typeFilter, q, requestedHorizonMonths: horizonMonths, horizonMonths: planningHorizonMonths, avgMonths: planningAvgMonths, shiftHours: effectiveDayHours },
-    workRule: {
-      shiftHours: prodRound(effectiveDayHours, 2),
-      effectiveHours: prodRound(effectiveDayHours, 2),
-      startHour: dayStartHour,
-      endHour: dayEndHour,
-      breaksHours: 1,
-      breakfastHours: 0.25,
-      lunchHours: 0.75,
-      label: `Jornada 07:00–16:00 · ${prodRound(effectiveDayHours,2)} h productivas`,
-      breaksLabel: '15 min de desayuno + 45 min de almuerzo',
-      lanes: [
-        prodPlanLaneMeta('LINEA_SALSAS'),
-        prodPlanLaneMeta('LINEA_LIMPIEZA'),
-      ],
-    },
-    calendarDays,
-    items: rows,
-    blockedItems,
-    summary: {
-      itemsPlanned: rows.length,
-      totalNeededQty: prodRound(totalNeededQty, 2),
-      totalPossibleQty: prodRound(totalPossibleQty, 2),
-      totalBlockedQty: prodRound(totalBlockedQty, 2),
-      totalScheduledHours: prodRound(totalScheduledHours, 2),
-      fullMaterialsScenario: !!fullMaterials,
-    },
-  };
-}
-
-function prodHumanDateShort(dateStr) {
-  const d = new Date(`${String(dateStr || '').slice(0,10)}T00:00:00`);
-  if (Number.isNaN(d.getTime())) return String(dateStr || '');
-  return `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}`;
-}
-function prodPlanMaterialPoolSeed(pool, requirements = [], plannedQty = 0) {
-  for (const req of Array.isArray(requirements) ? requirements : []) {
-    if (String(req?.componentType || '').toUpperCase() === 'RESOURCE') continue;
-    const code = String(req?.code || '').trim();
-    if (!code) continue;
-    const current = pool.get(code);
-    const stockQty = prodNum(req?.stockQty);
-    if (current == null || stockQty > current) pool.set(code, stockQty);
-  }
-  return pool;
-}
-function prodPlanPossibleQtyFromPool(plan, neededQty, pool) {
-  const requirements = Array.isArray(plan?.requirements?.all) ? plan.requirements.all.filter((x) => String(x?.componentType || '').toUpperCase() !== 'RESOURCE') : [];
-  if (!requirements.length) return Math.max(0, Math.floor(prodNum(neededQty)));
-  const baseQty = Math.max(1, prodNum(plan?.production?.adjustedQty || plan?.production?.neededQty || neededQty || 1));
-  let maxQty = Number.POSITIVE_INFINITY;
-  let mainConstraint = '';
-  for (const req of requirements) {
-    const code = String(req?.code || '').trim();
-    if (!code) continue;
-    const perUnit = prodNum(req?.requiredQty) / baseQty;
-    if (!(perUnit > 0)) continue;
-    const available = prodNum(pool.get(code));
-    const qty = Math.floor(available / perUnit);
-    if (qty < maxQty) {
-      maxQty = qty;
-      mainConstraint = `${code} · ${String(req?.description || '').trim()}`.trim();
-    }
-  }
-  if (!Number.isFinite(maxQty)) return Math.max(0, Math.floor(prodNum(neededQty)));
-  return { possibleQty: Math.max(0, Math.min(Math.floor(prodNum(neededQty)), maxQty)), mainConstraint };
-}
-function prodPlanConsumePool(plan, qty, pool) {
-  const requirements = Array.isArray(plan?.requirements?.all) ? plan.requirements.all.filter((x) => String(x?.componentType || '').toUpperCase() !== 'RESOURCE') : [];
-  const baseQty = Math.max(1, prodNum(plan?.production?.adjustedQty || plan?.production?.neededQty || qty || 1));
-  for (const req of requirements) {
-    const code = String(req?.code || '').trim();
-    if (!code) continue;
-    const perUnit = prodNum(req?.requiredQty) / baseQty;
-    if (!(perUnit > 0)) continue;
-    const next = Math.max(0, prodNum(pool.get(code)) - (perUnit * prodNum(qty)));
-    pool.set(code, prodRound(next, 6));
-  }
-}
-
-async function prodPlanPossibleQtyFromPoolDeep(plan, neededQty, pool, depth = 0, trail = []) {
-  const requirements = Array.isArray(plan?.requirements?.all)
-    ? plan.requirements.all.filter((x) => String(x?.componentType || '').toUpperCase() !== 'RESOURCE')
-    : [];
-  if (!requirements.length) {
-    return { possibleQty: Math.max(0, Math.floor(prodNum(neededQty))), mainConstraint: '' };
-  }
-  const baseQty = Math.max(1, prodNum(plan?.production?.adjustedQty || plan?.production?.neededQty || neededQty || 1));
-  let maxQty = Number.POSITIVE_INFINITY;
-  let mainConstraint = '';
-
-  for (const req of requirements) {
-    const code = String(req?.code || '').trim();
-    if (!code) continue;
-    const perUnit = prodNum(req?.requiredQty) / baseQty;
-    if (!(perUnit > 0)) continue;
-
-    let availableComponentQty = prodNum(pool.get(code));
-    const isMake = String(req?.procurementMethodLabel || '') === 'Se fabrica en planta';
-    const normalizedCode = prodNormalizeItemCodeLoose(code);
-
-    if (isMake && depth < 2 && !trail.includes(normalizedCode)) {
-      try {
-        const childNeedQty = Math.max(prodNum(req?.requiredQty), prodNum(req?.subPlanQty), perUnit * Math.max(1, prodNum(neededQty)));
-        const childPlan = await productionBuildItemPlanCached({
-          itemCode: code,
-          toDate: plan?.period?.endDate || getDateISOInOffset(TZ_OFFSET_MIN),
-          avgMonths: plan?.period?.avgMonths || 3,
-          horizonMonths: plan?.period?.horizonMonths || 1,
-          shiftHours: plan?.capacity?.shiftHours || 8,
-          plannedQtyOverride: childNeedQty,
-        });
-        prodPlanMaterialPoolSeed(pool, childPlan?.requirements?.all || [], childNeedQty);
-        const childInfo = await prodPlanPossibleQtyFromPoolDeep(childPlan, childNeedQty, pool, depth + 1, [...trail, normalizedCode]);
-        availableComponentQty += prodNum(childInfo?.possibleQty);
-        if (!mainConstraint && childInfo?.mainConstraint) mainConstraint = String(childInfo.mainConstraint || '');
-      } catch {}
-    }
-
-    const qty = Math.floor(availableComponentQty / perUnit);
-    if (qty < maxQty) {
-      maxQty = qty;
-      mainConstraint = `${code} · ${String(req?.description || '').trim()}`.trim() || mainConstraint;
-    }
-  }
-
-  if (!Number.isFinite(maxQty)) {
-    return { possibleQty: Math.max(0, Math.floor(prodNum(neededQty))), mainConstraint };
-  }
-  return {
-    possibleQty: Math.max(0, Math.min(Math.floor(prodNum(neededQty)), Math.floor(maxQty))),
-    mainConstraint,
-  };
-}
-
-async function prodPlanConsumePoolDeep(plan, qty, pool, depth = 0, trail = []) {
-  const requirements = Array.isArray(plan?.requirements?.all)
-    ? plan.requirements.all.filter((x) => String(x?.componentType || '').toUpperCase() !== 'RESOURCE')
-    : [];
-  const baseQty = Math.max(1, prodNum(plan?.production?.adjustedQty || plan?.production?.neededQty || qty || 1));
-
-  for (const req of requirements) {
-    const code = String(req?.code || '').trim();
-    if (!code) continue;
-    const perUnit = prodNum(req?.requiredQty) / baseQty;
-    if (!(perUnit > 0)) continue;
-    const neededComponentQty = prodRound(perUnit * prodNum(qty), 6);
-    const isMake = String(req?.procurementMethodLabel || '') === 'Se fabrica en planta';
-    const normalizedCode = prodNormalizeItemCodeLoose(code);
-
-    if (isMake && depth < 2 && !trail.includes(normalizedCode)) {
-      const currentStock = prodNum(pool.get(code));
-      const fromStock = Math.min(currentStock, neededComponentQty);
-      if (fromStock > 0) {
-        pool.set(code, prodRound(currentStock - fromStock, 6));
-      }
-      const remainingChildQty = Math.max(0, neededComponentQty - fromStock);
-      if (remainingChildQty > 0) {
-        try {
-          const childPlan = await productionBuildItemPlanCached({
-            itemCode: code,
-            toDate: plan?.period?.endDate || getDateISOInOffset(TZ_OFFSET_MIN),
-            avgMonths: plan?.period?.avgMonths || 3,
-            horizonMonths: plan?.period?.horizonMonths || 1,
-            shiftHours: plan?.capacity?.shiftHours || 8,
-            plannedQtyOverride: remainingChildQty,
-          });
-          prodPlanMaterialPoolSeed(pool, childPlan?.requirements?.all || [], remainingChildQty);
-          await prodPlanConsumePoolDeep(childPlan, remainingChildQty, pool, depth + 1, [...trail, normalizedCode]);
-        } catch {}
-      }
-      continue;
-    }
-
-    const next = Math.max(0, prodNum(pool.get(code)) - neededComponentQty);
-    pool.set(code, prodRound(next, 6));
-  }
-}
-
-async function productionBuildGanttPlan({ from, to, area, grupo, sizeUom = '__ALL__', abc = '__ALL__', typeFilter = 'Se fabrica en planta', q = '', avgMonths = 0, horizonMonths = 1, shiftHours = 8, startDate = '' }) {
-  return prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths, shiftHours, startDate, fullMaterials: false });
-}
-
 app.get("/api/admin/production/dashboard", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
@@ -11654,69 +10635,6 @@ app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
     if (row) plan.abcHint = row.totalLabel || "";
 
     return safeJson(res, 200, plan);
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-
-app.post("/api/admin/production/simulate", verifyAdmin, async (req, res) => {
-  try {
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = String(req.body?.from || req.query?.from || "2025-01-01");
-    const to = String(req.body?.to || req.query?.to || today);
-    const area = String(req.body?.area || req.query?.area || "__ALL__");
-    const grupo = String(req.body?.grupo || req.query?.grupo || "__ALL__");
-    const sizeUom = String(req.body?.sizeUom || req.query?.sizeUom || "__ALL__");
-    const abc = String(req.body?.abc || req.query?.abc || "__ALL__");
-    const typeFilter = String(req.body?.type || req.query?.type || "Se fabrica en planta");
-    const q = String(req.body?.q || req.query?.q || "");
-    const avgMonths = Math.max(1, Math.min(24, prodNum(req.body?.avgMonths || req.query?.avgMonths, 3)));
-    const horizonMonths = Math.max(1, Math.min(12, prodNum(req.body?.horizonMonths || req.query?.horizonMonths, 3)));
-    const shiftHours = Math.max(1, Math.min(24, prodNum(req.body?.shiftHours || req.query?.shiftHours, 8)));
-    const maxDepth = Math.max(1, Math.min(5, prodNum(req.body?.maxDepth || req.query?.maxDepth, 3)));
-    const itemCodes = Array.from(new Set((Array.isArray(req.body?.itemCodes) ? req.body.itemCodes : [])
-      .map((x) => String(x || "").trim())
-      .filter(Boolean)));
-
-    if (!itemCodes.length) {
-      return safeJson(res, 400, { ok: false, message: "Selecciona al menos un artículo para simular" });
-    }
-
-    const cacheParams = { from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths, shiftHours, itemCodes, maxDepth };
-    const cached = prodGetSimulationCached(cacheParams);
-    if (cached) {
-      cached.fromCache = true;
-      return safeJson(res, 200, cached);
-    }
-
-    const out = await productionBuildSimulationTree(cacheParams);
-    out.fromCache = false;
-    prodSetSimulationCached(cacheParams, out);
-    return safeJson(res, 200, out);
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-
-app.get("/api/admin/production/gantt-plan", verifyAdmin, async (req, res) => {
-  try {
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = String(req.query?.from || "2025-01-01");
-    const to = String(req.query?.to || today);
-    const area = String(req.query?.area || "__ALL__");
-    const grupo = String(req.query?.grupo || "__ALL__");
-    const sizeUom = String(req.query?.sizeUom || req.query?.size || "__ALL__");
-    const abc = String(req.query?.abc || "__ALL__");
-    const typeFilter = String(req.query?.type || req.query?.tipo || "Se fabrica en planta");
-    const q = String(req.query?.q || "");
-    const horizonMonths = Math.max(2, Math.min(12, prodNum(req.query?.horizonMonths, 2)));
-    const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
-    const shiftHours = Math.max(1, Math.min(24, prodNum(req.query?.shiftHours, 8)));
-    const startDate = String(req.query?.startDate || today).slice(0,10);
-    const out = await productionBuildGanttPlan({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths, shiftHours, startDate });
-    return safeJson(res, 200, out);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -11836,7 +10754,6 @@ async function handleProductionSync(req, res) {
 
     await setState("production_last_sync_at", new Date().toISOString());
     prodClearDashboardCache();
-    prodClearSimulationCache();
 
     return safeJson(res, 200, {
       ok: true,
@@ -12618,255 +11535,6 @@ app.post("/api/admin/estratificacion/ai-chat", verifyAdmin, async (req, res) => 
   }
 });
 
-
-
-/* =========================================================
-   Producción — Plan persistente + cierre diario SAP (v18)
-========================================================= */
-const PROD_PLAN_PERSIST_FILE = path.join(PROD_DATA_DIR, 'production_saved_plans_v18.json');
-
-function prodEnsureProductionDir() {
-  try { fs.mkdirSync(PROD_DATA_DIR, { recursive: true }); } catch {}
-}
-function prodSavedPlanEmptyStore() {
-  return { records: [], activeByUser: {} };
-}
-function prodReadSavedPlanFile() {
-  prodEnsureProductionDir();
-  try {
-    const raw = fs.readFileSync(PROD_PLAN_PERSIST_FILE, 'utf8');
-    const data = JSON.parse(raw || '{}');
-    if (!data || typeof data !== 'object') return prodSavedPlanEmptyStore();
-    if (!Array.isArray(data.records)) data.records = [];
-    if (!data.activeByUser || typeof data.activeByUser !== 'object') data.activeByUser = {};
-    return data;
-  } catch {
-    return prodSavedPlanEmptyStore();
-  }
-}
-function prodWriteSavedPlanFile(data) {
-  prodEnsureProductionDir();
-  fs.writeFileSync(PROD_PLAN_PERSIST_FILE, JSON.stringify(data || prodSavedPlanEmptyStore(), null, 2), 'utf8');
-}
-async function prodEnsureSavedPlanTable() {
-  if (!hasDb()) return;
-  await dbQuery(`
-    create table if not exists admin_production_saved_plans_v18 (
-      id text primary key,
-      admin_user text not null,
-      is_active boolean not null default true,
-      payload jsonb not null,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    )
-  `);
-  await dbQuery(`create index if not exists idx_admin_production_saved_plans_v18_active on admin_production_saved_plans_v18(admin_user, is_active, updated_at desc)`);
-}
-__extraBootTasks.push(prodEnsureSavedPlanTable);
-
-function prodSavedPlanUser(req) {
-  return String(req?.admin?.user || req?.admin?.sub || 'admin').trim().toLowerCase() || 'admin';
-}
-function prodSavedPlanId() {
-  return `plan_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
-}
-function prodNormalizeSavedPlanPayload(payload, meta = {}) {
-  const base = prodClone(payload || {}) || {};
-  base.planRecordId = String(base.planRecordId || meta.id || prodSavedPlanId());
-  base.persistedAt = String(meta.persistedAt || new Date().toISOString());
-  base.persistedBy = String(meta.adminUser || base.persistedBy || 'admin');
-  if (!Array.isArray(base.dayClosures)) base.dayClosures = [];
-  if (!base._serverMeta || typeof base._serverMeta !== 'object') base._serverMeta = {};
-  base._serverMeta.active = true;
-  return base;
-}
-async function prodSavedPlanSetCurrent(adminUser, payload) {
-  const normalized = prodNormalizeSavedPlanPayload(payload, { adminUser, persistedAt: new Date().toISOString(), id: payload?.planRecordId });
-  const id = String(normalized.planRecordId);
-  if (hasDb()) {
-    await dbQuery(`update admin_production_saved_plans_v18 set is_active=false, updated_at=now() where admin_user=$1`, [adminUser]);
-    await dbQuery(`
-      insert into admin_production_saved_plans_v18(id, admin_user, is_active, payload, created_at, updated_at)
-      values ($1,$2,true,$3::jsonb,now(),now())
-      on conflict (id) do update set admin_user=excluded.admin_user, is_active=true, payload=excluded.payload, updated_at=now()
-    `, [id, adminUser, JSON.stringify(normalized)]);
-    return normalized;
-  }
-  const store = prodReadSavedPlanFile();
-  store.records = (store.records || []).filter((x) => String(x?.id || '') !== id);
-  store.records.push({ id, adminUser, isActive: true, updatedAt: new Date().toISOString(), payload: normalized });
-  store.activeByUser[adminUser] = id;
-  prodWriteSavedPlanFile(store);
-  return normalized;
-}
-async function prodSavedPlanGetCurrent(adminUser) {
-  if (hasDb()) {
-    const q = await dbQuery(`
-      select id, admin_user, payload, created_at, updated_at
-      from admin_production_saved_plans_v18
-      where admin_user=$1 and is_active=true
-      order by updated_at desc
-      limit 1
-    `, [adminUser]);
-    const row = q.rows?.[0];
-    if (!row) return null;
-    return prodNormalizeSavedPlanPayload(row.payload || {}, { adminUser, persistedAt: row.updated_at, id: row.id });
-  }
-  const store = prodReadSavedPlanFile();
-  const activeId = String(store.activeByUser?.[adminUser] || '');
-  const row = (store.records || []).find((x) => String(x?.id || '') === activeId && String(x?.adminUser || '') === adminUser) || null;
-  if (!row) return null;
-  return prodNormalizeSavedPlanPayload(row.payload || {}, { adminUser, persistedAt: row.updatedAt, id: row.id });
-}
-async function prodSavedPlanUpdateById(adminUser, planId, updater) {
-  const current = await prodSavedPlanGetCurrent(adminUser);
-  if (!current) return null;
-  if (planId && String(current.planRecordId || '') !== String(planId || '')) return null;
-  const nextPayload = typeof updater === 'function' ? await updater(prodClone(current)) : prodClone(updater);
-  if (!nextPayload) return null;
-  nextPayload.planRecordId = current.planRecordId;
-  return await prodSavedPlanSetCurrent(adminUser, nextPayload);
-}
-function prodOrdersActualQtyForDate(orders, date) {
-  return prodRound((Array.isArray(orders) ? orders : []).filter((x) => String(x?.postDate || '').slice(0,10) === String(date || '').slice(0,10)).reduce((acc, x) => acc + prodNum(x?.completedQty || 0), 0), 2);
-}
-async function prodBuildPlanDayCloseSummary(planPayload, date, { forceFresh = true } = {}) {
-  const day = String(date || '').slice(0,10);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error('Fecha inválida para cierre del día');
-  const plan = prodClone(planPayload || {}) || {};
-  const rows = Array.isArray(plan?.items) ? plan.items : [];
-  const rowsForDay = rows.map((row) => {
-    const tasks = (Array.isArray(row?.tasks) ? row.tasks : []).filter((task) => String(task?.date || '') === day);
-    return { ...row, tasks };
-  }).filter((row) => row.tasks.length);
-  if (!rowsForDay.length) throw new Error('No hay producción programada para esa fecha');
-
-  const codes = Array.from(new Set(rowsForDay.map((x) => String(x?.itemCode || '').trim()).filter(Boolean)));
-  if (forceFresh) {
-    await prodRefreshInventoryForCodes(codes, { forceFresh: true, ttlMs: 0, timeoutMs: 120000 }).catch(() => {});
-  }
-
-  let plannedQty = 0;
-  let actualQtySap = 0;
-  let totalNeededContext = 0;
-  let totalPossibleContext = 0;
-  const items = [];
-
-  for (const row of rowsForDay) {
-    const itemCode = String(row?.itemCode || '').trim();
-    const plannedDayQty = prodRound((Array.isArray(row?.tasks) ? row.tasks : []).reduce((acc, task) => acc + prodNum(task?.qty || 0), 0), 2);
-    const orders = await prodFetchProductionOrders(itemCode, 120, { forceFresh: true, ttlMs: 0 }).catch(() => ({ orders: [] }));
-    const actualDayQty = prodOrdersActualQtyForDate(orders?.orders || [], day);
-    const fullItem = await prodGetFullItem(itemCode, { forceFresh: true, ttlMs: 0 }).catch(() => null);
-    const inv = prodExtractInventorySnapshotFromItem(fullItem);
-
-    plannedQty += plannedDayQty;
-    actualQtySap += actualDayQty;
-    totalNeededContext += prodNum(row?.neededQty || 0);
-    totalPossibleContext += prodNum(row?.possibleQty || 0);
-
-    items.push({
-      itemCode,
-      itemDesc: String(row?.itemDesc || ''),
-      familyLabel: String(row?.familyLabel || 'Producción'),
-      plannedDayQty: prodRound(plannedDayQty, 2),
-      neededQtyContext: prodRound(row?.neededQty || 0, 2),
-      possibleQtyContext: prodRound(row?.possibleQty || 0, 2),
-      actualQtySap: prodRound(actualDayQty, 2),
-      compliancePct: plannedDayQty > 0 ? prodRound((actualDayQty / plannedDayQty) * 100, 1) : 0,
-      stockActualQty: prodRound(inv?.stockTotal || row?.currentStockQty || 0, 2),
-      materials: (Array.isArray(row?.materials) ? row.materials : []).slice(0, 8),
-    });
-  }
-
-  const compliancePct = plannedQty > 0 ? prodRound((actualQtySap / plannedQty) * 100, 1) : 0;
-  return {
-    date: day,
-    closedAt: new Date().toISOString(),
-    plannedQty: prodRound(plannedQty, 2),
-    neededQtyContext: prodRound(totalNeededContext, 2),
-    possibleQtyContext: prodRound(totalPossibleContext, 2),
-    actualQtySap: prodRound(actualQtySap, 2),
-    compliancePct,
-    status: compliancePct >= 98 ? 'ok' : compliancePct >= 85 ? 'warn' : 'bad',
-    message: `Producción concluida para ${day}. Planificadas ${prodRound(plannedQty,2)} u, SAP registró ${prodRound(actualQtySap,2)} u. Cumplimiento: ${compliancePct}%.`,
-    items,
-  };
-}
-
-async function productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom = '__ALL__', abc = '__ALL__', typeFilter = 'Se fabrica en planta', q = '', avgMonths = 0, horizonMonths = 1, shiftHours = 8, startDate = '', fullMaterials = false }) {
-  return prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths, shiftHours, startDate, fullMaterials });
-}
-
-app.get('/api/admin/production/gantt-plan-v18', verifyAdmin, async (req, res) => {
-  try {
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = String(req.query?.from || '2025-01-01');
-    const to = String(req.query?.to || today);
-    const area = String(req.query?.area || '__ALL__');
-    const grupo = String(req.query?.grupo || '__ALL__');
-    const sizeUom = String(req.query?.sizeUom || req.query?.size || '__ALL__');
-    const abc = String(req.query?.abc || '__ALL__');
-    const typeFilter = String(req.query?.type || req.query?.tipo || 'Se fabrica en planta');
-    const q = String(req.query?.q || '');
-    const horizonMonths = Math.max(1, Math.min(12, prodNum(req.query?.horizonMonths, 1)));
-    const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
-    const shiftHours = Math.max(1, Math.min(24, prodNum(req.query?.shiftHours, 8)));
-    const startDate = String(req.query?.startDate || today).slice(0,10);
-    const fullMaterials = ['1','true','yes','si'].includes(String(req.query?.fullMaterials || req.query?.incomingMp || '').trim().toLowerCase());
-    const out = await productionBuildGanttPlanV18({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths, horizonMonths, shiftHours, startDate, fullMaterials });
-    out.scenario = { ...(out.scenario || {}), fullMaterials };
-    const saved = await prodSavedPlanSetCurrent(prodSavedPlanUser(req), out);
-    return safeJson(res, 200, saved);
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-
-app.post('/api/admin/production/plans/current/save', verifyAdmin, async (req, res) => {
-  try {
-    const payload = req.body?.payload || req.body || {};
-    if (!payload || typeof payload !== 'object') return safeJson(res, 400, { ok:false, message:'Payload inválido' });
-    const saved = await prodSavedPlanSetCurrent(prodSavedPlanUser(req), payload);
-    return safeJson(res, 200, saved);
-  } catch (e) {
-    return safeJson(res, 500, { ok:false, message: e.message || String(e) });
-  }
-});
-
-app.get('/api/admin/production/plans/current', verifyAdmin, async (req, res) => {
-  try {
-    const payload = await prodSavedPlanGetCurrent(prodSavedPlanUser(req));
-    if (!payload) return safeJson(res, 404, { ok: false, message: 'No hay un plan guardado todavía' });
-    return safeJson(res, 200, payload);
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-app.post('/api/admin/production/plans/day-close', verifyAdmin, async (req, res) => {
-  try {
-    const adminUser = prodSavedPlanUser(req);
-    const planId = String(req.body?.planId || '').trim();
-    const date = String(req.body?.date || req.query?.date || '').slice(0,10);
-    const payload = await prodSavedPlanGetCurrent(adminUser);
-    if (!payload) return safeJson(res, 404, { ok: false, message: 'No hay plan guardado' });
-    if (planId && String(payload.planRecordId || '') !== planId) return safeJson(res, 409, { ok: false, message: 'El plan cambió; vuelve a cargar el plan actual' });
-    const summary = await prodBuildPlanDayCloseSummary(payload, date, { forceFresh: true });
-    const updated = await prodSavedPlanUpdateById(adminUser, payload.planRecordId, (plan) => {
-      const list = Array.isArray(plan?.dayClosures) ? plan.dayClosures.filter((x) => String(x?.date || '') !== date) : [];
-      list.unshift(summary);
-      plan.dayClosures = list.slice(0, 30);
-      plan.lastSapSyncAt = new Date().toISOString();
-      plan.latestDaySummary = summary;
-      return plan;
-    });
-    return safeJson(res, 200, { ok: true, summary, plan: updated });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
 
 /* =========================================================
    Start
