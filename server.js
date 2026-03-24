@@ -12442,11 +12442,74 @@ async function prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc = "", top
   return out.slice(0, Math.max(1, Number(top || 5)));
 }
 
+async function prodFetchVendorCreditTerms(cardCode, fallbackName = "") {
+  const code = String(cardCode || "").trim();
+  if (!code) return {
+    supplierCode: code,
+    supplierName: String(fallbackName || ""),
+    paymentTermsName: "",
+    creditDays: 0,
+    balanceRaw: 0,
+    balanceDebt: 0,
+  };
+
+  let bp = null;
+  try {
+    bp = await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum`);
+  } catch {}
+
+  const result = {
+    supplierCode: code,
+    supplierName: String(bp?.CardName || fallbackName || ""),
+    paymentTermsName: "",
+    creditDays: 0,
+    balanceRaw: prodNum(bp?.Balance || 0),
+    balanceDebt: 0,
+  };
+
+  const negativeBalances = [
+    prodNum(bp?.Balance || 0),
+    prodNum(bp?.CurrentAccountBalance || 0),
+    prodNum(bp?.DebitBalance || 0),
+  ].filter((x) => x < -0.009).map((x) => Math.abs(x));
+  result.balanceDebt = negativeBalances.length ? Math.max(...negativeBalances) : 0;
+
+  const termCode = Number(bp?.PayTermsGrpCode ?? bp?.GroupNum ?? 0);
+  if (!(termCode > 0)) return result;
+
+  const termPaths = [
+    `/PaymentTermsTypes(${termCode})?$select=GroupNumber,PaymentTermsGroupName,NumberOfAdditionalDays,ExtraDays,ExtraMonth`,
+    `/PaymentTermsTypes?$select=GroupNumber,PaymentTermsGroupName,NumberOfAdditionalDays,ExtraDays,ExtraMonth&$filter=GroupNumber eq ${termCode}`,
+    `/PaymentTermsTypes?$filter=GroupNumber eq ${termCode}`,
+  ];
+
+  for (const path of termPaths) {
+    try {
+      const raw = await slFetchFreshSession(path);
+      const row = Array.isArray(raw) ? (raw[0] || null) : (prodAsArray(raw)[0] || raw || null);
+      if (!row) continue;
+      const name = String(row?.PaymentTermsGroupName || row?.Name || "").trim();
+      let creditDays = Math.max(
+        0,
+        Number(row?.NumberOfAdditionalDays || 0),
+        Number(row?.ExtraDays || 0)
+      );
+      if (!(creditDays > 0) && name) {
+        const m = name.match(/(\d+)\s*d[ií]a/i);
+        if (m) creditDays = Number(m[1] || 0);
+      }
+      result.paymentTermsName = name;
+      result.creditDays = creditDays > 0 ? creditDays : 0;
+      return result;
+    } catch {}
+  }
+
+  return result;
+}
+
 async function prodFetchVendorPayablesStatus(cardCode, cardName = "") {
   const code = String(cardCode || "").trim();
   const name = String(cardName || "").trim();
-  const today = getDateISOInOffset(TZ_OFFSET_MIN);
-  const safe = prodSapEscapeLiteral(code);
   const base = {
     supplierCode: code,
     supplierName: name,
@@ -12455,11 +12518,25 @@ async function prodFetchVendorPayablesStatus(cardCode, cardName = "") {
     oldestDebtDate: "",
     daysDue: 0,
     source: "",
+    paymentTermsName: "",
+    creditDays: 0,
+    balanceRaw: 0,
+    debtNote: "",
   };
   if (!code) return base;
 
+  const termInfo = await prodFetchVendorCreditTerms(code, name).catch(() => ({
+    supplierCode: code,
+    supplierName: name,
+    paymentTermsName: "",
+    creditDays: 0,
+    balanceRaw: 0,
+    balanceDebt: 0,
+  }));
+
   try {
-    const inv = await slFetchFreshSession(`/PurchaseInvoices?$select=DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,PaidToDate,DocCurrency&$filter=CardCode eq '${safe}'&$orderby=DocDueDate asc&$top=50`);
+    const safe = prodSapEscapeLiteral(code);
+    const inv = await slFetchFreshSession(`/PurchaseInvoices?$select=DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,PaidToDate,DocCurrency&$filter=CardCode eq '${safe}'&$orderby=DocDueDate asc&$top=100`);
     const rows = prodAsArray(inv).map((x) => {
       const total = prodNum(x?.DocTotal || 0);
       const paid = prodNum(x?.PaidToDate || 0);
@@ -12469,60 +12546,71 @@ async function prodFetchVendorPayablesStatus(cardCode, cardName = "") {
         dueDate: prodDateOnly(x?.DocDueDate || x?.DocDate),
         docDate: prodDateOnly(x?.DocDate),
         outstanding: prodRound(outstanding, 2),
-        status: String(x?.DocumentStatus || ""),
+        status: String(x?.DocumentStatus || x?.Status || ""),
         currency: String(x?.DocCurrency || "USD"),
       };
     });
+
     const open = rows.filter((x) => x.outstanding > 0.009 || prodDocStatusIsOpen(x.status));
-    if (open.length) {
-      const oldest = open
-        .map((x) => x.dueDate || x.docDate)
-        .filter(Boolean)
-        .sort()[0] || "";
+    const oldest = open.map((x) => x.dueDate || x.docDate).filter(Boolean).sort()[0] || "";
+    const invoiceDebt = prodRound(open.reduce((s, x) => s + prodNum(x.outstanding || 0), 0), 2);
+    const fallbackDebt = prodRound(prodNum(termInfo?.balanceDebt || 0), 2);
+    const finalDebt = Math.max(invoiceDebt, fallbackDebt, 0);
+
+    if (open.length || finalDebt > 0.009) {
       return {
         supplierCode: code,
-        supplierName: name || String(open[0]?.CardName || ""),
+        supplierName: String(termInfo?.supplierName || name || ""),
         paymentStatus: "SE_DEBE",
-        amountDue: prodRound(open.reduce((s, x) => s + prodNum(x.outstanding || 0), 0), 2),
+        amountDue: finalDebt,
         oldestDebtDate: oldest,
         daysDue: oldest ? Math.max(0, prodDiffDaysFromToday(oldest)) : 0,
-        source: "PurchaseInvoices",
+        source: open.length ? "PurchaseInvoices+BusinessPartners" : "BusinessPartners",
         openInvoices: open.slice(0, 10),
+        paymentTermsName: String(termInfo?.paymentTermsName || ""),
+        creditDays: Number(termInfo?.creditDays || 0),
+        balanceRaw: prodRound(prodNum(termInfo?.balanceRaw || 0), 2),
+        debtNote: oldest ? "" : (Number(termInfo?.creditDays || 0) > 0
+          ? `Saldo pendiente visible en cuenta del proveedor. Condición de pago: ${termInfo.paymentTermsName || `Crédito ${termInfo.creditDays} días`}.`
+          : "Saldo pendiente visible en cuenta del proveedor."),
       };
     }
+
     return {
       supplierCode: code,
-      supplierName: name,
+      supplierName: String(termInfo?.supplierName || name),
       paymentStatus: "PAZ_Y_SALVO",
       amountDue: 0,
       oldestDebtDate: "",
       daysDue: 0,
-      source: "PurchaseInvoices",
+      source: "PurchaseInvoices+BusinessPartners",
       openInvoices: [],
+      paymentTermsName: String(termInfo?.paymentTermsName || ""),
+      creditDays: Number(termInfo?.creditDays || 0),
+      balanceRaw: prodRound(prodNum(termInfo?.balanceRaw || 0), 2),
+      debtNote: "",
     };
   } catch {}
 
-  try {
-    const bp = await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Balance,CurrentAccountBalance,DebitBalance`);
-    const balance = Math.max(
-      prodNum(bp?.Balance || 0),
-      prodNum(bp?.CurrentAccountBalance || 0),
-      prodNum(bp?.DebitBalance || 0),
-      0
-    );
-    return {
-      supplierCode: code,
-      supplierName: String(bp?.CardName || name),
-      paymentStatus: balance > 0.009 ? "SE_DEBE" : "PAZ_Y_SALVO",
-      amountDue: prodRound(balance, 2),
-      oldestDebtDate: "",
-      daysDue: 0,
-      source: "BusinessPartners",
-      openInvoices: [],
-    };
-  } catch {}
-
-  return base;
+  const fallbackDebt = prodRound(prodNum(termInfo?.balanceDebt || 0), 2);
+  return {
+    supplierCode: code,
+    supplierName: String(termInfo?.supplierName || name),
+    paymentStatus: fallbackDebt > 0.009 ? "SE_DEBE" : "PAZ_Y_SALVO",
+    amountDue: fallbackDebt,
+    oldestDebtDate: "",
+    daysDue: 0,
+    source: "BusinessPartners",
+    openInvoices: [],
+    paymentTermsName: String(termInfo?.paymentTermsName || ""),
+    creditDays: Number(termInfo?.creditDays || 0),
+    balanceRaw: prodRound(prodNum(termInfo?.balanceRaw || 0), 2),
+    debtNote: fallbackDebt > 0.009
+      ? (Number(termInfo?.creditDays || 0) > 0
+        ? `Saldo pendiente visible en cuenta del proveedor. Condición de pago: ${termInfo.paymentTermsName || `Crédito ${termInfo.creditDays} días`}.`
+        : "Saldo pendiente visible en cuenta del proveedor.")
+      : "",
+  };
 }
 
 app.get("/api/admin/production/component-procurement", verifyAdmin, async (req, res) => {
