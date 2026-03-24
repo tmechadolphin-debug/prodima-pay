@@ -12367,6 +12367,110 @@ async function prodReadPurchaseOrderDetails(docEntry) {
   }
 }
 
+async function prodReadPurchaseInvoiceDetails(docEntry) {
+  const de = Number(docEntry);
+  if (!(de > 0)) return null;
+  const tries = [
+    `/PurchaseInvoices(${de})?$expand=DocumentLines`,
+    `/PurchaseInvoices?$filter=DocEntry eq ${de}&$expand=DocumentLines`,
+  ];
+  for (const path of tries) {
+    try {
+      const raw = await slFetchFreshSession(path);
+      if (raw?.DocEntry || raw?.DocumentLines || raw?.value?.length) {
+        const doc = raw?.DocEntry ? raw : (Array.isArray(raw?.value) && raw.value.length ? raw.value[0] : null);
+        if (doc) return doc;
+      }
+    } catch {}
+  }
+  try {
+    const base = await slFetchFreshSession(`/PurchaseInvoices(${de})`);
+    if (!base) return null;
+    try {
+      const linesRes = await slFetchFreshSession(`/PurchaseInvoices(${de})/DocumentLines?$top=500`);
+      const lines = prodAsArray(linesRes);
+      if (lines.length) base.DocumentLines = lines;
+    } catch {}
+    return base;
+  } catch {
+    return null;
+  }
+}
+
+async function prodFetchRecentPurchaseInvoicesForItem(itemCode, itemDesc = "", top = 5) {
+  const code = String(itemCode || "").trim();
+  const desc = String(itemDesc || "").trim();
+  if (!code && !desc) return [];
+  const out = [];
+  const seen = new Set();
+  const variants = prodBuildItemSearchVariants(code, desc);
+
+  const collectFromDoc = (doc) => {
+    if (!doc) return;
+    const lines = prodAsArray(doc?.DocumentLines);
+    for (const ln of lines) {
+      const lineCode = String(ln?.ItemCode || "").trim();
+      const lineDesc = String(ln?.ItemDescription || ln?.ItemDetails || "");
+      if (!lineCode && !lineDesc) continue;
+      if (!prodLineMatchesProcurementSearch(lineCode, lineDesc, variants)) continue;
+      const key = `${Number(doc?.DocEntry || 0)}::${Number(ln?.LineNum || 0)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        docEntry: Number(doc?.DocEntry || 0),
+        docNum: Number(doc?.DocNum || 0),
+        docDate: prodDateOnly(doc?.DocDate),
+        dueDate: prodDateOnly(doc?.DocDueDate || doc?.TaxDate),
+        quantity: prodRound(prodNum(ln?.Quantity || 0), 3),
+        lineTotal: prodRound(prodNum(ln?.LineTotal || 0), 2),
+        docTotal: prodRound(prodNum(doc?.DocTotal || 0), 2),
+        currency: String(doc?.DocCurrency || "USD"),
+        supplierCode: String(doc?.CardCode || ""),
+        supplierName: String(doc?.CardName || ""),
+        documentStatus: String(doc?.DocumentStatus || doc?.Status || ""),
+        openQty: prodRound(prodNum(ln?.OpenQuantity || ln?.OpenQty || 0), 3),
+        lineNum: Number(ln?.LineNum || 0),
+        itemCode: lineCode,
+        itemDesc: lineDesc,
+        sourceDocType: "FACTURA_PROVEEDOR",
+      });
+    }
+  };
+
+  try {
+    const expanded = await slFetchFreshSession(`/PurchaseInvoices?$orderby=DocDate desc&$top=200&$expand=DocumentLines`);
+    for (const doc of prodAsArray(expanded)) collectFromDoc(doc);
+  } catch {}
+
+  const scanBatch = async (skip = 0, topBatch = 100) => {
+    const path = `/PurchaseInvoices?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$orderby=DocDate desc&$top=${topBatch}&$skip=${skip}`;
+    const headers = await slFetchFreshSession(path).catch(() => []);
+    let count = 0;
+    for (const h of prodAsArray(headers)) {
+      count++;
+      const de = Number(h?.DocEntry || 0);
+      if (!(de > 0)) continue;
+      const full = await prodReadPurchaseInvoiceDetails(de).catch(() => null);
+      collectFromDoc(full || h);
+    }
+    return count;
+  };
+
+  if (out.length < top) {
+    for (let skip = 0; skip < 1200 && out.length < Math.max(top, 5); skip += 100) {
+      const count = await scanBatch(skip, 100).catch(() => 0);
+      if (!(count > 0)) break;
+    }
+  }
+
+  out.sort((a, b) =>
+    String(b.docDate || "").localeCompare(String(a.docDate || "")) ||
+    Number(b.docNum || 0) - Number(a.docNum || 0) ||
+    Number(a.lineNum || 0) - Number(b.lineNum || 0)
+  );
+  return out.slice(0, Math.max(1, Number(top || 5)));
+}
+
 async function prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc = "", top = 5) {
   const code = String(itemCode || "").trim();
   const desc = String(itemDesc || "").trim();
@@ -12547,32 +12651,39 @@ async function prodFetchVendorPayablesStatus(cardCode, cardName = "") {
   try {
     const safe = prodSapEscapeLiteral(code);
     const inv = await slFetchFreshSession(`/PurchaseInvoices?$select=DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,PaidToDate,DocCurrency&$filter=CardCode eq '${safe}'&$orderby=DocDueDate asc&$top=100`);
+    const todayIso = getDateISOInOffset(TZ_OFFSET_MIN);
     const rows = prodAsArray(inv).map((x) => {
       const total = prodNum(x?.DocTotal || 0);
       const paid = prodNum(x?.PaidToDate || 0);
       const outstanding = Math.max(0, total - paid);
+      const due = prodDateOnly(x?.DocDueDate || x?.DocDate);
       return {
         docNum: Number(x?.DocNum || 0),
-        dueDate: prodDateOnly(x?.DocDueDate || x?.DocDate),
+        dueDate: due,
         docDate: prodDateOnly(x?.DocDate),
         outstanding: prodRound(outstanding, 2),
         status: String(x?.DocumentStatus || x?.Status || ""),
         currency: String(x?.DocCurrency || "USD"),
+        overdue: !!(due && due < todayIso && outstanding > 0.009),
       };
     });
 
     const open = rows.filter((x) => x.outstanding > 0.009 || prodDocStatusIsOpen(x.status));
-    const oldest = open.map((x) => x.dueDate || x.docDate).filter(Boolean).sort()[0] || "";
+    const overdueRows = open.filter((x) => x.overdue);
+    const oldest = overdueRows.map((x) => x.dueDate || x.docDate).filter(Boolean).sort()[0] || open.map((x) => x.dueDate || x.docDate).filter(Boolean).sort()[0] || "";
     const invoiceDebt = prodRound(open.reduce((s, x) => s + prodNum(x.outstanding || 0), 0), 2);
+    const overdueDebt = prodRound(overdueRows.reduce((s, x) => s + prodNum(x.outstanding || 0), 0), 2);
     const fallbackDebt = prodRound(prodNum(termInfo?.balanceDebt || 0), 2);
     const finalDebt = Math.max(invoiceDebt, fallbackDebt, 0);
+    const effectiveDue = Math.max(overdueDebt, 0);
 
-    if (open.length || finalDebt > 0.009) {
+    if (open.length || finalDebt > 0.009 || effectiveDue > 0.009) {
       return {
         supplierCode: code,
         supplierName: String(termInfo?.supplierName || name || ""),
         paymentStatus: "SE_DEBE",
         amountDue: finalDebt,
+        overdueAmount: effectiveDue,
         oldestDebtDate: oldest,
         daysDue: oldest ? Math.max(0, prodDiffDaysFromToday(oldest)) : 0,
         source: open.length ? "PurchaseInvoices+BusinessPartners" : "BusinessPartners",
@@ -12591,6 +12702,7 @@ async function prodFetchVendorPayablesStatus(cardCode, cardName = "") {
       supplierName: String(termInfo?.supplierName || name),
       paymentStatus: "PAZ_Y_SALVO",
       amountDue: 0,
+      overdueAmount: 0,
       oldestDebtDate: "",
       daysDue: 0,
       source: "PurchaseInvoices+BusinessPartners",
@@ -12608,6 +12720,7 @@ async function prodFetchVendorPayablesStatus(cardCode, cardName = "") {
     supplierName: String(termInfo?.supplierName || name),
     paymentStatus: fallbackDebt > 0.009 ? "SE_DEBE" : "PAZ_Y_SALVO",
     amountDue: fallbackDebt,
+    overdueAmount: 0,
     oldestDebtDate: "",
     daysDue: 0,
     source: "BusinessPartners",
@@ -12630,7 +12743,10 @@ app.get("/api/admin/production/component-procurement", verifyAdmin, async (req, 
     const top = Math.max(1, Math.min(10, prodNum(req.query?.top, 5)));
     if (!itemCode) return safeJson(res, 400, { ok: false, message: "Falta itemCode" });
 
-    const purchaseOrders = await prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc, top).catch(() => []);
+    const purchaseInvoices = await prodFetchRecentPurchaseInvoicesForItem(itemCode, itemDesc, top).catch(() => []);
+    const purchaseOrders = purchaseInvoices.length
+      ? purchaseInvoices
+      : await prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc, top).catch(() => []);
     const suppliers = Array.from(new Map(
       purchaseOrders
         .map((x) => [String(x.supplierCode || "").trim(), String(x.supplierName || "").trim()])
@@ -12661,6 +12777,7 @@ app.get("/api/admin/production/component-procurement", verifyAdmin, async (req, 
       itemCode,
       itemDesc,
       purchaseOrders: enrichedOrders,
+      purchaseSource: purchaseInvoices.length ? "PurchaseInvoices" : "PurchaseOrders",
       vendorStatuses,
       generatedAt: new Date().toISOString(),
       summary: {
