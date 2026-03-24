@@ -8458,7 +8458,26 @@ function prodParseJsonSafe(v, fallback = {}) {
   try { return JSON.parse(String(v)); } catch { return fallback; }
 }
 function prodClone(v) {
-  return v == null ? v : JSON.parse(JSON.stringify(v));
+  if (v == null) return v;
+  if (typeof structuredClone === "function") {
+    try { return structuredClone(v); } catch {}
+  }
+  return JSON.parse(JSON.stringify(v));
+}
+function prodDispatchItemLookup(indexLike, itemCode = '') {
+  const code = String(itemCode || '').trim();
+  if (!code || indexLike == null) return null;
+  if (typeof indexLike.get === 'function') {
+    try { return indexLike.get(code) || null; } catch {}
+  }
+  if (Array.isArray(indexLike)) {
+    const hit = indexLike.find((x) => String(x?.itemCode || '').trim() === code);
+    return hit || null;
+  }
+  if (typeof indexLike === 'object') {
+    return indexLike[code] || null;
+  }
+  return null;
 }
 function prodCacheFresh(ts, ttlMs = PROD_CACHE_TTL_MS) {
   const ms = new Date(ts || 0).getTime();
@@ -9584,7 +9603,7 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
   const hit = prodRuntimeGet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, PROD_DISPATCH_ALERTS_TTL_MS);
   if (hit) return hit;
   if (missingSapEnv()) {
-    const empty = { alerts: [], byItem: [], byItemMap: new Map(), summary: { cardCode, warehouse, pendingItems: 0, overdueItems: 0, pendingQty: 0, overdueQty: 0, error: 'SAP no configurado' } };
+    const empty = { alerts: [], byItem: [], byItemMap: new Map(), byItemIndex: {}, summary: { cardCode, warehouse, pendingItems: 0, overdueItems: 0, pendingQty: 0, overdueQty: 0, error: 'SAP no configurado' } };
     prodRuntimeSet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, empty);
     return empty;
   }
@@ -9605,7 +9624,7 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
     if (orders.length && orders.length % 10 === 0) await sleep(10);
   }
   if (!orders.length) {
-    const empty = { alerts: [], byItem: [], byItemMap: new Map(), summary: { cardCode, warehouse, pendingItems: 0, overdueItems: 0, pendingQty: 0, overdueQty: 0 } };
+    const empty = { alerts: [], byItem: [], byItemMap: new Map(), byItemIndex: {}, summary: { cardCode, warehouse, pendingItems: 0, overdueItems: 0, pendingQty: 0, overdueQty: 0 } };
     prodRuntimeSet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, empty);
     return empty;
   }
@@ -9758,7 +9777,8 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
     latestDueDate: alerts[0]?.dueDate || '',
   };
 
-  const result = { alerts, byItem, byItemMap, summary };
+  const byItemIndex = Object.fromEntries(byItem.map((x) => [String(x?.itemCode || '').trim(), x]));
+  const result = { alerts, byItem, byItemMap, byItemIndex, summary };
   prodRuntimeSet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, result);
   return result;
 }
@@ -11441,7 +11461,7 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
   const materialPool = new Map();
   const blockedItems = [];
   const rows = [];
-  const dispatchInfo = await prodBuildCustomerDispatchAlerts({ today }).catch((err) => ({ alerts: [], byItem: [], byItemMap: new Map(), summary: { cardCode: PROD_SPECIAL_DISPATCH_CARD_CODE, warehouse: PROD_SPECIAL_DISPATCH_WAREHOUSE, error: err?.message || String(err) } }));
+  const dispatchInfo = await prodBuildCustomerDispatchAlerts({ today }).catch((err) => ({ alerts: [], byItem: [], byItemMap: new Map(), byItemIndex: {}, summary: { cardCode: PROD_SPECIAL_DISPATCH_CARD_CODE, warehouse: PROD_SPECIAL_DISPATCH_WAREHOUSE, error: err?.message || String(err) } }));
   const calendarSet = new Set();
   const laneStates = new Map();
   let totalNeededQty = 0;
@@ -11472,7 +11492,7 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     }
     if (!(unitsPerHour > 0)) unitsPerHour = Math.max(1 / Math.max(1, effectiveDayHours), unitsPerShift / Math.max(1, effectiveDayHours));
 
-    const dispatchDemand = dispatchInfo?.byItemMap?.get(String(row?.itemCode || '').trim()) || null;
+    const dispatchDemand = prodDispatchItemLookup(dispatchInfo?.byItemMap || dispatchInfo?.byItemIndex || dispatchInfo?.byItem, String(row?.itemCode || '').trim()) || null;
     const dispatchGapQty = Math.max(0, prodNum(dispatchDemand?.qtyPending) - Math.max(0, prodNum(row?.stockTotal)));
     const rawFinishedQtyNeeded = Math.max(0, Math.ceil(Math.max(prodNum(row?.productionAdjusted), dispatchGapQty)));
     const configuredMinRunQty = Math.max(1, Math.floor(prodNum(local.capacity?.minimumRunQty || local.capacity?.minRunQty || 600, 600)));
