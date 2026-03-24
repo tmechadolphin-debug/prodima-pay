@@ -9655,7 +9655,7 @@ function prodDispatchHeaderDateRelevant(h = {}, { from = '', to = '', today = ''
 }
 
 async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATCH_CARD_CODE, warehouse = PROD_SPECIAL_DISPATCH_WAREHOUSE, today = getDateISOInOffset(TZ_OFFSET_MIN), lookbackDays = PROD_SPECIAL_DISPATCH_LOOKBACK_DAYS, lookaheadDays = PROD_SPECIAL_DISPATCH_LOOKAHEAD_DAYS, maxDocs = 250 } = {}) {
-  const cacheKey = JSON.stringify({ v: 11, cardCode, warehouse, today, lookbackDays, lookaheadDays, maxDocs });
+  const cacheKey = JSON.stringify({ v: 12, cardCode, warehouse, today, lookbackDays, lookaheadDays, maxDocs });
   const hit = prodRuntimeGet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, PROD_DISPATCH_ALERTS_TTL_MS);
   if (hit) return hit;
 
@@ -9723,6 +9723,7 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
     let full = null;
     try { full = await getDoc('Orders', de); } catch {}
     let lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+
     if (!lines.length) {
       try {
         const expanded = await slFetch(`/Orders(${de})?$expand=DocumentLines`, { timeoutMs: 180000 });
@@ -9732,6 +9733,7 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
         }
       } catch {}
     }
+
     if (!lines.length) {
       try {
         const search = await slFetch(`/Orders?$filter=${encodeURIComponent(`DocEntry eq ${de}`)}&$expand=DocumentLines&$top=1`, { timeoutMs: 180000 });
@@ -9742,6 +9744,45 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
         }
       } catch {}
     }
+
+    // Fallback crítico para ambientes donde Service Layer no expone DocumentLines
+    // dentro del documento expandido, pero sí responde la colección hija.
+    if (!lines.length) {
+      const linePaths = [
+        `/Orders(${de})/DocumentLines`,
+        `/Orders(${de})/DocumentLines?$top=500`,
+        `/Orders?$filter=${encodeURIComponent(`DocEntry eq ${de}`)}&$select=DocEntry,DocNum,CardCode,CardName,DocDate,DocDueDate,DocumentStatus&$top=1`,
+      ];
+      for (const p of linePaths) {
+        try {
+          const raw = await slFetch(p, { timeoutMs: 180000 });
+          const childRows = Array.isArray(raw?.DocumentLines)
+            ? raw.DocumentLines
+            : Array.isArray(raw?.value)
+              ? raw.value
+              : Array.isArray(raw)
+                ? raw
+                : prodNormalizeSlCollection(raw);
+          if (Array.isArray(childRows) && childRows.length) {
+            lines = childRows;
+            full = {
+              ...(full || {}),
+              ...(p.includes('$select=') ? (Array.isArray(raw?.value) && raw.value[0] ? raw.value[0] : (Array.isArray(raw) && raw[0] ? raw[0] : {})) : {}),
+              DocEntry: Number((full || {}).DocEntry || de),
+              DocNum: (full || {}).DocNum ?? undefined,
+              CardCode: String((full || {}).CardCode || ''),
+              CardName: String((full || {}).CardName || ''),
+              DocDate: String((full || {}).DocDate || ''),
+              DocDueDate: String((full || {}).DocDueDate || ''),
+              DocumentStatus: (full || {}).DocumentStatus || '',
+              DocumentLines: childRows,
+            };
+            break;
+          }
+        } catch {}
+      }
+    }
+
     return full;
   };
 
@@ -9797,6 +9838,7 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
         orderDetailsRead,
         orderDetailErrors,
         sampleDocNums: orderHeaders.slice(0, 10).map((x) => Number(x?.DocNum || 0)).filter(Boolean),
+        hint: orderHeaders.length && !orders.length ? 'Se encontraron cabeceras, pero no se pudieron materializar líneas válidas del pedido. Revisar lectura de DocumentLines en Service Layer.' : '',
       }),
     };
     prodRuntimeSet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, empty);
