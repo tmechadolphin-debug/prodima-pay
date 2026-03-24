@@ -8451,6 +8451,46 @@ async function ensureProductionDb() {
     );
   `);
 
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS sync_batch TEXT;`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS item_code TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS item_desc TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS source_doc_type TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS doc_entry BIGINT NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS doc_num BIGINT;`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS line_num INTEGER NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS doc_date DATE;`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS due_date DATE;`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS quantity NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS line_total NUMERIC(18,2) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS doc_total NUMERIC(18,2) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS supplier_code TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS supplier_name TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS document_status TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS open_qty NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_procurement_docs_cache ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();`);
+  await dbQuery(`UPDATE production_procurement_docs_cache SET sync_batch = COALESCE(NULLIF(sync_batch,''), 'legacy') WHERE sync_batch IS NULL OR sync_batch = '';`);
+  await dbQuery(`CREATE UNIQUE INDEX IF NOT EXISTS uq_prod_proc_docs_batch_item_docline ON production_procurement_docs_cache(sync_batch, item_code, source_doc_type, doc_entry, line_num);`);
+
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS sync_batch TEXT;`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS supplier_code TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS supplier_name TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'SIN_DATOS';`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS amount_due NUMERIC(18,2) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS overdue_amount NUMERIC(18,2) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS oldest_debt_date DATE;`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS days_due INTEGER NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS debt_basis TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS payment_terms_name TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS credit_days INTEGER NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS balance_raw NUMERIC(18,2) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS debt_note TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS payload_json JSONB NOT NULL DEFAULT '{}'::jsonb;`);
+  await dbQuery(`ALTER TABLE production_procurement_vendor_cache ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();`);
+  await dbQuery(`UPDATE production_procurement_vendor_cache SET sync_batch = COALESCE(NULLIF(sync_batch,''), 'legacy') WHERE sync_batch IS NULL OR sync_batch = '';`);
+  await dbQuery(`CREATE UNIQUE INDEX IF NOT EXISTS uq_prod_proc_vendor_batch_supplier ON production_procurement_vendor_cache(sync_batch, supplier_code);`);
+
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_proc_docs_item_batch_date ON production_procurement_docs_cache(item_code, sync_batch, doc_date DESC);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_proc_docs_supplier_batch ON production_procurement_docs_cache(supplier_code, sync_batch);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_proc_vendor_batch ON production_procurement_vendor_cache(sync_batch, supplier_code);`);
