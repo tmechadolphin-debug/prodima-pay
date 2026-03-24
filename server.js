@@ -12293,6 +12293,50 @@ function prodLooseEqCode(a, b) {
   return prodNormalizeItemCodeLoose(a) === prodNormalizeItemCodeLoose(b);
 }
 
+function prodBuildItemSearchVariants(itemCode = "", itemDesc = "") {
+  const raw = String(itemCode || "").trim();
+  const rawDesc = String(itemDesc || "").trim();
+  const codes = new Set();
+  const push = (v) => { const s = String(v || "").trim(); if (s) codes.add(s); };
+  push(raw);
+  push(raw.replace(/\s+/g, ""));
+  push(raw.replace(/PS$/i, ""));
+  push(raw.replace(/MP$/i, ""));
+  push(raw.replace(/EMPAQUE$/i, ""));
+  const norm = prodNormalizeItemCodeLoose(raw);
+  if (norm) push(norm);
+  const tokens = Array.from(new Set(
+    rawDesc
+      .toUpperCase()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^A-Z0-9 ]+/g, ' ')
+      .split(/\s+/)
+      .map((x) => x.trim())
+      .filter((x) => x && x.length >= 3 && !['PARA','CON','DEL','LAS','LOS','THE','AND'].includes(x))
+  )).slice(0, 6);
+  return { codes: Array.from(codes), descTokens: tokens };
+}
+
+function prodLineMatchesProcurementSearch(lineCode = "", lineDesc = "", variants = {}) {
+  const code = String(lineCode || "").trim();
+  const desc = String(lineDesc || "")
+    .toUpperCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const codeList = Array.isArray(variants?.codes) ? variants.codes : [];
+  for (const c of codeList) {
+    if (!c) continue;
+    if (code === c || prodLooseEqCode(code, c)) return true;
+  }
+  const tokens = Array.isArray(variants?.descTokens) ? variants.descTokens : [];
+  if (tokens.length >= 2 && tokens.every((t) => desc.includes(String(t)))) return true;
+  if (tokens.length >= 3) {
+    let hits = 0;
+    for (const t of tokens) if (desc.includes(String(t))) hits++;
+    if (hits >= Math.min(3, tokens.length)) return true;
+  }
+  return false;
+}
+
 async function prodReadPurchaseOrderDetails(docEntry) {
   const de = Number(docEntry);
   if (!(de > 0)) return null;
@@ -12323,19 +12367,22 @@ async function prodReadPurchaseOrderDetails(docEntry) {
   }
 }
 
-async function prodFetchRecentPurchaseOrdersForItem(itemCode, top = 5) {
+async function prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc = "", top = 5) {
   const code = String(itemCode || "").trim();
-  if (!code) return [];
+  const desc = String(itemDesc || "").trim();
+  if (!code && !desc) return [];
   const out = [];
   const seen = new Set();
+  const variants = prodBuildItemSearchVariants(code, desc);
 
   const collectFromDoc = (doc) => {
     if (!doc) return;
     const lines = prodAsArray(doc?.DocumentLines);
     for (const ln of lines) {
       const lineCode = String(ln?.ItemCode || "").trim();
-      if (!lineCode) continue;
-      if (!(lineCode === code || prodLooseEqCode(lineCode, code))) continue;
+      const lineDesc = String(ln?.ItemDescription || ln?.ItemDetails || "");
+      if (!lineCode && !lineDesc) continue;
+      if (!prodLineMatchesProcurementSearch(lineCode, lineDesc, variants)) continue;
       const key = `${Number(doc?.DocEntry || 0)}::${Number(ln?.LineNum || 0)}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -12354,27 +12401,37 @@ async function prodFetchRecentPurchaseOrdersForItem(itemCode, top = 5) {
         openQty: prodRound(prodNum(ln?.OpenQuantity || ln?.OpenQty || 0), 3),
         lineNum: Number(ln?.LineNum || 0),
         itemCode: lineCode,
-        itemDesc: String(ln?.ItemDescription || ln?.ItemDetails || ""),
+        itemDesc: lineDesc,
       });
     }
   };
 
+  // 1) Intento rápido con documentos recientes ya expandidos
   try {
-    const expanded = await slFetchFreshSession(`/PurchaseOrders?$orderby=DocDate desc&$top=80&$expand=DocumentLines`);
+    const expanded = await slFetchFreshSession(`/PurchaseOrders?$orderby=DocDate desc&$top=120&$expand=DocumentLines`);
     for (const doc of prodAsArray(expanded)) collectFromDoc(doc);
   } catch {}
 
+  // 2) Barrido más profundo por cabeceras recientes y lectura del detalle
+  const scanBatch = async (skip = 0, topBatch = 100) => {
+    const path = `/PurchaseOrders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$orderby=DocDate desc&$top=${topBatch}&$skip=${skip}`;
+    const headers = await slFetchFreshSession(path).catch(() => []);
+    let count = 0;
+    for (const h of prodAsArray(headers)) {
+      count++;
+      const de = Number(h?.DocEntry || 0);
+      if (!(de > 0)) continue;
+      const full = await prodReadPurchaseOrderDetails(de).catch(() => null);
+      collectFromDoc(full || h);
+    }
+    return count;
+  };
+
   if (out.length < top) {
-    try {
-      const headers = await slFetchFreshSession(`/PurchaseOrders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$orderby=DocDate desc&$top=120`);
-      for (const h of prodAsArray(headers)) {
-        if (out.length >= Math.max(top, 8)) break;
-        const de = Number(h?.DocEntry || 0);
-        if (!(de > 0)) continue;
-        const full = await prodReadPurchaseOrderDetails(de).catch(() => null);
-        collectFromDoc(full || h);
-      }
-    } catch {}
+    for (let skip = 0; skip < 600 && out.length < Math.max(top, 5); skip += 100) {
+      const count = await scanBatch(skip, 100).catch(() => 0);
+      if (!(count > 0)) break;
+    }
   }
 
   out.sort((a, b) =>
@@ -12475,7 +12532,7 @@ app.get("/api/admin/production/component-procurement", verifyAdmin, async (req, 
     const top = Math.max(1, Math.min(10, prodNum(req.query?.top, 5)));
     if (!itemCode) return safeJson(res, 400, { ok: false, message: "Falta itemCode" });
 
-    const purchaseOrders = await prodFetchRecentPurchaseOrdersForItem(itemCode, top).catch(() => []);
+    const purchaseOrders = await prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc, top).catch(() => []);
     const suppliers = Array.from(new Map(
       purchaseOrders
         .map((x) => [String(x.supplierCode || "").trim(), String(x.supplierName || "").trim()])
