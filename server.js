@@ -12266,6 +12266,261 @@ app.get("/api/admin/production/dashboard", verifyAdmin, async (req, res) => {
   }
 });
 
+
+function prodSapEscapeLiteral(v) {
+  return String(v || "").replace(/'/g, "''");
+}
+
+function prodAsArray(v) {
+  if (Array.isArray(v)) return v;
+  if (Array.isArray(v?.value)) return v.value;
+  return [];
+}
+
+function prodDateOnly(v) {
+  return String(v || "").slice(0, 10);
+}
+
+function prodDiffDaysFromToday(isoDate) {
+  const d = prodDateOnly(isoDate);
+  if (!d) return 0;
+  const a = new Date(`${d}T00:00:00`);
+  const b = new Date(`${getDateISOInOffset(TZ_OFFSET_MIN)}T00:00:00`);
+  return Math.round((b.getTime() - a.getTime()) / 86400000);
+}
+
+function prodLooseEqCode(a, b) {
+  return prodNormalizeItemCodeLoose(a) === prodNormalizeItemCodeLoose(b);
+}
+
+async function prodReadPurchaseOrderDetails(docEntry) {
+  const de = Number(docEntry);
+  if (!(de > 0)) return null;
+  const tries = [
+    `/PurchaseOrders(${de})?$expand=DocumentLines`,
+    `/PurchaseOrders?$filter=DocEntry eq ${de}&$expand=DocumentLines`,
+  ];
+  for (const path of tries) {
+    try {
+      const raw = await slFetchFreshSession(path);
+      if (raw?.DocEntry || raw?.DocumentLines || raw?.value?.length) {
+        const doc = raw?.DocEntry ? raw : (Array.isArray(raw?.value) && raw.value.length ? raw.value[0] : null);
+        if (doc) return doc;
+      }
+    } catch {}
+  }
+  try {
+    const base = await slFetchFreshSession(`/PurchaseOrders(${de})`);
+    if (!base) return null;
+    try {
+      const linesRes = await slFetchFreshSession(`/PurchaseOrders(${de})/DocumentLines?$top=500`);
+      const lines = prodAsArray(linesRes);
+      if (lines.length) base.DocumentLines = lines;
+    } catch {}
+    return base;
+  } catch {
+    return null;
+  }
+}
+
+async function prodFetchRecentPurchaseOrdersForItem(itemCode, top = 5) {
+  const code = String(itemCode || "").trim();
+  if (!code) return [];
+  const out = [];
+  const seen = new Set();
+
+  const collectFromDoc = (doc) => {
+    if (!doc) return;
+    const lines = prodAsArray(doc?.DocumentLines);
+    for (const ln of lines) {
+      const lineCode = String(ln?.ItemCode || "").trim();
+      if (!lineCode) continue;
+      if (!(lineCode === code || prodLooseEqCode(lineCode, code))) continue;
+      const key = `${Number(doc?.DocEntry || 0)}::${Number(ln?.LineNum || 0)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        docEntry: Number(doc?.DocEntry || 0),
+        docNum: Number(doc?.DocNum || 0),
+        docDate: prodDateOnly(doc?.DocDate),
+        dueDate: prodDateOnly(doc?.DocDueDate || doc?.TaxDate),
+        quantity: prodRound(prodNum(ln?.Quantity || 0), 3),
+        lineTotal: prodRound(prodNum(ln?.LineTotal || 0), 2),
+        docTotal: prodRound(prodNum(doc?.DocTotal || 0), 2),
+        currency: String(doc?.DocCurrency || "USD"),
+        supplierCode: String(doc?.CardCode || ""),
+        supplierName: String(doc?.CardName || ""),
+        documentStatus: String(doc?.DocumentStatus || doc?.Status || ""),
+        openQty: prodRound(prodNum(ln?.OpenQuantity || ln?.OpenQty || 0), 3),
+        lineNum: Number(ln?.LineNum || 0),
+        itemCode: lineCode,
+        itemDesc: String(ln?.ItemDescription || ln?.ItemDetails || ""),
+      });
+    }
+  };
+
+  try {
+    const expanded = await slFetchFreshSession(`/PurchaseOrders?$orderby=DocDate desc&$top=80&$expand=DocumentLines`);
+    for (const doc of prodAsArray(expanded)) collectFromDoc(doc);
+  } catch {}
+
+  if (out.length < top) {
+    try {
+      const headers = await slFetchFreshSession(`/PurchaseOrders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$orderby=DocDate desc&$top=120`);
+      for (const h of prodAsArray(headers)) {
+        if (out.length >= Math.max(top, 8)) break;
+        const de = Number(h?.DocEntry || 0);
+        if (!(de > 0)) continue;
+        const full = await prodReadPurchaseOrderDetails(de).catch(() => null);
+        collectFromDoc(full || h);
+      }
+    } catch {}
+  }
+
+  out.sort((a, b) =>
+    String(b.docDate || "").localeCompare(String(a.docDate || "")) ||
+    Number(b.docNum || 0) - Number(a.docNum || 0) ||
+    Number(a.lineNum || 0) - Number(b.lineNum || 0)
+  );
+  return out.slice(0, Math.max(1, Number(top || 5)));
+}
+
+async function prodFetchVendorPayablesStatus(cardCode, cardName = "") {
+  const code = String(cardCode || "").trim();
+  const name = String(cardName || "").trim();
+  const today = getDateISOInOffset(TZ_OFFSET_MIN);
+  const safe = prodSapEscapeLiteral(code);
+  const base = {
+    supplierCode: code,
+    supplierName: name,
+    paymentStatus: "SIN_DATOS",
+    amountDue: 0,
+    oldestDebtDate: "",
+    daysDue: 0,
+    source: "",
+  };
+  if (!code) return base;
+
+  try {
+    const inv = await slFetchFreshSession(`/PurchaseInvoices?$select=DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,PaidToDate,DocCurrency&$filter=CardCode eq '${safe}'&$orderby=DocDueDate asc&$top=50`);
+    const rows = prodAsArray(inv).map((x) => {
+      const total = prodNum(x?.DocTotal || 0);
+      const paid = prodNum(x?.PaidToDate || 0);
+      const outstanding = Math.max(0, total - paid);
+      return {
+        docNum: Number(x?.DocNum || 0),
+        dueDate: prodDateOnly(x?.DocDueDate || x?.DocDate),
+        docDate: prodDateOnly(x?.DocDate),
+        outstanding: prodRound(outstanding, 2),
+        status: String(x?.DocumentStatus || ""),
+        currency: String(x?.DocCurrency || "USD"),
+      };
+    });
+    const open = rows.filter((x) => x.outstanding > 0.009 || prodDocStatusIsOpen(x.status));
+    if (open.length) {
+      const oldest = open
+        .map((x) => x.dueDate || x.docDate)
+        .filter(Boolean)
+        .sort()[0] || "";
+      return {
+        supplierCode: code,
+        supplierName: name || String(open[0]?.CardName || ""),
+        paymentStatus: "SE_DEBE",
+        amountDue: prodRound(open.reduce((s, x) => s + prodNum(x.outstanding || 0), 0), 2),
+        oldestDebtDate: oldest,
+        daysDue: oldest ? Math.max(0, prodDiffDaysFromToday(oldest)) : 0,
+        source: "PurchaseInvoices",
+        openInvoices: open.slice(0, 10),
+      };
+    }
+    return {
+      supplierCode: code,
+      supplierName: name,
+      paymentStatus: "PAZ_Y_SALVO",
+      amountDue: 0,
+      oldestDebtDate: "",
+      daysDue: 0,
+      source: "PurchaseInvoices",
+      openInvoices: [],
+    };
+  } catch {}
+
+  try {
+    const bp = await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Balance,CurrentAccountBalance,DebitBalance`);
+    const balance = Math.max(
+      prodNum(bp?.Balance || 0),
+      prodNum(bp?.CurrentAccountBalance || 0),
+      prodNum(bp?.DebitBalance || 0),
+      0
+    );
+    return {
+      supplierCode: code,
+      supplierName: String(bp?.CardName || name),
+      paymentStatus: balance > 0.009 ? "SE_DEBE" : "PAZ_Y_SALVO",
+      amountDue: prodRound(balance, 2),
+      oldestDebtDate: "",
+      daysDue: 0,
+      source: "BusinessPartners",
+      openInvoices: [],
+    };
+  } catch {}
+
+  return base;
+}
+
+app.get("/api/admin/production/component-procurement", verifyAdmin, async (req, res) => {
+  try {
+    const itemCode = String(req.query?.itemCode || "").trim();
+    const itemDesc = String(req.query?.itemDesc || "").trim();
+    const top = Math.max(1, Math.min(10, prodNum(req.query?.top, 5)));
+    if (!itemCode) return safeJson(res, 400, { ok: false, message: "Falta itemCode" });
+
+    const purchaseOrders = await prodFetchRecentPurchaseOrdersForItem(itemCode, top).catch(() => []);
+    const suppliers = Array.from(new Map(
+      purchaseOrders
+        .map((x) => [String(x.supplierCode || "").trim(), String(x.supplierName || "").trim()])
+        .filter(([code]) => !!code)
+    ).entries()).map(([code, name]) => ({ code, name }));
+
+    const vendorStatuses = [];
+    for (const supplier of suppliers) {
+      vendorStatuses.push(await prodFetchVendorPayablesStatus(supplier.code, supplier.name).catch(() => ({
+        supplierCode: supplier.code,
+        supplierName: supplier.name,
+        paymentStatus: "SIN_DATOS",
+        amountDue: 0,
+        oldestDebtDate: "",
+        daysDue: 0,
+        source: "",
+      })));
+    }
+
+    const vendorMap = new Map(vendorStatuses.map((x) => [String(x.supplierCode || "").trim(), x]));
+    const enrichedOrders = purchaseOrders.map((row) => ({
+      ...row,
+      vendorStatus: vendorMap.get(String(row.supplierCode || "").trim()) || null,
+    }));
+
+    return safeJson(res, 200, {
+      ok: true,
+      itemCode,
+      itemDesc,
+      purchaseOrders: enrichedOrders,
+      vendorStatuses,
+      generatedAt: new Date().toISOString(),
+      summary: {
+        purchaseOrders: enrichedOrders.length,
+        suppliers: vendorStatuses.length,
+        anyDebt: vendorStatuses.some((x) => String(x?.paymentStatus || "") === "SE_DEBE"),
+      },
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+
+
 app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
