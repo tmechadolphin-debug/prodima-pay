@@ -12501,7 +12501,7 @@ async function prodFetchRecentPurchaseInvoicesForItem(itemCode, itemDesc = "", t
   return prodSortProcurementRows(out).slice(0, Math.max(1, Number(top || 5)));
 }
 
-async function prodFetchRecentPurchaseOrdersForItemasync function prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc = "", top = 5) {
+async function prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc = "", top = 5) {
   const code = String(itemCode || "").trim();
   const desc = String(itemDesc || "").trim();
   if (!code && !desc) return [];
@@ -12560,7 +12560,7 @@ async function prodFetchRecentPurchaseOrdersForItemasync function prodFetchRecen
   return prodSortProcurementRows(out).slice(0, Math.max(1, Number(top || 5)));
 }
 
-async function prodFetchVendorCreditTermsasync function prodFetchVendorCreditTerms(cardCode, fallbackName = "") {
+async function prodFetchVendorCreditTerms(cardCode, fallbackName = "") {
   const code = String(cardCode || "").trim();
   if (!code) return {
     supplierCode: code,
