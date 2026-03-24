@@ -12451,35 +12451,49 @@ async function prodFetchVendorCreditTerms(cardCode, fallbackName = "") {
     creditDays: 0,
     balanceRaw: 0,
     balanceDebt: 0,
+    rawBusinessPartner: null,
   };
 
   let bp = null;
-  try {
-    bp = await slFetchFreshSession(`/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum`);
-  } catch {}
+  const safe = prodSapEscapeLiteral(code);
+  const bpPaths = [
+    `/BusinessPartners?$select=CardCode,CardName,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=CardCode eq '${safe}'&$top=1`,
+    `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum`,
+  ];
+  for (const path of bpPaths) {
+    try {
+      const raw = await slFetchFreshSession(path);
+      const row = Array.isArray(raw) ? (raw[0] || null) : (prodAsArray(raw)[0] || raw || null);
+      if (row) { bp = row; break; }
+    } catch {}
+  }
 
   const result = {
     supplierCode: code,
     supplierName: String(bp?.CardName || fallbackName || ""),
     paymentTermsName: "",
     creditDays: 0,
-    balanceRaw: prodNum(bp?.Balance || 0),
+    balanceRaw: 0,
     balanceDebt: 0,
+    rawBusinessPartner: bp || null,
   };
 
-  const negativeBalances = [
+  const balanceCandidates = [
     prodNum(bp?.Balance || 0),
     prodNum(bp?.CurrentAccountBalance || 0),
     prodNum(bp?.DebitBalance || 0),
-  ].filter((x) => x < -0.009).map((x) => Math.abs(x));
-  result.balanceDebt = negativeBalances.length ? Math.max(...negativeBalances) : 0;
+  ].filter((x) => Number.isFinite(x) && Math.abs(x) > 0.0001);
+  result.balanceRaw = balanceCandidates.length ? balanceCandidates[0] : 0;
+
+  const debtCandidates = balanceCandidates.map((x) => Math.abs(x));
+  result.balanceDebt = debtCandidates.length ? Math.max(...debtCandidates) : 0;
 
   const termCode = Number(bp?.PayTermsGrpCode ?? bp?.GroupNum ?? 0);
   if (!(termCode > 0)) return result;
 
   const termPaths = [
+    `/PaymentTermsTypes?$select=GroupNumber,PaymentTermsGroupName,NumberOfAdditionalDays,ExtraDays,ExtraMonth&$filter=GroupNumber eq ${termCode}&$top=1`,
     `/PaymentTermsTypes(${termCode})?$select=GroupNumber,PaymentTermsGroupName,NumberOfAdditionalDays,ExtraDays,ExtraMonth`,
-    `/PaymentTermsTypes?$select=GroupNumber,PaymentTermsGroupName,NumberOfAdditionalDays,ExtraDays,ExtraMonth&$filter=GroupNumber eq ${termCode}`,
     `/PaymentTermsTypes?$filter=GroupNumber eq ${termCode}`,
   ];
 
@@ -12489,11 +12503,7 @@ async function prodFetchVendorCreditTerms(cardCode, fallbackName = "") {
       const row = Array.isArray(raw) ? (raw[0] || null) : (prodAsArray(raw)[0] || raw || null);
       if (!row) continue;
       const name = String(row?.PaymentTermsGroupName || row?.Name || "").trim();
-      let creditDays = Math.max(
-        0,
-        Number(row?.NumberOfAdditionalDays || 0),
-        Number(row?.ExtraDays || 0)
-      );
+      let creditDays = Math.max(0, Number(row?.NumberOfAdditionalDays || 0), Number(row?.ExtraDays || 0));
       if (!(creditDays > 0) && name) {
         const m = name.match(/(\d+)\s*d[ií]a/i);
         if (m) creditDays = Number(m[1] || 0);
