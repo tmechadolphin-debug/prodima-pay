@@ -11037,6 +11037,117 @@ let PROD_AB_SUBPLAN_WARM_STATE = {
   sample: [],
 };
 
+let PROD_COMPONENT_SUBPLAN_WARM_STATE = {
+  running: false,
+  startedAt: '',
+  finishedAt: '',
+  lastError: '',
+  planned: 0,
+  completed: 0,
+  sample: [],
+};
+const PROD_COMPONENT_SUBPLAN_INFLIGHT = new Set();
+
+function prodExtractRequirementCodes(plan = null) {
+  const rows = Array.isArray(plan?.requirements?.all) ? plan.requirements.all : [];
+  const out = [];
+  const seen = new Set();
+  for (const r of rows) {
+    const code = String(r?.code || r?.itemCode || '').trim();
+    if (!code) continue;
+    const key = prodNormalizeItemCodeLoose(code);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(code);
+  }
+  return out;
+}
+
+async function prodWarmComponentSubplanCodes(codes = [], opts = {}) {
+  const uniq = [];
+  const seen = new Set();
+  for (const raw of (Array.isArray(codes) ? codes : [])) {
+    const code = String(raw || '').trim();
+    const key = prodNormalizeItemCodeLoose(code);
+    if (!code || !key || seen.has(key) || PROD_COMPONENT_SUBPLAN_INFLIGHT.has(key)) continue;
+    seen.add(key);
+    uniq.push(code);
+  }
+  if (!uniq.length) return PROD_COMPONENT_SUBPLAN_WARM_STATE;
+
+  const today = getDateISOInOffset(TZ_OFFSET_MIN);
+  const toDate = String(opts?.toDate || today).slice(0, 10);
+  const avgMonths = Math.max(1, Math.min(24, Math.round(prodNum(opts?.avgMonths, 3))));
+  const horizonMonths = Math.max(1, Math.min(12, Math.round(prodNum(opts?.horizonMonths, 3))));
+  const shiftHours = prodRound(Math.max(1, Math.min(24, prodNum(opts?.shiftHours, 8))), 2);
+  const concurrency = Math.max(1, Math.min(4, Math.round(prodNum(opts?.concurrency, 2))));
+  const limit = Math.max(1, Math.min(300, Math.round(prodNum(opts?.limit, uniq.length || 1))));
+
+  const target = uniq.slice(0, limit);
+  target.forEach((c) => PROD_COMPONENT_SUBPLAN_INFLIGHT.add(prodNormalizeItemCodeLoose(c)));
+
+  PROD_COMPONENT_SUBPLAN_WARM_STATE = {
+    running: true,
+    startedAt: new Date().toISOString(),
+    finishedAt: '',
+    lastError: '',
+    planned: target.length,
+    completed: 0,
+    sample: target.slice(0, 12),
+  };
+
+  try {
+    await prodMapLimit(target, concurrency, async (itemCode) => {
+      try {
+        await productionBuildItemPlanCached({
+          itemCode,
+          toDate,
+          avgMonths,
+          horizonMonths,
+          shiftHours,
+          plannedQtyOverride: 0,
+          forceRefresh: false,
+        });
+      } catch (e) {
+        PROD_COMPONENT_SUBPLAN_WARM_STATE.lastError = e?.message || String(e);
+      } finally {
+        PROD_COMPONENT_SUBPLAN_WARM_STATE.completed += 1;
+        PROD_COMPONENT_SUBPLAN_INFLIGHT.delete(prodNormalizeItemCodeLoose(itemCode));
+      }
+      return null;
+    });
+  } finally {
+    PROD_COMPONENT_SUBPLAN_WARM_STATE.running = false;
+    PROD_COMPONENT_SUBPLAN_WARM_STATE.finishedAt = new Date().toISOString();
+    for (const c of target) PROD_COMPONENT_SUBPLAN_INFLIGHT.delete(prodNormalizeItemCodeLoose(c));
+  }
+  return PROD_COMPONENT_SUBPLAN_WARM_STATE;
+}
+
+function prodStartComponentSubplanWarm(codes = [], opts = {}) {
+  const uniq = [];
+  const seen = new Set();
+  for (const raw of (Array.isArray(codes) ? codes : [])) {
+    const code = String(raw || '').trim();
+    const key = prodNormalizeItemCodeLoose(code);
+    if (!code || !key || seen.has(key) || PROD_COMPONENT_SUBPLAN_INFLIGHT.has(key)) continue;
+    seen.add(key);
+    uniq.push(code);
+  }
+  if (!uniq.length) return false;
+  setImmediate(async () => {
+    try {
+      await prodWarmComponentSubplanCodes(uniq, opts);
+    } catch (e) {
+      PROD_COMPONENT_SUBPLAN_WARM_STATE.running = false;
+      PROD_COMPONENT_SUBPLAN_WARM_STATE.lastError = e?.message || String(e);
+      PROD_COMPONENT_SUBPLAN_WARM_STATE.finishedAt = new Date().toISOString();
+      uniq.forEach((c) => PROD_COMPONENT_SUBPLAN_INFLIGHT.delete(prodNormalizeItemCodeLoose(c)));
+    }
+  });
+  return true;
+}
+
 function prodNormalizePlanCacheParams(params = {}) {
   const today = getDateISOInOffset(TZ_OFFSET_MIN);
   return {
@@ -11151,6 +11262,7 @@ async function prodWarmAbSubplanCache(opts = {}) {
   await setState('production_ab_subplan_warm_started_at', PROD_AB_SUBPLAN_WARM_STATE.startedAt).catch(() => {});
   await setState('production_ab_subplan_warm_status', JSON.stringify(PROD_AB_SUBPLAN_WARM_STATE)).catch(() => {});
 
+  const childCodes = new Set();
   try {
     await prodMapLimit(items, concurrency, async (row) => {
       const itemCode = String(row?.itemCode || '').trim();
@@ -11175,6 +11287,10 @@ async function prodWarmAbSubplanCache(opts = {}) {
           plannedQtyOverride: 0,
         });
         prodRuntimeSet(PROD_PLAN_RUNTIME_CACHE, key, plan);
+        for (const code of prodExtractRequirementCodes(plan)) {
+          const k = prodNormalizeItemCodeLoose(code);
+          if (k) childCodes.add(code);
+        }
       } catch (e) {
         PROD_AB_SUBPLAN_WARM_STATE.lastError = e?.message || String(e);
       } finally {
@@ -11182,6 +11298,17 @@ async function prodWarmAbSubplanCache(opts = {}) {
       }
       return null;
     });
+
+    if (childCodes.size) {
+      prodStartComponentSubplanWarm(Array.from(childCodes), {
+        toDate,
+        avgMonths,
+        horizonMonths,
+        shiftHours,
+        concurrency: Math.max(1, Math.min(4, concurrency)),
+        limit: Math.min(300, childCodes.size),
+      });
+    }
   } finally {
     PROD_AB_SUBPLAN_WARM_STATE.running = false;
     PROD_AB_SUBPLAN_WARM_STATE.finishedAt = new Date().toISOString();
@@ -13164,6 +13291,18 @@ app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
         plan.abcHint = row.totalLabel || "";
         await prodWriteSubplanCacheDb({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty }, plan, plan.abcHint).catch(() => null);
       }
+    }
+
+    const componentCodes = prodExtractRequirementCodes(plan);
+    if (componentCodes.length) {
+      prodStartComponentSubplanWarm(componentCodes, {
+        toDate,
+        avgMonths,
+        horizonMonths,
+        shiftHours,
+        concurrency: 2,
+        limit: 200,
+      });
     }
 
     return safeJson(res, 200, plan);
