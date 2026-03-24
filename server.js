@@ -8403,22 +8403,6 @@ async function ensureProductionDb() {
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_item_date ON production_demand_lines(item_code, doc_date DESC);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_date ON production_demand_lines(doc_date DESC);`);
 
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS production_subplan_cache (
-      item_code TEXT NOT NULL,
-      to_date DATE NOT NULL,
-      avg_months INTEGER NOT NULL DEFAULT 3,
-      horizon_months INTEGER NOT NULL DEFAULT 3,
-      shift_hours NUMERIC(10,2) NOT NULL DEFAULT 8,
-      planned_qty_override NUMERIC(18,4) NOT NULL DEFAULT 0,
-      abc_hint TEXT NOT NULL DEFAULT '',
-      plan_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-      updated_at TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY(item_code, to_date, avg_months, horizon_months, shift_hours, planned_qty_override)
-    );
-  `);
-
-  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_subplan_item_updated ON production_subplan_cache(item_code, updated_at DESC);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_inv_wh_item ON production_inv_wh_cache(item_code);`);
 }
 __extraBootTasks.push(async () => {
@@ -11025,378 +11009,19 @@ function prodCompactItemForAi(x) {
 
 
 
-
-const PROD_SUBPLAN_DB_TTL_MS = 1000 * 60 * 60 * 24 * 7;
-let PROD_AB_SUBPLAN_WARM_STATE = {
-  running: false,
-  startedAt: '',
-  finishedAt: '',
-  lastError: '',
-  planned: 0,
-  completed: 0,
-  sample: [],
-};
-
-let PROD_COMPONENT_SUBPLAN_WARM_STATE = {
-  running: false,
-  startedAt: '',
-  finishedAt: '',
-  lastError: '',
-  planned: 0,
-  completed: 0,
-  sample: [],
-};
-const PROD_COMPONENT_SUBPLAN_INFLIGHT = new Set();
-
-function prodExtractRequirementCodes(plan = null) {
-  const rows = Array.isArray(plan?.requirements?.all) ? plan.requirements.all : [];
-  const out = [];
-  const seen = new Set();
-  for (const r of rows) {
-    const code = String(r?.code || r?.itemCode || '').trim();
-    if (!code) continue;
-    const key = prodNormalizeItemCodeLoose(code);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(code);
-  }
-  return out;
-}
-
-async function prodWarmComponentSubplanCodes(codes = [], opts = {}) {
-  const uniq = [];
-  const seenSeed = new Set();
-  for (const raw of (Array.isArray(codes) ? codes : [])) {
-    const code = String(raw || '').trim();
-    const key = prodNormalizeItemCodeLoose(code);
-    if (!code || !key || seenSeed.has(key) || PROD_COMPONENT_SUBPLAN_INFLIGHT.has(key)) continue;
-    seenSeed.add(key);
-    uniq.push(code);
-  }
-  if (!uniq.length) return PROD_COMPONENT_SUBPLAN_WARM_STATE;
-
-  const today = getDateISOInOffset(TZ_OFFSET_MIN);
-  const toDate = String(opts?.toDate || today).slice(0, 10);
-  const avgMonths = Math.max(1, Math.min(24, Math.round(prodNum(opts?.avgMonths, 3))));
-  const horizonMonths = Math.max(1, Math.min(12, Math.round(prodNum(opts?.horizonMonths, 3))));
-  const shiftHours = prodRound(Math.max(1, Math.min(24, prodNum(opts?.shiftHours, 8))), 2);
-  const concurrency = Math.max(1, Math.min(4, Math.round(prodNum(opts?.concurrency, 2))));
-  const limit = Math.max(1, Math.min(600, Math.round(prodNum(opts?.limit, uniq.length || 1))));
-  const maxDepth = Math.max(1, Math.min(5, Math.round(prodNum(opts?.maxDepth, 3))));
-
-  const queue = [];
-  const queuedKeys = new Set();
-  const enqueue = (code, depth) => {
-    const itemCode = String(code || '').trim();
-    const key = prodNormalizeItemCodeLoose(itemCode);
-    if (!itemCode || !key || queuedKeys.has(key) || PROD_COMPONENT_SUBPLAN_INFLIGHT.has(key)) return false;
-    if ((queue.length + queuedKeys.size) > limit * 2) return false;
-    queuedKeys.add(key);
-    PROD_COMPONENT_SUBPLAN_INFLIGHT.add(key);
-    queue.push({ itemCode, depth, key });
-    return true;
-  };
-
-  uniq.slice(0, limit).forEach((code) => enqueue(code, 1));
-
-  PROD_COMPONENT_SUBPLAN_WARM_STATE = {
-    running: true,
-    startedAt: new Date().toISOString(),
-    finishedAt: '',
-    lastError: '',
-    planned: queue.length,
-    completed: 0,
-    sample: queue.slice(0, 12).map((x) => x.itemCode),
-    maxDepth,
-  };
-
-  const release = (node) => {
-    if (!node) return;
-    PROD_COMPONENT_SUBPLAN_INFLIGHT.delete(node.key || prodNormalizeItemCodeLoose(node.itemCode || ''));
-  };
-
-  try {
-    while (queue.length && PROD_COMPONENT_SUBPLAN_WARM_STATE.completed < limit) {
-      const batch = queue.splice(0, Math.max(1, concurrency));
-      await prodMapLimit(batch, concurrency, async (node) => {
-        try {
-          const plan = await productionBuildItemPlanCached({
-            itemCode: node.itemCode,
-            toDate,
-            avgMonths,
-            horizonMonths,
-            shiftHours,
-            plannedQtyOverride: 0,
-            forceRefresh: false,
-          });
-
-          if (node.depth < maxDepth) {
-            const childCodes = prodExtractRequirementCodes(plan);
-            for (const child of childCodes) {
-              if ((queue.length + PROD_COMPONENT_SUBPLAN_WARM_STATE.completed) >= limit) break;
-              if (enqueue(child, node.depth + 1)) {
-                PROD_COMPONENT_SUBPLAN_WARM_STATE.planned += 1;
-              }
-            }
-          }
-        } catch (e) {
-          PROD_COMPONENT_SUBPLAN_WARM_STATE.lastError = e?.message || String(e);
-        } finally {
-          PROD_COMPONENT_SUBPLAN_WARM_STATE.completed += 1;
-          release(node);
-        }
-        return null;
-      });
-    }
-  } finally {
-    PROD_COMPONENT_SUBPLAN_WARM_STATE.running = false;
-    PROD_COMPONENT_SUBPLAN_WARM_STATE.finishedAt = new Date().toISOString();
-    for (const node of queue) release(node);
-  }
-  return PROD_COMPONENT_SUBPLAN_WARM_STATE;
-}
-
-function prodStartComponentSubplanWarm(codes = [], opts = {}) {
-  const uniq = [];
-  const seen = new Set();
-  for (const raw of (Array.isArray(codes) ? codes : [])) {
-    const code = String(raw || '').trim();
-    const key = prodNormalizeItemCodeLoose(code);
-    if (!code || !key || seen.has(key) || PROD_COMPONENT_SUBPLAN_INFLIGHT.has(key)) continue;
-    seen.add(key);
-    uniq.push(code);
-  }
-  if (!uniq.length) return false;
-  setImmediate(async () => {
-    try {
-      await prodWarmComponentSubplanCodes(uniq, opts);
-    } catch (e) {
-      PROD_COMPONENT_SUBPLAN_WARM_STATE.running = false;
-      PROD_COMPONENT_SUBPLAN_WARM_STATE.lastError = e?.message || String(e);
-      PROD_COMPONENT_SUBPLAN_WARM_STATE.finishedAt = new Date().toISOString();
-      uniq.forEach((c) => PROD_COMPONENT_SUBPLAN_INFLIGHT.delete(prodNormalizeItemCodeLoose(c)));
-    }
-  });
-  return true;
-}
-
-function prodNormalizePlanCacheParams(params = {}) {
-  const today = getDateISOInOffset(TZ_OFFSET_MIN);
-  return {
-    itemCode: String(params.itemCode || "").trim(),
-    toDate: String(params.toDate || today).slice(0, 10),
-    avgMonths: Math.max(1, Math.min(24, Math.round(prodNum(params.avgMonths, 5)))),
-    horizonMonths: Math.max(1, Math.min(12, Math.round(prodNum(params.horizonMonths, 3)))),
-    shiftHours: prodRound(Math.max(1, Math.min(24, prodNum(params.shiftHours, 8))), 2),
-    plannedQtyOverride: prodRound(Math.max(0, prodNum(params.plannedQtyOverride, 0)), 4),
-    forceRefresh: !!params.forceRefresh,
-  };
-}
-
-async function prodReadSubplanCacheDb(params = {}, ttlMs = PROD_SUBPLAN_DB_TTL_MS) {
-  if (!hasDb()) return null;
-  const p = prodNormalizePlanCacheParams(params);
-  if (!p.itemCode) return null;
-  const res = await dbQuery(
-    `
-    SELECT abc_hint, plan_json, updated_at
-    FROM production_subplan_cache
-    WHERE item_code = $1
-      AND to_date = $2::date
-      AND avg_months = $3
-      AND horizon_months = $4
-      AND shift_hours = $5
-      AND planned_qty_override = $6
-    LIMIT 1
-    `,
-    [p.itemCode, p.toDate, p.avgMonths, p.horizonMonths, p.shiftHours, p.plannedQtyOverride]
-  ).catch(() => null);
-  const row = res?.rows?.[0];
-  if (!row?.plan_json) return null;
-  const updatedAt = row.updated_at ? new Date(row.updated_at).getTime() : 0;
-  if (ttlMs > 0 && updatedAt > 0 && (Date.now() - updatedAt) > ttlMs) return null;
-  const plan = typeof row.plan_json === 'string' ? JSON.parse(row.plan_json) : row.plan_json;
-  if (!plan || typeof plan !== 'object') return null;
-  if (row.abc_hint && !plan.abcHint) plan.abcHint = String(row.abc_hint || '');
-  plan.cacheSource = 'DB_SUBPLAN_CACHE';
-  plan.cacheUpdatedAt = row.updated_at ? new Date(row.updated_at).toISOString() : '';
-  return plan;
-}
-
-async function prodWriteSubplanCacheDb(params = {}, plan = null, abcHint = '') {
-  if (!hasDb() || !plan || typeof plan !== 'object') return false;
-  const p = prodNormalizePlanCacheParams(params);
-  if (!p.itemCode) return false;
-  await dbQuery(
-    `
-    INSERT INTO production_subplan_cache(
-      item_code, to_date, avg_months, horizon_months, shift_hours, planned_qty_override,
-      abc_hint, plan_json, updated_at
-    ) VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8::jsonb, NOW())
-    ON CONFLICT(item_code, to_date, avg_months, horizon_months, shift_hours, planned_qty_override)
-    DO UPDATE SET
-      abc_hint = EXCLUDED.abc_hint,
-      plan_json = EXCLUDED.plan_json,
-      updated_at = NOW()
-    `,
-    [p.itemCode, p.toDate, p.avgMonths, p.horizonMonths, p.shiftHours, p.plannedQtyOverride, String(abcHint || plan?.abcHint || ''), JSON.stringify(plan)]
-  ).catch(() => null);
-  return true;
-}
-
-function prodShouldPrecacheAbRow(row = null) {
-  if (!row) return false;
-  const cls = String(row?.totalLabel || '');
-  if (!cls.startsWith('AB')) return false;
-  return true;
-}
-
-async function prodWarmAbSubplanCache(opts = {}) {
-  const today = getDateISOInOffset(TZ_OFFSET_MIN);
-  const toDate = String(opts?.toDate || today).slice(0, 10);
-  const avgMonths = Math.max(1, Math.min(24, Math.round(prodNum(opts?.avgMonths, 3))));
-  const horizonMonths = Math.max(1, Math.min(12, Math.round(prodNum(opts?.horizonMonths, 3))));
-  const shiftHours = prodRound(Math.max(1, Math.min(24, prodNum(opts?.shiftHours, 8))), 2);
-  const limit = Math.max(10, Math.min(180, Math.round(prodNum(opts?.limit, 80))));
-  const concurrency = Math.max(1, Math.min(4, Math.round(prodNum(opts?.concurrency, 2))));
-
-  const dashboard = await productionDashboardFromDb({
-    from: '2025-01-01',
-    to: toDate,
-    area: '__ALL__',
-    grupo: '__ALL__',
-    q: '',
-    sizeUom: '__ALL__',
-    abc: '__ALL__',
-    typeFilter: 'Se fabrica en planta',
-    avgMonths,
-    horizonMonths,
-  });
-
-  const items = (Array.isArray(dashboard?.items) ? dashboard.items : [])
-    .filter(prodShouldPrecacheAbRow)
-    .sort((a, b) =>
-      (Number(prodNum(b?.productionAdjusted)) - Number(prodNum(a?.productionAdjusted))) ||
-      (Number(prodNum(b?.hoursNeeded)) - Number(prodNum(a?.hoursNeeded))) ||
-      String(a?.itemCode || '').localeCompare(String(b?.itemCode || ''))
-    )
-    .slice(0, limit);
-
-  PROD_AB_SUBPLAN_WARM_STATE = {
-    running: true,
-    startedAt: new Date().toISOString(),
-    finishedAt: '',
-    lastError: '',
-    planned: items.length,
-    completed: 0,
-    sample: items.slice(0, 10).map((x) => String(x?.itemCode || '')),
-  };
-  await setState('production_ab_subplan_warm_started_at', PROD_AB_SUBPLAN_WARM_STATE.startedAt).catch(() => {});
-  await setState('production_ab_subplan_warm_status', JSON.stringify(PROD_AB_SUBPLAN_WARM_STATE)).catch(() => {});
-
-  const childCodes = new Set();
-  try {
-    await prodMapLimit(items, concurrency, async (row) => {
-      const itemCode = String(row?.itemCode || '').trim();
-      if (!itemCode) return null;
-      try {
-        const plan = await productionBuildItemPlan({
-          itemCode,
-          toDate,
-          avgMonths,
-          horizonMonths,
-          shiftHours,
-          plannedQtyOverride: 0,
-        });
-        plan.abcHint = String(row?.totalLabel || '');
-        await prodWriteSubplanCacheDb({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: 0 }, plan, plan.abcHint);
-        const key = JSON.stringify({
-          itemCode,
-          toDate,
-          avgMonths,
-          horizonMonths,
-          shiftHours,
-          plannedQtyOverride: 0,
-        });
-        prodRuntimeSet(PROD_PLAN_RUNTIME_CACHE, key, plan);
-        for (const code of prodExtractRequirementCodes(plan)) {
-          const k = prodNormalizeItemCodeLoose(code);
-          if (k) childCodes.add(code);
-        }
-      } catch (e) {
-        PROD_AB_SUBPLAN_WARM_STATE.lastError = e?.message || String(e);
-      } finally {
-        PROD_AB_SUBPLAN_WARM_STATE.completed += 1;
-      }
-      return null;
-    });
-
-    if (childCodes.size) {
-      prodStartComponentSubplanWarm(Array.from(childCodes), {
-        toDate,
-        avgMonths,
-        horizonMonths,
-        shiftHours,
-        concurrency: Math.max(1, Math.min(4, concurrency)),
-        limit: Math.min(500, Math.max(120, childCodes.size * 4)),
-        maxDepth: 3,
-      });
-    }
-  } finally {
-    PROD_AB_SUBPLAN_WARM_STATE.running = false;
-    PROD_AB_SUBPLAN_WARM_STATE.finishedAt = new Date().toISOString();
-    await setState('production_ab_subplan_warm_finished_at', PROD_AB_SUBPLAN_WARM_STATE.finishedAt).catch(() => {});
-    await setState('production_ab_subplan_warm_status', JSON.stringify(PROD_AB_SUBPLAN_WARM_STATE)).catch(() => {});
-  }
-  return PROD_AB_SUBPLAN_WARM_STATE;
-}
-
-function prodStartAbSubplanWarm(opts = {}) {
-  if (PROD_AB_SUBPLAN_WARM_STATE.running) return false;
-  setImmediate(async () => {
-    try {
-      await prodWarmAbSubplanCache(opts);
-    } catch (e) {
-      PROD_AB_SUBPLAN_WARM_STATE.running = false;
-      PROD_AB_SUBPLAN_WARM_STATE.lastError = e?.message || String(e);
-      PROD_AB_SUBPLAN_WARM_STATE.finishedAt = new Date().toISOString();
-      try {
-        await setState('production_ab_subplan_warm_status', JSON.stringify(PROD_AB_SUBPLAN_WARM_STATE));
-      } catch {}
-    }
-  });
-  return true;
-}
-
 async function productionBuildItemPlanCached(params = {}) {
-  const p = prodNormalizePlanCacheParams(params);
   const key = JSON.stringify({
-    itemCode: p.itemCode,
-    toDate: p.toDate,
-    avgMonths: p.avgMonths,
-    horizonMonths: p.horizonMonths,
-    shiftHours: p.shiftHours,
-    plannedQtyOverride: p.plannedQtyOverride,
+    itemCode: String(params.itemCode || "").trim(),
+    toDate: String(params.toDate || ""),
+    avgMonths: Number(params.avgMonths || 5),
+    horizonMonths: Number(params.horizonMonths || 3),
+    shiftHours: Number(params.shiftHours || 8),
+    plannedQtyOverride: Number(params.plannedQtyOverride || 0),
   });
-  if (!p.forceRefresh) {
-    const hit = prodRuntimeGet(PROD_PLAN_RUNTIME_CACHE, key, PROD_PLAN_TTL_MS);
-    if (hit) return hit;
-    const dbHit = await prodReadSubplanCacheDb(p).catch(() => null);
-    if (dbHit) {
-      prodRuntimeSet(PROD_PLAN_RUNTIME_CACHE, key, dbHit);
-      return dbHit;
-    }
-  }
-  const plan = await productionBuildItemPlan({
-    itemCode: p.itemCode,
-    toDate: p.toDate,
-    avgMonths: p.avgMonths,
-    horizonMonths: p.horizonMonths,
-    shiftHours: p.shiftHours,
-    plannedQtyOverride: p.plannedQtyOverride,
-  });
+  const hit = prodRuntimeGet(PROD_PLAN_RUNTIME_CACHE, key, PROD_PLAN_TTL_MS);
+  if (hit) return hit;
+  const plan = await productionBuildItemPlan(params);
   prodRuntimeSet(PROD_PLAN_RUNTIME_CACHE, key, plan);
-  await prodWriteSubplanCacheDb(p, plan, plan?.abcHint || '').catch(() => null);
   return plan;
 }
 
@@ -12860,42 +12485,23 @@ async function prodFetchRecentPurchaseInvoicesForItem(itemCode, itemDesc = "", t
   const fastAnyFilter = prodBuildProcurementItemAnyFilter(code);
   if (fastAnyFilter) {
     try {
-      const fastPath = `/PurchaseInvoices?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$filter=${fastAnyFilter}&$orderby=DocDate desc&$top=${Math.max(20, Number(top || 5) * 4)}&$expand=DocumentLines`;
+      const fastPath = `/PurchaseInvoices?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$filter=${fastAnyFilter}&$orderby=DocDate desc&$top=${Math.max(10, Number(top || 5) * 3)}&$expand=DocumentLines`;
       const fastDocs = await slFetchFreshSession(fastPath);
       for (const doc of prodAsArray(fastDocs)) collectFromDoc(doc);
     } catch {}
   }
 
-  if (out.length < top) {
+  if (out.length < top && desc) {
     try {
-      const expanded = await slFetchFreshSession(`/PurchaseInvoices?$orderby=DocDate desc&$top=80&$expand=DocumentLines`);
+      const expanded = await slFetchFreshSession(`/PurchaseInvoices?$orderby=DocDate desc&$top=40&$expand=DocumentLines`);
       for (const doc of prodAsArray(expanded)) collectFromDoc(doc);
     } catch {}
-  }
-
-  const scanBatch = async (skip = 0, topBatch = 100) => {
-    const path = `/PurchaseInvoices?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$orderby=DocDate desc&$top=${topBatch}&$skip=${skip}`;
-    const headers = prodAsArray(await slFetchFreshSession(path).catch(() => []));
-    const docs = await prodMapLimit(headers, 10, async (h) => {
-      const de = Number(h?.DocEntry || 0);
-      if (!(de > 0)) return null;
-      return await prodReadPurchaseInvoiceDetails(de).catch(() => h || null);
-    }).catch(() => []);
-    for (const doc of docs) collectFromDoc(doc);
-    return headers.length;
-  };
-
-  if (out.length < top) {
-    for (let skip = 0; skip < 600 && out.length < Math.max(top, 5); skip += 100) {
-      const count = await scanBatch(skip, 100).catch(() => 0);
-      if (!(count > 0)) break;
-    }
   }
 
   return prodSortProcurementRows(out).slice(0, Math.max(1, Number(top || 5)));
 }
 
-async function prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc = "", top = 5) {
+async function prodFetchRecentPurchaseOrdersForItemasync function prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc = "", top = 5) {
   const code = String(itemCode || "").trim();
   const desc = String(itemDesc || "").trim();
   if (!code && !desc) return [];
@@ -12938,42 +12544,23 @@ async function prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc = "", top
   const fastAnyFilter = prodBuildProcurementItemAnyFilter(code);
   if (fastAnyFilter) {
     try {
-      const fastPath = `/PurchaseOrders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$filter=${fastAnyFilter}&$orderby=DocDate desc&$top=${Math.max(20, Number(top || 5) * 4)}&$expand=DocumentLines`;
+      const fastPath = `/PurchaseOrders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$filter=${fastAnyFilter}&$orderby=DocDate desc&$top=${Math.max(10, Number(top || 5) * 3)}&$expand=DocumentLines`;
       const fastDocs = await slFetchFreshSession(fastPath);
       for (const doc of prodAsArray(fastDocs)) collectFromDoc(doc);
     } catch {}
   }
 
-  if (out.length < top) {
+  if (out.length < top && desc) {
     try {
-      const expanded = await slFetchFreshSession(`/PurchaseOrders?$orderby=DocDate desc&$top=80&$expand=DocumentLines`);
+      const expanded = await slFetchFreshSession(`/PurchaseOrders?$orderby=DocDate desc&$top=30&$expand=DocumentLines`);
       for (const doc of prodAsArray(expanded)) collectFromDoc(doc);
     } catch {}
-  }
-
-  const scanBatch = async (skip = 0, topBatch = 100) => {
-    const path = `/PurchaseOrders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$orderby=DocDate desc&$top=${topBatch}&$skip=${skip}`;
-    const headers = prodAsArray(await slFetchFreshSession(path).catch(() => []));
-    const docs = await prodMapLimit(headers, 10, async (h) => {
-      const de = Number(h?.DocEntry || 0);
-      if (!(de > 0)) return null;
-      return await prodReadPurchaseOrderDetails(de).catch(() => h || null);
-    }).catch(() => []);
-    for (const doc of docs) collectFromDoc(doc);
-    return headers.length;
-  };
-
-  if (out.length < top) {
-    for (let skip = 0; skip < 600 && out.length < Math.max(top, 5); skip += 100) {
-      const count = await scanBatch(skip, 100).catch(() => 0);
-      if (!(count > 0)) break;
-    }
   }
 
   return prodSortProcurementRows(out).slice(0, Math.max(1, Number(top || 5)));
 }
 
-async function prodFetchVendorCreditTerms(cardCode, fallbackName = "") {
+async function prodFetchVendorCreditTermsasync function prodFetchVendorCreditTerms(cardCode, fallbackName = "") {
   const code = String(cardCode || "").trim();
   if (!code) return {
     supplierCode: code,
@@ -12989,6 +12576,8 @@ async function prodFetchVendorCreditTerms(cardCode, fallbackName = "") {
   const safe = prodSapEscapeLiteral(code);
   const bpPaths = [
     `/BusinessPartners?$select=CardCode,CardName,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=CardCode eq '${safe}'&$top=1`,
+    `/BusinessPartners?$select=CardCode,CardName,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=contains(CardCode,'${safe}')&$top=5`,
+    `/BusinessPartners?$select=CardCode,CardName,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=substringof('${safe}',CardCode)&$top=5`,
     `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum`,
   ];
   for (const path of bpPaths) {
@@ -13006,9 +12595,6 @@ async function prodFetchVendorCreditTerms(cardCode, fallbackName = "") {
     creditDays: 0,
     balanceRaw: 0,
     balanceDebt: 0,
-    currentAccountBalance: 0,
-    ocrdBalance: 0,
-    debitBalance: 0,
     balanceSource: "",
     rawBusinessPartner: bp || null,
   };
@@ -13016,64 +12602,51 @@ async function prodFetchVendorCreditTerms(cardCode, fallbackName = "") {
   const currentAccountBalance = prodNum(bp?.CurrentAccountBalance || 0);
   const ocrdBalance = prodNum(bp?.Balance || 0);
   const debitBalance = prodNum(bp?.DebitBalance || 0);
+  const chosen = [
+    { v: currentAccountBalance, src: "CurrentAccountBalance" },
+    { v: ocrdBalance, src: "Balance" },
+    { v: debitBalance, src: "DebitBalance" },
+  ].find((x) => Number.isFinite(x.v) && Math.abs(x.v) > 0.0001) || { v: 0, src: "" };
 
-  result.currentAccountBalance = currentAccountBalance;
-  result.ocrdBalance = ocrdBalance;
-  result.debitBalance = debitBalance;
-
-  if (Number.isFinite(currentAccountBalance) && Math.abs(currentAccountBalance) > 0.0001) {
-    result.balanceRaw = currentAccountBalance;
-    result.balanceSource = "CurrentAccountBalance";
-  } else if (Number.isFinite(ocrdBalance) && Math.abs(ocrdBalance) > 0.0001) {
-    result.balanceRaw = ocrdBalance;
-    result.balanceSource = "Balance";
-  } else if (Number.isFinite(debitBalance) && Math.abs(debitBalance) > 0.0001) {
-    result.balanceRaw = debitBalance;
-    result.balanceSource = "DebitBalance";
-  } else {
-    result.balanceRaw = 0;
-    result.balanceSource = "";
-  }
-
-  result.balanceDebt = Math.abs(prodNum(result.balanceRaw || 0));
+  result.balanceRaw = chosen.v;
+  result.balanceSource = chosen.src;
+  result.balanceDebt = chosen.v < -0.0001 ? Math.abs(chosen.v) : 0;
 
   const termCode = Number(bp?.PayTermsGrpCode ?? bp?.GroupNum ?? 0);
-  if (!(termCode > 0)) return result;
-
-  const termPaths = [
-    `/PaymentTermsTypes?$select=GroupNumber,PaymentTermsGroupName,NumberOfAdditionalDays,ExtraDays,ExtraMonth&$filter=GroupNumber eq ${termCode}&$top=1`,
-    `/PaymentTermsTypes(${termCode})?$select=GroupNumber,PaymentTermsGroupName,NumberOfAdditionalDays,ExtraDays,ExtraMonth`,
-    `/PaymentTermsTypes?$filter=GroupNumber eq ${termCode}`,
-  ];
-
-  for (const path of termPaths) {
-    try {
-      const raw = await slFetchFreshSession(path);
-      const row = Array.isArray(raw) ? (raw[0] || null) : (prodAsArray(raw)[0] || raw || null);
-      if (!row) continue;
-      const name = String(row?.PaymentTermsGroupName || row?.Name || "").trim();
-      let creditDays = Math.max(0, Number(row?.NumberOfAdditionalDays || 0), Number(row?.ExtraDays || 0));
-      if (!(creditDays > 0) && name) {
-        const m = name.match(/(\d+)\s*d[ií]a/i);
-        if (m) creditDays = Number(m[1] || 0);
-      }
-      result.paymentTermsName = name;
-      result.creditDays = creditDays > 0 ? creditDays : 0;
-      return result;
-    } catch {}
+  if (termCode > 0) {
+    const termPaths = [
+      `/PaymentTermsTypes?$select=GroupNumber,PaymentTermsGroupName,NumberOfAdditionalDays,ExtraDays,ExtraMonth&$filter=GroupNumber eq ${termCode}&$top=1`,
+      `/PaymentTermsTypes(${termCode})?$select=GroupNumber,PaymentTermsGroupName,NumberOfAdditionalDays,ExtraDays,ExtraMonth`,
+    ];
+    for (const path of termPaths) {
+      try {
+        const raw = await slFetchFreshSession(path);
+        const row = Array.isArray(raw) ? (raw[0] || null) : (prodAsArray(raw)[0] || raw || null);
+        if (!row) continue;
+        const name = String(row?.PaymentTermsGroupName || row?.Name || "").trim();
+        let creditDays = Math.max(0, Number(row?.NumberOfAdditionalDays || 0), Number(row?.ExtraDays || 0));
+        if (!(creditDays > 0) && name) {
+          const m = name.match(/(\d+)\s*d[ií]a/i);
+          if (m) creditDays = Number(m[1] || 0);
+        }
+        result.paymentTermsName = name;
+        result.creditDays = creditDays > 0 ? creditDays : 0;
+        break;
+      } catch {}
+    }
   }
-
   return result;
 }
 
 async function prodFetchVendorPayablesStatus(cardCode, cardName = "") {
   const code = String(cardCode || "").trim();
   const name = String(cardName || "").trim();
-  const base = {
+  if (!code) return {
     supplierCode: code,
     supplierName: name,
     paymentStatus: "SIN_DATOS",
     amountDue: 0,
+    overdueAmount: 0,
     oldestDebtDate: "",
     daysDue: 0,
     source: "",
@@ -13082,150 +12655,71 @@ async function prodFetchVendorPayablesStatus(cardCode, cardName = "") {
     balanceRaw: 0,
     debtNote: "",
   };
-  if (!code) return base;
 
   const termInfo = await prodFetchVendorCreditTerms(code, name).catch(() => ({
-    supplierCode: code,
-    supplierName: name,
-    paymentTermsName: "",
-    creditDays: 0,
-    balanceRaw: 0,
-    balanceDebt: 0,
+    supplierCode: code, supplierName: name, paymentTermsName: "", creditDays: 0, balanceRaw: 0, balanceDebt: 0, balanceSource: ""
   }));
 
+  const todayIso = getDateISOInOffset(TZ_OFFSET_MIN);
+  let openRows = [];
   try {
     const safe = prodSapEscapeLiteral(code);
-    const invoiceSelect = `DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,PaidToDate,DocCurrency`;
-    let inv = [];
-    const invoicePaths = [
-      `/PurchaseInvoices?$select=${invoiceSelect}&$filter=CardCode eq '${safe}' and DocumentStatus eq 'bost_Open'&$orderby=DocDueDate asc&$top=100`,
-      `/PurchaseInvoices?$select=${invoiceSelect}&$filter=CardCode eq '${safe}' and DocumentStatus eq 'bo_Open'&$orderby=DocDueDate asc&$top=100`,
-      `/PurchaseInvoices?$select=${invoiceSelect}&$filter=CardCode eq '${safe}'&$orderby=DocDueDate asc&$top=200`,
-    ];
-    for (const path of invoicePaths) {
-      try {
-        inv = prodAsArray(await slFetchFreshSession(path));
-      } catch {
-        inv = [];
-      }
-      if (inv.some((x) => prodDocStatusIsOpen(x?.DocumentStatus || x?.Status || ''))) break;
-      if (inv.length && path === invoicePaths[invoicePaths.length - 1]) break;
-    }
-    const todayIso = getDateISOInOffset(TZ_OFFSET_MIN);
-    const rows = prodAsArray(inv).map((x) => {
+    const select = `DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,PaidToDate,DocCurrency`;
+    const inv = await slFetchFreshSession(`/PurchaseInvoices?$select=${select}&$filter=CardCode eq '${safe}' and (DocumentStatus eq 'bost_Open' or DocumentStatus eq 'bo_Open')&$orderby=DocDueDate asc&$top=50`);
+    openRows = prodAsArray(inv).map((x) => {
       const total = prodNum(x?.DocTotal || 0);
       const paid = prodNum(x?.PaidToDate || 0);
       const outstanding = Math.max(0, total - paid);
       const due = prodDateOnly(x?.DocDueDate || x?.DocDate);
       return {
-        docNum: Number(x?.DocNum || 0),
         dueDate: due,
         docDate: prodDateOnly(x?.DocDate),
         outstanding: prodRound(outstanding, 2),
         status: String(x?.DocumentStatus || x?.Status || ""),
-        currency: String(x?.DocCurrency || "USD"),
         overdue: !!(due && due < todayIso && outstanding > 0.009),
       };
-    });
-
-    const open = rows.filter((x) => x.outstanding > 0.009 || prodDocStatusIsOpen(x.status));
-    const overdueRows = open.filter((x) => x.overdue);
-    const oldest = overdueRows.map((x) => x.dueDate || x.docDate).filter(Boolean).sort()[0] || open.map((x) => x.dueDate || x.docDate).filter(Boolean).sort()[0] || "";
-    const invoiceDebt = prodRound(open.reduce((s, x) => s + prodNum(x.outstanding || 0), 0), 2);
-    const overdueDebt = prodRound(overdueRows.reduce((s, x) => s + prodNum(x.outstanding || 0), 0), 2);
-    const accountDebt = prodRound(prodNum(termInfo?.balanceDebt || 0), 2);
-
-    const useAccountBalance = accountDebt > 0.009;
-    const finalDebt = useAccountBalance ? accountDebt : Math.max(invoiceDebt, 0);
-    const effectiveDue = useAccountBalance ? 0 : Math.max(overdueDebt, 0);
-    const debtBasis = useAccountBalance ? "SALDO_CUENTA" : (open.length ? "FACTURAS_ABIERTAS" : "");
-
-    if (finalDebt > 0.009 || open.length || effectiveDue > 0.009) {
-      return {
-        supplierCode: code,
-        supplierName: String(termInfo?.supplierName || name || ""),
-        paymentStatus: "SE_DEBE",
-        amountDue: finalDebt,
-        overdueAmount: effectiveDue,
-        oldestDebtDate: useAccountBalance ? "" : oldest,
-        daysDue: useAccountBalance ? 0 : (oldest ? Math.max(0, prodDiffDaysFromToday(oldest)) : 0),
-        source: useAccountBalance
-          ? `BusinessPartners.${String(termInfo?.balanceSource || "CurrentAccountBalance")}`
-          : (open.length ? "PurchaseInvoices" : "BusinessPartners"),
-        debtBasis,
-        openInvoices: open.slice(0, 10),
-        paymentTermsName: String(termInfo?.paymentTermsName || ""),
-        creditDays: Number(termInfo?.creditDays || 0),
-        balanceRaw: prodRound(prodNum(termInfo?.balanceRaw || 0), 2),
-        debtNote: useAccountBalance
-          ? (Number(termInfo?.creditDays || 0) > 0
-            ? `Saldo pendiente detectado por saldo de cuenta del proveedor en SAP. Condición de pago: ${termInfo.paymentTermsName || `Crédito ${termInfo.creditDays} días`}.`
-            : "Saldo pendiente detectado por saldo de cuenta del proveedor en SAP.")
-          : (oldest ? "" : (Number(termInfo?.creditDays || 0) > 0
-            ? `Saldo pendiente visible en facturas / documentos del proveedor. Condición de pago: ${termInfo.paymentTermsName || `Crédito ${termInfo.creditDays} días`}.`
-            : "Saldo pendiente visible en facturas / documentos del proveedor.")),
-      };
-    }
-
-    return {
-      supplierCode: code,
-      supplierName: String(termInfo?.supplierName || name),
-      paymentStatus: "PAZ_Y_SALVO",
-      amountDue: 0,
-      overdueAmount: 0,
-      oldestDebtDate: "",
-      daysDue: 0,
-      source: `BusinessPartners.${String(termInfo?.balanceSource || "CurrentAccountBalance") || "CurrentAccountBalance"}`,
-      debtBasis: "SALDO_CUENTA",
-      openInvoices: [],
-      paymentTermsName: String(termInfo?.paymentTermsName || ""),
-      creditDays: Number(termInfo?.creditDays || 0),
-      balanceRaw: prodRound(prodNum(termInfo?.balanceRaw || 0), 2),
-      debtNote: "",
-    };
+    }).filter((x) => x.outstanding > 0.009 || prodDocStatusIsOpen(x.status));
   } catch {}
 
-  const fallbackDebt = prodRound(prodNum(termInfo?.balanceDebt || 0), 2);
+  const oldest = openRows.map((x) => x.dueDate || x.docDate).filter(Boolean).sort()[0] || "";
+  const overdueAmount = prodRound(openRows.filter((x) => x.overdue).reduce((s, x) => s + prodNum(x.outstanding || 0), 0), 2);
+  const debtFromAccount = prodRound(prodNum(termInfo?.balanceDebt || 0), 2);
+  const amountDue = debtFromAccount > 0.009 ? debtFromAccount : prodRound(openRows.reduce((s, x) => s + prodNum(x.outstanding || 0), 0), 2);
+  const hasDebt = amountDue > 0.009 || overdueAmount > 0.009;
+
   return {
     supplierCode: code,
-    supplierName: String(termInfo?.supplierName || name),
-    paymentStatus: fallbackDebt > 0.009 ? "SE_DEBE" : "PAZ_Y_SALVO",
-    amountDue: fallbackDebt,
-    overdueAmount: 0,
-    oldestDebtDate: "",
-    daysDue: 0,
-    source: `BusinessPartners.${String(termInfo?.balanceSource || "CurrentAccountBalance") || "CurrentAccountBalance"}`,
-    debtBasis: "SALDO_CUENTA",
-    openInvoices: [],
+    supplierName: String(termInfo?.supplierName || name || ""),
+    paymentStatus: hasDebt ? "SE_DEBE" : "PAZ_Y_SALVO",
+    amountDue,
+    overdueAmount,
+    oldestDebtDate: oldest,
+    daysDue: oldest ? Math.max(0, prodDiffDaysFromToday(oldest)) : 0,
+    source: termInfo?.balanceSource ? `BusinessPartners.${termInfo.balanceSource}` : (openRows.length ? "PurchaseInvoices" : ""),
+    debtBasis: debtFromAccount > 0.009 ? "SALDO_CUENTA" : (openRows.length ? "FACTURAS_ABIERTAS" : ""),
+    openInvoices: openRows.slice(0, 10),
     paymentTermsName: String(termInfo?.paymentTermsName || ""),
     creditDays: Number(termInfo?.creditDays || 0),
     balanceRaw: prodRound(prodNum(termInfo?.balanceRaw || 0), 2),
-    debtNote: fallbackDebt > 0.009
-      ? (Number(termInfo?.creditDays || 0) > 0
-        ? `Saldo pendiente detectado por saldo de cuenta del proveedor en SAP. Condición de pago: ${termInfo.paymentTermsName || `Crédito ${termInfo.creditDays} días`}.`
-        : "Saldo pendiente detectado por saldo de cuenta del proveedor en SAP.")
-      : "",
+    debtNote: hasDebt ? (oldest ? "" : "Saldo pendiente detectado por saldo de cuenta del proveedor en SAP.") : "",
   };
 }
 
-app.get("/api/admin/production/component-procurement", verifyAdmin, async (req, res) => {
+app.get("/api/admin/production/component-procurement"app.get("/api/admin/production/component-procurement", verifyAdmin, async (req, res) => {
   try {
     const itemCode = String(req.query?.itemCode || "").trim();
     const itemDesc = String(req.query?.itemDesc || "").trim();
     const top = Math.max(1, Math.min(10, prodNum(req.query?.top, 5)));
     if (!itemCode) return safeJson(res, 400, { ok: false, message: "Falta itemCode" });
 
-    const [purchaseInvoices, purchaseOrdersOnly] = await Promise.all([
-      prodFetchRecentPurchaseInvoicesForItem(itemCode, itemDesc, top).catch(() => []),
-      prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc, top).catch(() => []),
-    ]);
-
-    const mergedDocs = prodSortProcurementRows(
-      [...purchaseInvoices, ...purchaseOrdersOnly].filter(Boolean)
-    ).filter((row, idx, arr) => {
-      const key = `${String(row?.sourceDocType || '')}::${Number(row?.docEntry || 0)}::${Number(row?.lineNum || 0)}`;
-      return arr.findIndex((x) => `${String(x?.sourceDocType || '')}::${Number(x?.docEntry || 0)}::${Number(x?.lineNum || 0)}` === key) === idx;
-    }).slice(0, top);
+    const purchaseInvoices = await prodFetchRecentPurchaseInvoicesForItem(itemCode, itemDesc, top).catch(() => []);
+    const purchaseOrdersOnly = purchaseInvoices.length ? [] : await prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc, top).catch(() => []);
+    const mergedDocs = prodSortProcurementRows([...purchaseInvoices, ...purchaseOrdersOnly].filter(Boolean))
+      .filter((row, idx, arr) => {
+        const key = `${String(row?.sourceDocType || '')}::${Number(row?.docEntry || 0)}::${Number(row?.lineNum || 0)}`;
+        return arr.findIndex((x) => `${String(x?.sourceDocType || '')}::${Number(x?.docEntry || 0)}::${Number(x?.lineNum || 0)}` === key) === idx;
+      })
+      .slice(0, top);
 
     const suppliers = Array.from(new Map(
       mergedDocs
@@ -13233,38 +12727,30 @@ app.get("/api/admin/production/component-procurement", verifyAdmin, async (req, 
         .filter(([code]) => !!code)
     ).entries()).map(([code, name]) => ({ code, name }));
 
-    const vendorStatuses = await Promise.all(suppliers.map(async (supplier) => {
-      return await prodFetchVendorPayablesStatus(supplier.code, supplier.name).catch(() => ({
+    const vendorStatuses = await Promise.all(suppliers.map(async (supplier) => (
+      await prodFetchVendorPayablesStatus(supplier.code, supplier.name).catch(() => ({
         supplierCode: supplier.code,
         supplierName: supplier.name,
         paymentStatus: "SIN_DATOS",
         amountDue: 0,
+        overdueAmount: 0,
         oldestDebtDate: "",
         daysDue: 0,
         source: "",
-      }));
-    }));
-
+      }))
+    )));
     const vendorMap = new Map(vendorStatuses.map((x) => [String(x.supplierCode || "").trim(), x]));
     const enrichedOrders = mergedDocs.map((row) => ({
       ...row,
       vendorStatus: vendorMap.get(String(row.supplierCode || "").trim()) || null,
     }));
 
-    const purchaseSource = purchaseInvoices.length && purchaseOrdersOnly.length
-      ? "Mixed"
-      : purchaseInvoices.length
-        ? "PurchaseInvoices"
-        : purchaseOrdersOnly.length
-          ? "PurchaseOrders"
-          : "";
-
     return safeJson(res, 200, {
       ok: true,
       itemCode,
       itemDesc,
       purchaseOrders: enrichedOrders,
-      purchaseSource,
+      purchaseSource: purchaseInvoices.length ? "PurchaseInvoices" : (purchaseOrdersOnly.length ? "PurchaseOrders" : ""),
       vendorStatuses,
       generatedAt: new Date().toISOString(),
       summary: {
@@ -13280,8 +12766,7 @@ app.get("/api/admin/production/component-procurement", verifyAdmin, async (req, 
 });
 
 
-
-app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
+app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
     const itemCode = String(req.query?.itemCode || "").trim();
@@ -13293,51 +12778,21 @@ app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
     const shiftHours = Math.max(1, Math.min(24, prodNum(req.query?.shiftHours, 8)));
     const plannedQty = Math.max(0, prodNum(req.query?.plannedQty, 0));
-    const forceRefresh = String(req.query?.forceRefresh || req.body?.forceRefresh || '').trim() === '1';
 
-    if (forceRefresh) {
-      await prodRefreshInventoryForCodes([itemCode]).catch(() => {});
-    }
+    await prodRefreshInventoryForCodes([itemCode]).catch(() => {});
+    const plan = await productionBuildItemPlanCached({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty });
 
-    const plan = await productionBuildItemPlanCached({
-      itemCode,
-      toDate,
+    const dash = await productionDashboardFromDb({
+      from: "2025-01-01",
+      to: today,
+      area: "__ALL__",
+      grupo: "__ALL__",
+      q: itemCode,
       avgMonths,
       horizonMonths,
-      shiftHours,
-      plannedQtyOverride: plannedQty,
-      forceRefresh,
     });
-
-    if (!plan?.abcHint) {
-      const dash = await productionDashboardFromDb({
-        from: "2025-01-01",
-        to: today,
-        area: "__ALL__",
-        grupo: "__ALL__",
-        q: itemCode,
-        avgMonths,
-        horizonMonths,
-      });
-      const row = (dash.items || []).find((x) => String(x.itemCode || "") === itemCode);
-      if (row) {
-        plan.abcHint = row.totalLabel || "";
-        await prodWriteSubplanCacheDb({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty }, plan, plan.abcHint).catch(() => null);
-      }
-    }
-
-    const componentCodes = prodExtractRequirementCodes(plan);
-    if (componentCodes.length) {
-      prodStartComponentSubplanWarm(componentCodes, {
-        toDate,
-        avgMonths,
-        horizonMonths,
-        shiftHours,
-        concurrency: 2,
-        limit: 350,
-        maxDepth: 3,
-      });
-    }
+    const row = (dash.items || []).find((x) => String(x.itemCode || "") === itemCode);
+    if (row) plan.abcHint = row.totalLabel || "";
 
     return safeJson(res, 200, plan);
   } catch (e) {
@@ -13520,28 +12975,16 @@ async function handleProductionSync(req, res) {
       syncErrors.push({ step: "mrp", message: e.message || String(e) });
     }
 
-    const syncFinishedAt = new Date().toISOString();
-    await setState("production_last_sync_at", syncFinishedAt);
+    await setState("production_last_sync_at", new Date().toISOString());
     prodClearDashboardCache();
     prodClearSimulationCache();
     prodClearProductionRuntimeCaches();
-
-    const abSubplanPrecacheStarted = prodStartAbSubplanWarm({
-      toDate: to,
-      avgMonths: 3,
-      horizonMonths: 3,
-      shiftHours: 8,
-      limit: 100,
-      concurrency: 2,
-    });
 
     return safeJson(res, 200, {
       ok: true,
       from, to, maxDocs,
       salesSaved, demandSaved, groupsSaved, invSaved, invWhSaved, mrpSaved,
       syncErrors,
-      abSubplanPrecacheStarted,
-      abSubplanWarmStatus: PROD_AB_SUBPLAN_WARM_STATE,
       formulasLoaded: Object.keys(loadProductionLocalData().formulas?.products || {}).length,
       materialsLoaded: Object.keys(loadProductionLocalData().materials?.materials || {}).length,
     });
@@ -13551,22 +12994,6 @@ async function handleProductionSync(req, res) {
 }
 app.get("/api/admin/production/sync", verifyAdmin, handleProductionSync);
 app.post("/api/admin/production/sync", verifyAdmin, handleProductionSync);
-
-app.get("/api/admin/production/subplan-cache-status", verifyAdmin, async (_req, res) => {
-  try {
-    return safeJson(res, 200, {
-      ok: true,
-      warm: PROD_AB_SUBPLAN_WARM_STATE,
-      lastSyncAt: await getState("production_last_sync_at"),
-      lastWarmStatus: await getState("production_ab_subplan_warm_status"),
-      lastWarmStartedAt: await getState("production_ab_subplan_warm_started_at"),
-      lastWarmFinishedAt: await getState("production_ab_subplan_warm_finished_at"),
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
 
 app.get("/api/admin/production/health", verifyAdmin, async (_req, res) => {
   try {
