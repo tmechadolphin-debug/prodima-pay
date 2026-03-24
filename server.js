@@ -11065,12 +11065,12 @@ function prodExtractRequirementCodes(plan = null) {
 
 async function prodWarmComponentSubplanCodes(codes = [], opts = {}) {
   const uniq = [];
-  const seen = new Set();
+  const seenSeed = new Set();
   for (const raw of (Array.isArray(codes) ? codes : [])) {
     const code = String(raw || '').trim();
     const key = prodNormalizeItemCodeLoose(code);
-    if (!code || !key || seen.has(key) || PROD_COMPONENT_SUBPLAN_INFLIGHT.has(key)) continue;
-    seen.add(key);
+    if (!code || !key || seenSeed.has(key) || PROD_COMPONENT_SUBPLAN_INFLIGHT.has(key)) continue;
+    seenSeed.add(key);
     uniq.push(code);
   }
   if (!uniq.length) return PROD_COMPONENT_SUBPLAN_WARM_STATE;
@@ -11081,45 +11081,77 @@ async function prodWarmComponentSubplanCodes(codes = [], opts = {}) {
   const horizonMonths = Math.max(1, Math.min(12, Math.round(prodNum(opts?.horizonMonths, 3))));
   const shiftHours = prodRound(Math.max(1, Math.min(24, prodNum(opts?.shiftHours, 8))), 2);
   const concurrency = Math.max(1, Math.min(4, Math.round(prodNum(opts?.concurrency, 2))));
-  const limit = Math.max(1, Math.min(300, Math.round(prodNum(opts?.limit, uniq.length || 1))));
+  const limit = Math.max(1, Math.min(600, Math.round(prodNum(opts?.limit, uniq.length || 1))));
+  const maxDepth = Math.max(1, Math.min(5, Math.round(prodNum(opts?.maxDepth, 3))));
 
-  const target = uniq.slice(0, limit);
-  target.forEach((c) => PROD_COMPONENT_SUBPLAN_INFLIGHT.add(prodNormalizeItemCodeLoose(c)));
+  const queue = [];
+  const queuedKeys = new Set();
+  const enqueue = (code, depth) => {
+    const itemCode = String(code || '').trim();
+    const key = prodNormalizeItemCodeLoose(itemCode);
+    if (!itemCode || !key || queuedKeys.has(key) || PROD_COMPONENT_SUBPLAN_INFLIGHT.has(key)) return false;
+    if ((queue.length + queuedKeys.size) > limit * 2) return false;
+    queuedKeys.add(key);
+    PROD_COMPONENT_SUBPLAN_INFLIGHT.add(key);
+    queue.push({ itemCode, depth, key });
+    return true;
+  };
+
+  uniq.slice(0, limit).forEach((code) => enqueue(code, 1));
 
   PROD_COMPONENT_SUBPLAN_WARM_STATE = {
     running: true,
     startedAt: new Date().toISOString(),
     finishedAt: '',
     lastError: '',
-    planned: target.length,
+    planned: queue.length,
     completed: 0,
-    sample: target.slice(0, 12),
+    sample: queue.slice(0, 12).map((x) => x.itemCode),
+    maxDepth,
+  };
+
+  const release = (node) => {
+    if (!node) return;
+    PROD_COMPONENT_SUBPLAN_INFLIGHT.delete(node.key || prodNormalizeItemCodeLoose(node.itemCode || ''));
   };
 
   try {
-    await prodMapLimit(target, concurrency, async (itemCode) => {
-      try {
-        await productionBuildItemPlanCached({
-          itemCode,
-          toDate,
-          avgMonths,
-          horizonMonths,
-          shiftHours,
-          plannedQtyOverride: 0,
-          forceRefresh: false,
-        });
-      } catch (e) {
-        PROD_COMPONENT_SUBPLAN_WARM_STATE.lastError = e?.message || String(e);
-      } finally {
-        PROD_COMPONENT_SUBPLAN_WARM_STATE.completed += 1;
-        PROD_COMPONENT_SUBPLAN_INFLIGHT.delete(prodNormalizeItemCodeLoose(itemCode));
-      }
-      return null;
-    });
+    while (queue.length && PROD_COMPONENT_SUBPLAN_WARM_STATE.completed < limit) {
+      const batch = queue.splice(0, Math.max(1, concurrency));
+      await prodMapLimit(batch, concurrency, async (node) => {
+        try {
+          const plan = await productionBuildItemPlanCached({
+            itemCode: node.itemCode,
+            toDate,
+            avgMonths,
+            horizonMonths,
+            shiftHours,
+            plannedQtyOverride: 0,
+            forceRefresh: false,
+          });
+
+          if (node.depth < maxDepth) {
+            const childCodes = prodExtractRequirementCodes(plan);
+            for (const child of childCodes) {
+              if ((queue.length + PROD_COMPONENT_SUBPLAN_WARM_STATE.completed) >= limit) break;
+              if (enqueue(child, node.depth + 1)) {
+                PROD_COMPONENT_SUBPLAN_WARM_STATE.planned += 1;
+              }
+            }
+          }
+        } catch (e) {
+          PROD_COMPONENT_SUBPLAN_WARM_STATE.lastError = e?.message || String(e);
+        } finally {
+          PROD_COMPONENT_SUBPLAN_WARM_STATE.completed += 1;
+          release(node);
+        }
+        return null;
+      });
+    }
   } finally {
     PROD_COMPONENT_SUBPLAN_WARM_STATE.running = false;
     PROD_COMPONENT_SUBPLAN_WARM_STATE.finishedAt = new Date().toISOString();
-    for (const c of target) PROD_COMPONENT_SUBPLAN_INFLIGHT.delete(prodNormalizeItemCodeLoose(c));
+    for (const node of queue) release(node);
   }
   return PROD_COMPONENT_SUBPLAN_WARM_STATE;
 }
@@ -11306,7 +11338,8 @@ async function prodWarmAbSubplanCache(opts = {}) {
         horizonMonths,
         shiftHours,
         concurrency: Math.max(1, Math.min(4, concurrency)),
-        limit: Math.min(300, childCodes.size),
+        limit: Math.min(500, Math.max(120, childCodes.size * 4)),
+        maxDepth: 3,
       });
     }
   } finally {
@@ -13301,7 +13334,8 @@ app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
         horizonMonths,
         shiftHours,
         concurrency: 2,
-        limit: 200,
+        limit: 350,
+        maxDepth: 3,
       });
     }
 
