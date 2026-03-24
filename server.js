@@ -9811,14 +9811,24 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
       }
       if (!whLines.length) continue;
 
+      // Solo queremos PEDIDOS ABIERTOS sin factura.
+      // En algunos ambientes OpenQty puede venir inconsistente, por eso aceptamos
+      // cualquiera de estas señales de apertura:
+      // - cabecera abierta
+      // - al menos una línea abierta
+      // - al menos una línea con OpenQty > 0
+      const headerOpenForDispatch = prodDocStatusIsOpen(full?.DocumentStatus || full?.Status || h?.DocumentStatus || h?.Status || '');
+      const openLineCountForDispatch = whLines.filter((ln) => prodDocStatusIsOpen(ln?.LineStatus || ln?.DocumentLineStatus || ln?.Status || '')).length;
+      const anyOpenQtyForDispatch = whLines.some((ln) => prodNum(ln?.OpenQty ?? ln?.RemainingOpenQuantity ?? 0) > 0.0001);
+      if (!(headerOpenForDispatch || openLineCountForDispatch > 0 || anyOpenQtyForDispatch)) continue;
+
       // Regla operativa:
-      // Para C01600 el pedido sigue pendiente hasta que exista FACTURA relacionada.
-      // No descartamos la OV solo porque OpenQty venga 0 o el status venga cerrado.
-      // Primero la conservamos si tiene líneas válidas del almacén, y luego abajo
-      // calculamos pendiente real = cantidad pedida - cantidad facturada.
+      // Para C01600 el pedido sigue pendiente hasta que exista FACTURA relacionada,
+      // pero únicamente si el pedido sigue ABIERTO en SAP.
       orders.push({
         ...full,
         __dispatchWhLines: whLines,
+        __dispatchHeaderOpen: !!headerOpenForDispatch,
       });
     } catch (err) {
       orderDetailErrors += 1;
@@ -9913,11 +9923,13 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
       const qtyBase = Math.max(0, prodNum(ln?.Quantity || 0) * factor);
       const openQtyBase = Math.max(0, prodNum(ln?.OpenQty ?? ln?.RemainingOpenQuantity ?? 0) * factor);
       const invoicedQtyBase = Math.max(0, prodNum(invoicedQtyByOrderLine.get(`${docEntry}:${lineNum}`)));
-      const headerIsOpen = prodDocStatusIsOpen(order?.DocumentStatus || order?.Status || '');
+      const headerIsOpen = !!order?.__dispatchHeaderOpen || prodDocStatusIsOpen(order?.DocumentStatus || order?.Status || '');
       const lineIsOpen = prodDocStatusIsOpen(ln?.LineStatus || ln?.DocumentLineStatus || ln?.Status || '');
+      // Solo incluir líneas abiertas. Si la cabecera y la línea vienen cerradas
+      // y OpenQty es 0, se considera documento cerrado y no debe mostrarse.
+      if (!(headerIsOpen || lineIsOpen || openQtyBase > 0.01)) continue;
       // El criterio final es FACTURA:
-      // si no hay factura suficiente, la línea sigue pendiente aunque SAP marque OpenQty=0
-      // o aunque el status venga cerrado/abierto de forma inconsistente.
+      // si no hay factura suficiente, la línea sigue pendiente aunque OpenQty no ayude.
       let pendingQty = prodRound(Math.max(openQtyBase, qtyBase - invoicedQtyBase), 2);
       if (!(pendingQty > 0.01) && qtyBase > invoicedQtyBase + 0.01) {
         pendingQty = prodRound(qtyBase - invoicedQtyBase, 2);
