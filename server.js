@@ -9559,6 +9559,15 @@ function prodDaysUntilFromTo(targetDate, refDate) {
   return Math.floor((target.getTime() - ref.getTime()) / 86400000);
 }
 
+function prodDocStatusIsOpen(status) {
+  const s = String(status || '').trim().toLowerCase();
+  return s === 'bost_open' || s === 'bo_open' || s === 'open' || s === 'o';
+}
+function prodDocStatusIsClosed(status) {
+  const s = String(status || '').trim().toLowerCase();
+  return s === 'bost_closed' || s === 'bo_closed' || s === 'closed' || s === 'c';
+}
+
 async function prodFetchDocHeadersByDateRange(entity, { from, to, maxDocs = 400, cardCode = '' } = {}) {
   if (missingSapEnv()) return [];
   const fromDate = String(from || '').slice(0,10);
@@ -9599,7 +9608,7 @@ async function prodFetchDocHeadersByDateRange(entity, { from, to, maxDocs = 400,
 }
 
 async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATCH_CARD_CODE, warehouse = PROD_SPECIAL_DISPATCH_WAREHOUSE, today = getDateISOInOffset(TZ_OFFSET_MIN), lookbackDays = PROD_SPECIAL_DISPATCH_LOOKBACK_DAYS, lookaheadDays = PROD_SPECIAL_DISPATCH_LOOKAHEAD_DAYS, maxDocs = 250 } = {}) {
-  const cacheKey = JSON.stringify({ cardCode, warehouse, today, lookbackDays, lookaheadDays, maxDocs });
+  const cacheKey = JSON.stringify({ v: 8, cardCode, warehouse, today, lookbackDays, lookaheadDays, maxDocs });
   const hit = prodRuntimeGet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, PROD_DISPATCH_ALERTS_TTL_MS);
   if (hit) return hit;
   if (missingSapEnv()) {
@@ -9610,16 +9619,31 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
 
   const from = addDaysISO(today, -Math.max(1, Number(lookbackDays || 120)));
   const to = addDaysISO(today, Math.max(1, Number(lookaheadDays || 45)));
-  const orderHeaders = (await prodScanDocHeadersForOrders({ from, to, maxDocs: Math.max(50, maxDocs) }))
-    .filter((x) => String(x?.CardCode || '').trim() === String(cardCode || '').trim());
+  let orderHeaders = await prodFetchDocHeadersByDateRange('Orders', { from, to, maxDocs: Math.max(100, maxDocs * 2), cardCode });
+  orderHeaders = orderHeaders.filter((x) => String(x?.CardCode || '').trim() === String(cardCode || '').trim());
+
+  if (!orderHeaders.length) {
+    const fallbackHeaders = await prodScanDocHeadersForOrders({ from, to, maxDocs: Math.max(50, maxDocs) }).catch(() => []);
+    orderHeaders = fallbackHeaders.filter((x) => String(x?.CardCode || '').trim() === String(cardCode || '').trim());
+  }
 
   const orders = [];
   for (const h of orderHeaders) {
     try {
       const full = await getDoc('Orders', h.DocEntry);
       const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
-      const hasWarehouseLines = lines.some((ln) => String(ln?.WarehouseCode ?? ln?.WhsCode ?? '').trim() === String(warehouse || '').trim());
-      if (hasWarehouseLines) orders.push(full);
+      const whLines = lines.filter((ln) => String(ln?.WarehouseCode ?? ln?.WhsCode ?? '').trim() === String(warehouse || '').trim());
+      if (!whLines.length) continue;
+      const headerOpen = prodDocStatusIsOpen(full?.DocumentStatus || h?.DocumentStatus || '');
+      const hasOpenWarehouseLines = whLines.some((ln) => {
+        const factor = Math.max(1, prodNum(ln?.NumPerMsr ?? ln?.ItemsPerUnit ?? 1, 1));
+        const openQtyRaw = Math.max(0, prodNum(ln?.OpenQty ?? ln?.RemainingOpenQuantity ?? 0));
+        const openQtyBase = openQtyRaw * factor;
+        return openQtyBase > 0.0001 || prodDocStatusIsOpen(ln?.LineStatus || ln?.DocumentLineStatus || ln?.Status || '');
+      });
+      if (headerOpen || hasOpenWarehouseLines || !String(full?.DocumentStatus || h?.DocumentStatus || '').trim()) {
+        orders.push(full);
+      }
     } catch {}
     if (orders.length && orders.length % 10 === 0) await sleep(10);
   }
@@ -9697,10 +9721,17 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
       const qtyBase = Math.max(0, prodNum(ln?.Quantity || 0) * factor);
       const openQtyBase = Math.max(0, prodNum(ln?.OpenQty ?? ln?.RemainingOpenQuantity ?? 0) * factor);
       const invoicedQtyBase = Math.max(0, prodNum(invoicedQtyByOrderLine.get(`${docEntry}:${lineNum}`)));
-      const pendingQty = prodRound(Math.max(openQtyBase, qtyBase - invoicedQtyBase), 2);
+      const headerIsOpen = prodDocStatusIsOpen(order?.DocumentStatus || order?.Status || '');
+      const lineIsOpen = prodDocStatusIsOpen(ln?.LineStatus || ln?.DocumentLineStatus || ln?.Status || '');
+      let pendingQty = prodRound(Math.max(openQtyBase, qtyBase - invoicedQtyBase), 2);
+      if (!(pendingQty > 0.01) && invoicedQtyBase <= 0.01 && (headerIsOpen || lineIsOpen) && qtyBase > 0.01) {
+        pendingQty = prodRound(Math.max(qtyBase, openQtyBase), 2);
+      }
       if (!(pendingQty > 0.01)) continue;
-      const daysLate = prodDaysLateFromTo(dueDate, today);
-      const daysUntilDue = prodDaysUntilFromTo(dueDate, today);
+      const lineDueDate = String(ln?.ShipDate || ln?.DueDate || dueDate || '').slice(0,10);
+      const effectiveDueDate = lineDueDate || dueDate;
+      const daysLate = prodDaysLateFromTo(effectiveDueDate, today);
+      const daysUntilDue = prodDaysUntilFromTo(effectiveDueDate, today);
       const priorityState = daysLate > 0 ? 'overdue' : daysUntilDue <= 0 ? 'today' : daysUntilDue <= 3 ? 'soon' : 'open';
       const priorityScore = (daysLate * 1000) + (daysLate > 0 ? 5000 : daysUntilDue <= 3 ? 1000 - Math.max(daysUntilDue, 0) * 100 : 0) + pendingQty;
       const message = daysLate > 0
@@ -9717,7 +9748,7 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
         docNum,
         lineNum,
         docDate,
-        dueDate,
+        dueDate: effectiveDueDate,
         itemCode,
         itemDesc,
         qtyOrdered: prodRound(qtyBase, 2),
@@ -9738,7 +9769,7 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
         qtyPending: 0,
         qtyOverdue: 0,
         maxDaysLate: 0,
-        earliestDueDate: dueDate,
+        earliestDueDate: effectiveDueDate,
         docNums: [],
         lines: 0,
         priorityScore: 0,
@@ -9746,7 +9777,7 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
       agg.qtyPending = prodRound(agg.qtyPending + pendingQty, 2);
       if (daysLate > 0) agg.qtyOverdue = prodRound(agg.qtyOverdue + pendingQty, 2);
       agg.maxDaysLate = Math.max(agg.maxDaysLate, daysLate);
-      agg.earliestDueDate = !agg.earliestDueDate || (dueDate && dueDate < agg.earliestDueDate) ? dueDate : agg.earliestDueDate;
+      agg.earliestDueDate = !agg.earliestDueDate || (effectiveDueDate && effectiveDueDate < agg.earliestDueDate) ? effectiveDueDate : agg.earliestDueDate;
       if (docNum && !agg.docNums.includes(docNum)) agg.docNums.push(docNum);
       agg.lines += 1;
       agg.priorityScore = Math.max(agg.priorityScore, priorityScore);
