@@ -9607,8 +9607,55 @@ async function prodFetchDocHeadersByDateRange(entity, { from, to, maxDocs = 400,
   return out.slice(0, top);
 }
 
+async function prodFetchOrderHeadersByCardCodeLoose({ cardCode, maxDocs = 400 } = {}) {
+  if (missingSapEnv()) return [];
+  const safeCardCode = String(cardCode || '').trim().replace(/'/g, "''");
+  if (!safeCardCode) return [];
+  const out = [];
+  const seen = new Set();
+  const top = Math.max(50, Math.min(2000, Number(maxDocs || 400)));
+  const filterVariants = [
+    `CardCode eq '${safeCardCode}' and Cancelled eq 'tNO'`,
+    `CardCode eq '${safeCardCode}'`,
+  ];
+  for (const filter of filterVariants) {
+    let skip = 0;
+    while (skip < top) {
+      const path = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,Cancelled&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=200&$skip=${skip}`;
+      let batch = [];
+      try {
+        const res = await slFetch(path, { timeoutMs: 120000 });
+        batch = prodNormalizeSlCollection(res);
+      } catch {
+        batch = [];
+      }
+      if (!batch.length) break;
+      for (const row of batch) {
+        const key = String(row?.DocEntry ?? row?.DocNum ?? '').trim();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push(row);
+      }
+      if (batch.length < 200 || out.length >= top) break;
+      skip += batch.length;
+    }
+    if (out.length >= top) break;
+  }
+  return out.slice(0, top);
+}
+
+function prodDispatchHeaderDateRelevant(h = {}, { from = '', to = '', today = '' } = {}) {
+  const docDate = String(h?.DocDate || '').slice(0, 10);
+  const dueDate = String(h?.DocDueDate || h?.DueDate || '').slice(0, 10);
+  const status = String(h?.DocumentStatus || '').trim();
+  if (!status || prodDocStatusIsOpen(status)) return true;
+  if (dueDate && today && dueDate <= addDaysISO(today, 45)) return true;
+  if (docDate && from && to && docDate >= from && docDate <= to) return true;
+  return false;
+}
+
 async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATCH_CARD_CODE, warehouse = PROD_SPECIAL_DISPATCH_WAREHOUSE, today = getDateISOInOffset(TZ_OFFSET_MIN), lookbackDays = PROD_SPECIAL_DISPATCH_LOOKBACK_DAYS, lookaheadDays = PROD_SPECIAL_DISPATCH_LOOKAHEAD_DAYS, maxDocs = 250 } = {}) {
-  const cacheKey = JSON.stringify({ v: 8, cardCode, warehouse, today, lookbackDays, lookaheadDays, maxDocs });
+  const cacheKey = JSON.stringify({ v: 9, cardCode, warehouse, today, lookbackDays, lookaheadDays, maxDocs });
   const hit = prodRuntimeGet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, PROD_DISPATCH_ALERTS_TTL_MS);
   if (hit) return hit;
   if (missingSapEnv()) {
@@ -9619,20 +9666,35 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
 
   const from = addDaysISO(today, -Math.max(1, Number(lookbackDays || 120)));
   const to = addDaysISO(today, Math.max(1, Number(lookaheadDays || 45)));
-  let orderHeaders = await prodFetchDocHeadersByDateRange('Orders', { from, to, maxDocs: Math.max(100, maxDocs * 2), cardCode });
-  orderHeaders = orderHeaders.filter((x) => String(x?.CardCode || '').trim() === String(cardCode || '').trim());
+  const headerMap = new Map();
+  const pushHeaders = (rows = []) => {
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (String(row?.CardCode || '').trim() !== String(cardCode || '').trim()) continue;
+      const key = String(row?.DocEntry ?? row?.DocNum ?? '').trim();
+      if (!key) continue;
+      if (!prodDispatchHeaderDateRelevant(row, { from, to, today })) continue;
+      if (!headerMap.has(key)) headerMap.set(key, row);
+    }
+  };
 
-  if (!orderHeaders.length) {
-    const fallbackHeaders = await prodScanDocHeadersForOrders({ from, to, maxDocs: Math.max(50, maxDocs) }).catch(() => []);
-    orderHeaders = fallbackHeaders.filter((x) => String(x?.CardCode || '').trim() === String(cardCode || '').trim());
+  pushHeaders(await prodFetchDocHeadersByDateRange('Orders', { from, to, maxDocs: Math.max(100, maxDocs * 2), cardCode }).catch(() => []));
+  if (!headerMap.size) {
+    pushHeaders(await prodScanDocHeadersForOrders({ from, to, maxDocs: Math.max(50, maxDocs) }).catch(() => []));
   }
+  pushHeaders(await prodFetchOrderHeadersByCardCodeLoose({ cardCode, maxDocs: Math.max(150, maxDocs * 3) }).catch(() => []));
+
+  const orderHeaders = Array.from(headerMap.values()).sort((a, b) => String(b?.DocDate || '').localeCompare(String(a?.DocDate || '')) || (Number(b?.DocEntry || 0) - Number(a?.DocEntry || 0)));
 
   const orders = [];
   for (const h of orderHeaders) {
     try {
       const full = await getDoc('Orders', h.DocEntry);
       const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
-      const whLines = lines.filter((ln) => String(ln?.WarehouseCode ?? ln?.WhsCode ?? '').trim() === String(warehouse || '').trim());
+      const whLines = lines.filter((ln) => {
+        const wh = String(ln?.WarehouseCode ?? ln?.WhsCode ?? ln?.Warehouse ?? ln?.FromWarehouseCode ?? '').trim();
+        if (wh) return wh === String(warehouse || '').trim();
+        return !warehouse;
+      });
       if (!whLines.length) continue;
       const headerOpen = prodDocStatusIsOpen(full?.DocumentStatus || h?.DocumentStatus || '');
       const hasOpenWarehouseLines = whLines.some((ln) => {
@@ -9710,7 +9772,7 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
     const docDate = String(order?.DocDate || '').slice(0,10);
     const lines = Array.isArray(order?.DocumentLines) ? order.DocumentLines : [];
     for (const ln of lines) {
-      const wh = String(ln?.WarehouseCode ?? ln?.WhsCode ?? '').trim();
+      const wh = String(ln?.WarehouseCode ?? ln?.WhsCode ?? ln?.Warehouse ?? ln?.FromWarehouseCode ?? '').trim();
       if (wh !== String(warehouse || '').trim()) continue;
       const lineNum = Number(ln?.LineNum ?? -1);
       if (lineNum < 0) continue;
@@ -9800,6 +9862,8 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
   const summary = {
     cardCode: String(cardCode || '').trim(),
     warehouse: String(warehouse || '').trim(),
+    ordersFound: orders.length,
+    orderHeadersFound: orderHeaders.length,
     pendingLines: alerts.length,
     pendingItems: byItem.length,
     overdueItems: byItem.filter((x) => prodNum(x?.maxDaysLate) > 0).length,
