@@ -9655,7 +9655,7 @@ function prodDispatchHeaderDateRelevant(h = {}, { from = '', to = '', today = ''
 }
 
 async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATCH_CARD_CODE, warehouse = PROD_SPECIAL_DISPATCH_WAREHOUSE, today = getDateISOInOffset(TZ_OFFSET_MIN), lookbackDays = PROD_SPECIAL_DISPATCH_LOOKBACK_DAYS, lookaheadDays = PROD_SPECIAL_DISPATCH_LOOKAHEAD_DAYS, maxDocs = 250 } = {}) {
-  const cacheKey = JSON.stringify({ v: 10, cardCode, warehouse, today, lookbackDays, lookaheadDays, maxDocs });
+  const cacheKey = JSON.stringify({ v: 11, cardCode, warehouse, today, lookbackDays, lookaheadDays, maxDocs });
   const hit = prodRuntimeGet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, PROD_DISPATCH_ALERTS_TTL_MS);
   if (hit) return hit;
 
@@ -9770,20 +9770,15 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
       }
       if (!whLines.length) continue;
 
-      const headerOpen = prodDocStatusIsOpen(full?.DocumentStatus || h?.DocumentStatus || '');
-      const hasOpenWarehouseLines = whLines.some((ln) => {
-        const factor = Math.max(1, prodNum(ln?.NumPerMsr ?? ln?.ItemsPerUnit ?? 1, 1));
-        const openQtyRaw = Math.max(0, prodNum(ln?.OpenQty ?? ln?.RemainingOpenQuantity ?? 0));
-        const openQtyBase = openQtyRaw * factor;
-        return openQtyBase > 0.0001 || prodDocStatusIsOpen(ln?.LineStatus || ln?.DocumentLineStatus || ln?.Status || '');
+      // Regla operativa:
+      // Para C01600 el pedido sigue pendiente hasta que exista FACTURA relacionada.
+      // No descartamos la OV solo porque OpenQty venga 0 o el status venga cerrado.
+      // Primero la conservamos si tiene líneas válidas del almacén, y luego abajo
+      // calculamos pendiente real = cantidad pedida - cantidad facturada.
+      orders.push({
+        ...full,
+        __dispatchWhLines: whLines,
       });
-
-      if (headerOpen || hasOpenWarehouseLines || !String(full?.DocumentStatus || h?.DocumentStatus || '').trim()) {
-        orders.push({
-          ...full,
-          __dispatchWhLines: whLines,
-        });
-      }
     } catch (err) {
       orderDetailErrors += 1;
     }
@@ -9878,8 +9873,14 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
       const invoicedQtyBase = Math.max(0, prodNum(invoicedQtyByOrderLine.get(`${docEntry}:${lineNum}`)));
       const headerIsOpen = prodDocStatusIsOpen(order?.DocumentStatus || order?.Status || '');
       const lineIsOpen = prodDocStatusIsOpen(ln?.LineStatus || ln?.DocumentLineStatus || ln?.Status || '');
+      // El criterio final es FACTURA:
+      // si no hay factura suficiente, la línea sigue pendiente aunque SAP marque OpenQty=0
+      // o aunque el status venga cerrado/abierto de forma inconsistente.
       let pendingQty = prodRound(Math.max(openQtyBase, qtyBase - invoicedQtyBase), 2);
-      if (!(pendingQty > 0.01) && invoicedQtyBase <= 0.01 && (headerIsOpen || lineIsOpen || qtyBase > 0.01)) {
+      if (!(pendingQty > 0.01) && qtyBase > invoicedQtyBase + 0.01) {
+        pendingQty = prodRound(qtyBase - invoicedQtyBase, 2);
+      }
+      if (!(pendingQty > 0.01) && invoicedQtyBase <= 0.01 && qtyBase > 0.01) {
         pendingQty = prodRound(Math.max(qtyBase, openQtyBase), 2);
       }
       if (!(pendingQty > 0.01)) continue;
