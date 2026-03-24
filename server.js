@@ -12317,6 +12317,22 @@ function prodBuildItemSearchVariants(itemCode = "", itemDesc = "") {
   return { codes: Array.from(codes), descTokens: tokens };
 }
 
+const PROD_COMPONENT_PROCUREMENT_CACHE = new Map();
+function prodGetComponentProcurementCache(key, ttlMs = 5 * 60 * 1000) {
+  const hit = PROD_COMPONENT_PROCUREMENT_CACHE.get(String(key || ""));
+  if (!hit) return null;
+  if ((Date.now() - Number(hit.ts || 0)) > ttlMs) { PROD_COMPONENT_PROCUREMENT_CACHE.delete(String(key || "")); return null; }
+  return hit.value || null;
+}
+function prodSetComponentProcurementCache(key, value) {
+  PROD_COMPONENT_PROCUREMENT_CACHE.set(String(key || ""), { ts: Date.now(), value });
+  return value;
+}
+function prodProcurementDocOpenRank(row = {}) {
+  const status = String(row?.documentStatus || row?.status || "");
+  const openQty = prodNum(row?.openQty || row?.OpenQty || 0);
+  return (prodDocStatusIsOpen(status) || openQty > 0.0001) ? 1 : 0;
+}
 function prodLineMatchesProcurementSearch(lineCode = "", lineDesc = "", variants = {}) {
   const code = String(lineCode || "").trim();
   const desc = String(lineDesc || "")
@@ -12401,12 +12417,17 @@ async function prodFetchRecentPurchaseInvoicesForItem(itemCode, itemDesc = "", t
   const code = String(itemCode || "").trim();
   const desc = String(itemDesc || "").trim();
   if (!code && !desc) return [];
+  const cacheKey = `inv::${code}::${desc}::${top}`;
+  const cached = prodGetComponentProcurementCache(cacheKey, 10 * 60 * 1000);
+  if (cached) return cached;
+
   const out = [];
   const seen = new Set();
   const variants = prodBuildItemSearchVariants(code, desc);
 
   const collectFromDoc = (doc) => {
-    if (!doc) return;
+    if (!doc) return 0;
+    let added = 0;
     const lines = prodAsArray(doc?.DocumentLines);
     for (const ln of lines) {
       const lineCode = String(ln?.ItemCode || "").trim();
@@ -12434,53 +12455,74 @@ async function prodFetchRecentPurchaseInvoicesForItem(itemCode, itemDesc = "", t
         itemDesc: lineDesc,
         sourceDocType: "FACTURA_PROVEEDOR",
       });
+      added++;
     }
+    return added;
   };
 
-  try {
-    const expanded = await slFetchFreshSession(`/PurchaseInvoices?$orderby=DocDate desc&$top=200&$expand=DocumentLines`);
-    for (const doc of prodAsArray(expanded)) collectFromDoc(doc);
-  } catch {}
-
-  const scanBatch = async (skip = 0, topBatch = 100) => {
+  // Estrategia: barrido reciente y priorización de documentos abiertos.
+  const scanBatch = async (skip = 0, topBatch = 60) => {
     const path = `/PurchaseInvoices?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$orderby=DocDate desc&$top=${topBatch}&$skip=${skip}`;
     const headers = await slFetchFreshSession(path).catch(() => []);
-    let count = 0;
-    for (const h of prodAsArray(headers)) {
-      count++;
+    const rows = prodAsArray(headers);
+    if (!rows.length) return 0;
+    for (const h of rows) {
       const de = Number(h?.DocEntry || 0);
       if (!(de > 0)) continue;
       const full = await prodReadPurchaseInvoiceDetails(de).catch(() => null);
       collectFromDoc(full || h);
+      // cuando ya haya suficientes coincidencias, paramos pronto
+      if (out.length >= Math.max(top * 3, 8)) break;
     }
-    return count;
+    return rows.length;
   };
 
-  if (out.length < top) {
-    for (let skip = 0; skip < 1200 && out.length < Math.max(top, 5); skip += 100) {
-      const count = await scanBatch(skip, 100).catch(() => 0);
+  // 1) Primer barrido corto y reciente
+  await scanBatch(0, 80).catch(() => 0);
+  // 2) Si no encontramos suficiente, ampliar un poco pero sin irnos a miles de docs
+  if (out.length < Math.max(top, 3)) {
+    for (let skip = 80; skip < 260 && out.length < Math.max(top * 2, 6); skip += 60) {
+      const count = await scanBatch(skip, 60).catch(() => 0);
       if (!(count > 0)) break;
     }
   }
 
   out.sort((a, b) =>
+    (prodProcurementDocOpenRank(b) - prodProcurementDocOpenRank(a)) ||
     String(b.docDate || "").localeCompare(String(a.docDate || "")) ||
+    String(b.dueDate || "").localeCompare(String(a.dueDate || "")) ||
     Number(b.docNum || 0) - Number(a.docNum || 0) ||
     Number(a.lineNum || 0) - Number(b.lineNum || 0)
   );
-  return out.slice(0, Math.max(1, Number(top || 5)));
+
+  // dedupe by doc num + supplier + line item keeping best ranked docs
+  const finalRows = [];
+  const seenDocLine = new Set();
+  for (const row of out) {
+    const key = `${row.docNum}::${row.supplierCode}::${row.itemCode}::${row.lineNum}`;
+    if (seenDocLine.has(key)) continue;
+    seenDocLine.add(key);
+    finalRows.push(row);
+    if (finalRows.length >= Math.max(1, Number(top || 5))) break;
+  }
+  return prodSetComponentProcurementCache(cacheKey, finalRows);
 }
 
 async function prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc = "", top = 5) {
   const code = String(itemCode || "").trim();
   const desc = String(itemDesc || "").trim();
   if (!code && !desc) return [];
+  const cacheKey = `po::${code}::${desc}::${top}`;
+  const cached = prodGetComponentProcurementCache(cacheKey, 10 * 60 * 1000);
+  if (cached) return cached;
+
   const out = [];
   const seen = new Set();
   const variants = prodBuildItemSearchVariants(code, desc);
 
   const collectFromDoc = (doc) => {
-    if (!doc) return;
+    if (!doc) return 0;
+    let added = 0;
     const lines = prodAsArray(doc?.DocumentLines);
     for (const ln of lines) {
       const lineCode = String(ln?.ItemCode || "").trim();
@@ -12506,44 +12548,44 @@ async function prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc = "", top
         lineNum: Number(ln?.LineNum || 0),
         itemCode: lineCode,
         itemDesc: lineDesc,
+        sourceDocType: "ORDEN_COMPRA",
       });
+      added++;
     }
+    return added;
   };
 
-  // 1) Intento rápido con documentos recientes ya expandidos
-  try {
-    const expanded = await slFetchFreshSession(`/PurchaseOrders?$orderby=DocDate desc&$top=120&$expand=DocumentLines`);
-    for (const doc of prodAsArray(expanded)) collectFromDoc(doc);
-  } catch {}
-
-  // 2) Barrido más profundo por cabeceras recientes y lectura del detalle
-  const scanBatch = async (skip = 0, topBatch = 100) => {
+  const scanBatch = async (skip = 0, topBatch = 50) => {
     const path = `/PurchaseOrders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$orderby=DocDate desc&$top=${topBatch}&$skip=${skip}`;
     const headers = await slFetchFreshSession(path).catch(() => []);
-    let count = 0;
-    for (const h of prodAsArray(headers)) {
-      count++;
+    const rows = prodAsArray(headers);
+    if (!rows.length) return 0;
+    for (const h of rows) {
       const de = Number(h?.DocEntry || 0);
       if (!(de > 0)) continue;
       const full = await prodReadPurchaseOrderDetails(de).catch(() => null);
       collectFromDoc(full || h);
+      if (out.length >= Math.max(top * 2, 6)) break;
     }
-    return count;
+    return rows.length;
   };
 
-  if (out.length < top) {
-    for (let skip = 0; skip < 600 && out.length < Math.max(top, 5); skip += 100) {
-      const count = await scanBatch(skip, 100).catch(() => 0);
+  await scanBatch(0, 60).catch(() => 0);
+  if (out.length < Math.max(top, 3)) {
+    for (let skip = 60; skip < 220 && out.length < Math.max(top * 2, 6); skip += 40) {
+      const count = await scanBatch(skip, 40).catch(() => 0);
       if (!(count > 0)) break;
     }
   }
 
   out.sort((a, b) =>
+    (prodProcurementDocOpenRank(b) - prodProcurementDocOpenRank(a)) ||
     String(b.docDate || "").localeCompare(String(a.docDate || "")) ||
     Number(b.docNum || 0) - Number(a.docNum || 0) ||
     Number(a.lineNum || 0) - Number(b.lineNum || 0)
   );
-  return out.slice(0, Math.max(1, Number(top || 5)));
+  const finalRows = out.slice(0, Math.max(1, Number(top || 5)));
+  return prodSetComponentProcurementCache(cacheKey, finalRows);
 }
 
 async function prodFetchVendorCreditTerms(cardCode, fallbackName = "") {
@@ -12629,6 +12671,7 @@ async function prodFetchVendorPayablesStatus(cardCode, cardName = "") {
     supplierName: name,
     paymentStatus: "SIN_DATOS",
     amountDue: 0,
+    overdueAmount: 0,
     oldestDebtDate: "",
     daysDue: 0,
     source: "",
@@ -12639,6 +12682,10 @@ async function prodFetchVendorPayablesStatus(cardCode, cardName = "") {
   };
   if (!code) return base;
 
+  const cacheKey = `vendor::${code}`;
+  const cached = prodGetComponentProcurementCache(cacheKey, 10 * 60 * 1000);
+  if (cached) return cached;
+
   const termInfo = await prodFetchVendorCreditTerms(code, name).catch(() => ({
     supplierCode: code,
     supplierName: name,
@@ -12648,92 +12695,81 @@ async function prodFetchVendorPayablesStatus(cardCode, cardName = "") {
     balanceDebt: 0,
   }));
 
-  try {
-    const safe = prodSapEscapeLiteral(code);
-    const inv = await slFetchFreshSession(`/PurchaseInvoices?$select=DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,PaidToDate,DocCurrency&$filter=CardCode eq '${safe}'&$orderby=DocDueDate asc&$top=100`);
-    const todayIso = getDateISOInOffset(TZ_OFFSET_MIN);
-    const rows = prodAsArray(inv).map((x) => {
-      const total = prodNum(x?.DocTotal || 0);
-      const paid = prodNum(x?.PaidToDate || 0);
-      const outstanding = Math.max(0, total - paid);
-      const due = prodDateOnly(x?.DocDueDate || x?.DocDate);
-      return {
-        docNum: Number(x?.DocNum || 0),
-        dueDate: due,
-        docDate: prodDateOnly(x?.DocDate),
-        outstanding: prodRound(outstanding, 2),
-        status: String(x?.DocumentStatus || x?.Status || ""),
-        currency: String(x?.DocCurrency || "USD"),
-        overdue: !!(due && due < todayIso && outstanding > 0.009),
-      };
-    });
+  const safe = prodSapEscapeLiteral(code);
+  const todayIso = getDateISOInOffset(TZ_OFFSET_MIN);
 
-    const open = rows.filter((x) => x.outstanding > 0.009 || prodDocStatusIsOpen(x.status));
-    const overdueRows = open.filter((x) => x.overdue);
-    const oldest = overdueRows.map((x) => x.dueDate || x.docDate).filter(Boolean).sort()[0] || open.map((x) => x.dueDate || x.docDate).filter(Boolean).sort()[0] || "";
-    const invoiceDebt = prodRound(open.reduce((s, x) => s + prodNum(x.outstanding || 0), 0), 2);
-    const overdueDebt = prodRound(overdueRows.reduce((s, x) => s + prodNum(x.outstanding || 0), 0), 2);
-    const fallbackDebt = prodRound(prodNum(termInfo?.balanceDebt || 0), 2);
-    const finalDebt = Math.max(invoiceDebt, fallbackDebt, 0);
-    const effectiveDue = Math.max(overdueDebt, 0);
-
-    if (open.length || finalDebt > 0.009 || effectiveDue > 0.009) {
-      return {
-        supplierCode: code,
-        supplierName: String(termInfo?.supplierName || name || ""),
-        paymentStatus: "SE_DEBE",
-        amountDue: finalDebt,
-        overdueAmount: effectiveDue,
-        oldestDebtDate: oldest,
-        daysDue: oldest ? Math.max(0, prodDiffDaysFromToday(oldest)) : 0,
-        source: open.length ? "PurchaseInvoices+BusinessPartners" : "BusinessPartners",
-        openInvoices: open.slice(0, 10),
-        paymentTermsName: String(termInfo?.paymentTermsName || ""),
-        creditDays: Number(termInfo?.creditDays || 0),
-        balanceRaw: prodRound(prodNum(termInfo?.balanceRaw || 0), 2),
-        debtNote: oldest ? "" : (Number(termInfo?.creditDays || 0) > 0
-          ? `Saldo pendiente visible en cuenta del proveedor. Condición de pago: ${termInfo.paymentTermsName || `Crédito ${termInfo.creditDays} días`}.`
-          : "Saldo pendiente visible en cuenta del proveedor."),
-      };
-    }
-
+  const normalizeInvoiceRows = (raw) => prodAsArray(raw).map((x) => {
+    const total = prodNum(x?.DocTotal || 0);
+    const paid = prodNum(x?.PaidToDate || 0);
+    const outstanding = Math.max(0, total - paid);
+    const due = prodDateOnly(x?.DocDueDate || x?.DocDate);
+    const status = String(x?.DocumentStatus || x?.Status || "");
     return {
-      supplierCode: code,
-      supplierName: String(termInfo?.supplierName || name),
-      paymentStatus: "PAZ_Y_SALVO",
-      amountDue: 0,
-      overdueAmount: 0,
-      oldestDebtDate: "",
-      daysDue: 0,
-      source: "PurchaseInvoices+BusinessPartners",
-      openInvoices: [],
-      paymentTermsName: String(termInfo?.paymentTermsName || ""),
-      creditDays: Number(termInfo?.creditDays || 0),
-      balanceRaw: prodRound(prodNum(termInfo?.balanceRaw || 0), 2),
-      debtNote: "",
+      docNum: Number(x?.DocNum || 0),
+      dueDate: due,
+      docDate: prodDateOnly(x?.DocDate),
+      outstanding: prodRound(outstanding, 2),
+      status,
+      currency: String(x?.DocCurrency || "USD"),
+      overdue: !!(due && due < todayIso && (outstanding > 0.009 || prodDocStatusIsOpen(status))),
+      openLike: !!(outstanding > 0.009 || prodDocStatusIsOpen(status)),
     };
-  } catch {}
+  });
 
+  let rows = [];
+  // 1) Priorizar facturas abiertas del proveedor
+  const invPaths = [
+    `/PurchaseInvoices?$select=DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,PaidToDate,DocCurrency&$filter=CardCode eq '${safe}' and DocumentStatus eq 'bost_Open'&$orderby=DocDueDate asc&$top=200`,
+    `/PurchaseInvoices?$select=DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,PaidToDate,DocCurrency&$filter=CardCode eq '${safe}'&$orderby=DocDate desc&$top=200`,
+  ];
+  for (const path of invPaths) {
+    try {
+      const raw = await slFetchFreshSession(path);
+      const arr = normalizeInvoiceRows(raw);
+      if (arr.length) {
+        rows = arr;
+        if (arr.some((x) => x.openLike)) break;
+      }
+    } catch {}
+  }
+
+  const open = rows.filter((x) => x.openLike);
+  const overdueRows = open.filter((x) => x.overdue);
+  const oldest = overdueRows.map((x) => x.dueDate || x.docDate).filter(Boolean).sort()[0]
+    || open.map((x) => x.dueDate || x.docDate).filter(Boolean).sort()[0]
+    || "";
+  const invoiceDebt = prodRound(open.reduce((s, x) => s + prodNum(x.outstanding || 0), 0), 2);
+  const overdueDebt = prodRound(overdueRows.reduce((s, x) => s + prodNum(x.outstanding || 0), 0), 2);
+
+  // 2) Fallback con saldo del BP, si existe y es mayor al cálculo de facturas
   const fallbackDebt = prodRound(prodNum(termInfo?.balanceDebt || 0), 2);
-  return {
+  const finalDebt = Math.max(invoiceDebt, fallbackDebt, 0);
+  const finalOverdue = Math.max(overdueDebt, 0);
+
+  const result = {
     supplierCode: code,
-    supplierName: String(termInfo?.supplierName || name),
-    paymentStatus: fallbackDebt > 0.009 ? "SE_DEBE" : "PAZ_Y_SALVO",
-    amountDue: fallbackDebt,
-    overdueAmount: 0,
-    oldestDebtDate: "",
-    daysDue: 0,
-    source: "BusinessPartners",
-    openInvoices: [],
+    supplierName: String(termInfo?.supplierName || name || ""),
+    paymentStatus: finalDebt > 0.009 || finalOverdue > 0.009 ? "SE_DEBE" : "PAZ_Y_SALVO",
+    amountDue: finalDebt,
+    overdueAmount: finalOverdue,
+    oldestDebtDate: oldest,
+    daysDue: oldest ? Math.max(0, prodDiffDaysFromToday(oldest)) : 0,
+    source: rows.length ? "PurchaseInvoices+BusinessPartners" : "BusinessPartners",
+    openInvoices: open.slice(0, 20),
     paymentTermsName: String(termInfo?.paymentTermsName || ""),
     creditDays: Number(termInfo?.creditDays || 0),
     balanceRaw: prodRound(prodNum(termInfo?.balanceRaw || 0), 2),
-    debtNote: fallbackDebt > 0.009
-      ? (Number(termInfo?.creditDays || 0) > 0
-        ? `Saldo pendiente visible en cuenta del proveedor. Condición de pago: ${termInfo.paymentTermsName || `Crédito ${termInfo.creditDays} días`}.`
-        : "Saldo pendiente visible en cuenta del proveedor.")
-      : "",
+    debtNote: "",
   };
+
+  if (result.paymentStatus === "SE_DEBE" && !result.oldestDebtDate && result.creditDays > 0) {
+    result.debtNote = `Saldo pendiente visible. Condición: ${result.paymentTermsName || `Crédito ${result.creditDays} días`}.`;
+  }
+  if (result.paymentStatus !== "SE_DEBE" && result.balanceRaw) {
+    result.debtNote = `Saldo de cuenta SAP: ${prodRound(prodNum(result.balanceRaw || 0), 2)}.`;
+  }
+
+  return prodSetComponentProcurementCache(cacheKey, result);
 }
 
 app.get("/api/admin/production/component-procurement", verifyAdmin, async (req, res) => {
@@ -12747,27 +12783,34 @@ app.get("/api/admin/production/component-procurement", verifyAdmin, async (req, 
     const purchaseOrders = purchaseInvoices.length
       ? purchaseInvoices
       : await prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc, top).catch(() => []);
+    purchaseOrders.sort((a, b) =>
+      (prodProcurementDocOpenRank(b) - prodProcurementDocOpenRank(a)) ||
+      String(b.docDate || "").localeCompare(String(a.docDate || "")) ||
+      String(b.dueDate || "").localeCompare(String(a.dueDate || "")) ||
+      Number(b.docNum || 0) - Number(a.docNum || 0)
+    );
+    const finalDocs = purchaseOrders.slice(0, Math.max(1, top));
     const suppliers = Array.from(new Map(
-      purchaseOrders
+      finalDocs
         .map((x) => [String(x.supplierCode || "").trim(), String(x.supplierName || "").trim()])
         .filter(([code]) => !!code)
     ).entries()).map(([code, name]) => ({ code, name }));
 
-    const vendorStatuses = [];
-    for (const supplier of suppliers) {
-      vendorStatuses.push(await prodFetchVendorPayablesStatus(supplier.code, supplier.name).catch(() => ({
+    const vendorStatuses = await Promise.all(suppliers.map(async (supplier) => (
+      await prodFetchVendorPayablesStatus(supplier.code, supplier.name).catch(() => ({
         supplierCode: supplier.code,
         supplierName: supplier.name,
         paymentStatus: "SIN_DATOS",
         amountDue: 0,
+        overdueAmount: 0,
         oldestDebtDate: "",
         daysDue: 0,
         source: "",
-      })));
-    }
+      }))
+    )));
 
     const vendorMap = new Map(vendorStatuses.map((x) => [String(x.supplierCode || "").trim(), x]));
-    const enrichedOrders = purchaseOrders.map((row) => ({
+    const enrichedOrders = finalDocs.map((row) => ({
       ...row,
       vendorStatus: vendorMap.get(String(row.supplierCode || "").trim()) || null,
     }));
