@@ -9655,21 +9655,50 @@ function prodDispatchHeaderDateRelevant(h = {}, { from = '', to = '', today = ''
 }
 
 async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATCH_CARD_CODE, warehouse = PROD_SPECIAL_DISPATCH_WAREHOUSE, today = getDateISOInOffset(TZ_OFFSET_MIN), lookbackDays = PROD_SPECIAL_DISPATCH_LOOKBACK_DAYS, lookaheadDays = PROD_SPECIAL_DISPATCH_LOOKAHEAD_DAYS, maxDocs = 250 } = {}) {
-  const cacheKey = JSON.stringify({ v: 9, cardCode, warehouse, today, lookbackDays, lookaheadDays, maxDocs });
+  const cacheKey = JSON.stringify({ v: 10, cardCode, warehouse, today, lookbackDays, lookaheadDays, maxDocs });
   const hit = prodRuntimeGet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, PROD_DISPATCH_ALERTS_TTL_MS);
   if (hit) return hit;
+
+  const safeSummary = (extra = {}) => ({
+    cardCode: String(cardCode || '').trim(),
+    warehouse: String(warehouse || '').trim(),
+    orderHeadersFound: 0,
+    ordersFound: 0,
+    orderDetailsRead: 0,
+    orderDetailErrors: 0,
+    pendingLines: 0,
+    pendingItems: 0,
+    overdueItems: 0,
+    pendingQty: 0,
+    overdueQty: 0,
+    latestDueDate: '',
+    ...extra,
+  });
+
   if (missingSapEnv()) {
-    const empty = { alerts: [], byItem: [], byItemMap: new Map(), byItemIndex: {}, summary: { cardCode, warehouse, pendingItems: 0, overdueItems: 0, pendingQty: 0, overdueQty: 0, error: 'SAP no configurado' } };
+    const empty = { alerts: [], byItem: [], byItemMap: new Map(), byItemIndex: {}, summary: safeSummary({ error: 'SAP no configurado' }) };
     prodRuntimeSet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, empty);
     return empty;
   }
 
   const from = addDaysISO(today, -Math.max(1, Number(lookbackDays || 120)));
   const to = addDaysISO(today, Math.max(1, Number(lookaheadDays || 45)));
+  const targetWarehouse = String(warehouse || '').trim();
+  const targetCardCode = String(cardCode || '').trim();
+
+  const normWh = (ln = {}) => String(
+    ln?.WarehouseCode ??
+    ln?.WhsCode ??
+    ln?.Warehouse ??
+    ln?.FromWarehouseCode ??
+    ln?.Whs ??
+    ''
+  ).trim();
+
   const headerMap = new Map();
   const pushHeaders = (rows = []) => {
     for (const row of Array.isArray(rows) ? rows : []) {
-      if (String(row?.CardCode || '').trim() !== String(cardCode || '').trim()) continue;
+      if (String(row?.CardCode || '').trim() !== targetCardCode) continue;
       const key = String(row?.DocEntry ?? row?.DocNum ?? '').trim();
       if (!key) continue;
       if (!prodDispatchHeaderDateRelevant(row, { from, to, today })) continue;
@@ -9683,19 +9712,64 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
   }
   pushHeaders(await prodFetchOrderHeadersByCardCodeLoose({ cardCode, maxDocs: Math.max(150, maxDocs * 3) }).catch(() => []));
 
-  const orderHeaders = Array.from(headerMap.values()).sort((a, b) => String(b?.DocDate || '').localeCompare(String(a?.DocDate || '')) || (Number(b?.DocEntry || 0) - Number(a?.DocEntry || 0)));
+  const orderHeaders = Array.from(headerMap.values()).sort((a, b) =>
+    String(b?.DocDate || '').localeCompare(String(a?.DocDate || '')) ||
+    (Number(b?.DocEntry || 0) - Number(a?.DocEntry || 0))
+  );
+
+  const fetchFullOrder = async (docEntry) => {
+    const de = Number(docEntry || 0);
+    if (!(de > 0)) return null;
+    let full = null;
+    try { full = await getDoc('Orders', de); } catch {}
+    let lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+    if (!lines.length) {
+      try {
+        const expanded = await slFetch(`/Orders(${de})?$expand=DocumentLines`, { timeoutMs: 180000 });
+        if (expanded) {
+          full = expanded;
+          lines = Array.isArray(expanded?.DocumentLines) ? expanded.DocumentLines : [];
+        }
+      } catch {}
+    }
+    if (!lines.length) {
+      try {
+        const search = await slFetch(`/Orders?$filter=${encodeURIComponent(`DocEntry eq ${de}`)}&$expand=DocumentLines&$top=1`, { timeoutMs: 180000 });
+        const rows = prodNormalizeSlCollection(search);
+        if (rows.length) {
+          full = rows[0];
+          lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+        }
+      } catch {}
+    }
+    return full;
+  };
 
   const orders = [];
+  let orderDetailsRead = 0;
+  let orderDetailErrors = 0;
   for (const h of orderHeaders) {
     try {
-      const full = await getDoc('Orders', h.DocEntry);
+      const full = await fetchFullOrder(h?.DocEntry);
       const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
-      const whLines = lines.filter((ln) => {
-        const wh = String(ln?.WarehouseCode ?? ln?.WhsCode ?? ln?.Warehouse ?? ln?.FromWarehouseCode ?? '').trim();
-        if (wh) return wh === String(warehouse || '').trim();
-        return !warehouse;
-      });
+      orderDetailsRead += 1;
+      if (!full || !lines.length) continue;
+
+      const explicitWhLines = lines.filter((ln) => normWh(ln) === targetWarehouse);
+      const anyWhValues = Array.from(new Set(lines.map(normWh).filter(Boolean)));
+      let whLines = explicitWhLines;
+
+      if (!whLines.length) {
+        if (!targetWarehouse) {
+          whLines = lines.slice();
+        } else if (!anyWhValues.length) {
+          whLines = lines.slice();
+        } else if (anyWhValues.length === 1 && anyWhValues[0] === targetWarehouse) {
+          whLines = lines.slice();
+        }
+      }
       if (!whLines.length) continue;
+
       const headerOpen = prodDocStatusIsOpen(full?.DocumentStatus || h?.DocumentStatus || '');
       const hasOpenWarehouseLines = whLines.some((ln) => {
         const factor = Math.max(1, prodNum(ln?.NumPerMsr ?? ln?.ItemsPerUnit ?? 1, 1));
@@ -9703,14 +9777,33 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
         const openQtyBase = openQtyRaw * factor;
         return openQtyBase > 0.0001 || prodDocStatusIsOpen(ln?.LineStatus || ln?.DocumentLineStatus || ln?.Status || '');
       });
+
       if (headerOpen || hasOpenWarehouseLines || !String(full?.DocumentStatus || h?.DocumentStatus || '').trim()) {
-        orders.push(full);
+        orders.push({
+          ...full,
+          __dispatchWhLines: whLines,
+        });
       }
-    } catch {}
+    } catch (err) {
+      orderDetailErrors += 1;
+    }
     if (orders.length && orders.length % 10 === 0) await sleep(10);
   }
+
   if (!orders.length) {
-    const empty = { alerts: [], byItem: [], byItemMap: new Map(), byItemIndex: {}, summary: { cardCode, warehouse, pendingItems: 0, overdueItems: 0, pendingQty: 0, overdueQty: 0 } };
+    const empty = {
+      alerts: [],
+      byItem: [],
+      byItemMap: new Map(),
+      byItemIndex: {},
+      summary: safeSummary({
+        orderHeadersFound: orderHeaders.length,
+        ordersFound: 0,
+        orderDetailsRead,
+        orderDetailErrors,
+        sampleDocNums: orderHeaders.slice(0, 10).map((x) => Number(x?.DocNum || 0)).filter(Boolean),
+      }),
+    };
     prodRuntimeSet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, empty);
     return empty;
   }
@@ -9770,10 +9863,10 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
     const docNum = Number(order?.DocNum || 0);
     const dueDate = String(order?.DocDueDate || order?.DueDate || order?.TaxDate || order?.DocDate || '').slice(0,10);
     const docDate = String(order?.DocDate || '').slice(0,10);
-    const lines = Array.isArray(order?.DocumentLines) ? order.DocumentLines : [];
+    const lines = Array.isArray(order?.__dispatchWhLines) ? order.__dispatchWhLines : (Array.isArray(order?.DocumentLines) ? order.DocumentLines : []);
     for (const ln of lines) {
-      const wh = String(ln?.WarehouseCode ?? ln?.WhsCode ?? ln?.Warehouse ?? ln?.FromWarehouseCode ?? '').trim();
-      if (wh !== String(warehouse || '').trim()) continue;
+      const wh = normWh(ln) || targetWarehouse;
+      if (targetWarehouse && wh !== targetWarehouse) continue;
       const lineNum = Number(ln?.LineNum ?? -1);
       if (lineNum < 0) continue;
       const itemCode = String(ln?.ItemCode || '').trim();
@@ -9786,7 +9879,7 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
       const headerIsOpen = prodDocStatusIsOpen(order?.DocumentStatus || order?.Status || '');
       const lineIsOpen = prodDocStatusIsOpen(ln?.LineStatus || ln?.DocumentLineStatus || ln?.Status || '');
       let pendingQty = prodRound(Math.max(openQtyBase, qtyBase - invoicedQtyBase), 2);
-      if (!(pendingQty > 0.01) && invoicedQtyBase <= 0.01 && (headerIsOpen || lineIsOpen) && qtyBase > 0.01) {
+      if (!(pendingQty > 0.01) && invoicedQtyBase <= 0.01 && (headerIsOpen || lineIsOpen || qtyBase > 0.01)) {
         pendingQty = prodRound(Math.max(qtyBase, openQtyBase), 2);
       }
       if (!(pendingQty > 0.01)) continue;
@@ -9804,7 +9897,7 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
             ? `Entrega próxima en ${daysUntilDue} día(s). Pedido pendiente por despachar.`
             : 'Pedido abierto pendiente por despachar.';
       const row = {
-        cardCode: String(cardCode || '').trim(),
+        cardCode: targetCardCode,
         warehouse: wh,
         docEntry,
         docNum,
@@ -9858,19 +9951,25 @@ async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATC
     return String(a?.itemCode || '').localeCompare(String(b?.itemCode || ''));
   });
 
-  const byItem = Array.from(byItemMap.values()).sort((a, b) => prodNum(b?.priorityScore) - prodNum(a?.priorityScore) || prodNum(b?.qtyPending) - prodNum(a?.qtyPending) || String(a?.itemCode || '').localeCompare(String(b?.itemCode || '')));
-  const summary = {
-    cardCode: String(cardCode || '').trim(),
-    warehouse: String(warehouse || '').trim(),
-    ordersFound: orders.length,
+  const byItem = Array.from(byItemMap.values()).sort((a, b) =>
+    prodNum(b?.priorityScore) - prodNum(a?.priorityScore) ||
+    prodNum(b?.qtyPending) - prodNum(a?.qtyPending) ||
+    String(a?.itemCode || '').localeCompare(String(b?.itemCode || ''))
+  );
+
+  const summary = safeSummary({
     orderHeadersFound: orderHeaders.length,
+    ordersFound: orders.length,
+    orderDetailsRead,
+    orderDetailErrors,
     pendingLines: alerts.length,
     pendingItems: byItem.length,
     overdueItems: byItem.filter((x) => prodNum(x?.maxDaysLate) > 0).length,
     pendingQty: prodRound(alerts.reduce((acc, row) => acc + prodNum(row?.qtyPending), 0), 2),
     overdueQty: prodRound(alerts.filter((x) => prodNum(x?.daysLate) > 0).reduce((acc, row) => acc + prodNum(row?.qtyPending), 0), 2),
     latestDueDate: alerts[0]?.dueDate || '',
-  };
+    sampleDocNums: orderHeaders.slice(0, 10).map((x) => Number(x?.DocNum || 0)).filter(Boolean),
+  });
 
   const byItemIndex = Object.fromEntries(byItem.map((x) => [String(x?.itemCode || '').trim(), x]));
   const result = { alerts, byItem, byItemMap, byItemIndex, summary };
