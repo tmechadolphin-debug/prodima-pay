@@ -8442,8 +8442,15 @@ const PROD_ITEM_RUNTIME_CACHE = new Map();
 const PROD_ORDERS_RUNTIME_CACHE = new Map();
 const PROD_BOM_RUNTIME_CACHE = new Map();
 const PROD_PLAN_RUNTIME_CACHE = new Map();
+const PROD_DISPATCH_ALERTS_CACHE = new Map();
 const PROD_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const PROD_PLAN_TTL_MS = 2 * 60 * 1000;
+const PROD_DISPATCH_ALERTS_TTL_MS = 2 * 60 * 1000;
+
+const PROD_SPECIAL_DISPATCH_CARD_CODE = 'C01600';
+const PROD_SPECIAL_DISPATCH_WAREHOUSE = '01';
+const PROD_SPECIAL_DISPATCH_LOOKBACK_DAYS = 120;
+const PROD_SPECIAL_DISPATCH_LOOKAHEAD_DAYS = 45;
 
 function prodParseJsonSafe(v, fallback = {}) {
   if (v == null || v === "") return fallback;
@@ -9509,7 +9516,251 @@ async function syncProductionDemandOrders({ from, to, maxDocs = 4000 }) {
     } catch {}
     await sleep(10);
   }
-  return saved;
+  
+return saved;
+}
+
+function prodDocLineBaseQty(ln = {}) {
+  const factor = Math.max(1, prodNum(ln?.NumPerMsr ?? ln?.ItemsPerUnit ?? 1, 1));
+  const qty = Math.max(0, prodNum(ln?.Quantity ?? ln?.OpenQty ?? 0));
+  return prodRound(qty * factor, 4);
+}
+
+function prodDaysLateFromTo(dueDate, refDate) {
+  const due = new Date(`${String(dueDate || '').slice(0,10)}T00:00:00`);
+  const ref = new Date(`${String(refDate || '').slice(0,10)}T00:00:00`);
+  if (Number.isNaN(due.getTime()) || Number.isNaN(ref.getTime())) return 0;
+  return Math.max(0, Math.floor((ref.getTime() - due.getTime()) / 86400000));
+}
+
+function prodDaysUntilFromTo(targetDate, refDate) {
+  const target = new Date(`${String(targetDate || '').slice(0,10)}T00:00:00`);
+  const ref = new Date(`${String(refDate || '').slice(0,10)}T00:00:00`);
+  if (Number.isNaN(target.getTime()) || Number.isNaN(ref.getTime())) return 0;
+  return Math.floor((target.getTime() - ref.getTime()) / 86400000);
+}
+
+async function prodFetchDocHeadersByDateRange(entity, { from, to, maxDocs = 400, cardCode = '' } = {}) {
+  if (missingSapEnv()) return [];
+  const fromDate = String(from || '').slice(0,10);
+  const toDate = String(to || '').slice(0,10);
+  if (!fromDate || !toDate) return [];
+  const top = Math.max(50, Math.min(2000, Number(maxDocs || 400)));
+  const chunks = [];
+  let cur = fromDate;
+  while (cur <= toDate) {
+    const end = addDaysISO(cur, 29) < toDate ? addDaysISO(cur, 29) : toDate;
+    chunks.push([cur, end]);
+    cur = addDaysISO(end, 1);
+  }
+  const safeCardCode = String(cardCode || '').replace(/'/g, "''");
+  const out = [];
+  const seen = new Set();
+  for (const [f, t] of chunks) {
+    let skip = 0;
+    while (skip < top) {
+      let filter = `DocDate ge '${f}' and DocDate le '${t}' and Cancelled eq 'tNO'`;
+      if (safeCardCode) filter += ` and CardCode eq '${safeCardCode}'`;
+      const path = `/${entity}?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=200&$skip=${skip}`;
+      const res = await slFetch(path, { timeoutMs: 120000 });
+      const batch = prodNormalizeSlCollection(res);
+      if (!batch.length) break;
+      for (const row of batch) {
+        const key = String(row?.DocEntry ?? row?.DocNum ?? '').trim();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push(row);
+      }
+      if (batch.length < 200 || out.length >= top) break;
+      skip += batch.length;
+    }
+    if (out.length >= top) break;
+  }
+  return out.slice(0, top);
+}
+
+async function prodBuildCustomerDispatchAlerts({ cardCode = PROD_SPECIAL_DISPATCH_CARD_CODE, warehouse = PROD_SPECIAL_DISPATCH_WAREHOUSE, today = getDateISOInOffset(TZ_OFFSET_MIN), lookbackDays = PROD_SPECIAL_DISPATCH_LOOKBACK_DAYS, lookaheadDays = PROD_SPECIAL_DISPATCH_LOOKAHEAD_DAYS, maxDocs = 250 } = {}) {
+  const cacheKey = JSON.stringify({ cardCode, warehouse, today, lookbackDays, lookaheadDays, maxDocs });
+  const hit = prodRuntimeGet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, PROD_DISPATCH_ALERTS_TTL_MS);
+  if (hit) return hit;
+  if (missingSapEnv()) {
+    const empty = { alerts: [], byItem: [], byItemMap: new Map(), summary: { cardCode, warehouse, pendingItems: 0, overdueItems: 0, pendingQty: 0, overdueQty: 0, error: 'SAP no configurado' } };
+    prodRuntimeSet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, empty);
+    return empty;
+  }
+
+  const from = addDaysISO(today, -Math.max(1, Number(lookbackDays || 120)));
+  const to = addDaysISO(today, Math.max(1, Number(lookaheadDays || 45)));
+  const orderHeaders = (await prodScanDocHeadersForOrders({ from, to, maxDocs: Math.max(50, maxDocs) }))
+    .filter((x) => String(x?.CardCode || '').trim() === String(cardCode || '').trim());
+
+  const orders = [];
+  for (const h of orderHeaders) {
+    try {
+      const full = await getDoc('Orders', h.DocEntry);
+      const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+      const hasWarehouseLines = lines.some((ln) => String(ln?.WarehouseCode ?? ln?.WhsCode ?? '').trim() === String(warehouse || '').trim());
+      if (hasWarehouseLines) orders.push(full);
+    } catch {}
+    if (orders.length && orders.length % 10 === 0) await sleep(10);
+  }
+  if (!orders.length) {
+    const empty = { alerts: [], byItem: [], byItemMap: new Map(), summary: { cardCode, warehouse, pendingItems: 0, overdueItems: 0, pendingQty: 0, overdueQty: 0 } };
+    prodRuntimeSet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, empty);
+    return empty;
+  }
+
+  const orderEntrySet = new Set(orders.map((o) => Number(o?.DocEntry || 0)).filter(Boolean));
+  const deliveries = [];
+  const deliveryHeaders = await prodFetchDocHeadersByDateRange('DeliveryNotes', { from, to, maxDocs: Math.max(100, maxDocs * 2), cardCode });
+  for (const h of deliveryHeaders) {
+    try {
+      const full = await getDoc('DeliveryNotes', h.DocEntry);
+      const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+      const linked = lines.some((ln) => Number(ln?.BaseType) === 17 && orderEntrySet.has(Number(ln?.BaseEntry || 0)));
+      if (linked) deliveries.push(full);
+    } catch {}
+    if (deliveries.length && deliveries.length % 10 === 0) await sleep(10);
+  }
+
+  const deliveryLineToOrderLine = new Map();
+  for (const dd of deliveries) {
+    const lines = Array.isArray(dd?.DocumentLines) ? dd.DocumentLines : [];
+    for (const ln of lines) {
+      if (Number(ln?.BaseType) !== 17) continue;
+      const orderEntry = Number(ln?.BaseEntry || 0);
+      const orderLine = Number(ln?.BaseLine ?? ln?.BaseLineNumber ?? -1);
+      const lineNum = Number(ln?.LineNum ?? -1);
+      if (!orderEntrySet.has(orderEntry) || orderLine < 0 || lineNum < 0) continue;
+      deliveryLineToOrderLine.set(`${Number(dd?.DocEntry || 0)}:${lineNum}`, `${orderEntry}:${orderLine}`);
+    }
+  }
+
+  const invoicedQtyByOrderLine = new Map();
+  const invoiceHeaders = await prodFetchDocHeadersByDateRange('Invoices', { from, to: addDaysISO(today, 15), maxDocs: Math.max(120, maxDocs * 3), cardCode });
+  for (const h of invoiceHeaders) {
+    try {
+      const full = await getDoc('Invoices', h.DocEntry);
+      const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+      for (const ln of lines) {
+        const qtyBase = prodDocLineBaseQty(ln);
+        if (!(qtyBase > 0)) continue;
+        if (Number(ln?.BaseType) === 17 && orderEntrySet.has(Number(ln?.BaseEntry || 0))) {
+          const key = `${Number(ln?.BaseEntry || 0)}:${Number(ln?.BaseLine ?? ln?.BaseLineNumber ?? -1)}`;
+          invoicedQtyByOrderLine.set(key, prodRound(prodNum(invoicedQtyByOrderLine.get(key)) + qtyBase, 4));
+        } else if (Number(ln?.BaseType) === 15) {
+          const key = deliveryLineToOrderLine.get(`${Number(ln?.BaseEntry || 0)}:${Number(ln?.BaseLine ?? ln?.BaseLineNumber ?? -1)}`);
+          if (!key) continue;
+          invoicedQtyByOrderLine.set(key, prodRound(prodNum(invoicedQtyByOrderLine.get(key)) + qtyBase, 4));
+        }
+      }
+    } catch {}
+    if (invoiceHeaders.length > 20) await sleep(5);
+  }
+
+  const alerts = [];
+  const byItemMap = new Map();
+  for (const order of orders) {
+    const docEntry = Number(order?.DocEntry || 0);
+    const docNum = Number(order?.DocNum || 0);
+    const dueDate = String(order?.DocDueDate || order?.DueDate || order?.TaxDate || order?.DocDate || '').slice(0,10);
+    const docDate = String(order?.DocDate || '').slice(0,10);
+    const lines = Array.isArray(order?.DocumentLines) ? order.DocumentLines : [];
+    for (const ln of lines) {
+      const wh = String(ln?.WarehouseCode ?? ln?.WhsCode ?? '').trim();
+      if (wh !== String(warehouse || '').trim()) continue;
+      const lineNum = Number(ln?.LineNum ?? -1);
+      if (lineNum < 0) continue;
+      const itemCode = String(ln?.ItemCode || '').trim();
+      if (!itemCode) continue;
+      const itemDesc = String(ln?.ItemDescription || ln?.ItemName || '').trim();
+      const factor = Math.max(1, prodNum(ln?.NumPerMsr ?? ln?.ItemsPerUnit ?? 1, 1));
+      const qtyBase = Math.max(0, prodNum(ln?.Quantity || 0) * factor);
+      const openQtyBase = Math.max(0, prodNum(ln?.OpenQty ?? ln?.RemainingOpenQuantity ?? 0) * factor);
+      const invoicedQtyBase = Math.max(0, prodNum(invoicedQtyByOrderLine.get(`${docEntry}:${lineNum}`)));
+      const pendingQty = prodRound(Math.max(openQtyBase, qtyBase - invoicedQtyBase), 2);
+      if (!(pendingQty > 0.01)) continue;
+      const daysLate = prodDaysLateFromTo(dueDate, today);
+      const daysUntilDue = prodDaysUntilFromTo(dueDate, today);
+      const priorityState = daysLate > 0 ? 'overdue' : daysUntilDue <= 0 ? 'today' : daysUntilDue <= 3 ? 'soon' : 'open';
+      const priorityScore = (daysLate * 1000) + (daysLate > 0 ? 5000 : daysUntilDue <= 3 ? 1000 - Math.max(daysUntilDue, 0) * 100 : 0) + pendingQty;
+      const message = daysLate > 0
+        ? `Atraso de ${daysLate} día(s). Pedido sin factura relacionada; despachar con prioridad.`
+        : daysUntilDue === 0
+          ? 'Entrega vence hoy. Pedido sin factura relacionada; revisar despacho.'
+          : daysUntilDue > 0 && daysUntilDue <= 3
+            ? `Entrega próxima en ${daysUntilDue} día(s). Pedido pendiente por despachar.`
+            : 'Pedido abierto pendiente por despachar.';
+      const row = {
+        cardCode: String(cardCode || '').trim(),
+        warehouse: wh,
+        docEntry,
+        docNum,
+        lineNum,
+        docDate,
+        dueDate,
+        itemCode,
+        itemDesc,
+        qtyOrdered: prodRound(qtyBase, 2),
+        qtyOpen: prodRound(openQtyBase, 2),
+        qtyInvoiced: prodRound(invoicedQtyBase, 2),
+        qtyPending: pendingQty,
+        daysLate,
+        daysUntilDue,
+        priorityState,
+        priorityScore: prodRound(priorityScore, 2),
+        hasInvoice: invoicedQtyBase > 0,
+        message,
+      };
+      alerts.push(row);
+      const agg = byItemMap.get(itemCode) || {
+        itemCode,
+        itemDesc,
+        qtyPending: 0,
+        qtyOverdue: 0,
+        maxDaysLate: 0,
+        earliestDueDate: dueDate,
+        docNums: [],
+        lines: 0,
+        priorityScore: 0,
+      };
+      agg.qtyPending = prodRound(agg.qtyPending + pendingQty, 2);
+      if (daysLate > 0) agg.qtyOverdue = prodRound(agg.qtyOverdue + pendingQty, 2);
+      agg.maxDaysLate = Math.max(agg.maxDaysLate, daysLate);
+      agg.earliestDueDate = !agg.earliestDueDate || (dueDate && dueDate < agg.earliestDueDate) ? dueDate : agg.earliestDueDate;
+      if (docNum && !agg.docNums.includes(docNum)) agg.docNums.push(docNum);
+      agg.lines += 1;
+      agg.priorityScore = Math.max(agg.priorityScore, priorityScore);
+      agg.priorityState = agg.maxDaysLate > 0 ? 'overdue' : (daysUntilDue <= 3 ? 'soon' : 'open');
+      byItemMap.set(itemCode, agg);
+    }
+  }
+
+  alerts.sort((a, b) => {
+    const late = prodNum(b?.daysLate) - prodNum(a?.daysLate);
+    if (late) return late;
+    const dueCmp = String(a?.dueDate || '').localeCompare(String(b?.dueDate || ''));
+    if (dueCmp) return dueCmp;
+    const prio = prodNum(b?.priorityScore) - prodNum(a?.priorityScore);
+    if (prio) return prio;
+    return String(a?.itemCode || '').localeCompare(String(b?.itemCode || ''));
+  });
+
+  const byItem = Array.from(byItemMap.values()).sort((a, b) => prodNum(b?.priorityScore) - prodNum(a?.priorityScore) || prodNum(b?.qtyPending) - prodNum(a?.qtyPending) || String(a?.itemCode || '').localeCompare(String(b?.itemCode || '')));
+  const summary = {
+    cardCode: String(cardCode || '').trim(),
+    warehouse: String(warehouse || '').trim(),
+    pendingLines: alerts.length,
+    pendingItems: byItem.length,
+    overdueItems: byItem.filter((x) => prodNum(x?.maxDaysLate) > 0).length,
+    pendingQty: prodRound(alerts.reduce((acc, row) => acc + prodNum(row?.qtyPending), 0), 2),
+    overdueQty: prodRound(alerts.filter((x) => prodNum(x?.daysLate) > 0).reduce((acc, row) => acc + prodNum(row?.qtyPending), 0), 2),
+    latestDueDate: alerts[0]?.dueDate || '',
+  };
+
+  const result = { alerts, byItem, byItemMap, summary };
+  prodRuntimeSet(PROD_DISPATCH_ALERTS_CACHE, cacheKey, result);
+  return result;
 }
 
 
@@ -11183,12 +11434,14 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
   const effectiveDayHours = prodPlanEffectiveDayHours(local.capacity?.shiftHours || shiftHours || 8);
   const dayStartHour = PROD_PLAN_DAY_START_HOUR;
   const dayEndHour = PROD_PLAN_DAY_END_HOUR;
-  const start = prodPlanNextWorkday(startDate || getDateISOInOffset(TZ_OFFSET_MIN));
+  const today = getDateISOInOffset(TZ_OFFSET_MIN);
+  const start = prodPlanNextWorkday(startDate || today);
   const planningHorizonDays = Math.max(30, Math.round(planningHorizonMonths * 30));
   const planEnd = addDaysISO(start, Math.max(0, planningHorizonDays - 1));
   const materialPool = new Map();
   const blockedItems = [];
   const rows = [];
+  const dispatchInfo = await prodBuildCustomerDispatchAlerts({ today }).catch((err) => ({ alerts: [], byItem: [], byItemMap: new Map(), summary: { cardCode: PROD_SPECIAL_DISPATCH_CARD_CODE, warehouse: PROD_SPECIAL_DISPATCH_WAREHOUSE, error: err?.message || String(err) } }));
   const calendarSet = new Set();
   const laneStates = new Map();
   let totalNeededQty = 0;
@@ -11219,7 +11472,9 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     }
     if (!(unitsPerHour > 0)) unitsPerHour = Math.max(1 / Math.max(1, effectiveDayHours), unitsPerShift / Math.max(1, effectiveDayHours));
 
-    const rawFinishedQtyNeeded = Math.max(0, Math.ceil(prodNum(row?.productionAdjusted)));
+    const dispatchDemand = dispatchInfo?.byItemMap?.get(String(row?.itemCode || '').trim()) || null;
+    const dispatchGapQty = Math.max(0, prodNum(dispatchDemand?.qtyPending) - Math.max(0, prodNum(row?.stockTotal)));
+    const rawFinishedQtyNeeded = Math.max(0, Math.ceil(Math.max(prodNum(row?.productionAdjusted), dispatchGapQty)));
     const configuredMinRunQty = Math.max(1, Math.floor(prodNum(local.capacity?.minimumRunQty || local.capacity?.minRunQty || 600, 600)));
     const practicalMinRunQty = Math.max(1, Math.min(configuredMinRunQty, Math.max(1, Math.floor(unitsPerShift))));
     const minBatchQty = Math.max(
@@ -11268,12 +11523,20 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
       minBatchQty,
       directMaterials,
       sharedSemiCode: String((Array.isArray(plan?.requirements?.all) ? plan.requirements.all : []).find((x) => String(x?.procurementMethodLabel || '') === 'Se fabrica en planta')?.code || '').trim(),
+      dispatchDemand,
+      dispatchGapQty: prodRound(dispatchGapQty, 2),
     });
   }
 
   candidates.sort((a, b) => {
     const lane = prodNum(b?.laneMeta?.priority) - prodNum(a?.laneMeta?.priority);
     if (lane) return lane;
+    const dispatchPrio = prodNum(b?.dispatchDemand?.priorityScore) - prodNum(a?.dispatchDemand?.priorityScore);
+    if (dispatchPrio) return dispatchPrio;
+    const dispatchLate = prodNum(b?.dispatchDemand?.maxDaysLate) - prodNum(a?.dispatchDemand?.maxDaysLate);
+    if (dispatchLate) return dispatchLate;
+    const dispatchPending = prodNum(b?.dispatchDemand?.qtyPending) - prodNum(a?.dispatchDemand?.qtyPending);
+    if (dispatchPending) return dispatchPending;
     const urgent = prodUrgentFinishedPriority(b?.row) - prodUrgentFinishedPriority(a?.row);
     if (urgent) return urgent;
     const ab = prodAbcPriority(b?.row?.totalLabel) - prodAbcPriority(a?.row?.totalLabel);
@@ -11305,7 +11568,7 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
   };
 
   for (const candidate of candidates) {
-    const { row, plan, familyKey, familyMeta, laneKey, laneMeta, unitsPerHour, rawFinishedQtyNeeded, finishedQtyNeeded, minBatchQty, directMaterials } = candidate;
+    const { row, plan, familyKey, familyMeta, laneKey, laneMeta, unitsPerHour, rawFinishedQtyNeeded, finishedQtyNeeded, minBatchQty, directMaterials, dispatchDemand, dispatchGapQty } = candidate;
     if (!(finishedQtyNeeded > 0)) continue;
 
     const laneState = getLaneState(laneKey, laneMeta);
@@ -11354,6 +11617,14 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
         mainConstraint: mainConstraint || 'Materia prima insuficiente',
         currentStockQty: prodRound(row?.stockTotal || 0, 3),
         materials: directMaterials,
+        dispatchDemand: dispatchDemand ? {
+          qtyPending: prodRound(dispatchDemand.qtyPending || 0, 2),
+          qtyOverdue: prodRound(dispatchDemand.qtyOverdue || 0, 2),
+          maxDaysLate: prodNum(dispatchDemand.maxDaysLate),
+          earliestDueDate: String(dispatchDemand.earliestDueDate || ''),
+          docNums: Array.isArray(dispatchDemand.docNums) ? dispatchDemand.docNums.slice(0, 6) : [],
+          priorityState: String(dispatchDemand.priorityState || ''),
+        } : null,
       });
       continue;
     }
@@ -11435,6 +11706,15 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
       sharedSemiCode: candidate.sharedSemiCode,
       materials: directMaterials,
       tasks,
+      dispatchDemand: dispatchDemand ? {
+        qtyPending: prodRound(dispatchDemand.qtyPending || 0, 2),
+        qtyOverdue: prodRound(dispatchDemand.qtyOverdue || 0, 2),
+        maxDaysLate: prodNum(dispatchDemand.maxDaysLate),
+        earliestDueDate: String(dispatchDemand.earliestDueDate || ''),
+        docNums: Array.isArray(dispatchDemand.docNums) ? dispatchDemand.docNums.slice(0, 6) : [],
+        priorityState: String(dispatchDemand.priorityState || ''),
+      } : null,
+      dispatchGapQty: prodRound(dispatchGapQty || 0, 2),
     });
 
     if (blockedQty > 0) {
@@ -11454,6 +11734,14 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
         mainConstraint: mainConstraint || 'Materia prima insuficiente',
         currentStockQty: prodRound(row?.stockTotal || 0, 3),
         materials: directMaterials,
+        dispatchDemand: dispatchDemand ? {
+          qtyPending: prodRound(dispatchDemand.qtyPending || 0, 2),
+          qtyOverdue: prodRound(dispatchDemand.qtyOverdue || 0, 2),
+          maxDaysLate: prodNum(dispatchDemand.maxDaysLate),
+          earliestDueDate: String(dispatchDemand.earliestDueDate || ''),
+          docNums: Array.isArray(dispatchDemand.docNums) ? dispatchDemand.docNums.slice(0, 6) : [],
+          priorityState: String(dispatchDemand.priorityState || ''),
+        } : null,
       });
     }
   }
@@ -11508,6 +11796,8 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     calendarDays,
     items: rows,
     blockedItems,
+    dispatchAlerts: dispatchInfo.alerts,
+    dispatchSummary: dispatchInfo.summary,
     summary: {
       itemsPlanned: rows.length,
       totalNeededQty: prodRound(totalNeededQty, 2),
@@ -11515,6 +11805,9 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
       totalBlockedQty: prodRound(totalBlockedQty, 2),
       totalScheduledHours: prodRound(totalScheduledHours, 2),
       fullMaterialsScenario: !!fullMaterials,
+      priorityDispatchItems: prodNum(dispatchInfo?.summary?.pendingItems),
+      priorityDispatchOverdue: prodNum(dispatchInfo?.summary?.overdueItems),
+      priorityDispatchQty: prodRound(dispatchInfo?.summary?.pendingQty || 0, 2),
     },
   };
 }
