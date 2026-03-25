@@ -56,6 +56,7 @@
     "nonAbRequireHalfShift": true,
     "nonAbHalfShiftPct": 0.5,
     "cMinFillPctOfStockMax": 0.8,
-    "abMinRunQty": 2000
+    "abMinRunQty": 2000,
+    "abMaxDailyOvertimeFactor": 1.5
   }
 }
