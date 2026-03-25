@@ -14516,6 +14516,7 @@ function comprasDedupResolvedSuppliers(list = []) {
 function comprasExtractBusinessPartnerName(node, fallback = '') {
   const fb = comprasStr(fallback);
   if (!node) return fb;
+
   const direct = [
     node?.CardName,
     node?.cardName,
@@ -14533,8 +14534,83 @@ function comprasExtractBusinessPartnerName(node, fallback = '') {
     node?.aliasName,
     node?.CompanyName,
     node?.companyName,
+    node?.CardFName,
+    node?.cardFName,
   ].map((x) => comprasStr(x)).find(Boolean);
-  return direct || fb;
+  if (direct) return direct;
+
+  const queue = [];
+  const seen = new WeakSet();
+  if (node && typeof node === 'object') queue.push(node);
+
+  while (queue.length) {
+    const cur = queue.shift();
+    if (!cur || typeof cur !== 'object') continue;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+
+    const nestedDirect = [
+      cur?.CardName,
+      cur?.cardName,
+      cur?.BPName,
+      cur?.bpName,
+      cur?.SupplierName,
+      cur?.supplierName,
+      cur?.VendorName,
+      cur?.vendorName,
+      cur?.Name,
+      cur?.name,
+      cur?.ForeignName,
+      cur?.foreignName,
+      cur?.AliasName,
+      cur?.aliasName,
+      cur?.CompanyName,
+      cur?.companyName,
+      cur?.CardFName,
+      cur?.cardFName,
+    ].map((x) => comprasStr(x)).find(Boolean);
+    if (nestedDirect) return nestedDirect;
+
+    if (Array.isArray(cur)) {
+      for (const v of cur.slice(0, 20)) {
+        if (v && typeof v === 'object') queue.push(v);
+      }
+      continue;
+    }
+
+    for (const v of Object.values(cur)) {
+      if (v && typeof v === 'object') queue.push(v);
+    }
+  }
+
+  return fb;
+}
+
+async function comprasFetchBusinessPartnerNameFromDocs(cardCode, fallbackName = '') {
+  const code = comprasStr(cardCode);
+  const fallback = comprasStr(fallbackName);
+  if (!code) return { cardCode: code, cardName: fallback, raw: null, source: '' };
+  const safe = prodSapEscapeLiteral(code);
+  const paths = [
+    { path: `/BusinessPartners('${encodeURIComponent(code)}')`, source: 'BusinessPartners.byKey' },
+    { path: `/BusinessPartners?$filter=CardCode eq '${safe}'&$top=1`, source: 'BusinessPartners.eq' },
+    { path: `/PurchaseInvoices?$select=CardCode,CardName,DocDate&$filter=CardCode eq '${safe}'&$orderby=DocDate desc&$top=3`, source: 'PurchaseInvoices' },
+    { path: `/PurchaseOrders?$select=CardCode,CardName,DocDate&$filter=CardCode eq '${safe}'&$orderby=DocDate desc&$top=3`, source: 'PurchaseOrders' },
+  ];
+
+  for (const cfg of paths) {
+    try {
+      const raw = await slFetchFreshSession(cfg.path);
+      const rows = comprasToArray(raw);
+      const row = rows.find((x) => comprasSameText(x?.CardCode, code)) || rows[0] || (raw && typeof raw === 'object' ? raw : null);
+      const cardName = comprasExtractBusinessPartnerName(row, comprasExtractBusinessPartnerName(raw, fallback));
+      if (cardName) {
+        return { cardCode: comprasStr(row?.CardCode || code), cardName, raw: row || raw || null, source: cfg.source };
+      }
+    } catch {}
+  }
+
+  return { cardCode: code, cardName: fallback, raw: null, source: '' };
 }
 
 async function comprasFetchBusinessPartnerSummary(cardCode, fallbackName = '') {
@@ -14542,25 +14618,42 @@ async function comprasFetchBusinessPartnerSummary(cardCode, fallbackName = '') {
   const fallback = comprasStr(fallbackName);
   if (!code) return { cardCode: code, cardName: fallback, raw: null };
   const safe = code.replace(/'/g, "''");
-  const select = 'CardCode,CardName,CardType,ForeignName,AliasName,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum';
+  const select = 'CardCode,CardName,CardType,ForeignName,AliasName,CardFName,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum';
   const paths = [
     `/BusinessPartners?$select=${select}&$filter=CardCode eq '${safe}'&$top=1`,
     `/BusinessPartners('${encodeURIComponent(code)}')?$select=${select}`,
+    `/BusinessPartners('${encodeURIComponent(code)}')`,
     `/BusinessPartners?$select=${select}&$filter=contains(CardCode,'${safe}')&$top=5`,
   ];
   for (const path of paths) {
     try {
       const raw = await slFetchFreshSession(path);
-      const rows = Array.isArray(raw) ? raw : (comprasToArray(raw).length ? comprasToArray(raw) : [raw]);
-      const row = rows.find((x) => comprasSameText(x?.CardCode, code)) || rows[0] || null;
-      if (row?.CardCode || row?.CardName || row?.ForeignName || row?.AliasName) {
+      const rows = Array.isArray(raw) ? raw : comprasToArray(raw);
+      const row = rows.find((x) => comprasSameText(x?.CardCode, code)) || rows[0] || (raw && typeof raw === 'object' ? raw : null);
+      const lookedUpName = comprasExtractBusinessPartnerName(row, comprasExtractBusinessPartnerName(raw, fallback));
+      if ((row?.CardCode || row?.CardName || row?.ForeignName || row?.AliasName || row?.Name || row?.CardFName) && lookedUpName) {
         return {
           cardCode: comprasStr(row?.CardCode || code),
-          cardName: comprasExtractBusinessPartnerName(row, fallback),
-          raw: row,
+          cardName: lookedUpName,
+          raw: row || raw || null,
+        };
+      }
+      if (row?.CardCode || lookedUpName) {
+        return {
+          cardCode: comprasStr(row?.CardCode || code),
+          cardName: lookedUpName || fallback,
+          raw: row || raw || null,
         };
       }
     } catch {}
+  }
+  const docLookup = await comprasFetchBusinessPartnerNameFromDocs(code, fallback).catch(() => null);
+  if (docLookup?.cardName || docLookup?.raw) {
+    return {
+      cardCode: comprasStr(docLookup?.cardCode || code),
+      cardName: comprasStr(docLookup?.cardName || fallback),
+      raw: docLookup?.raw || null,
+    };
   }
   return { cardCode: code, cardName: fallback, raw: null };
 }
@@ -14736,6 +14829,13 @@ async function comprasFetchLive(itemCode) {
       const lookedUpName = comprasExtractBusinessPartnerName(bp?.raw, bp?.cardName || finalCardName || supplierName);
       if (lookedUpName) finalCardName = comprasStr(lookedUpName);
       if (bp?.raw) bpRaw = bp.raw;
+
+      if (!finalCardName || comprasSameText(finalCardName, supplierCode)) {
+        const docBp = await comprasFetchBusinessPartnerNameFromDocs(supplierCode, finalCardName || supplierName).catch(() => null);
+        const docName = comprasExtractBusinessPartnerName(docBp?.raw, docBp?.cardName || finalCardName || supplierName);
+        if (docName) finalCardName = comprasStr(docName);
+        if (!bpRaw && docBp?.raw) bpRaw = docBp.raw;
+      }
     }
     if (!finalCardName) finalCardName = comprasExtractBusinessPartnerName(bpRaw, supplierName);
 
