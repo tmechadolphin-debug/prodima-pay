@@ -14209,6 +14209,7 @@ function comprasNormalizeDateTime(value) {
 function comprasResponseFromRow(row, source = 'db') {
   if (!row) return null;
   const resultJson = row.result_json && typeof row.result_json === 'object' ? row.result_json : {};
+  const baseResult = resultJson && typeof resultJson === 'object' ? resultJson : {};
   return {
     itemCode: comprasStr(row.item_code),
     itemName: comprasStr(row.item_name),
@@ -14218,6 +14219,7 @@ function comprasResponseFromRow(row, source = 'db') {
       source: comprasStr(row.supplier_source),
       hint: comprasStr(row.supplier_hint),
     },
+    suppliers: Array.isArray(baseResult.suppliers) ? baseResult.suppliers : [],
     balance: {
       paymentStatus: comprasStr(row.payment_status || 'SIN_DATOS'),
       amountDue: comprasNum(row.amount_due || 0),
@@ -14232,8 +14234,10 @@ function comprasResponseFromRow(row, source = 'db') {
     source,
     cacheHit: source === 'db',
     raw: {
-      item: row.item_json || resultJson?.raw?.item || null,
-      supplier: row.supplier_json || resultJson?.raw?.supplier || null,
+      item: row.item_json || baseResult?.raw?.item || null,
+      supplier: row.supplier_json || baseResult?.raw?.supplier || null,
+      itemRaw: baseResult?.raw?.itemRaw || null,
+      supplierCandidates: Array.isArray(baseResult?.raw?.supplierCandidates) ? baseResult.raw.supplierCandidates : [],
     },
   };
 }
@@ -14437,6 +14441,47 @@ function comprasChooseBestSupplierCandidate(candidates, ctx = {}) {
   return arr[0] || null;
 }
 
+function comprasBuildSupplierList(candidates, ctx = {}) {
+  const out = [];
+  const seen = new Set();
+  for (const cand of Array.isArray(candidates) ? candidates : []) {
+    const cardCode = comprasStr(cand?.cardCode);
+    const cardName = comprasStr(cand?.cardName);
+    if (!cardCode && !cardName) continue;
+    const key = `${comprasNormalizeText(cardCode)}|${comprasNormalizeText(cardName)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      cardCode,
+      cardName,
+      source: comprasStr(cand?.source),
+      raw: cand?.raw || null,
+    });
+  }
+  return out;
+}
+
+function comprasAggregateSupplierStatuses(suppliers = []) {
+  const list = Array.isArray(suppliers) ? suppliers : [];
+  const totalAmountDue = prodRound(list.reduce((s, x) => s + comprasNum(x?.balance?.amountDue || 0), 0), 2);
+  const totalOverdue = prodRound(list.reduce((s, x) => s + comprasNum(x?.balance?.overdueAmount || 0), 0), 2);
+  const anyDebt = list.some((x) => comprasNum(x?.balance?.amountDue || 0) > 0.009 || comprasStr(x?.balance?.paymentStatus) === 'SE_DEBE');
+  const anyUnknown = list.some((x) => !comprasStr(x?.balance?.paymentStatus) || comprasStr(x?.balance?.paymentStatus) === 'SIN_DATOS');
+  const allClear = list.length > 0 && list.every((x) => comprasNum(x?.balance?.amountDue || 0) <= 0.009 && comprasStr(x?.balance?.paymentStatus) === 'PAZ_Y_SALVO');
+  const sources = Array.from(new Set(list.map((x) => comprasStr(x?.balance?.balanceSource || x?.balance?.source)).filter(Boolean)));
+  return {
+    totalAmountDue,
+    totalOverdue,
+    paymentStatus: anyDebt ? 'SE_DEBE' : (allClear ? 'PAZ_Y_SALVO' : (anyUnknown ? 'SIN_DATOS' : 'SIN_DATOS')),
+    balanceSource: list.length > 1 ? `Suma ${list.length} proveedores` : (sources[0] || ''),
+    paymentTermsName: list.length > 1 ? `${list.length} proveedores` : comprasStr(list[0]?.balance?.paymentTermsName),
+    creditDays: list.length > 1 ? 0 : Number(list[0]?.balance?.creditDays || 0),
+    debtNote: list.length > 1
+      ? `Se detectaron ${list.length} proveedores predefinidos en SAP. El saldo mostrado arriba es la suma de sus estados de cuenta.`
+      : comprasStr(list[0]?.balance?.debtNote),
+  };
+}
+
 async function comprasResolveSupplierFromHistory(itemCode, itemName = '') {
   const code = comprasStr(itemCode);
   if (!code) return null;
@@ -14533,63 +14578,111 @@ async function comprasFetchLive(itemCode) {
 
   const supplierResolved = await comprasResolveSupplierCandidate({ itemCode: code, itemName, item, hint });
   const chosen = supplierResolved?.chosen || null;
-  let supplierCode = comprasStr(chosen?.cardCode);
-  let supplierName = comprasStr(chosen?.cardName);
-  let supplierSource = comprasStr(chosen?.source);
+  const supplierList = comprasBuildSupplierList(supplierResolved?.candidates || [], { itemCode: code, itemName });
 
-  let balanceInfo = {
-    supplierCode,
-    supplierName,
-    paymentStatus: 'SIN_PROVEEDOR',
-    amountDue: 0,
-    overdueAmount: 0,
-    source: '',
-    paymentTermsName: '',
-    creditDays: 0,
-    balanceRaw: 0,
-    debtNote: supplierCode
-      ? ''
-      : 'El artículo no tiene proveedor fijo identificable en SAP. Se intentó Item Master, búsqueda del socio de negocio y el historial de compras.',
-  };
-
-  if (supplierCode) {
-    balanceInfo = await prodFetchVendorPayablesStatus(supplierCode, supplierName || '').catch(async () => {
-      const credit = await prodFetchVendorCreditTerms(supplierCode, supplierName || '').catch(() => null);
-      return {
-        supplierCode,
-        supplierName: comprasStr(credit?.supplierName || supplierName),
-        paymentStatus: 'SIN_DATOS',
-        amountDue: 0,
-        overdueAmount: 0,
-        source: credit?.balanceSource ? `BusinessPartners.${credit.balanceSource}` : 'BusinessPartners',
-        paymentTermsName: comprasStr(credit?.paymentTermsName),
-        creditDays: Number(credit?.creditDays || 0),
-        balanceRaw: comprasNum(credit?.balanceRaw || 0),
-        debtNote: '',
-        rawBusinessPartner: credit?.rawBusinessPartner || null,
-      };
+  if (!supplierList.length && chosen) {
+    supplierList.push({
+      cardCode: comprasStr(chosen?.cardCode),
+      cardName: comprasStr(chosen?.cardName),
+      source: comprasStr(chosen?.source),
+      raw: chosen?.raw || null,
     });
-    supplierName = comprasStr(balanceInfo?.supplierName || supplierName);
   }
+
+  const suppliers = await Promise.all(supplierList.map(async (cand) => {
+    const supplierCode = comprasStr(cand?.cardCode);
+    const supplierName = comprasStr(cand?.cardName);
+    let balanceInfo = {
+      supplierCode,
+      supplierName,
+      paymentStatus: supplierCode ? 'SIN_DATOS' : 'SIN_PROVEEDOR',
+      amountDue: 0,
+      overdueAmount: 0,
+      source: '',
+      paymentTermsName: '',
+      creditDays: 0,
+      balanceRaw: 0,
+      debtNote: supplierCode ? '' : 'Proveedor sin CardCode identificable en SAP.',
+      rawBusinessPartner: cand?.raw || null,
+    };
+
+    if (supplierCode) {
+      balanceInfo = await prodFetchVendorPayablesStatus(supplierCode, supplierName || '').catch(async () => {
+        const credit = await prodFetchVendorCreditTerms(supplierCode, supplierName || '').catch(() => null);
+        return {
+          supplierCode,
+          supplierName: comprasStr(credit?.supplierName || supplierName),
+          paymentStatus: 'SIN_DATOS',
+          amountDue: 0,
+          overdueAmount: 0,
+          source: credit?.balanceSource ? `BusinessPartners.${credit.balanceSource}` : 'BusinessPartners',
+          paymentTermsName: comprasStr(credit?.paymentTermsName),
+          creditDays: Number(credit?.creditDays || 0),
+          balanceRaw: comprasNum(credit?.balanceRaw || 0),
+          debtNote: '',
+          rawBusinessPartner: credit?.rawBusinessPartner || null,
+        };
+      });
+    }
+
+    return {
+      cardCode: supplierCode,
+      cardName: comprasStr(balanceInfo?.supplierName || supplierName),
+      source: comprasStr(cand?.source),
+      hint,
+      balance: {
+        paymentStatus: comprasStr(balanceInfo?.paymentStatus || (supplierCode ? 'SIN_DATOS' : 'SIN_PROVEEDOR')),
+        amountDue: comprasNum(balanceInfo?.amountDue || 0),
+        overdueAmount: comprasNum(balanceInfo?.overdueAmount || 0),
+        balanceRaw: comprasNum(balanceInfo?.balanceRaw || 0),
+        balanceSource: comprasStr(balanceInfo?.source || balanceInfo?.balanceSource),
+        paymentTermsName: comprasStr(balanceInfo?.paymentTermsName),
+        creditDays: Number(balanceInfo?.creditDays || 0),
+        debtNote: comprasStr(balanceInfo?.debtNote),
+      },
+      raw: balanceInfo?.rawBusinessPartner || cand?.raw || null,
+    };
+  }));
+
+  const validSuppliers = suppliers.filter((x) => x.cardCode || x.cardName);
+  const aggregate = comprasAggregateSupplierStatuses(validSuppliers);
+  const primary = validSuppliers[0] || {
+    cardCode: comprasStr(chosen?.cardCode),
+    cardName: comprasStr(chosen?.cardName),
+    source: comprasStr(chosen?.source),
+    hint,
+    balance: {
+      paymentStatus: 'SIN_PROVEEDOR',
+      amountDue: 0,
+      overdueAmount: 0,
+      balanceRaw: 0,
+      balanceSource: '',
+      paymentTermsName: '',
+      creditDays: 0,
+      debtNote: 'El artículo no tiene proveedor fijo identificable en SAP. Se intentó Item Master, búsqueda del socio de negocio y el historial de compras.',
+    },
+    raw: chosen?.raw || null,
+  };
 
   const result = {
     itemCode: code,
     itemName,
     supplier: {
-      cardCode: supplierCode,
-      cardName: supplierName,
-      source: supplierSource || (supplierCode ? 'SAP' : ''),
+      cardCode: comprasStr(primary?.cardCode),
+      cardName: comprasStr(primary?.cardName),
+      source: comprasStr(primary?.source || (primary?.cardCode ? 'SAP' : '')),
       hint,
     },
+    suppliers: validSuppliers,
     balance: {
-      paymentStatus: comprasStr(balanceInfo?.paymentStatus || (supplierCode ? 'SIN_DATOS' : 'SIN_PROVEEDOR')),
-      amountDue: comprasNum(balanceInfo?.amountDue || 0),
-      overdueAmount: comprasNum(balanceInfo?.overdueAmount || 0),
-      balanceRaw: comprasNum(balanceInfo?.balanceRaw || 0),
-      balanceSource: comprasStr(balanceInfo?.source || balanceInfo?.balanceSource),
-      paymentTermsName: comprasStr(balanceInfo?.paymentTermsName),
-      creditDays: Number(balanceInfo?.creditDays || 0),
-      debtNote: comprasStr(balanceInfo?.debtNote),
+      paymentStatus: validSuppliers.length > 1 ? comprasStr(aggregate.paymentStatus) : comprasStr(primary?.balance?.paymentStatus || (primary?.cardCode ? 'SIN_DATOS' : 'SIN_PROVEEDOR')),
+      amountDue: validSuppliers.length > 1 ? comprasNum(aggregate.totalAmountDue || 0) : comprasNum(primary?.balance?.amountDue || 0),
+      overdueAmount: validSuppliers.length > 1 ? comprasNum(aggregate.totalOverdue || 0) : comprasNum(primary?.balance?.overdueAmount || 0),
+      balanceRaw: validSuppliers.length > 1 ? comprasNum(aggregate.totalAmountDue || 0) : comprasNum(primary?.balance?.balanceRaw || 0),
+      balanceSource: validSuppliers.length > 1 ? comprasStr(aggregate.balanceSource) : comprasStr(primary?.balance?.balanceSource),
+      paymentTermsName: validSuppliers.length > 1 ? comprasStr(aggregate.paymentTermsName) : comprasStr(primary?.balance?.paymentTermsName),
+      creditDays: validSuppliers.length > 1 ? Number(aggregate.creditDays || 0) : Number(primary?.balance?.creditDays || 0),
+      debtNote: validSuppliers.length > 1 ? comprasStr(aggregate.debtNote) : comprasStr(primary?.balance?.debtNote),
     },
     updatedAt: new Date().toISOString(),
     source: 'sap_live',
@@ -14597,7 +14690,7 @@ async function comprasFetchLive(itemCode) {
     raw: {
       item,
       itemRaw: supplierResolved?.rawItem || null,
-      supplier: balanceInfo?.rawBusinessPartner || chosen?.raw || null,
+      supplier: primary?.raw || null,
       supplierCandidates: supplierResolved?.candidates || [],
     },
   };
