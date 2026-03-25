@@ -14513,23 +14513,50 @@ function comprasDedupResolvedSuppliers(list = []) {
   return Array.from(map.values());
 }
 
+function comprasExtractBusinessPartnerName(node, fallback = '') {
+  const fb = comprasStr(fallback);
+  if (!node) return fb;
+  const direct = [
+    node?.CardName,
+    node?.cardName,
+    node?.BPName,
+    node?.bpName,
+    node?.SupplierName,
+    node?.supplierName,
+    node?.VendorName,
+    node?.vendorName,
+    node?.Name,
+    node?.name,
+    node?.ForeignName,
+    node?.foreignName,
+    node?.AliasName,
+    node?.aliasName,
+    node?.CompanyName,
+    node?.companyName,
+  ].map((x) => comprasStr(x)).find(Boolean);
+  return direct || fb;
+}
+
 async function comprasFetchBusinessPartnerSummary(cardCode, fallbackName = '') {
   const code = comprasStr(cardCode);
   const fallback = comprasStr(fallbackName);
   if (!code) return { cardCode: code, cardName: fallback, raw: null };
   const safe = code.replace(/'/g, "''");
+  const select = 'CardCode,CardName,CardType,ForeignName,AliasName,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum';
   const paths = [
-    `/BusinessPartners?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=CardCode eq '${safe}'&$top=1`,
-    `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum`,
+    `/BusinessPartners?$select=${select}&$filter=CardCode eq '${safe}'&$top=1`,
+    `/BusinessPartners('${encodeURIComponent(code)}')?$select=${select}`,
+    `/BusinessPartners?$select=${select}&$filter=contains(CardCode,'${safe}')&$top=5`,
   ];
   for (const path of paths) {
     try {
       const raw = await slFetchFreshSession(path);
-      const row = Array.isArray(raw) ? (raw[0] || null) : (comprasToArray(raw)[0] || raw || null);
-      if (row?.CardCode) {
+      const rows = Array.isArray(raw) ? raw : (comprasToArray(raw).length ? comprasToArray(raw) : [raw]);
+      const row = rows.find((x) => comprasSameText(x?.CardCode, code)) || rows[0] || null;
+      if (row?.CardCode || row?.CardName || row?.ForeignName || row?.AliasName) {
         return {
-          cardCode: comprasStr(row.CardCode || code),
-          cardName: comprasStr(row.CardName || fallback),
+          cardCode: comprasStr(row?.CardCode || code),
+          cardName: comprasExtractBusinessPartnerName(row, fallback),
           raw: row,
         };
       }
@@ -14702,13 +14729,15 @@ async function comprasFetchLive(itemCode) {
       });
     }
 
-    let finalCardName = comprasStr(balanceInfo?.supplierName || supplierName);
+    let finalCardName = comprasExtractBusinessPartnerName(balanceInfo?.rawBusinessPartner, balanceInfo?.supplierName || supplierName);
     let bpRaw = balanceInfo?.rawBusinessPartner || cand?.raw || null;
-    if (supplierCode && (!finalCardName || comprasSameText(finalCardName, supplierCode))) {
+    if (supplierCode) {
       const bp = await comprasFetchBusinessPartnerSummary(supplierCode, finalCardName || supplierName).catch(() => null);
-      if (bp?.cardName) finalCardName = comprasStr(bp.cardName);
-      if (!bpRaw && bp?.raw) bpRaw = bp.raw;
+      const lookedUpName = comprasExtractBusinessPartnerName(bp?.raw, bp?.cardName || finalCardName || supplierName);
+      if (lookedUpName) finalCardName = comprasStr(lookedUpName);
+      if (bp?.raw) bpRaw = bp.raw;
     }
+    if (!finalCardName) finalCardName = comprasExtractBusinessPartnerName(bpRaw, supplierName);
 
     return {
       cardCode: supplierCode,
