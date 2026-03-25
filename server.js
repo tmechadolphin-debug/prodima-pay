@@ -11655,9 +11655,9 @@ const PROD_PLAN_BREAKS = [
   { code: 'breakfast', thresholdHours: 2, durationHours: 0.25, label: 'desayuno' },
   { code: 'lunch', thresholdHours: 5, durationHours: 0.75, label: 'almuerzo' },
 ];
-function prodPlanEffectiveDayHours(requestedHours = 8) {
-  const hours = prodRound(prodNum(requestedHours || 8), 2);
-  return Math.max(0.5, Math.min(8, hours || 8));
+function prodPlanEffectiveDayHours(requestedHours = 9) {
+  const hours = prodRound(prodNum(requestedHours || 9), 2);
+  return Math.max(0.5, Math.min(9, hours || 9));
 }
 function prodPlanLaneKey(familyKey = '', row = {}, plan = null) {
   const fam = String(familyKey || '').toUpperCase();
@@ -11777,6 +11777,48 @@ function prodPlanBalancedDayChunks(totalQty = 0, unitsPerHour = 0, effectiveDayH
   return chunks.filter((x) => prodNum(x) > 0.0001);
 }
 
+
+function prodConsolidateDashboardPlanItems(items = []) {
+  const byCode = new Map();
+  for (const raw of (Array.isArray(items) ? items : [])) {
+    const itemCode = String(raw?.itemCode || '').trim();
+    if (!itemCode) continue;
+    const prev = byCode.get(itemCode);
+    if (!prev) {
+      byCode.set(itemCode, {
+        ...raw,
+        itemCode,
+        productionAdjusted: prodNum(raw?.productionAdjusted || 0),
+        productionNeeded: prodNum(raw?.productionNeeded || 0),
+        revenue: prodNum(raw?.revenue || 0),
+        avgMonthlyQty: prodNum(raw?.avgMonthlyQty || 0),
+        hoursNeeded: prodNum(raw?.hoursNeeded || 0),
+        sourceRows: 1,
+      });
+      continue;
+    }
+    prev.productionAdjusted = prodRound(prodNum(prev.productionAdjusted) + prodNum(raw?.productionAdjusted || 0), 3);
+    prev.productionNeeded = prodRound(prodNum(prev.productionNeeded) + prodNum(raw?.productionNeeded || 0), 3);
+    prev.revenue = prodRound(prodNum(prev.revenue) + prodNum(raw?.revenue || 0), 2);
+    prev.avgMonthlyQty = prodRound(Math.max(prodNum(prev.avgMonthlyQty || 0), prodNum(raw?.avgMonthlyQty || 0)), 3);
+    prev.hoursNeeded = prodRound(prodNum(prev.hoursNeeded || 0) + prodNum(raw?.hoursNeeded || 0), 3);
+    prev.stockTotal = prodRound(Math.max(prodNum(prev.stockTotal || 0), prodNum(raw?.stockTotal || 0)), 3);
+    prev.stockMin = prodRound(Math.max(prodNum(prev.stockMin || 0), prodNum(raw?.stockMin || 0)), 3);
+    prev.stockMax = prodRound(Math.max(prodNum(prev.stockMax || 0), prodNum(raw?.stockMax || 0)), 3);
+    prev.unitsPerHour = prodRound(Math.max(prodNum(prev.unitsPerHour || 0), prodNum(raw?.unitsPerHour || 0)), 4);
+    prev.projectedQty = prodRound(Math.max(prodNum(prev.projectedQty || 0), prodNum(raw?.projectedQty || 0)), 3);
+    prev.productionType = prev.productionType || raw?.productionType || '';
+    prev.itemDesc = prev.itemDesc || raw?.itemDesc || '';
+    prev.totalLabel = prev.totalLabel || raw?.totalLabel || '';
+    prev.machine = prev.machine || raw?.machine || '';
+    prev.area = prev.area || raw?.area || '';
+    prev.grupo = prev.grupo || raw?.grupo || '';
+    prev.sizeUom = prev.sizeUom || raw?.sizeUom || '';
+    prev.sourceRows += 1;
+  }
+  return Array.from(byCode.values());
+}
+
 async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '__ALL__', abc = '__ALL__', typeFilter = 'Se fabrica en planta', q = '', avgMonths = 0, horizonMonths = 1, shiftHours = 8, startDate = '', fullMaterials = false }) {
   const local = loadProductionLocalData();
   const planPolicy = prodPlanPolicy(local.capacity || {});
@@ -11801,7 +11843,7 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
   let totalBlockedQty = 0;
   let totalScheduledHours = 0;
 
-  const baseItems = (Array.isArray(dash?.items) ? dash.items : [])
+  const baseItems = prodConsolidateDashboardPlanItems(Array.isArray(dash?.items) ? dash.items : [])
     .filter((x) => prodNum(x?.productionAdjusted) > 0 && prodIsFinishedGoodCode(x?.itemCode, x?.itemDesc, x?.sizeUom))
     .slice(0, 180);
 
