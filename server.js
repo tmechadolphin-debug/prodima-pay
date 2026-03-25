@@ -368,7 +368,7 @@ function verifyUser(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded?.role !== "user") return safeJson(res, 403, { ok: false, message: "Forbidden" });
+    if (!["user","admin"].includes(String(decoded?.role || ""))) return safeJson(res, 403, { ok: false, message: "Forbidden" });
     req.user = decoded;
     next();
   } catch {
@@ -2923,7 +2923,7 @@ function verifyUser(req, res, next) {
   if (!token) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded?.role !== "user") return safeJson(res, 403, { ok: false, message: "Forbidden" });
+    if (!["user","admin"].includes(String(decoded?.role || ""))) return safeJson(res, 403, { ok: false, message: "Forbidden" });
     req.user = decoded;
     next();
   } catch {
