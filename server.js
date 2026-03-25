@@ -14308,24 +14308,215 @@ async function comprasUpsertCache(result) {
   return comprasReadCache(result.itemCode);
 }
 
-async function comprasFindSupplierByHint(hint) {
+async function comprasFindSupplierByHint(hint, { itemName = '', itemCode = '' } = {}) {
   const q = comprasStr(hint);
   if (!q) return null;
+  if (!comprasLooksLikeSupplierName(q, { itemName, itemCode })) return null;
   const safe = q.replace(/'/g, "''");
   const paths = [
     `/BusinessPartners?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=CardCode eq '${safe}'&$top=1`,
     `/BusinessPartners?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=CardName eq '${safe}'&$top=1`,
-    `/BusinessPartners?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=contains(CardName,'${safe}')&$top=1`,
-    `/BusinessPartners?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=substringof('${safe}',CardName)&$top=1`,
+    `/BusinessPartners?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=contains(CardName,'${safe}')&$top=5`,
+    `/BusinessPartners?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=substringof('${safe}',CardName)&$top=5`,
   ];
   for (const path of paths) {
     try {
       const raw = await slFetchFreshSession(path);
-      const row = comprasToArray(raw)[0] || null;
-      if (row?.CardCode) return row;
+      const rows = comprasToArray(raw);
+      const exact = rows.find((row) => comprasSameText(row?.CardName, q) || comprasSameText(row?.CardCode, q));
+      const best = exact || rows.find((row) => comprasLooksLikeSupplierCode(row?.CardCode, { itemCode })) || rows[0] || null;
+      if (best?.CardCode) return best;
     } catch {}
   }
   return null;
+}
+
+function comprasNormalizeText(v) {
+  return String(v || '')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, ' ')
+    .trim();
+}
+
+function comprasSameText(a, b) {
+  return comprasNormalizeText(a) && comprasNormalizeText(a) === comprasNormalizeText(b);
+}
+
+function comprasLooksLikeSupplierCode(v, { itemCode = '' } = {}) {
+  const s = comprasStr(v);
+  if (!s) return false;
+  if (s.length > 60) return false;
+  if (comprasSameText(s, itemCode)) return false;
+  if (/\s{2,}/.test(s)) return false;
+  return true;
+}
+
+function comprasLooksLikeSupplierName(v, { itemName = '', itemCode = '' } = {}) {
+  const s = comprasStr(v);
+  if (!s) return false;
+  if (s.length < 2 || s.length > 120) return false;
+  if (comprasSameText(s, itemName) || comprasSameText(s, itemCode)) return false;
+  return true;
+}
+
+function comprasPushSupplierCandidate(out, seen, cand, ctx = {}) {
+  const cardCode = comprasStr(cand?.cardCode);
+  const cardName = comprasStr(cand?.cardName);
+  if (!comprasLooksLikeSupplierCode(cardCode, ctx) && !comprasLooksLikeSupplierName(cardName, ctx)) return;
+  const key = `${comprasNormalizeText(cardCode)}|${comprasNormalizeText(cardName)}|${comprasStr(cand?.source)}`;
+  if (seen.has(key)) return;
+  seen.add(key);
+  out.push({
+    cardCode: comprasLooksLikeSupplierCode(cardCode, ctx) ? cardCode : '',
+    cardName: comprasLooksLikeSupplierName(cardName, ctx) ? cardName : '',
+    source: comprasStr(cand?.source),
+    raw: cand?.raw || null,
+  });
+}
+
+function comprasExtractSupplierCandidatesFromObject(node, ctx = {}, out = [], seen = new Set(), walk = new WeakSet(), path = 'item') {
+  if (!node || typeof node !== 'object') return out;
+  if (walk.has(node)) return out;
+  walk.add(node);
+
+  const codeKeyRe = /(mainsupplier|preferredvendor|defaultsupplier|defaultvendor|vendorcode|suppliercode|bpcode|cardcode|supplier|vendor)/i;
+  const nameKeyRe = /(suppliername|vendorname|bpname|cardname|mainsuppliername|preferredvendorname|supplier)/i;
+
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length && i < 25; i++) {
+      comprasExtractSupplierCandidatesFromObject(node[i], ctx, out, seen, walk, `${path}[${i}]`);
+    }
+    return out;
+  }
+
+  let localCode = '';
+  let localName = '';
+  for (const [k, v] of Object.entries(node)) {
+    if (v == null) continue;
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+      const sv = comprasStr(v);
+      if (!sv) continue;
+      if (!localCode && codeKeyRe.test(k) && comprasLooksLikeSupplierCode(sv, ctx)) localCode = sv;
+      if (!localName && nameKeyRe.test(k) && comprasLooksLikeSupplierName(sv, ctx)) localName = sv;
+    }
+  }
+
+  if (localCode || localName) {
+    comprasPushSupplierCandidate(out, seen, { cardCode: localCode, cardName: localName, source: `SAP ${path}` }, ctx);
+  }
+
+  for (const [k, v] of Object.entries(node)) {
+    if (!v || typeof v !== 'object') continue;
+    comprasExtractSupplierCandidatesFromObject(v, ctx, out, seen, walk, `${path}.${k}`);
+  }
+  return out;
+}
+
+function comprasRankSupplierCandidate(cand, ctx = {}) {
+  let score = 0;
+  const src = comprasStr(cand?.source).toLowerCase();
+  if (cand?.cardCode) score += 120;
+  if (cand?.cardName) score += 25;
+  if (src.includes('mainsupplier')) score += 80;
+  if (src.includes('preferredvendor')) score += 70;
+  if (src.includes('defaultsupplier') || src.includes('defaultvendor')) score += 65;
+  if (src.includes('businesspartners')) score += 45;
+  if (src.includes('historial')) score += 40;
+  if (src.includes('purchaseorders')) score += 30;
+  if (src.includes('purchaseinvoices')) score += 25;
+  if (cand?.cardName && !comprasLooksLikeSupplierName(cand.cardName, ctx)) score -= 80;
+  if (cand?.cardCode && !comprasLooksLikeSupplierCode(cand.cardCode, ctx)) score -= 80;
+  return score;
+}
+
+function comprasChooseBestSupplierCandidate(candidates, ctx = {}) {
+  const arr = Array.isArray(candidates) ? candidates.slice() : [];
+  arr.sort((a, b) => comprasRankSupplierCandidate(b, ctx) - comprasRankSupplierCandidate(a, ctx) || comprasStr(a?.source).localeCompare(comprasStr(b?.source)));
+  return arr[0] || null;
+}
+
+async function comprasResolveSupplierFromHistory(itemCode, itemName = '') {
+  const code = comprasStr(itemCode);
+  if (!code) return null;
+  const ctx = { itemCode: code, itemName };
+  const [poRows, invRows] = await Promise.all([
+    prodFetchRecentPurchaseOrdersForItem(code, itemName, 8).catch(() => []),
+    prodFetchRecentPurchaseInvoicesForItem(code, itemName, 8).catch(() => []),
+  ]);
+  const candidates = [];
+  const seen = new Set();
+  for (const row of [...comprasToArray(poRows), ...comprasToArray(invRows)]) {
+    comprasPushSupplierCandidate(candidates, seen, {
+      cardCode: row?.supplierCode,
+      cardName: row?.supplierName,
+      source: `Historial ${comprasStr(row?.sourceDocType || '').toUpperCase() || 'compras'}`,
+      raw: row,
+    }, ctx);
+  }
+  return comprasChooseBestSupplierCandidate(candidates, ctx);
+}
+
+async function comprasFetchRawItemForSupplier(itemCode) {
+  const code = comprasStr(itemCode);
+  if (!code) return null;
+  try {
+    return await slFetchFreshSession(`/Items('${code.replace(/'/g, "''")}')`);
+  } catch {
+    return null;
+  }
+}
+
+async function comprasResolveSupplierCandidate({ itemCode, itemName, item, hint }) {
+  const ctx = { itemCode, itemName };
+  const candidates = [];
+  const seen = new Set();
+
+  comprasPushSupplierCandidate(candidates, seen, {
+    cardCode: item?.MainSupplier,
+    cardName: '',
+    source: 'Item.MainSupplier',
+    raw: item,
+  }, ctx);
+  comprasPushSupplierCandidate(candidates, seen, {
+    cardCode: item?.PreferredVendor,
+    cardName: '',
+    source: 'Item.PreferredVendor',
+    raw: item,
+  }, ctx);
+
+  comprasExtractSupplierCandidatesFromObject(item, ctx, candidates, seen);
+
+  let rawItem = null;
+  if (!candidates.some((x) => x.cardCode)) {
+    rawItem = await comprasFetchRawItemForSupplier(itemCode).catch(() => null);
+    if (rawItem) comprasExtractSupplierCandidatesFromObject(rawItem, ctx, candidates, seen, new WeakSet(), 'itemRaw');
+  }
+
+  if (!candidates.some((x) => x.cardCode) && hint) {
+    const bp = await comprasFindSupplierByHint(hint, ctx).catch(() => null);
+    if (bp?.CardCode) {
+      comprasPushSupplierCandidate(candidates, seen, {
+        cardCode: bp.CardCode,
+        cardName: bp.CardName,
+        source: 'BusinessPartners por nombre',
+        raw: bp,
+      }, ctx);
+    }
+  }
+
+  if (!candidates.some((x) => x.cardCode)) {
+    const hist = await comprasResolveSupplierFromHistory(itemCode, itemName).catch(() => null);
+    if (hist) comprasPushSupplierCandidate(candidates, seen, hist, ctx);
+  }
+
+  const chosen = comprasChooseBestSupplierCandidate(candidates, ctx);
+  return {
+    chosen,
+    candidates,
+    rawItem,
+  };
 }
 
 async function comprasFetchLive(itemCode) {
@@ -14337,21 +14528,14 @@ async function comprasFetchLive(itemCode) {
   if (!item || !comprasStr(item?.ItemCode)) throw new Error(`No se encontró el artículo ${code} en SAP`);
 
   const itemName = comprasStr(item?.ItemName);
-  const hint = comprasStr(typeof prodExtractSupplierFromItem === 'function' ? prodExtractSupplierFromItem(item) : '');
-  let supplierCode = comprasStr(item?.MainSupplier || item?.PreferredVendor);
-  let supplierName = '';
-  let supplierSource = supplierCode
-    ? (comprasStr(item?.MainSupplier) ? 'Item.MainSupplier' : 'Item.PreferredVendor')
-    : '';
+  const rawHint = comprasStr(typeof prodExtractSupplierFromItem === 'function' ? prodExtractSupplierFromItem(item) : '');
+  const hint = comprasLooksLikeSupplierName(rawHint, { itemName, itemCode: code }) ? rawHint : '';
 
-  if (!supplierCode && hint) {
-    const match = await comprasFindSupplierByHint(hint).catch(() => null);
-    if (match?.CardCode) {
-      supplierCode = comprasStr(match.CardCode);
-      supplierName = comprasStr(match.CardName);
-      supplierSource = 'BusinessPartners por nombre';
-    }
-  }
+  const supplierResolved = await comprasResolveSupplierCandidate({ itemCode: code, itemName, item, hint });
+  const chosen = supplierResolved?.chosen || null;
+  let supplierCode = comprasStr(chosen?.cardCode);
+  let supplierName = comprasStr(chosen?.cardName);
+  let supplierSource = comprasStr(chosen?.source);
 
   let balanceInfo = {
     supplierCode,
@@ -14363,15 +14547,17 @@ async function comprasFetchLive(itemCode) {
     paymentTermsName: '',
     creditDays: 0,
     balanceRaw: 0,
-    debtNote: supplierCode ? '' : 'El artículo no tiene proveedor fijo identificable en SAP.',
+    debtNote: supplierCode
+      ? ''
+      : 'El artículo no tiene proveedor fijo identificable en SAP. Se intentó Item Master, búsqueda del socio de negocio y el historial de compras.',
   };
 
   if (supplierCode) {
-    balanceInfo = await prodFetchVendorPayablesStatus(supplierCode, supplierName || hint || '').catch(async () => {
-      const credit = await prodFetchVendorCreditTerms(supplierCode, supplierName || hint || '').catch(() => null);
+    balanceInfo = await prodFetchVendorPayablesStatus(supplierCode, supplierName || '').catch(async () => {
+      const credit = await prodFetchVendorCreditTerms(supplierCode, supplierName || '').catch(() => null);
       return {
         supplierCode,
-        supplierName: comprasStr(credit?.supplierName || supplierName || hint),
+        supplierName: comprasStr(credit?.supplierName || supplierName),
         paymentStatus: 'SIN_DATOS',
         amountDue: 0,
         overdueAmount: 0,
@@ -14383,7 +14569,7 @@ async function comprasFetchLive(itemCode) {
         rawBusinessPartner: credit?.rawBusinessPartner || null,
       };
     });
-    supplierName = comprasStr(balanceInfo?.supplierName || supplierName || hint);
+    supplierName = comprasStr(balanceInfo?.supplierName || supplierName);
   }
 
   const result = {
@@ -14410,7 +14596,9 @@ async function comprasFetchLive(itemCode) {
     cacheHit: false,
     raw: {
       item,
-      supplier: balanceInfo?.rawBusinessPartner || null,
+      itemRaw: supplierResolved?.rawItem || null,
+      supplier: balanceInfo?.rawBusinessPartner || chosen?.raw || null,
+      supplierCandidates: supplierResolved?.candidates || [],
     },
   };
 
