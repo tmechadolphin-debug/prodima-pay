@@ -14210,16 +14210,12 @@ function comprasResponseFromRow(row, source = 'db') {
   if (!row) return null;
   const resultJson = row.result_json && typeof row.result_json === 'object' ? row.result_json : {};
   const baseResult = resultJson && typeof resultJson === 'object' ? resultJson : {};
-  return {
-    itemCode: comprasStr(row.item_code),
-    itemName: comprasStr(row.item_name),
-    supplier: {
-      cardCode: comprasStr(row.supplier_code),
-      cardName: comprasStr(row.supplier_name),
-      source: comprasStr(row.supplier_source),
-      hint: comprasStr(row.supplier_hint),
-    },
-    suppliers: Array.isArray(baseResult.suppliers) ? baseResult.suppliers : [],
+  const suppliers = comprasDedupResolvedSuppliers(Array.isArray(baseResult.suppliers) ? baseResult.suppliers : []);
+  const aggregate = comprasAggregateSupplierStatuses(suppliers);
+  const primary = suppliers[0] || {
+    cardCode: comprasStr(row.supplier_code),
+    cardName: comprasStr(row.supplier_name),
+    source: comprasStr(row.supplier_source),
     balance: {
       paymentStatus: comprasStr(row.payment_status || 'SIN_DATOS'),
       amountDue: comprasNum(row.amount_due || 0),
@@ -14229,6 +14225,28 @@ function comprasResponseFromRow(row, source = 'db') {
       paymentTermsName: comprasStr(row.payment_terms_name),
       creditDays: Number(row.credit_days || 0),
       debtNote: comprasStr(row.debt_note),
+    },
+  };
+  const hasMany = suppliers.length > 1;
+  return {
+    itemCode: comprasStr(row.item_code),
+    itemName: comprasStr(row.item_name),
+    supplier: {
+      cardCode: hasMany ? suppliers.map((x) => comprasStr(x?.cardCode)).filter(Boolean).join(', ') : comprasStr(primary?.cardCode || row.supplier_code),
+      cardName: hasMany ? suppliers.map((x) => comprasStr(x?.cardName)).filter(Boolean).join(' · ') : comprasStr(primary?.cardName || row.supplier_name),
+      source: comprasStr(primary?.source || row.supplier_source),
+      hint: comprasStr(row.supplier_hint),
+    },
+    suppliers,
+    balance: {
+      paymentStatus: hasMany ? comprasStr(aggregate.paymentStatus) : comprasStr(primary?.balance?.paymentStatus || row.payment_status || 'SIN_DATOS'),
+      amountDue: hasMany ? comprasNum(aggregate.totalAmountDue || 0) : comprasNum(primary?.balance?.amountDue || row.amount_due || 0),
+      overdueAmount: hasMany ? comprasNum(aggregate.totalOverdue || 0) : comprasNum(primary?.balance?.overdueAmount || row.overdue_amount || 0),
+      balanceRaw: hasMany ? comprasNum(aggregate.totalAmountDue || 0) : comprasNum(primary?.balance?.balanceRaw || row.balance_raw || 0),
+      balanceSource: hasMany ? comprasStr(aggregate.balanceSource) : comprasStr(primary?.balance?.balanceSource || row.balance_source),
+      paymentTermsName: hasMany ? comprasStr(aggregate.paymentTermsName) : comprasStr(primary?.balance?.paymentTermsName || row.payment_terms_name),
+      creditDays: hasMany ? Number(aggregate.creditDays || 0) : Number(primary?.balance?.creditDays || row.credit_days || 0),
+      debtNote: hasMany ? comprasStr(aggregate.debtNote) : comprasStr(primary?.balance?.debtNote || row.debt_note),
     },
     updatedAt: comprasNormalizeDateTime(row.updated_at),
     source,
@@ -14386,7 +14404,7 @@ function comprasExtractSupplierCandidatesFromObject(node, ctx = {}, out = [], se
   walk.add(node);
 
   const codeKeyRe = /(mainsupplier|preferredvendor|defaultsupplier|defaultvendor|vendorcode|suppliercode|bpcode|cardcode|supplier|vendor)/i;
-  const nameKeyRe = /(suppliername|vendorname|bpname|cardname|mainsuppliername|preferredvendorname|supplier)/i;
+  const nameKeyRe = /(suppliername|vendorname|bpname|cardname|mainsuppliername|preferredvendorname|defaultsuppliername|defaultvendorname)/i;
 
   if (Array.isArray(node)) {
     for (let i = 0; i < node.length && i < 25; i++) {
@@ -14442,23 +14460,82 @@ function comprasChooseBestSupplierCandidate(candidates, ctx = {}) {
 }
 
 function comprasBuildSupplierList(candidates, ctx = {}) {
-  const out = [];
-  const seen = new Set();
+  const map = new Map();
   for (const cand of Array.isArray(candidates) ? candidates : []) {
     const cardCode = comprasStr(cand?.cardCode);
     const cardName = comprasStr(cand?.cardName);
     if (!cardCode && !cardName) continue;
-    const key = `${comprasNormalizeText(cardCode)}|${comprasNormalizeText(cardName)}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({
-      cardCode,
-      cardName,
-      source: comprasStr(cand?.source),
-      raw: cand?.raw || null,
-    });
+    const key = cardCode ? `C:${comprasNormalizeText(cardCode)}` : `N:${comprasNormalizeText(cardName)}`;
+    const prev = map.get(key);
+    if (!prev) {
+      map.set(key, {
+        cardCode,
+        cardName,
+        source: comprasStr(cand?.source),
+        raw: cand?.raw || null,
+      });
+      continue;
+    }
+    if (!prev.cardCode && cardCode) prev.cardCode = cardCode;
+    if ((!prev.cardName || comprasSameText(prev.cardName, prev.cardCode)) && cardName) prev.cardName = cardName;
+    if (!prev.source && cand?.source) prev.source = comprasStr(cand?.source);
+    if (!prev.raw && cand?.raw) prev.raw = cand.raw;
   }
-  return out;
+  return Array.from(map.values());
+}
+
+function comprasDedupResolvedSuppliers(list = []) {
+  const map = new Map();
+  for (const row of Array.isArray(list) ? list : []) {
+    const cardCode = comprasStr(row?.cardCode);
+    const cardName = comprasStr(row?.cardName);
+    if (!cardCode && !cardName) continue;
+    const key = cardCode ? `C:${comprasNormalizeText(cardCode)}` : `N:${comprasNormalizeText(cardName)}`;
+    const prev = map.get(key);
+    if (!prev) {
+      map.set(key, {
+        ...row,
+        cardCode,
+        cardName,
+        source: comprasStr(row?.source),
+        balance: { ...(row?.balance || {}) },
+      });
+      continue;
+    }
+    if (!prev.cardCode && cardCode) prev.cardCode = cardCode;
+    if ((!prev.cardName || comprasSameText(prev.cardName, prev.cardCode)) && cardName) prev.cardName = cardName;
+    if (!prev.source && row?.source) prev.source = comprasStr(row?.source);
+    const prevAmt = comprasNum(prev?.balance?.amountDue || prev?.balance?.balanceRaw || 0);
+    const nextAmt = comprasNum(row?.balance?.amountDue || row?.balance?.balanceRaw || 0);
+    if (nextAmt > prevAmt + 0.0001) prev.balance = { ...(row?.balance || {}) };
+    if (!prev.raw && row?.raw) prev.raw = row.raw;
+  }
+  return Array.from(map.values());
+}
+
+async function comprasFetchBusinessPartnerSummary(cardCode, fallbackName = '') {
+  const code = comprasStr(cardCode);
+  const fallback = comprasStr(fallbackName);
+  if (!code) return { cardCode: code, cardName: fallback, raw: null };
+  const safe = code.replace(/'/g, "''");
+  const paths = [
+    `/BusinessPartners?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=CardCode eq '${safe}'&$top=1`,
+    `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum`,
+  ];
+  for (const path of paths) {
+    try {
+      const raw = await slFetchFreshSession(path);
+      const row = Array.isArray(raw) ? (raw[0] || null) : (comprasToArray(raw)[0] || raw || null);
+      if (row?.CardCode) {
+        return {
+          cardCode: comprasStr(row.CardCode || code),
+          cardName: comprasStr(row.CardName || fallback),
+          raw: row,
+        };
+      }
+    } catch {}
+  }
+  return { cardCode: code, cardName: fallback, raw: null };
 }
 
 function comprasAggregateSupplierStatuses(suppliers = []) {
@@ -14625,9 +14702,17 @@ async function comprasFetchLive(itemCode) {
       });
     }
 
+    let finalCardName = comprasStr(balanceInfo?.supplierName || supplierName);
+    let bpRaw = balanceInfo?.rawBusinessPartner || cand?.raw || null;
+    if (supplierCode && (!finalCardName || comprasSameText(finalCardName, supplierCode))) {
+      const bp = await comprasFetchBusinessPartnerSummary(supplierCode, finalCardName || supplierName).catch(() => null);
+      if (bp?.cardName) finalCardName = comprasStr(bp.cardName);
+      if (!bpRaw && bp?.raw) bpRaw = bp.raw;
+    }
+
     return {
       cardCode: supplierCode,
-      cardName: comprasStr(balanceInfo?.supplierName || supplierName),
+      cardName: finalCardName,
       source: comprasStr(cand?.source),
       hint,
       balance: {
@@ -14640,11 +14725,11 @@ async function comprasFetchLive(itemCode) {
         creditDays: Number(balanceInfo?.creditDays || 0),
         debtNote: comprasStr(balanceInfo?.debtNote),
       },
-      raw: balanceInfo?.rawBusinessPartner || cand?.raw || null,
+      raw: bpRaw,
     };
   }));
 
-  const validSuppliers = suppliers.filter((x) => x.cardCode || x.cardName);
+  const validSuppliers = comprasDedupResolvedSuppliers(suppliers.filter((x) => x.cardCode || x.cardName));
   const aggregate = comprasAggregateSupplierStatuses(validSuppliers);
   const primary = validSuppliers[0] || {
     cardCode: comprasStr(chosen?.cardCode),
