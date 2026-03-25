@@ -12047,101 +12047,41 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
       continue;
     }
 
-    const tasks = [];
-    let qtyRemaining = possibleQty;
-    let hoursRemaining = possibleQty / unitsPerHour;
-    let cumulativeProduced = 0;
+const tasks = [];
+let cumulativeProduced = 0;
 
-    const balancedAbChunks = isAbCritical
-      ? prodPlanBalancedDayChunks(possibleQty, unitsPerHour, effectiveDayHours, {
-          isAbCritical: true,
-          maxDailyOvertimeFactor: planPolicy.abMaxDailyOvertimeFactor || 1.5,
-        })
-      : [];
+if (laneState.currentHourOffset > 0.0001) {
+  laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
+  laneState.currentHourOffset = 0;
+}
 
-    if (balancedAbChunks.length) {
-      if (laneState.currentHourOffset > 0.0001) {
-        laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
-        laneState.currentHourOffset = 0;
-      }
-      for (const chunkQtyRaw of balancedAbChunks) {
-        const chunkQty = Math.max(0, Math.min(qtyRemaining, prodNum(chunkQtyRaw)));
-        if (!(chunkQty > 0)) continue;
-        const takeHours = chunkQty / unitsPerHour;
-        const startOffset = laneState.currentHourOffset;
-        const endOffset = laneState.currentHourOffset + takeHours;
-        const startStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
-        cumulativeProduced += chunkQty;
-        const endStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
-        const taskDate = laneState.currentDate;
-        calendarSet.add(taskDate);
-        tasks.push({
-          taskId: `${row.itemCode}_${laneKey}_${taskDate}_${tasks.length + 1}`,
-          date: taskDate,
-          weekLabel: prodWeekLabelFromDate(taskDate),
-          monthLabel: prodMonthLabelFromDate(taskDate),
-          qty: prodRound(chunkQty, 2),
-          hours: prodRound(takeHours, 2),
-          startAt: prodIsoDateTimeByProductiveOffset(taskDate, startOffset, dayStartHour, 'start'),
-          endAt: prodIsoDateTimeByProductiveOffset(taskDate, endOffset, dayStartHour, 'end'),
-          timeLabel: prodTimeRangeLabelFromProductiveOffsets(startOffset, endOffset, dayStartHour),
-          fillPct: prodRound((takeHours / effectiveDayHours) * 100, 1),
-          stockStartQty: startStockQty,
-          stockEndQty: endStockQty,
-          laneKey,
-          laneLabel: laneMeta.label,
-        });
-        qtyRemaining = Math.max(0, qtyRemaining - chunkQty);
-        hoursRemaining = Math.max(0, hoursRemaining - takeHours);
-        laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
-        laneState.currentHourOffset = 0;
-      }
-    } else {
-      while (hoursRemaining > 0.0001) {
-        if (laneState.currentHourOffset >= effectiveDayHours - 0.0001) {
-          laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
-          laneState.currentHourOffset = 0;
-        }
-        const availableHours = Math.max(0, effectiveDayHours - laneState.currentHourOffset);
-        const takeHours = Math.min(availableHours, hoursRemaining);
-        const qtySlice = Math.min(qtyRemaining, takeHours * unitsPerHour);
-        const startOffset = laneState.currentHourOffset;
-        const endOffset = laneState.currentHourOffset + takeHours;
-        const startStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
-        cumulativeProduced += qtySlice;
-        const endStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
-        const taskDate = laneState.currentDate;
-        calendarSet.add(taskDate);
+const taskDate = laneState.currentDate;
+const startOffset = 0;
+const endOffset = effectiveDayHours;
+const startStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
+cumulativeProduced += possibleQty;
+const endStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
+calendarSet.add(taskDate);
+tasks.push({
+  taskId: `${row.itemCode}_${laneKey}_${taskDate}_1`,
+  date: taskDate,
+  weekLabel: prodWeekLabelFromDate(taskDate),
+  monthLabel: prodMonthLabelFromDate(taskDate),
+  qty: prodRound(possibleQty, 2),
+  hours: prodRound(effectiveDayHours, 2),
+  startAt: prodIsoDateTimeByProductiveOffset(taskDate, startOffset, dayStartHour, 'start'),
+  endAt: prodIsoDateTimeByProductiveOffset(taskDate, endOffset, dayStartHour, 'end'),
+  timeLabel: '07:00 → 16:00',
+  fillPct: 100,
+  stockStartQty: startStockQty,
+  stockEndQty: endStockQty,
+  laneKey,
+  laneLabel: laneMeta.label,
+});
+laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
+laneState.currentHourOffset = 0;
 
-        const task = {
-          taskId: `${row.itemCode}_${laneKey}_${taskDate}_${tasks.length + 1}`,
-          date: taskDate,
-          weekLabel: prodWeekLabelFromDate(taskDate),
-          monthLabel: prodMonthLabelFromDate(taskDate),
-          qty: prodRound(qtySlice, 2),
-          hours: prodRound(takeHours, 2),
-          startAt: prodIsoDateTimeByProductiveOffset(taskDate, startOffset, dayStartHour, 'start'),
-          endAt: prodIsoDateTimeByProductiveOffset(taskDate, endOffset, dayStartHour, 'end'),
-          timeLabel: prodTimeRangeLabelFromProductiveOffsets(startOffset, endOffset, dayStartHour),
-          fillPct: prodRound((takeHours / effectiveDayHours) * 100, 1),
-          stockStartQty: startStockQty,
-          stockEndQty: endStockQty,
-          laneKey,
-          laneLabel: laneMeta.label,
-        };
-        tasks.push(task);
-
-        qtyRemaining = Math.max(0, qtyRemaining - qtySlice);
-        hoursRemaining = Math.max(0, hoursRemaining - takeHours);
-        laneState.currentHourOffset += takeHours;
-        if (laneState.currentHourOffset >= effectiveDayHours - 0.0001) {
-          laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
-          laneState.currentHourOffset = 0;
-        }
-      }
-    }
-
-    totalScheduledHours += possibleQty / unitsPerHour;
+totalScheduledHours += effectiveDayHours;
     if (!fullMaterials) {
       await prodPlanConsumePoolDeep(plan, possibleQty, materialPool, 0, [prodNormalizeItemCodeLoose(row.itemCode)]);
     }
@@ -14147,9 +14087,118 @@ async function prodEnsureSavedPlanTable() {
   `);
   await dbQuery(`create index if not exists idx_admin_production_saved_plans_v18_active on admin_production_saved_plans_v18(admin_user, is_active, updated_at desc)`);
 }
+
 __extraBootTasks.push(prodEnsureSavedPlanTable);
 
+const PROD_PLAN_DAY_CLOSURE_FILE = path.join(PROD_DATA_DIR, 'production_day_closures_v1.json');
+
+function prodDayClosureEmptyStore() {
+  return { records: [] };
+}
+function prodReadDayClosureFile() {
+  prodEnsureProductionDir();
+  try {
+    const raw = fs.readFileSync(PROD_PLAN_DAY_CLOSURE_FILE, 'utf8');
+    const data = JSON.parse(raw || '{}');
+    if (!data || typeof data !== 'object') return prodDayClosureEmptyStore();
+    if (!Array.isArray(data.records)) data.records = [];
+    return data;
+  } catch {
+    return prodDayClosureEmptyStore();
+  }
+}
+function prodWriteDayClosureFile(data) {
+  prodEnsureProductionDir();
+  fs.writeFileSync(PROD_PLAN_DAY_CLOSURE_FILE, JSON.stringify(data || prodDayClosureEmptyStore(), null, 2), 'utf8');
+}
+async function prodEnsureDayClosureTable() {
+  if (!hasDb()) return;
+  await dbQuery(`
+    create table if not exists admin_production_day_closures_v1 (
+      admin_user text not null,
+      closure_date date not null,
+      plan_id text default '',
+      summary jsonb not null,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      primary key (admin_user, closure_date)
+    )
+  `);
+  await dbQuery(`create index if not exists idx_admin_production_day_closures_v1_user_updated on admin_production_day_closures_v1(admin_user, updated_at desc)`);
+}
+__extraBootTasks.push(prodEnsureDayClosureTable);
+
+function prodNormalizeDayClosureSummary(summary = {}, meta = {}) {
+  const out = prodClone(summary || {}) || {};
+  const day = String(out.date || meta.date || '').slice(0,10);
+  out.date = day;
+  out.planId = String(out.planId || meta.planId || '');
+  out.persistedAt = String(meta.persistedAt || out.persistedAt || new Date().toISOString());
+  out.adminUser = String(meta.adminUser || out.adminUser || 'admin');
+  if (!Array.isArray(out.items)) out.items = [];
+  out.plannedQty = prodRound(out.plannedQty || 0, 2);
+  out.actualQtySap = prodRound(out.actualQtySap || 0, 2);
+  out.compliancePct = prodRound(out.compliancePct || 0, 2);
+  out.neededQtyContext = prodRound(out.neededQtyContext || 0, 2);
+  out.possibleQtyContext = prodRound(out.possibleQtyContext || 0, 2);
+  return out;
+}
+async function prodDayClosureUpsert(adminUser, planId, summary) {
+  const normalized = prodNormalizeDayClosureSummary(summary, { adminUser, planId, date: summary?.date, persistedAt: new Date().toISOString() });
+  const date = String(normalized.date || '').slice(0,10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('Fecha inválida para guardar cierre del día');
+  if (hasDb()) {
+    await dbQuery(`
+      insert into admin_production_day_closures_v1(admin_user, closure_date, plan_id, summary, created_at, updated_at)
+      values ($1,$2,$3,$4::jsonb,now(),now())
+      on conflict (admin_user, closure_date) do update set plan_id=excluded.plan_id, summary=excluded.summary, updated_at=now()
+    `, [adminUser, date, String(planId || ''), JSON.stringify(normalized)]);
+    return normalized;
+  }
+  const store = prodReadDayClosureFile();
+  store.records = (store.records || []).filter((x) => !(String(x?.adminUser || '') === String(adminUser || '') && String(x?.date || '').slice(0,10) === date));
+  store.records.push({ adminUser, date, planId: String(planId || ''), updatedAt: new Date().toISOString(), summary: normalized });
+  prodWriteDayClosureFile(store);
+  return normalized;
+}
+async function prodDayClosureGet(adminUser, date) {
+  const day = String(date || '').slice(0,10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+  if (hasDb()) {
+    const q = await dbQuery(`
+      select summary, updated_at
+      from admin_production_day_closures_v1
+      where admin_user=$1 and closure_date=$2
+      limit 1
+    `, [adminUser, day]);
+    const row = q.rows?.[0];
+    return row ? prodNormalizeDayClosureSummary(row.summary || {}, { adminUser, date: day, persistedAt: row.updated_at }) : null;
+  }
+  const row = (prodReadDayClosureFile().records || []).find((x) => String(x?.adminUser || '') === String(adminUser || '') && String(x?.date || '').slice(0,10) === day);
+  return row ? prodNormalizeDayClosureSummary(row.summary || {}, { adminUser, date: day, persistedAt: row.updatedAt }) : null;
+}
+async function prodDayClosureList(adminUser, limit = 180) {
+  const max = Math.max(1, Math.min(365, Number(limit || 180)));
+  if (hasDb()) {
+    const q = await dbQuery(`
+      select summary, updated_at
+      from admin_production_day_closures_v1
+      where admin_user=$1
+      order by closure_date desc
+      limit $2
+    `, [adminUser, max]);
+    return (q.rows || []).map((row) => prodNormalizeDayClosureSummary(row.summary || {}, { adminUser, persistedAt: row.updated_at })).filter((x) => x?.date);
+  }
+  return (prodReadDayClosureFile().records || [])
+    .filter((x) => String(x?.adminUser || '') === String(adminUser || ''))
+    .sort((a, b) => String(b?.date || '').localeCompare(String(a?.date || '')))
+    .slice(0, max)
+    .map((row) => prodNormalizeDayClosureSummary(row.summary || {}, { adminUser, persistedAt: row.updatedAt }))
+    .filter((x) => x?.date);
+}
+
 function prodSavedPlanUser(req) {
+
   return String(req?.admin?.user || req?.admin?.sub || 'admin').trim().toLowerCase() || 'admin';
 }
 function prodSavedPlanId() {
