@@ -14151,354 +14151,335 @@ app.post('/api/admin/production/plans/day-close', verifyAdmin, async (req, res) 
 });
 
 
+
 /* =========================================================
-   Compras · Proveedor fijo del artículo (basado en server 59)
+   Compras — proveedor fijo por artículo + saldo proveedor
 ========================================================= */
-async function ensureFixedVendorPurchasesDb() {
+async function comprasEnsureDb() {
   if (!hasDb()) return;
   await dbQuery(`
-    CREATE TABLE IF NOT EXISTS purchases_fixed_vendor_cache (
+    CREATE TABLE IF NOT EXISTS admin_compras_supplier_cache (
       item_code TEXT PRIMARY KEY,
       item_name TEXT DEFAULT '',
       supplier_code TEXT DEFAULT '',
       supplier_name TEXT DEFAULT '',
+      supplier_source TEXT DEFAULT '',
+      supplier_hint TEXT DEFAULT '',
+      payment_status TEXT DEFAULT 'SIN_DATOS',
+      amount_due NUMERIC(19,6) DEFAULT 0,
+      overdue_amount NUMERIC(19,6) DEFAULT 0,
+      balance_raw NUMERIC(19,6) DEFAULT 0,
+      balance_source TEXT DEFAULT '',
       payment_terms_name TEXT DEFAULT '',
       credit_days INT DEFAULT 0,
-      balance_raw NUMERIC(19,6) DEFAULT 0,
-      amount_due NUMERIC(19,6) DEFAULT 0,
-      payment_status TEXT DEFAULT 'SIN_DATOS',
-      balance_source TEXT DEFAULT '',
-      source TEXT DEFAULT '',
+      debt_note TEXT DEFAULT '',
       item_json JSONB DEFAULT '{}'::jsonb,
-      bp_json JSONB DEFAULT '{}'::jsonb,
-      synced_at TIMESTAMP DEFAULT NOW()
-    );
+      supplier_json JSONB DEFAULT '{}'::jsonb,
+      result_json JSONB DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
   `);
-  const alters = [
-    `ALTER TABLE purchases_fixed_vendor_cache ADD COLUMN IF NOT EXISTS item_name TEXT DEFAULT ''`,
-    `ALTER TABLE purchases_fixed_vendor_cache ADD COLUMN IF NOT EXISTS supplier_code TEXT DEFAULT ''`,
-    `ALTER TABLE purchases_fixed_vendor_cache ADD COLUMN IF NOT EXISTS supplier_name TEXT DEFAULT ''`,
-    `ALTER TABLE purchases_fixed_vendor_cache ADD COLUMN IF NOT EXISTS payment_terms_name TEXT DEFAULT ''`,
-    `ALTER TABLE purchases_fixed_vendor_cache ADD COLUMN IF NOT EXISTS credit_days INT DEFAULT 0`,
-    `ALTER TABLE purchases_fixed_vendor_cache ADD COLUMN IF NOT EXISTS balance_raw NUMERIC(19,6) DEFAULT 0`,
-    `ALTER TABLE purchases_fixed_vendor_cache ADD COLUMN IF NOT EXISTS amount_due NUMERIC(19,6) DEFAULT 0`,
-    `ALTER TABLE purchases_fixed_vendor_cache ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'SIN_DATOS'`,
-    `ALTER TABLE purchases_fixed_vendor_cache ADD COLUMN IF NOT EXISTS balance_source TEXT DEFAULT ''`,
-    `ALTER TABLE purchases_fixed_vendor_cache ADD COLUMN IF NOT EXISTS source TEXT DEFAULT ''`,
-    `ALTER TABLE purchases_fixed_vendor_cache ADD COLUMN IF NOT EXISTS item_json JSONB DEFAULT '{}'::jsonb`,
-    `ALTER TABLE purchases_fixed_vendor_cache ADD COLUMN IF NOT EXISTS bp_json JSONB DEFAULT '{}'::jsonb`,
-    `ALTER TABLE purchases_fixed_vendor_cache ADD COLUMN IF NOT EXISTS synced_at TIMESTAMP DEFAULT NOW()`
-  ];
-  for (const q of alters) {
-    try { await dbQuery(q); } catch {}
-  }
-  const indexes = [
-    `CREATE INDEX IF NOT EXISTS idx_purchases_fixed_vendor_supplier ON purchases_fixed_vendor_cache(supplier_code)`,
-    `CREATE INDEX IF NOT EXISTS idx_purchases_fixed_vendor_synced ON purchases_fixed_vendor_cache(synced_at DESC)`
-  ];
-  for (const q of indexes) {
-    try { await dbQuery(q); } catch {}
-  }
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_compras_supplier_cache_updated_at ON admin_compras_supplier_cache(updated_at DESC)`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_compras_supplier_cache_supplier_code ON admin_compras_supplier_cache(supplier_code)`);
 }
-__extraBootTasks.push(ensureFixedVendorPurchasesDb);
+__extraBootTasks.push(comprasEnsureDb);
 
-function fvNum(v, d = 2) {
+function comprasNum(v, d = 2) {
   const n = Number(v || 0);
   return Number.isFinite(n) ? Number(n.toFixed(d)) : 0;
 }
-
-function fvPickSupplierCode(item) {
-  const candidates = [item?.MainSupplier, item?.PreferredVendor, item?.PreferredVendorCode, item?.MainSupplierCode];
-  for (const c of candidates) {
-    const v = String(c || '').trim();
-    if (v) return v;
-  }
-  return '';
+function comprasStr(v) {
+  return String(v || '').trim();
 }
-
-async function fvFetchItemAndVendorLive(itemCode) {
-  const code = String(itemCode || '').trim();
-  if (!code) throw new Error('ItemCode requerido');
-  if (missingSapEnv()) throw new Error('Faltan variables SAP');
-
-  let item = null;
+function comprasToArray(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (Array.isArray(raw?.value)) return raw.value;
+  if (raw && typeof raw === 'object') return [raw];
+  return [];
+}
+function comprasNormalizeDateTime(value) {
   try {
-    item = await prodFetchFullItemFromSap(code, { timeoutMs: 25000 });
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toISOString();
   } catch {
-    item = await slFetchFreshSession(`/Items('${encodeURIComponent(code)}')`, { timeoutMs: 25000 });
+    return '';
   }
-  if (!item || String(item?.ItemCode || '').trim() === '') {
-    throw new Error(`No se encontró el artículo ${code} en SAP`);
-  }
-
-  const supplierCode = fvPickSupplierCode(item);
-  const itemName = String(item?.ItemName || '').trim();
-  if (!supplierCode) {
-    return {
-      ok: true,
-      itemCode: code,
-      itemName,
-      supplierCode: '',
-      supplierName: '',
-      paymentTermsName: '',
-      creditDays: 0,
-      balanceRaw: 0,
-      amountDue: 0,
-      paymentStatus: 'SIN_PROVEEDOR',
-      balanceSource: '',
-      source: 'SAP.Items',
-      itemJson: item || {},
-      bpJson: {},
-      generatedAt: new Date().toISOString(),
-      cacheMode: 'live'
-    };
-  }
-
-  const termInfo = await prodFetchVendorCreditTerms(supplierCode, '').catch(() => ({
-    supplierCode,
-    supplierName: '',
-    paymentTermsName: '',
-    creditDays: 0,
-    balanceRaw: 0,
-    balanceDebt: 0,
-    balanceSource: '',
-    rawBusinessPartner: null,
-  }));
-
-  const balanceRaw = fvNum(termInfo?.balanceRaw || 0, 2);
-  const amountDue = fvNum(Math.abs(Number(termInfo?.balanceDebt || balanceRaw || 0)), 2);
-  const paymentStatus = amountDue > 0.009 ? 'SE_DEBE' : 'PAZ_Y_SALVO';
-
+}
+function comprasResponseFromRow(row, source = 'db') {
+  if (!row) return null;
+  const resultJson = row.result_json && typeof row.result_json === 'object' ? row.result_json : {};
   return {
-    ok: true,
-    itemCode: code,
-    itemName,
-    supplierCode,
-    supplierName: String(termInfo?.supplierName || '').trim(),
-    paymentTermsName: String(termInfo?.paymentTermsName || '').trim(),
-    creditDays: Math.max(0, Number(termInfo?.creditDays || 0) || 0),
-    balanceRaw,
-    amountDue,
-    paymentStatus,
-    balanceSource: String(termInfo?.balanceSource || '').trim(),
-    source: `SAP.BusinessPartners${termInfo?.balanceSource ? '.' + String(termInfo.balanceSource) : ''}`,
-    itemJson: item || {},
-    bpJson: termInfo?.rawBusinessPartner || {},
-    generatedAt: new Date().toISOString(),
-    cacheMode: 'live'
+    itemCode: comprasStr(row.item_code),
+    itemName: comprasStr(row.item_name),
+    supplier: {
+      cardCode: comprasStr(row.supplier_code),
+      cardName: comprasStr(row.supplier_name),
+      source: comprasStr(row.supplier_source),
+      hint: comprasStr(row.supplier_hint),
+    },
+    balance: {
+      paymentStatus: comprasStr(row.payment_status || 'SIN_DATOS'),
+      amountDue: comprasNum(row.amount_due || 0),
+      overdueAmount: comprasNum(row.overdue_amount || 0),
+      balanceRaw: comprasNum(row.balance_raw || 0),
+      balanceSource: comprasStr(row.balance_source),
+      paymentTermsName: comprasStr(row.payment_terms_name),
+      creditDays: Number(row.credit_days || 0),
+      debtNote: comprasStr(row.debt_note),
+    },
+    updatedAt: comprasNormalizeDateTime(row.updated_at),
+    source,
+    cacheHit: source === 'db',
+    raw: {
+      item: row.item_json || resultJson?.raw?.item || null,
+      supplier: row.supplier_json || resultJson?.raw?.supplier || null,
+    },
   };
 }
 
-async function fvCacheUpsert(row) {
-  if (!hasDb()) return row;
-  await dbQuery(
-    `INSERT INTO purchases_fixed_vendor_cache(
-      item_code, item_name, supplier_code, supplier_name, payment_terms_name,
-      credit_days, balance_raw, amount_due, payment_status, balance_source,
-      source, item_json, bp_json, synced_at
+async function comprasReadCache(itemCode) {
+  if (!hasDb()) return null;
+  const code = comprasStr(itemCode);
+  if (!code) return null;
+  const q = await dbQuery(`
+    SELECT item_code, item_name, supplier_code, supplier_name, supplier_source, supplier_hint,
+           payment_status, amount_due, overdue_amount, balance_raw, balance_source,
+           payment_terms_name, credit_days, debt_note,
+           item_json, supplier_json, result_json, updated_at
+    FROM admin_compras_supplier_cache
+    WHERE item_code = $1
+    LIMIT 1
+  `, [code]);
+  return q.rows?.[0] || null;
+}
+
+async function comprasUpsertCache(result) {
+  if (!hasDb() || !result?.itemCode) return null;
+  await dbQuery(`
+    INSERT INTO admin_compras_supplier_cache (
+      item_code, item_name, supplier_code, supplier_name, supplier_source, supplier_hint,
+      payment_status, amount_due, overdue_amount, balance_raw, balance_source,
+      payment_terms_name, credit_days, debt_note,
+      item_json, supplier_json, result_json, updated_at
     ) VALUES (
-      $1,$2,$3,$4,$5,
-      $6,$7,$8,$9,$10,
-      $11,$12::jsonb,$13::jsonb,NOW()
+      $1,$2,$3,$4,$5,$6,
+      $7,$8,$9,$10,$11,
+      $12,$13,$14,
+      $15::jsonb,$16::jsonb,$17::jsonb,NOW()
     )
     ON CONFLICT (item_code) DO UPDATE SET
       item_name = EXCLUDED.item_name,
       supplier_code = EXCLUDED.supplier_code,
       supplier_name = EXCLUDED.supplier_name,
+      supplier_source = EXCLUDED.supplier_source,
+      supplier_hint = EXCLUDED.supplier_hint,
+      payment_status = EXCLUDED.payment_status,
+      amount_due = EXCLUDED.amount_due,
+      overdue_amount = EXCLUDED.overdue_amount,
+      balance_raw = EXCLUDED.balance_raw,
+      balance_source = EXCLUDED.balance_source,
       payment_terms_name = EXCLUDED.payment_terms_name,
       credit_days = EXCLUDED.credit_days,
-      balance_raw = EXCLUDED.balance_raw,
-      amount_due = EXCLUDED.amount_due,
-      payment_status = EXCLUDED.payment_status,
-      balance_source = EXCLUDED.balance_source,
-      source = EXCLUDED.source,
+      debt_note = EXCLUDED.debt_note,
       item_json = EXCLUDED.item_json,
-      bp_json = EXCLUDED.bp_json,
-      synced_at = NOW()`,
-    [
-      String(row?.itemCode || ''),
-      String(row?.itemName || ''),
-      String(row?.supplierCode || ''),
-      String(row?.supplierName || ''),
-      String(row?.paymentTermsName || ''),
-      Math.max(0, Number(row?.creditDays || 0) || 0),
-      fvNum(row?.balanceRaw || 0, 2),
-      fvNum(row?.amountDue || 0, 2),
-      String(row?.paymentStatus || 'SIN_DATOS'),
-      String(row?.balanceSource || ''),
-      String(row?.source || ''),
-      JSON.stringify(row?.itemJson || {}),
-      JSON.stringify(row?.bpJson || {}),
-    ]
-  );
-  return row;
+      supplier_json = EXCLUDED.supplier_json,
+      result_json = EXCLUDED.result_json,
+      updated_at = NOW()
+  `, [
+    comprasStr(result.itemCode),
+    comprasStr(result.itemName),
+    comprasStr(result.supplier?.cardCode),
+    comprasStr(result.supplier?.cardName),
+    comprasStr(result.supplier?.source),
+    comprasStr(result.supplier?.hint),
+    comprasStr(result.balance?.paymentStatus || 'SIN_DATOS'),
+    comprasNum(result.balance?.amountDue || 0, 6),
+    comprasNum(result.balance?.overdueAmount || 0, 6),
+    comprasNum(result.balance?.balanceRaw || 0, 6),
+    comprasStr(result.balance?.balanceSource),
+    comprasStr(result.balance?.paymentTermsName),
+    Number(result.balance?.creditDays || 0),
+    comprasStr(result.balance?.debtNote),
+    JSON.stringify(result.raw?.item || {}),
+    JSON.stringify(result.raw?.supplier || {}),
+    JSON.stringify(result || {}),
+  ]);
+  return comprasReadCache(result.itemCode);
 }
 
-async function fvCacheGet(itemCode) {
-  if (!hasDb()) return null;
-  const code = String(itemCode || '').trim();
-  if (!code) return null;
-  const r = await dbQuery(
-    `SELECT
-      item_code AS "itemCode",
-      item_name AS "itemName",
-      supplier_code AS "supplierCode",
-      supplier_name AS "supplierName",
-      payment_terms_name AS "paymentTermsName",
-      credit_days AS "creditDays",
-      balance_raw::float AS "balanceRaw",
-      amount_due::float AS "amountDue",
-      payment_status AS "paymentStatus",
-      balance_source AS "balanceSource",
-      source,
-      item_json AS "itemJson",
-      bp_json AS "bpJson",
-      synced_at AS "syncedAt"
-     FROM purchases_fixed_vendor_cache
-     WHERE item_code = $1
-     LIMIT 1`,
-    [code]
-  );
-  const row = r.rows?.[0] || null;
-  if (!row) return null;
-  return {
-    ok: true,
-    ...row,
-    generatedAt: row.syncedAt,
-    cacheMode: 'db',
-    cacheHit: true,
-  };
+async function comprasFindSupplierByHint(hint) {
+  const q = comprasStr(hint);
+  if (!q) return null;
+  const safe = q.replace(/'/g, "''");
+  const paths = [
+    `/BusinessPartners?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=CardCode eq '${safe}'&$top=1`,
+    `/BusinessPartners?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=CardName eq '${safe}'&$top=1`,
+    `/BusinessPartners?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=contains(CardName,'${safe}')&$top=1`,
+    `/BusinessPartners?$select=CardCode,CardName,CardType,Balance,CurrentAccountBalance,DebitBalance,PayTermsGrpCode,GroupNum&$filter=substringof('${safe}',CardName)&$top=1`,
+  ];
+  for (const path of paths) {
+    try {
+      const raw = await slFetchFreshSession(path);
+      const row = comprasToArray(raw)[0] || null;
+      if (row?.CardCode) return row;
+    } catch {}
+  }
+  return null;
 }
 
-async function fvBuildResponse(itemCode, { live = false } = {}) {
-  const code = String(itemCode || '').trim();
+async function comprasFetchLive(itemCode) {
+  const code = comprasStr(itemCode);
   if (!code) throw new Error('ItemCode requerido');
-  if (!live) {
-    const cached = await fvCacheGet(code).catch(() => null);
-    if (cached) return cached;
+  if (missingSapEnv()) throw new Error('Faltan variables SAP');
+
+  const item = await prodFetchFullItemFromSap(code, { timeoutMs: 45000 });
+  if (!item || !comprasStr(item?.ItemCode)) throw new Error(`No se encontró el artículo ${code} en SAP`);
+
+  const itemName = comprasStr(item?.ItemName);
+  const hint = comprasStr(typeof prodExtractSupplierFromItem === 'function' ? prodExtractSupplierFromItem(item) : '');
+  let supplierCode = comprasStr(item?.MainSupplier || item?.PreferredVendor);
+  let supplierName = '';
+  let supplierSource = supplierCode
+    ? (comprasStr(item?.MainSupplier) ? 'Item.MainSupplier' : 'Item.PreferredVendor')
+    : '';
+
+  if (!supplierCode && hint) {
+    const match = await comprasFindSupplierByHint(hint).catch(() => null);
+    if (match?.CardCode) {
+      supplierCode = comprasStr(match.CardCode);
+      supplierName = comprasStr(match.CardName);
+      supplierSource = 'BusinessPartners por nombre';
+    }
   }
-  const liveRow = await fvFetchItemAndVendorLive(code);
-  await fvCacheUpsert(liveRow).catch(() => {});
-  return liveRow;
+
+  let balanceInfo = {
+    supplierCode,
+    supplierName,
+    paymentStatus: 'SIN_PROVEEDOR',
+    amountDue: 0,
+    overdueAmount: 0,
+    source: '',
+    paymentTermsName: '',
+    creditDays: 0,
+    balanceRaw: 0,
+    debtNote: supplierCode ? '' : 'El artículo no tiene proveedor fijo identificable en SAP.',
+  };
+
+  if (supplierCode) {
+    balanceInfo = await prodFetchVendorPayablesStatus(supplierCode, supplierName || hint || '').catch(async () => {
+      const credit = await prodFetchVendorCreditTerms(supplierCode, supplierName || hint || '').catch(() => null);
+      return {
+        supplierCode,
+        supplierName: comprasStr(credit?.supplierName || supplierName || hint),
+        paymentStatus: 'SIN_DATOS',
+        amountDue: 0,
+        overdueAmount: 0,
+        source: credit?.balanceSource ? `BusinessPartners.${credit.balanceSource}` : 'BusinessPartners',
+        paymentTermsName: comprasStr(credit?.paymentTermsName),
+        creditDays: Number(credit?.creditDays || 0),
+        balanceRaw: comprasNum(credit?.balanceRaw || 0),
+        debtNote: '',
+        rawBusinessPartner: credit?.rawBusinessPartner || null,
+      };
+    });
+    supplierName = comprasStr(balanceInfo?.supplierName || supplierName || hint);
+  }
+
+  const result = {
+    itemCode: code,
+    itemName,
+    supplier: {
+      cardCode: supplierCode,
+      cardName: supplierName,
+      source: supplierSource || (supplierCode ? 'SAP' : ''),
+      hint,
+    },
+    balance: {
+      paymentStatus: comprasStr(balanceInfo?.paymentStatus || (supplierCode ? 'SIN_DATOS' : 'SIN_PROVEEDOR')),
+      amountDue: comprasNum(balanceInfo?.amountDue || 0),
+      overdueAmount: comprasNum(balanceInfo?.overdueAmount || 0),
+      balanceRaw: comprasNum(balanceInfo?.balanceRaw || 0),
+      balanceSource: comprasStr(balanceInfo?.source || balanceInfo?.balanceSource),
+      paymentTermsName: comprasStr(balanceInfo?.paymentTermsName),
+      creditDays: Number(balanceInfo?.creditDays || 0),
+      debtNote: comprasStr(balanceInfo?.debtNote),
+    },
+    updatedAt: new Date().toISOString(),
+    source: 'sap_live',
+    cacheHit: false,
+    raw: {
+      item,
+      supplier: balanceInfo?.rawBusinessPartner || null,
+    },
+  };
+
+  const saved = await comprasUpsertCache(result).catch(() => null);
+  return saved ? comprasResponseFromRow(saved, 'sap_live') : result;
 }
 
-app.get('/api/admin/purchases/fixed-vendor/item', verifyAdmin, async (req, res) => {
+async function comprasResolveRequest(req, { forceLive = false } = {}) {
+  const itemCode = comprasStr(req.query?.itemCode || req.body?.itemCode || req.query?.code || req.body?.code);
+  if (!itemCode) throw new Error('ItemCode requerido');
+
+  if (!forceLive) {
+    const cached = await comprasReadCache(itemCode).catch(() => null);
+    if (cached) return comprasResponseFromRow(cached, 'db');
+  }
+  return comprasFetchLive(itemCode);
+}
+
+app.get('/api/admin/compras/item', verifyAdmin, async (req, res) => {
   try {
-    const itemCode = String(req.query?.itemCode || req.query?.code || '').trim();
-    const live = ['1','true','yes','si'].includes(String(req.query?.live || '').trim().toLowerCase());
-    if (!itemCode) return safeJson(res, 400, { ok: false, message: 'itemCode requerido' });
-    const out = await fvBuildResponse(itemCode, { live });
-    return safeJson(res, 200, out);
+    const forceLive = ['1','true','yes','si'].includes(comprasStr(req.query?.forceLive).toLowerCase());
+    const result = await comprasResolveRequest(req, { forceLive });
+    return safeJson(res, 200, { ok: true, result, meta: { forceLive, source: result?.source || '' } });
+  } catch (e) {
+    return safeJson(res, 400, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/compras/item', verifyAdmin, async (req, res) => {
+  try {
+    const forceLive = ['1','true','yes','si'].includes(comprasStr(req.body?.forceLive).toLowerCase());
+    const result = await comprasResolveRequest(req, { forceLive });
+    return safeJson(res, 200, { ok: true, result, meta: { forceLive, source: result?.source || '' } });
+  } catch (e) {
+    return safeJson(res, 400, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/compras/item/sync', verifyAdmin, async (req, res) => {
+  try {
+    const itemCode = comprasStr(req.body?.itemCode || req.query?.itemCode || req.body?.code || req.query?.code);
+    if (!itemCode) return safeJson(res, 400, { ok: false, message: 'ItemCode requerido' });
+    const result = await comprasFetchLive(itemCode);
+    return safeJson(res, 200, { ok: true, result, meta: { source: 'sap_live', sync: true } });
+  } catch (e) {
+    return safeJson(res, 400, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/compras/recent', verifyAdmin, async (_req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 200, { ok: true, rows: [] });
+    const limit = Math.max(1, Math.min(100, Number(_req.query?.limit || 30)));
+    const q = await dbQuery(`
+      SELECT item_code, item_name, supplier_code, supplier_name, supplier_source, supplier_hint,
+             payment_status, amount_due, overdue_amount, balance_raw, balance_source,
+             payment_terms_name, credit_days, debt_note,
+             item_json, supplier_json, result_json, updated_at
+      FROM admin_compras_supplier_cache
+      ORDER BY updated_at DESC
+      LIMIT $1
+    `, [limit]);
+    const rows = (q.rows || []).map((row) => comprasResponseFromRow(row, 'db'));
+    return safeJson(res, 200, { ok: true, rows });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
 });
 
-app.post('/api/admin/purchases/fixed-vendor/sync', verifyAdmin, async (req, res) => {
-  try {
-    const one = String(req.body?.itemCode || req.query?.itemCode || '').trim();
-    if (one) {
-      const out = await fvFetchItemAndVendorLive(one);
-      await fvCacheUpsert(out);
-      return safeJson(res, 200, { ok: true, mode: 'single', item: out });
-    }
-
-    if (!hasDb()) return safeJson(res, 400, { ok: false, message: 'DB no configurada' });
-    const limit = Math.max(1, Math.min(500, Number(req.body?.limit || req.query?.limit || 100) || 100));
-    const cached = await dbQuery(
-      `SELECT item_code FROM purchases_fixed_vendor_cache ORDER BY synced_at DESC NULLS LAST, item_code ASC LIMIT $1`,
-      [limit]
-    );
-    const codes = (cached.rows || []).map((x) => String(x.item_code || '').trim()).filter(Boolean);
-    if (!codes.length) {
-      return safeJson(res, 200, { ok: true, mode: 'batch', refreshed: 0, message: 'No hay artículos cacheados todavía. Usa Sync con itemCode primero.' });
-    }
-
-    const results = [];
-    for (const code of codes) {
-      try {
-        const out = await fvFetchItemAndVendorLive(code);
-        await fvCacheUpsert(out);
-        results.push({ itemCode: code, ok: true });
-      } catch (e) {
-        results.push({ itemCode: code, ok: false, message: e.message || String(e) });
-      }
-    }
-    return safeJson(res, 200, {
-      ok: true,
-      mode: 'batch',
-      refreshed: results.filter((x) => x.ok).length,
-      errors: results.filter((x) => !x.ok),
-      results,
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-app.get('/api/admin/purchases/fixed-vendor/dashboard', verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 200, { ok: true, cacheEnabled: false, summary: { cached: 0, withDebt: 0, pazYSalvo: 0 }, topSuppliers: [], recentItems: [] });
-    const totalsR = await dbQuery(
-      `SELECT
-        COUNT(*)::int AS cached,
-        COUNT(*) FILTER (WHERE amount_due > 0.009)::int AS with_debt,
-        COUNT(*) FILTER (WHERE amount_due <= 0.009)::int AS paz_y_salvo
-       FROM purchases_fixed_vendor_cache`
-    );
-    const totals = totalsR.rows?.[0] || { cached: 0, with_debt: 0, paz_y_salvo: 0 };
-
-    const topSuppliersR = await dbQuery(
-      `SELECT
-        COALESCE(NULLIF(supplier_name,''), supplier_code, 'SIN PROVEEDOR') AS supplier,
-        supplier_code AS "supplierCode",
-        COUNT(*)::int AS items,
-        COALESCE(SUM(amount_due),0)::float AS amount_due
-       FROM purchases_fixed_vendor_cache
-       GROUP BY 1,2
-       ORDER BY amount_due DESC, items DESC
-       LIMIT 20`
-    );
-
-    const recentItemsR = await dbQuery(
-      `SELECT
-        item_code AS "itemCode",
-        item_name AS "itemName",
-        supplier_code AS "supplierCode",
-        supplier_name AS "supplierName",
-        amount_due::float AS "amountDue",
-        payment_status AS "paymentStatus",
-        synced_at AS "syncedAt"
-       FROM purchases_fixed_vendor_cache
-       ORDER BY synced_at DESC NULLS LAST, item_code ASC
-       LIMIT 30`
-    );
-
-    return safeJson(res, 200, {
-      ok: true,
-      cacheEnabled: true,
-      summary: {
-        cached: Number(totals.cached || 0),
-        withDebt: Number(totals.with_debt || 0),
-        pazYSalvo: Number(totals.paz_y_salvo || 0),
-      },
-      topSuppliers: topSuppliersR.rows || [],
-      recentItems: recentItemsR.rows || [],
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
-
-app.get('/compras-vendor-fijo', async (req, res) => {
-  try {
-    const local = path.join(process.cwd(), 'modulo_compras_vendor_fijo.html');
-    if (fs.existsSync(local)) return res.sendFile(local);
-    return res.status(200).send('<!doctype html><html><body style="font-family:Arial;padding:24px"><h2>Sube modulo_compras_vendor_fijo.html junto a server.js</h2></body></html>');
-  } catch (e) {
-    return res.status(500).send(String(e.message || e));
-  }
-});
 
 /* =========================================================
    Start
