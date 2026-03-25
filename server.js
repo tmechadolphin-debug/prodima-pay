@@ -14665,7 +14665,7 @@ async function purchaseModuleEnsureTables() {
       synced_at TIMESTAMP DEFAULT NOW()
     );
   `);
-  for stmt in [
+  for (const stmt of [
     "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS item_code_norm TEXT DEFAULT ''",
     "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS source_doc_type TEXT DEFAULT ''",
     "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS doc_entry BIGINT",
@@ -14681,8 +14681,9 @@ async function purchaseModuleEnsureTables() {
     "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS open_qty NUMERIC(18,3) DEFAULT 0",
     "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'USD'",
     "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS synced_at TIMESTAMP DEFAULT NOW()",
-  ]:
-    await dbQuery(stmt)
+  ]) {
+    await dbQuery(stmt);
+  }
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_purchase_module_docs_norm ON purchase_module_docs_cache(item_code_norm, doc_date DESC)`);
 
   await dbQuery(`
