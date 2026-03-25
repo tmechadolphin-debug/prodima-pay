@@ -11704,6 +11704,7 @@ function prodPlanPolicy(capacity = {}) {
     nonAbHalfShiftPct: Math.max(0.25, Math.min(1, prodNum(raw.nonAbHalfShiftPct || 0.5, 0.5))),
     cMinFillPctOfStockMax: Math.max(0.5, Math.min(1, prodNum(raw.cMinFillPctOfStockMax || 0.8, 0.8))),
     abMinRunQty: Math.max(0, prodNum(raw.abMinRunQty || 2000, 2000)),
+    abMaxDailyOvertimeFactor: Math.max(1, Math.min(2, prodNum(raw.abMaxDailyOvertimeFactor || 1.5, 1.5))),
   };
 }
 function prodIsPlanAb(label) {
@@ -11715,6 +11716,7 @@ function prodIsPlanC(label) {
 function prodIsPlanD(label) {
   return String(label || '').trim().toUpperCase() === 'D';
 }
+
 function prodBuildPolicyBlockedItem({ row, familyKey = '', familyMeta = {}, laneKey = '', laneMeta = {}, neededQty = 0, possibleQty = 0, directMaterials = [], dispatchDemand = null, reason = '' }) {
   return {
     itemCode: row?.itemCode,
@@ -11741,6 +11743,38 @@ function prodBuildPolicyBlockedItem({ row, familyKey = '', familyMeta = {}, lane
       priorityState: String(dispatchDemand.priorityState || ''),
     } : null,
   };
+}
+function prodPlanBalancedDayChunks(totalQty = 0, unitsPerHour = 0, effectiveDayHours = 8, { isAbCritical = false, maxDailyOvertimeFactor = 1.5 } = {}) {
+  const total = Math.max(0, prodNum(totalQty));
+  if (!(total > 0)) return [];
+  const hourRate = Math.max(0, prodNum(unitsPerHour));
+  const dayHours = Math.max(1, prodNum(effectiveDayHours, 8));
+  if (!(hourRate > 0)) return [prodRound(total, 2)];
+  const nominalDayQty = Math.max(1, hourRate * dayHours);
+  const dayCapQty = isAbCritical
+    ? Math.max(nominalDayQty, nominalDayQty * Math.max(1, prodNum(maxDailyOvertimeFactor, 1.5)))
+    : nominalDayQty;
+  const dayCount = Math.max(1, Math.ceil(total / Math.max(1, dayCapQty)));
+  const chunks = [];
+  let remaining = total;
+  for (let i = 0; i < dayCount; i += 1) {
+    const slotsLeft = Math.max(1, dayCount - i);
+    let target = remaining / slotsLeft;
+    if (isAbCritical) {
+      if (remaining <= dayCapQty + 0.0001) target = remaining;
+      target = Math.min(dayCapQty, target);
+    } else {
+      if (remaining <= nominalDayQty + 0.0001) target = remaining;
+      target = Math.min(nominalDayQty, target);
+    }
+    target = Math.max(1, target);
+    target = slotsLeft === 1 ? remaining : Math.min(remaining, target);
+    const rounded = prodRound(target, 2);
+    chunks.push(rounded);
+    remaining = Math.max(0, prodRound(remaining - rounded, 6));
+  }
+  if (remaining > 0.001 && chunks.length) chunks[chunks.length - 1] = prodRound(chunks[chunks.length - 1] + remaining, 2);
+  return chunks.filter((x) => prodNum(x) > 0.0001);
 }
 
 async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '__ALL__', abc = '__ALL__', typeFilter = 'Se fabrica en planta', q = '', avgMonths = 0, horizonMonths = 1, shiftHours = 8, startDate = '', fullMaterials = false }) {
@@ -11842,8 +11876,11 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
         policyReason = 'Regla automática: no sobre stockear; el artículo ya está en o por encima del stock máximo SAP.';
       } else if (isCImportant && prodNum(row?.stockMax) > 0) {
         const cThreshold = prodNum(row?.stockMax) * prodNum(planPolicy.cMinFillPctOfStockMax || 0.8);
+        const cTargetQty = Math.max(0, cThreshold - prodNum(row?.stockTotal));
         if (gapToMax < cThreshold) {
           policyReason = `Regla automática: categoría C solo se fabrica si falta al menos ${prodRound((planPolicy.cMinFillPctOfStockMax || 0.8) * 100, 0)}% del stock máximo SAP.`;
+        } else if (cTargetQty > 0) {
+          planningTargetQty = Math.max(planningTargetQty, cTargetQty);
         }
       }
       if (!policyReason && planPolicy.nonAbRequireHalfShift && machineBatchQty > 0) {
@@ -11971,7 +12008,7 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     const mainConstraint = String(possibleInfo?.mainConstraint || '');
 
     if (isAbCritical && minBatchQty > 0) {
-      possibleQty = possibleQty >= minBatchQty ? Math.floor(possibleQty / minBatchQty) * minBatchQty : 0;
+      possibleQty = possibleQty >= minBatchQty ? Math.floor(possibleQty) : 0;
     } else {
       possibleQty = Math.floor(possibleQty);
     }
@@ -12015,46 +12052,92 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     let hoursRemaining = possibleQty / unitsPerHour;
     let cumulativeProduced = 0;
 
-    while (hoursRemaining > 0.0001) {
-      if (laneState.currentHourOffset >= effectiveDayHours - 0.0001) {
+    const balancedAbChunks = isAbCritical
+      ? prodPlanBalancedDayChunks(possibleQty, unitsPerHour, effectiveDayHours, {
+          isAbCritical: true,
+          maxDailyOvertimeFactor: planPolicy.abMaxDailyOvertimeFactor || 1.5,
+        })
+      : [];
+
+    if (balancedAbChunks.length) {
+      if (laneState.currentHourOffset > 0.0001) {
         laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
         laneState.currentHourOffset = 0;
       }
-      const availableHours = Math.max(0, effectiveDayHours - laneState.currentHourOffset);
-      const takeHours = Math.min(availableHours, hoursRemaining);
-      const qtySlice = Math.min(qtyRemaining, takeHours * unitsPerHour);
-      const startOffset = laneState.currentHourOffset;
-      const endOffset = laneState.currentHourOffset + takeHours;
-      const startStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
-      cumulativeProduced += qtySlice;
-      const endStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
-      const taskDate = laneState.currentDate;
-      calendarSet.add(taskDate);
-
-      const task = {
-        taskId: `${row.itemCode}_${laneKey}_${taskDate}_${tasks.length + 1}`,
-        date: taskDate,
-        weekLabel: prodWeekLabelFromDate(taskDate),
-        monthLabel: prodMonthLabelFromDate(taskDate),
-        qty: prodRound(qtySlice, 2),
-        hours: prodRound(takeHours, 2),
-        startAt: prodIsoDateTimeByProductiveOffset(taskDate, startOffset, dayStartHour, 'start'),
-        endAt: prodIsoDateTimeByProductiveOffset(taskDate, endOffset, dayStartHour, 'end'),
-        timeLabel: prodTimeRangeLabelFromProductiveOffsets(startOffset, endOffset, dayStartHour),
-        fillPct: prodRound((takeHours / effectiveDayHours) * 100, 1),
-        stockStartQty: startStockQty,
-        stockEndQty: endStockQty,
-        laneKey,
-        laneLabel: laneMeta.label,
-      };
-      tasks.push(task);
-
-      qtyRemaining = Math.max(0, qtyRemaining - qtySlice);
-      hoursRemaining = Math.max(0, hoursRemaining - takeHours);
-      laneState.currentHourOffset += takeHours;
-      if (laneState.currentHourOffset >= effectiveDayHours - 0.0001) {
+      for (const chunkQtyRaw of balancedAbChunks) {
+        const chunkQty = Math.max(0, Math.min(qtyRemaining, prodNum(chunkQtyRaw)));
+        if (!(chunkQty > 0)) continue;
+        const takeHours = chunkQty / unitsPerHour;
+        const startOffset = laneState.currentHourOffset;
+        const endOffset = laneState.currentHourOffset + takeHours;
+        const startStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
+        cumulativeProduced += chunkQty;
+        const endStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
+        const taskDate = laneState.currentDate;
+        calendarSet.add(taskDate);
+        tasks.push({
+          taskId: `${row.itemCode}_${laneKey}_${taskDate}_${tasks.length + 1}`,
+          date: taskDate,
+          weekLabel: prodWeekLabelFromDate(taskDate),
+          monthLabel: prodMonthLabelFromDate(taskDate),
+          qty: prodRound(chunkQty, 2),
+          hours: prodRound(takeHours, 2),
+          startAt: prodIsoDateTimeByProductiveOffset(taskDate, startOffset, dayStartHour, 'start'),
+          endAt: prodIsoDateTimeByProductiveOffset(taskDate, endOffset, dayStartHour, 'end'),
+          timeLabel: prodTimeRangeLabelFromProductiveOffsets(startOffset, endOffset, dayStartHour),
+          fillPct: prodRound((takeHours / effectiveDayHours) * 100, 1),
+          stockStartQty: startStockQty,
+          stockEndQty: endStockQty,
+          laneKey,
+          laneLabel: laneMeta.label,
+        });
+        qtyRemaining = Math.max(0, qtyRemaining - chunkQty);
+        hoursRemaining = Math.max(0, hoursRemaining - takeHours);
         laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
         laneState.currentHourOffset = 0;
+      }
+    } else {
+      while (hoursRemaining > 0.0001) {
+        if (laneState.currentHourOffset >= effectiveDayHours - 0.0001) {
+          laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
+          laneState.currentHourOffset = 0;
+        }
+        const availableHours = Math.max(0, effectiveDayHours - laneState.currentHourOffset);
+        const takeHours = Math.min(availableHours, hoursRemaining);
+        const qtySlice = Math.min(qtyRemaining, takeHours * unitsPerHour);
+        const startOffset = laneState.currentHourOffset;
+        const endOffset = laneState.currentHourOffset + takeHours;
+        const startStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
+        cumulativeProduced += qtySlice;
+        const endStockQty = prodRound(prodNum(row?.stockTotal) + cumulativeProduced, 3);
+        const taskDate = laneState.currentDate;
+        calendarSet.add(taskDate);
+
+        const task = {
+          taskId: `${row.itemCode}_${laneKey}_${taskDate}_${tasks.length + 1}`,
+          date: taskDate,
+          weekLabel: prodWeekLabelFromDate(taskDate),
+          monthLabel: prodMonthLabelFromDate(taskDate),
+          qty: prodRound(qtySlice, 2),
+          hours: prodRound(takeHours, 2),
+          startAt: prodIsoDateTimeByProductiveOffset(taskDate, startOffset, dayStartHour, 'start'),
+          endAt: prodIsoDateTimeByProductiveOffset(taskDate, endOffset, dayStartHour, 'end'),
+          timeLabel: prodTimeRangeLabelFromProductiveOffsets(startOffset, endOffset, dayStartHour),
+          fillPct: prodRound((takeHours / effectiveDayHours) * 100, 1),
+          stockStartQty: startStockQty,
+          stockEndQty: endStockQty,
+          laneKey,
+          laneLabel: laneMeta.label,
+        };
+        tasks.push(task);
+
+        qtyRemaining = Math.max(0, qtyRemaining - qtySlice);
+        hoursRemaining = Math.max(0, hoursRemaining - takeHours);
+        laneState.currentHourOffset += takeHours;
+        if (laneState.currentHourOffset >= effectiveDayHours - 0.0001) {
+          laneState.currentDate = prodMoveToNextWorkday(laneState.currentDate);
+          laneState.currentHourOffset = 0;
+        }
       }
     }
 
@@ -12195,6 +12278,7 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
         nonAbRequireHalfShift: !!planPolicy.nonAbRequireHalfShift,
         cMinFillPctOfStockMax: prodRound(planPolicy.cMinFillPctOfStockMax || 0.8, 2),
         abMinRunQty: prodRound(planPolicy.abMinRunQty || 0, 0),
+        abMaxDailyOvertimeFactor: prodRound(planPolicy.abMaxDailyOvertimeFactor || 1.5, 2),
       },
     },
   };
