@@ -8404,6 +8404,56 @@ async function ensureProductionDb() {
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_date ON production_demand_lines(doc_date DESC);`);
 
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_inv_wh_item ON production_inv_wh_cache(item_code);`);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_procurement_docs_cache (
+      sync_batch TEXT NOT NULL,
+      item_code TEXT NOT NULL,
+      item_desc TEXT NOT NULL DEFAULT '',
+      source_doc_type TEXT NOT NULL DEFAULT '',
+      doc_entry BIGINT NOT NULL,
+      doc_num BIGINT,
+      line_num INTEGER NOT NULL DEFAULT 0,
+      doc_date DATE,
+      due_date DATE,
+      quantity NUMERIC(18,4) NOT NULL DEFAULT 0,
+      line_total NUMERIC(18,2) NOT NULL DEFAULT 0,
+      doc_total NUMERIC(18,2) NOT NULL DEFAULT 0,
+      currency TEXT NOT NULL DEFAULT '',
+      supplier_code TEXT NOT NULL DEFAULT '',
+      supplier_name TEXT NOT NULL DEFAULT '',
+      document_status TEXT NOT NULL DEFAULT '',
+      open_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY(sync_batch, item_code, source_doc_type, doc_entry, line_num)
+    );
+  `);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_procurement_vendor_cache (
+      sync_batch TEXT NOT NULL,
+      supplier_code TEXT NOT NULL,
+      supplier_name TEXT NOT NULL DEFAULT '',
+      payment_status TEXT NOT NULL DEFAULT 'SIN_DATOS',
+      amount_due NUMERIC(18,2) NOT NULL DEFAULT 0,
+      overdue_amount NUMERIC(18,2) NOT NULL DEFAULT 0,
+      oldest_debt_date DATE,
+      days_due INTEGER NOT NULL DEFAULT 0,
+      source TEXT NOT NULL DEFAULT '',
+      debt_basis TEXT NOT NULL DEFAULT '',
+      payment_terms_name TEXT NOT NULL DEFAULT '',
+      credit_days INTEGER NOT NULL DEFAULT 0,
+      balance_raw NUMERIC(18,2) NOT NULL DEFAULT 0,
+      debt_note TEXT NOT NULL DEFAULT '',
+      payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY(sync_batch, supplier_code)
+    );
+  `);
+
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_proc_docs_item_batch_date ON production_procurement_docs_cache(item_code, sync_batch, doc_date DESC);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_proc_docs_supplier_batch ON production_procurement_docs_cache(supplier_code, sync_batch);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_proc_vendor_batch ON production_procurement_vendor_cache(sync_batch, supplier_code);`);
 }
 __extraBootTasks.push(async () => {
   try {
@@ -11026,112 +11076,6 @@ async function productionBuildItemPlanCached(params = {}) {
 }
 
 
-function prodPlanRuntimeCacheKey(params = {}) {
-  return JSON.stringify({
-    itemCode: String(params.itemCode || "").trim(),
-    toDate: String(params.toDate || ""),
-    avgMonths: Number(params.avgMonths || 5),
-    horizonMonths: Number(params.horizonMonths || 3),
-    shiftHours: Number(params.shiftHours || 8),
-    plannedQtyOverride: Number(params.plannedQtyOverride || 0),
-  });
-}
-
-let PROD_AB_PLAN_WARM_STATE = {
-  running: false,
-  startedAt: "",
-  finishedAt: "",
-  lastError: "",
-  planned: 0,
-  completed: 0,
-  sample: [],
-};
-
-async function prodWarmAbItemPlanCache(opts = {}) {
-  const today = getDateISOInOffset(TZ_OFFSET_MIN);
-  const toDate = String(opts?.toDate || today).slice(0, 10);
-  const avgMonths = Math.max(1, Math.min(12, prodNum(opts?.avgMonths, 3)));
-  const horizonMonths = Math.max(1, Math.min(12, prodNum(opts?.horizonMonths, 3)));
-  const shiftHours = Math.max(1, Math.min(24, prodNum(opts?.shiftHours, 8)));
-  const limit = Math.max(1, Math.min(400, prodNum(opts?.limit, 200)));
-  const concurrency = Math.max(1, Math.min(4, prodNum(opts?.concurrency, 2)));
-
-  const dash = await productionDashboardFromDb({
-    from: "2025-01-01",
-    to: today,
-    area: "__ALL__",
-    grupo: "__ALL__",
-    sizeUom: "__ALL__",
-    abc: "__ALL__",
-    typeFilter: "Se fabrica en planta",
-    q: "",
-    avgMonths,
-    horizonMonths,
-  });
-
-  const items = (Array.isArray(dash?.items) ? dash.items : [])
-    .filter((x) => /^AB\b/i.test(String(x?.totalLabel || "")))
-    .slice(0, limit);
-
-  PROD_AB_PLAN_WARM_STATE = {
-    running: true,
-    startedAt: new Date().toISOString(),
-    finishedAt: "",
-    lastError: "",
-    planned: items.length,
-    completed: 0,
-    sample: items.slice(0, 12).map((x) => String(x?.itemCode || "")),
-  };
-
-  try {
-    await prodMapLimit(items, concurrency, async (row) => {
-      const itemCode = String(row?.itemCode || "").trim();
-      if (!itemCode) {
-        PROD_AB_PLAN_WARM_STATE.completed += 1;
-        return null;
-      }
-      try {
-        const plan = await productionBuildItemPlan({
-          itemCode,
-          toDate,
-          avgMonths,
-          horizonMonths,
-          shiftHours,
-          plannedQtyOverride: 0,
-        });
-        if (row?.totalLabel) plan.abcHint = String(row.totalLabel);
-        prodRuntimeSet(PROD_PLAN_RUNTIME_CACHE, prodPlanRuntimeCacheKey({
-          itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: 0
-        }), plan);
-      } catch (e) {
-        PROD_AB_PLAN_WARM_STATE.lastError = e?.message || String(e);
-      } finally {
-        PROD_AB_PLAN_WARM_STATE.completed += 1;
-      }
-      return null;
-    });
-  } finally {
-    PROD_AB_PLAN_WARM_STATE.running = false;
-    PROD_AB_PLAN_WARM_STATE.finishedAt = new Date().toISOString();
-  }
-  return PROD_AB_PLAN_WARM_STATE;
-}
-
-function prodStartAbItemPlanWarm(opts = {}) {
-  if (PROD_AB_PLAN_WARM_STATE.running) return false;
-  setImmediate(async () => {
-    try {
-      await prodWarmAbItemPlanCache(opts);
-    } catch (e) {
-      PROD_AB_PLAN_WARM_STATE.running = false;
-      PROD_AB_PLAN_WARM_STATE.lastError = e?.message || String(e);
-      PROD_AB_PLAN_WARM_STATE.finishedAt = new Date().toISOString();
-    }
-  });
-  return true;
-}
-
-
 async function prodBuildSimulationNode({
   itemCode,
   plannedQty = 0,
@@ -12939,127 +12883,409 @@ async function prodFetchVendorPayablesStatus(cardCode, cardName = "") {
   };
 }
 
+async function prodBuildComponentProcurementLive(itemCode, itemDesc = "", top = 5) {
+  const [purchaseInvoices, purchaseOrdersOnly] = await Promise.all([
+    prodFetchRecentPurchaseInvoicesForItem(itemCode, itemDesc, top).catch(() => []),
+    prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc, top).catch(() => []),
+  ]);
 
-function prodExactItemCodeEq(a, b) {
-  const aa = String(a || "").trim();
-  const bb = String(b || "").trim();
-  if (!aa || !bb) return false;
-  return aa.toUpperCase() === bb.toUpperCase() || prodNormalizeItemCodeLoose(aa) === prodNormalizeItemCodeLoose(bb);
-}
+  const mergedDocs = prodSortProcurementRows(
+    [...purchaseInvoices, ...purchaseOrdersOnly].filter(Boolean)
+  ).filter((row, idx, arr) => {
+    const key = `${String(row?.sourceDocType || '')}::${Number(row?.docEntry || 0)}::${Number(row?.lineNum || 0)}`;
+    return arr.findIndex((x) => `${String(x?.sourceDocType || '')}::${Number(x?.docEntry || 0)}::${Number(x?.lineNum || 0)}` === key) === idx;
+  }).slice(0, top);
 
-function prodMapSapDocStatusLabel(status) {
-  return prodDocStatusIsOpen(status) ? "Abierta" : (prodDocStatusIsClosed(status) ? "Cerrada" : String(status || ""));
-}
+  const suppliers = Array.from(new Map(
+    mergedDocs
+      .map((x) => [String(x.supplierCode || "").trim(), String(x.supplierName || "").trim()])
+      .filter(([code]) => !!code)
+  ).entries()).map(([code, name]) => ({ code, name }));
 
-async function prodFetchRecentPurchaseInvoicesForPurchasedItem(itemCode, itemDesc = "", top = 5) {
-  const code = String(itemCode || "").trim();
-  const desc = String(itemDesc || "").trim();
-  if (!code && !desc) return [];
-  const target = [];
-  const seen = new Set();
+  const vendorStatuses = await Promise.all(suppliers.map(async (supplier) => {
+    return await prodFetchVendorPayablesStatus(supplier.code, supplier.name).catch(() => ({
+      supplierCode: supplier.code,
+      supplierName: supplier.name,
+      paymentStatus: "SIN_DATOS",
+      amountDue: 0,
+      overdueAmount: 0,
+      oldestDebtDate: "",
+      daysDue: 0,
+      source: "",
+      debtBasis: "",
+      openInvoices: [],
+      paymentTermsName: "",
+      creditDays: 0,
+      balanceRaw: 0,
+      debtNote: "",
+    }));
+  }));
 
-  const collectFromDoc = (doc) => {
-    if (!doc) return;
-    const lines = prodAsArray(doc?.DocumentLines);
-    for (const ln of lines) {
-      const lineCode = String(ln?.ItemCode || "").trim();
-      const lineDesc = String(ln?.ItemDescription || ln?.ItemDetails || "").trim();
-      const exactMatch = code ? prodExactItemCodeEq(lineCode, code) : false;
-      const descMatch = !code && desc ? prodLineMatchesProcurementSearch(lineCode, lineDesc, prodBuildItemSearchVariants("", desc)) : false;
-      if (!(exactMatch || descMatch)) continue;
-      const key = `${Number(doc?.DocEntry || 0)}::${Number(ln?.LineNum || 0)}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      target.push({
-        docEntry: Number(doc?.DocEntry || 0),
-        docNum: Number(doc?.DocNum || 0),
-        docDate: prodDateOnly(doc?.DocDate),
-        dueDate: prodDateOnly(doc?.DocDueDate || doc?.TaxDate),
-        quantity: prodRound(prodNum(ln?.Quantity || 0), 3),
-        lineTotal: prodRound(prodNum(ln?.LineTotal || 0), 2),
-        docTotal: prodRound(prodNum(doc?.DocTotal || 0), 2),
-        currency: String(doc?.DocCurrency || "USD"),
-        supplierCode: String(doc?.CardCode || ""),
-        supplierName: String(doc?.CardName || ""),
-        documentStatus: prodMapSapDocStatusLabel(doc?.DocumentStatus || doc?.Status || ""),
-        openQty: prodRound(prodNum(ln?.OpenQuantity || ln?.OpenQty || 0), 3),
-        lineNum: Number(ln?.LineNum || 0),
-        itemCode: lineCode,
-        itemDesc: lineDesc,
-        sourceDocType: "FACTURA_PROVEEDOR",
-      });
-    }
-  };
+  const vendorMap = new Map(vendorStatuses.map((x) => [String(x.supplierCode || "").trim(), x]));
+  const enrichedOrders = mergedDocs.map((row) => ({
+    ...row,
+    vendorStatus: vendorMap.get(String(row.supplierCode || "").trim()) || null,
+  }));
 
-  const fastAnyFilter = code ? prodBuildProcurementItemAnyFilter(code) : "";
-  const expandedPaths = [];
-  if (fastAnyFilter) {
-    expandedPaths.push(`/PurchaseInvoices?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$filter=${fastAnyFilter}&$orderby=DocDate desc&$top=${Math.max(20, Number(top || 5) * 4)}&$expand=DocumentLines`);
-  }
-  expandedPaths.push(`/PurchaseInvoices?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$orderby=DocDate desc&$top=60&$expand=DocumentLines`);
-
-  for (const path of expandedPaths) {
-    try {
-      const docs = prodAsArray(await slFetchFreshSession(path));
-      for (const doc of docs) collectFromDoc(doc);
-      if (target.length >= Math.max(1, Number(top || 5))) break;
-    } catch {}
-  }
-
-  if (target.length < Math.max(1, Number(top || 5))) {
-    let skip = 0;
-    const pageSize = 40;
-    const maxPages = 4;
-    for (let page = 0; page < maxPages && target.length < Math.max(1, Number(top || 5)); page++) {
-      try {
-        const docs = prodAsArray(await slFetchFreshSession(`/PurchaseInvoices?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$orderby=DocDate desc&$top=${pageSize}&$skip=${skip}&$expand=DocumentLines`));
-        if (!docs.length) break;
-        for (const doc of docs) collectFromDoc(doc);
-      } catch {}
-      skip += pageSize;
-    }
-  }
-
-  return [...target].sort((a, b) =>
-    String(b.docDate || "").localeCompare(String(a.docDate || "")) ||
-    Number(b.docNum || 0) - Number(a.docNum || 0) ||
-    Number(a.lineNum || 0) - Number(b.lineNum || 0)
-  ).slice(0, Math.max(1, Number(top || 5)));
-}
-
-async function prodBuildPurchasedQuickView(itemCode, itemDesc = "", top = 5) {
-  const docs = await prodFetchRecentPurchaseInvoicesForPurchasedItem(itemCode, itemDesc, top).catch(() => []);
-  const fallbackOrders = docs.length ? [] : await prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc, top).catch(() => []);
-  const recentDocs = (docs.length ? docs : fallbackOrders).slice(0, Math.max(1, Number(top || 5)));
-  const latest = recentDocs[0] || null;
-  const supplierStatus = latest
-    ? await prodFetchVendorPayablesStatus(latest.supplierCode, latest.supplierName).catch(() => ({
-        supplierCode: latest.supplierCode || "",
-        supplierName: latest.supplierName || "",
-        paymentStatus: "SIN_DATOS",
-        amountDue: 0,
-        balanceRaw: 0,
-      }))
-    : {
-        supplierCode: "",
-        supplierName: "",
-        paymentStatus: "SIN_DATOS",
-        amountDue: 0,
-        balanceRaw: 0,
-      };
+  const purchaseSource = purchaseInvoices.length && purchaseOrdersOnly.length
+    ? "Mixed"
+    : purchaseInvoices.length
+      ? "PurchaseInvoices"
+      : purchaseOrdersOnly.length
+        ? "PurchaseOrders"
+        : "";
 
   return {
     ok: true,
-    kind: "supplier_account",
-    mode: "procurement",
-    isPurchasedQuickView: true,
-    itemCode: String(itemCode || ""),
-    itemDesc: String(itemDesc || latest?.itemDesc || ""),
-    supplierStatus,
-    recentProcurementDocs: recentDocs,
-    source: docs.length ? "PurchaseInvoices" : (fallbackOrders.length ? "PurchaseOrders" : ""),
-    businessDocCount: recentDocs.length,
-    usingLocalFallback: false,
+    itemCode,
+    itemDesc,
+    purchaseOrders: enrichedOrders,
+    purchaseSource,
+    vendorStatuses,
+    generatedAt: new Date().toISOString(),
+    summary: {
+      purchaseOrders: enrichedOrders.length,
+      suppliers: vendorStatuses.length,
+      anyDebt: vendorStatuses.some((x) => String(x?.paymentStatus || "") === "SE_DEBE"),
+      openDocs: enrichedOrders.filter((x) => prodProcurementRowIsOpen(x)).length,
+    },
+  };
+}
+
+function prodLooksLikeProcurementItemCode(code) {
+  const s = String(code || '').trim();
+  if (!s || s.length < 3 || s.length > 40) return false;
+  if (/\s/.test(s)) return false;
+  if (!/^[A-Za-z0-9._\/-]+$/.test(s)) return false;
+  return true;
+}
+
+function prodBuildLocalProcurementSeedMap() {
+  const local = loadProductionLocalData();
+  const out = new Map();
+  const materials = local?.materials?.materials || {};
+  for (const [rawCode, meta] of Object.entries(materials)) {
+    const code = String(rawCode || '').trim();
+    if (!prodLooksLikeProcurementItemCode(code)) continue;
+    const desc = String(
+      meta?.itemDesc || meta?.description || meta?.name || meta?.itemName || meta?.materialName || ''
+    ).trim();
+    out.set(code, desc || out.get(code) || '');
+    const candidateFields = [meta?.itemCode, meta?.ItemCode, meta?.code, meta?.Code, meta?.materialCode, meta?.MaterialCode];
+    for (const candidate of candidateFields) {
+      const c = String(candidate || '').trim();
+      if (prodLooksLikeProcurementItemCode(c)) out.set(c, desc || out.get(c) || '');
+    }
+  }
+  return out;
+}
+
+async function prodGetProcurementSeedMap() {
+  const out = prodBuildLocalProcurementSeedMap();
+  if (hasDb()) {
+    try {
+      const bomRows = await dbQuery(`
+        SELECT DISTINCT component_code AS item_code, MAX(component_desc) AS item_desc
+        FROM production_bom_cache
+        WHERE COALESCE(component_code,'') <> ''
+        GROUP BY component_code
+      `);
+      for (const row of bomRows.rows || []) {
+        const code = String(row?.item_code || '').trim();
+        if (!prodLooksLikeProcurementItemCode(code)) continue;
+        const desc = String(row?.item_desc || '').trim();
+        if (!out.has(code) || (!out.get(code) && desc)) out.set(code, desc || out.get(code) || '');
+      }
+    } catch {}
+  }
+  return out;
+}
+
+async function prodUpsertProcurementDocCache(syncBatch, itemCode, row) {
+  await dbQuery(
+    `INSERT INTO production_procurement_docs_cache(
+      sync_batch,item_code,item_desc,source_doc_type,doc_entry,doc_num,line_num,doc_date,due_date,
+      quantity,line_total,doc_total,currency,supplier_code,supplier_name,document_status,open_qty,updated_at
+    ) VALUES(
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,
+      $10,$11,$12,$13,$14,$15,$16,$17,NOW()
+    )
+    ON CONFLICT (sync_batch, item_code, source_doc_type, doc_entry, line_num) DO UPDATE SET
+      item_desc=EXCLUDED.item_desc,
+      doc_num=EXCLUDED.doc_num,
+      doc_date=EXCLUDED.doc_date,
+      due_date=EXCLUDED.due_date,
+      quantity=EXCLUDED.quantity,
+      line_total=EXCLUDED.line_total,
+      doc_total=EXCLUDED.doc_total,
+      currency=EXCLUDED.currency,
+      supplier_code=EXCLUDED.supplier_code,
+      supplier_name=EXCLUDED.supplier_name,
+      document_status=EXCLUDED.document_status,
+      open_qty=EXCLUDED.open_qty,
+      updated_at=NOW()`,
+    [
+      syncBatch,
+      String(itemCode || '').trim(),
+      String(row?.itemDesc || ''),
+      String(row?.sourceDocType || ''),
+      Number(row?.docEntry || 0),
+      Number(row?.docNum || 0) || null,
+      Number(row?.lineNum || 0),
+      row?.docDate ? String(row.docDate).slice(0, 10) : null,
+      row?.dueDate ? String(row.dueDate).slice(0, 10) : null,
+      prodNum(row?.quantity || 0),
+      prodNum(row?.lineTotal || 0),
+      prodNum(row?.docTotal || 0),
+      String(row?.currency || ''),
+      String(row?.supplierCode || ''),
+      String(row?.supplierName || ''),
+      String(row?.documentStatus || ''),
+      prodNum(row?.openQty || 0),
+    ]
+  );
+}
+
+async function prodUpsertProcurementVendorCache(syncBatch, row) {
+  const payload = {
+    supplierCode: String(row?.supplierCode || ''),
+    supplierName: String(row?.supplierName || ''),
+    paymentStatus: String(row?.paymentStatus || 'SIN_DATOS'),
+    amountDue: prodRound(prodNum(row?.amountDue || 0), 2),
+    overdueAmount: prodRound(prodNum(row?.overdueAmount || 0), 2),
+    oldestDebtDate: String(row?.oldestDebtDate || ''),
+    daysDue: Number(row?.daysDue || 0),
+    source: String(row?.source || ''),
+    debtBasis: String(row?.debtBasis || ''),
+    openInvoices: Array.isArray(row?.openInvoices) ? row.openInvoices : [],
+    paymentTermsName: String(row?.paymentTermsName || ''),
+    creditDays: Number(row?.creditDays || 0),
+    balanceRaw: prodRound(prodNum(row?.balanceRaw || 0), 2),
+    debtNote: String(row?.debtNote || ''),
+  };
+  await dbQuery(
+    `INSERT INTO production_procurement_vendor_cache(
+      sync_batch,supplier_code,supplier_name,payment_status,amount_due,overdue_amount,
+      oldest_debt_date,days_due,source,debt_basis,payment_terms_name,credit_days,
+      balance_raw,debt_note,payload_json,updated_at
+    ) VALUES(
+      $1,$2,$3,$4,$5,$6,
+      $7,$8,$9,$10,$11,$12,
+      $13,$14,$15::jsonb,NOW()
+    )
+    ON CONFLICT (sync_batch, supplier_code) DO UPDATE SET
+      supplier_name=EXCLUDED.supplier_name,
+      payment_status=EXCLUDED.payment_status,
+      amount_due=EXCLUDED.amount_due,
+      overdue_amount=EXCLUDED.overdue_amount,
+      oldest_debt_date=EXCLUDED.oldest_debt_date,
+      days_due=EXCLUDED.days_due,
+      source=EXCLUDED.source,
+      debt_basis=EXCLUDED.debt_basis,
+      payment_terms_name=EXCLUDED.payment_terms_name,
+      credit_days=EXCLUDED.credit_days,
+      balance_raw=EXCLUDED.balance_raw,
+      debt_note=EXCLUDED.debt_note,
+      payload_json=EXCLUDED.payload_json,
+      updated_at=NOW()`,
+    [
+      syncBatch,
+      payload.supplierCode,
+      payload.supplierName,
+      payload.paymentStatus,
+      payload.amountDue,
+      payload.overdueAmount,
+      payload.oldestDebtDate ? payload.oldestDebtDate.slice(0, 10) : null,
+      payload.daysDue,
+      payload.source,
+      payload.debtBasis,
+      payload.paymentTermsName,
+      payload.creditDays,
+      payload.balanceRaw,
+      payload.debtNote,
+      JSON.stringify(payload),
+    ]
+  );
+}
+
+async function prodReadComponentProcurementCache(itemCode, top = 5) {
+  const code = String(itemCode || '').trim();
+  const activeBatch = await getState('production_procurement_active_batch');
+  if (!code || !activeBatch) {
+    return {
+      activeBatch: activeBatch || '',
+      purchaseOrders: [],
+      vendorStatuses: [],
+      purchaseSource: '',
+      generatedAt: await getState('production_procurement_last_sync_at'),
+    };
+  }
+
+  const docsRes = await dbQuery(
+    `SELECT *
+       FROM production_procurement_docs_cache
+      WHERE sync_batch = $1 AND item_code = $2
+      ORDER BY doc_date DESC NULLS LAST, doc_num DESC NULLS LAST, line_num ASC
+      LIMIT $3`,
+    [activeBatch, code, Math.max(1, Math.min(20, Number(top || 5)))]
+  );
+  const docRows = docsRes.rows || [];
+  const supplierCodes = Array.from(new Set(docRows.map((r) => String(r?.supplier_code || '').trim()).filter(Boolean)));
+
+  let vendorRows = [];
+  if (supplierCodes.length) {
+    const placeholders = supplierCodes.map((_, idx) => `$${idx + 2}`).join(', ');
+    const vendorRes = await dbQuery(
+      `SELECT *
+         FROM production_procurement_vendor_cache
+        WHERE sync_batch = $1 AND supplier_code IN (${placeholders})`,
+      [activeBatch, ...supplierCodes]
+    );
+    vendorRows = vendorRes.rows || [];
+  }
+
+  const vendorStatuses = vendorRows.map((row) => {
+    const payload = row?.payload_json && typeof row.payload_json === 'object' ? row.payload_json : null;
+    return payload || {
+      supplierCode: String(row?.supplier_code || ''),
+      supplierName: String(row?.supplier_name || ''),
+      paymentStatus: String(row?.payment_status || 'SIN_DATOS'),
+      amountDue: prodRound(prodNum(row?.amount_due || 0), 2),
+      overdueAmount: prodRound(prodNum(row?.overdue_amount || 0), 2),
+      oldestDebtDate: row?.oldest_debt_date ? String(row.oldest_debt_date).slice(0, 10) : '',
+      daysDue: Number(row?.days_due || 0),
+      source: String(row?.source || ''),
+      debtBasis: String(row?.debt_basis || ''),
+      openInvoices: [],
+      paymentTermsName: String(row?.payment_terms_name || ''),
+      creditDays: Number(row?.credit_days || 0),
+      balanceRaw: prodRound(prodNum(row?.balance_raw || 0), 2),
+      debtNote: String(row?.debt_note || ''),
+    };
+  });
+
+  const vendorMap = new Map(vendorStatuses.map((x) => [String(x?.supplierCode || '').trim(), x]));
+  const purchaseOrders = docRows.map((row) => ({
+    docEntry: Number(row?.doc_entry || 0),
+    docNum: Number(row?.doc_num || 0),
+    docDate: row?.doc_date ? String(row.doc_date).slice(0, 10) : '',
+    dueDate: row?.due_date ? String(row.due_date).slice(0, 10) : '',
+    quantity: prodRound(prodNum(row?.quantity || 0), 3),
+    lineTotal: prodRound(prodNum(row?.line_total || 0), 2),
+    docTotal: prodRound(prodNum(row?.doc_total || 0), 2),
+    currency: String(row?.currency || 'USD'),
+    supplierCode: String(row?.supplier_code || ''),
+    supplierName: String(row?.supplier_name || ''),
+    documentStatus: String(row?.document_status || ''),
+    openQty: prodRound(prodNum(row?.open_qty || 0), 3),
+    lineNum: Number(row?.line_num || 0),
+    itemCode: String(row?.item_code || ''),
+    itemDesc: String(row?.item_desc || ''),
+    sourceDocType: String(row?.source_doc_type || ''),
+    vendorStatus: vendorMap.get(String(row?.supplier_code || '').trim()) || null,
+  }));
+
+  const hasInvoices = purchaseOrders.some((x) => String(x?.sourceDocType || '') === 'FACTURA_PROVEEDOR');
+  const hasOrders = purchaseOrders.some((x) => String(x?.sourceDocType || '') === 'ORDEN_COMPRA');
+  const purchaseSource = hasInvoices && hasOrders
+    ? 'Mixed'
+    : hasInvoices
+      ? 'PurchaseInvoices'
+      : hasOrders
+        ? 'PurchaseOrders'
+        : '';
+
+  return {
+    activeBatch,
+    purchaseOrders,
+    vendorStatuses,
+    purchaseSource,
+    generatedAt: await getState('production_procurement_last_sync_at'),
+  };
+}
+
+async function prodRebuildProcurementCache({ from = '', to = '', topPerItem = 10 } = {}) {
+  if (!hasDb()) return { ok: false, items: 0, docs: 0, vendors: 0, batchId: '' };
+  const seedMap = await prodGetProcurementSeedMap();
+  const itemEntries = Array.from(seedMap.entries()).map(([itemCode, itemDesc]) => ({
+    itemCode: String(itemCode || '').trim(),
+    itemDesc: String(itemDesc || '').trim(),
+  })).filter((x) => prodLooksLikeProcurementItemCode(x.itemCode));
+
+  const batchId = `proc_${Date.now()}`;
+  const docsByItem = [];
+  const supplierMap = new Map();
+  const itemErrors = [];
+
+  await prodMapLimit(itemEntries, 2, async ({ itemCode, itemDesc }) => {
+    try {
+      const live = await prodBuildComponentProcurementLive(itemCode, itemDesc, Math.max(1, Math.min(10, Number(topPerItem || 10))));
+      const docs = Array.isArray(live?.purchaseOrders) ? live.purchaseOrders : [];
+      docsByItem.push({ itemCode, itemDesc, docs });
+      for (const row of docs) {
+        const code = String(row?.supplierCode || '').trim();
+        if (code && !supplierMap.has(code)) {
+          supplierMap.set(code, String(row?.supplierName || '').trim());
+        }
+      }
+    } catch (e) {
+      itemErrors.push({ itemCode, message: e?.message || String(e) });
+    }
+  });
+
+  let docsSaved = 0;
+  for (const item of docsByItem) {
+    for (const row of item.docs || []) {
+      await prodUpsertProcurementDocCache(batchId, item.itemCode, row);
+      docsSaved += 1;
+    }
+  }
+
+  const suppliers = Array.from(supplierMap.entries()).map(([code, name]) => ({ code, name }));
+  const vendorErrors = [];
+  let vendorsSaved = 0;
+  await prodMapLimit(suppliers, 4, async (supplier) => {
+    try {
+      const status = await prodFetchVendorPayablesStatus(supplier.code, supplier.name).catch(() => ({
+        supplierCode: supplier.code,
+        supplierName: supplier.name,
+        paymentStatus: 'SIN_DATOS',
+        amountDue: 0,
+        overdueAmount: 0,
+        oldestDebtDate: '',
+        daysDue: 0,
+        source: '',
+        debtBasis: '',
+        openInvoices: [],
+        paymentTermsName: '',
+        creditDays: 0,
+        balanceRaw: 0,
+        debtNote: '',
+      }));
+      await prodUpsertProcurementVendorCache(batchId, status);
+      vendorsSaved += 1;
+    } catch (e) {
+      vendorErrors.push({ supplierCode: supplier.code, message: e?.message || String(e) });
+    }
+  });
+
+  if (docsSaved > 0 || vendorsSaved > 0) {
+    await dbQuery(`DELETE FROM production_procurement_docs_cache WHERE sync_batch <> $1`, [batchId]);
+    await dbQuery(`DELETE FROM production_procurement_vendor_cache WHERE sync_batch <> $1`, [batchId]);
+    await setState('production_procurement_active_batch', batchId);
+    await setState('production_procurement_last_sync_at', new Date().toISOString());
+  }
+
+  return {
+    ok: true,
+    batchId,
+    items: itemEntries.length,
+    docs: docsSaved,
+    vendors: vendorsSaved,
+    itemErrors,
+    vendorErrors,
+    from,
+    to,
   };
 }
 
@@ -13068,67 +13294,34 @@ app.get("/api/admin/production/component-procurement", verifyAdmin, async (req, 
     const itemCode = String(req.query?.itemCode || "").trim();
     const itemDesc = String(req.query?.itemDesc || "").trim();
     const top = Math.max(1, Math.min(10, prodNum(req.query?.top, 5)));
+    const live = String(req.query?.live || '0') === '1';
     if (!itemCode) return safeJson(res, 400, { ok: false, message: "Falta itemCode" });
 
-    const [purchaseInvoices, purchaseOrdersOnly] = await Promise.all([
-      prodFetchRecentPurchaseInvoicesForPurchasedItem(itemCode, itemDesc, top).catch(() => []),
-      prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc, top).catch(() => []),
-    ]);
+    const payload = live
+      ? await prodBuildComponentProcurementLive(itemCode, itemDesc, top)
+      : await (async () => {
+          const cached = await prodReadComponentProcurementCache(itemCode, top);
+          return {
+            ok: true,
+            itemCode,
+            itemDesc,
+            purchaseOrders: cached.purchaseOrders,
+            purchaseSource: cached.purchaseSource,
+            vendorStatuses: cached.vendorStatuses,
+            generatedAt: cached.generatedAt || new Date().toISOString(),
+            cacheMode: 'db',
+            cacheBatch: cached.activeBatch || '',
+            summary: {
+              purchaseOrders: cached.purchaseOrders.length,
+              suppliers: cached.vendorStatuses.length,
+              anyDebt: cached.vendorStatuses.some((x) => String(x?.paymentStatus || '') === 'SE_DEBE'),
+              openDocs: cached.purchaseOrders.filter((x) => prodProcurementRowIsOpen(x)).length,
+            },
+          };
+        })();
 
-    const mergedDocs = prodSortProcurementRows(
-      [...purchaseInvoices, ...purchaseOrdersOnly].filter(Boolean)
-    ).filter((row, idx, arr) => {
-      const key = `${String(row?.sourceDocType || '')}::${Number(row?.docEntry || 0)}::${Number(row?.lineNum || 0)}`;
-      return arr.findIndex((x) => `${String(x?.sourceDocType || '')}::${Number(x?.docEntry || 0)}::${Number(x?.lineNum || 0)}` === key) === idx;
-    }).slice(0, top);
-
-    const suppliers = Array.from(new Map(
-      mergedDocs
-        .map((x) => [String(x.supplierCode || "").trim(), String(x.supplierName || "").trim()])
-        .filter(([code]) => !!code)
-    ).entries()).map(([code, name]) => ({ code, name }));
-
-    const vendorStatuses = await Promise.all(suppliers.map(async (supplier) => {
-      return await prodFetchVendorPayablesStatus(supplier.code, supplier.name).catch(() => ({
-        supplierCode: supplier.code,
-        supplierName: supplier.name,
-        paymentStatus: "SIN_DATOS",
-        amountDue: 0,
-        oldestDebtDate: "",
-        daysDue: 0,
-        source: "",
-      }));
-    }));
-
-    const vendorMap = new Map(vendorStatuses.map((x) => [String(x.supplierCode || "").trim(), x]));
-    const enrichedOrders = mergedDocs.map((row) => ({
-      ...row,
-      vendorStatus: vendorMap.get(String(row.supplierCode || "").trim()) || null,
-    }));
-
-    const purchaseSource = purchaseInvoices.length && purchaseOrdersOnly.length
-      ? "Mixed"
-      : purchaseInvoices.length
-        ? "PurchaseInvoices"
-        : purchaseOrdersOnly.length
-          ? "PurchaseOrders"
-          : "";
-
-    return safeJson(res, 200, {
-      ok: true,
-      itemCode,
-      itemDesc,
-      purchaseOrders: enrichedOrders,
-      purchaseSource,
-      vendorStatuses,
-      generatedAt: new Date().toISOString(),
-      summary: {
-        purchaseOrders: enrichedOrders.length,
-        suppliers: vendorStatuses.length,
-        anyDebt: vendorStatuses.some((x) => String(x?.paymentStatus || "") === "SE_DEBE"),
-        openDocs: enrichedOrders.filter((x) => prodProcurementRowIsOpen(x)).length,
-      },
-    });
+    if (live) payload.cacheMode = 'live';
+    return safeJson(res, 200, payload);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -13148,29 +13341,9 @@ app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
     const shiftHours = Math.max(1, Math.min(24, prodNum(req.query?.shiftHours, 8)));
     const plannedQty = Math.max(0, prodNum(req.query?.plannedQty, 0));
-    const forceRefresh = String(req.query?.forceRefresh || "").trim() === "1";
 
-    if (forceRefresh) {
-      await prodRefreshInventoryForCodes([itemCode]).catch(() => {});
-    }
-
+    await prodRefreshInventoryForCodes([itemCode]).catch(() => {});
     const plan = await productionBuildItemPlanCached({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty });
-
-    const procurementLabel = String(
-      plan?.procurementMethodLabel ||
-      plan?.mrp?.procurementMethodLabel ||
-      ""
-    ).trim();
-    const machineLabel = String(plan?.machineLabel || plan?.capacity?.machineLineLabel || "").trim();
-    const isPurchased = /no se fabrica en planta/i.test(procurementLabel) || /^compra$/i.test(machineLabel);
-
-    if (isPurchased) {
-      const quick = await prodBuildPurchasedQuickView(itemCode, plan?.itemDesc || "", 5);
-      return safeJson(res, 200, {
-        ...plan,
-        ...quick,
-      });
-    }
 
     const dash = await productionDashboardFromDb({
       from: "2025-01-01",
@@ -13365,31 +13538,30 @@ async function handleProductionSync(req, res) {
       syncErrors.push({ step: "mrp", message: e.message || String(e) });
     }
 
+    let procurementCache = { ok: false, batchId: '', items: 0, docs: 0, vendors: 0, itemErrors: [], vendorErrors: [] };
+    try {
+      procurementCache = await prodRebuildProcurementCache({ from, to, topPerItem: 10 });
+      if (Array.isArray(procurementCache?.itemErrors) && procurementCache.itemErrors.length) {
+        syncErrors.push({ step: "procurement_cache_items", message: `items con error: ${procurementCache.itemErrors.length}`, sample: procurementCache.itemErrors.slice(0, 5) });
+      }
+      if (Array.isArray(procurementCache?.vendorErrors) && procurementCache.vendorErrors.length) {
+        syncErrors.push({ step: "procurement_cache_vendors", message: `proveedores con error: ${procurementCache.vendorErrors.length}`, sample: procurementCache.vendorErrors.slice(0, 5) });
+      }
+    } catch (e) {
+      syncErrors.push({ step: "procurement_cache", message: e.message || String(e) });
+    }
+
     await setState("production_last_sync_at", new Date().toISOString());
     prodClearDashboardCache();
     prodClearSimulationCache();
     prodClearProductionRuntimeCaches();
 
-    let warmAbStarted = false;
-    try {
-      warmAbStarted = prodStartAbItemPlanWarm({
-        toDate: today,
-        avgMonths: 3,
-        horizonMonths: 3,
-        shiftHours: 8,
-        limit: 220,
-        concurrency: 2,
-      });
-    } catch (e) {
-      syncErrors.push({ step: "ab_warm", message: e.message || String(e) });
-    }
-
     return safeJson(res, 200, {
       ok: true,
       from, to, maxDocs,
       salesSaved, demandSaved, groupsSaved, invSaved, invWhSaved, mrpSaved,
+      procurementCache,
       syncErrors,
-      warmAbStarted,
       formulasLoaded: Object.keys(loadProductionLocalData().formulas?.products || {}).length,
       materialsLoaded: Object.keys(loadProductionLocalData().materials?.materials || {}).length,
     });
@@ -13399,19 +13571,6 @@ async function handleProductionSync(req, res) {
 }
 app.get("/api/admin/production/sync", verifyAdmin, handleProductionSync);
 app.post("/api/admin/production/sync", verifyAdmin, handleProductionSync);
-
-app.get("/api/admin/production/subplan-cache-status", verifyAdmin, async (_req, res) => {
-  try {
-    return safeJson(res, 200, {
-      ok: true,
-      memory: PROD_AB_PLAN_WARM_STATE,
-      runtimePlanCacheSize: PROD_PLAN_RUNTIME_CACHE.size,
-      lastSyncAt: await getState("production_last_sync_at"),
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
 
 app.get("/api/admin/production/health", verifyAdmin, async (_req, res) => {
   try {
@@ -14423,6 +14582,615 @@ app.post('/api/admin/production/plans/day-close', verifyAdmin, async (req, res) 
       return plan;
     });
     return safeJson(res, 200, { ok: true, summary, plan: updated });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+
+
+/* =========================================================
+   Compras rápido · módulo nuevo
+========================================================= */
+function purchaseModuleNowIso() {
+  return new Date().toISOString();
+}
+
+function purchaseModuleDateOnly(v) {
+  return String(v || '').slice(0, 10);
+}
+
+function purchaseModuleNormCode(v) {
+  return prodNormalizeItemCodeLoose ? prodNormalizeItemCodeLoose(v) : String(v || '').trim().toUpperCase();
+}
+
+function purchaseModuleAbsMoney(v) {
+  return prodRound(Math.abs(prodNum(v || 0)), 2);
+}
+
+async function purchaseModuleEnsureTables() {
+  if (!hasDb()) return;
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS purchase_module_summary_cache (
+      item_code TEXT PRIMARY KEY,
+      item_code_norm TEXT NOT NULL,
+      item_desc TEXT DEFAULT '',
+      supplier_code TEXT DEFAULT '',
+      supplier_name TEXT DEFAULT '',
+      saldo_cuenta NUMERIC(18,2) DEFAULT 0,
+      deuda_abs NUMERIC(18,2) DEFAULT 0,
+      fecha_ultima_compra DATE,
+      invoice_doc_entry BIGINT,
+      invoice_doc_num BIGINT,
+      invoice_doc_total NUMERIC(18,2) DEFAULT 0,
+      invoice_currency TEXT DEFAULT 'USD',
+      source TEXT DEFAULT 'LIVE',
+      synced_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await dbQuery(`ALTER TABLE purchase_module_summary_cache ADD COLUMN IF NOT EXISTS item_code_norm TEXT DEFAULT ''`);
+  await dbQuery(`ALTER TABLE purchase_module_summary_cache ADD COLUMN IF NOT EXISTS item_desc TEXT DEFAULT ''`);
+  await dbQuery(`ALTER TABLE purchase_module_summary_cache ADD COLUMN IF NOT EXISTS supplier_code TEXT DEFAULT ''`);
+  await dbQuery(`ALTER TABLE purchase_module_summary_cache ADD COLUMN IF NOT EXISTS supplier_name TEXT DEFAULT ''`);
+  await dbQuery(`ALTER TABLE purchase_module_summary_cache ADD COLUMN IF NOT EXISTS saldo_cuenta NUMERIC(18,2) DEFAULT 0`);
+  await dbQuery(`ALTER TABLE purchase_module_summary_cache ADD COLUMN IF NOT EXISTS deuda_abs NUMERIC(18,2) DEFAULT 0`);
+  await dbQuery(`ALTER TABLE purchase_module_summary_cache ADD COLUMN IF NOT EXISTS fecha_ultima_compra DATE`);
+  await dbQuery(`ALTER TABLE purchase_module_summary_cache ADD COLUMN IF NOT EXISTS invoice_doc_entry BIGINT`);
+  await dbQuery(`ALTER TABLE purchase_module_summary_cache ADD COLUMN IF NOT EXISTS invoice_doc_num BIGINT`);
+  await dbQuery(`ALTER TABLE purchase_module_summary_cache ADD COLUMN IF NOT EXISTS invoice_doc_total NUMERIC(18,2) DEFAULT 0`);
+  await dbQuery(`ALTER TABLE purchase_module_summary_cache ADD COLUMN IF NOT EXISTS invoice_currency TEXT DEFAULT 'USD'`);
+  await dbQuery(`ALTER TABLE purchase_module_summary_cache ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'LIVE'`);
+  await dbQuery(`ALTER TABLE purchase_module_summary_cache ADD COLUMN IF NOT EXISTS synced_at TIMESTAMP DEFAULT NOW()`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_purchase_module_summary_norm ON purchase_module_summary_cache(item_code_norm)`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_purchase_module_summary_supplier ON purchase_module_summary_cache(supplier_code)`);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS purchase_module_docs_cache (
+      id BIGSERIAL PRIMARY KEY,
+      item_code TEXT NOT NULL,
+      item_code_norm TEXT NOT NULL,
+      source_doc_type TEXT DEFAULT '',
+      doc_entry BIGINT,
+      doc_num BIGINT,
+      doc_date DATE,
+      due_date DATE,
+      supplier_code TEXT DEFAULT '',
+      supplier_name TEXT DEFAULT '',
+      document_status TEXT DEFAULT '',
+      quantity NUMERIC(18,3) DEFAULT 0,
+      line_total NUMERIC(18,2) DEFAULT 0,
+      doc_total NUMERIC(18,2) DEFAULT 0,
+      open_qty NUMERIC(18,3) DEFAULT 0,
+      currency TEXT DEFAULT 'USD',
+      synced_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  for stmt in [
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS item_code_norm TEXT DEFAULT ''",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS source_doc_type TEXT DEFAULT ''",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS doc_entry BIGINT",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS doc_num BIGINT",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS doc_date DATE",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS due_date DATE",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS supplier_code TEXT DEFAULT ''",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS supplier_name TEXT DEFAULT ''",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS document_status TEXT DEFAULT ''",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS quantity NUMERIC(18,3) DEFAULT 0",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS line_total NUMERIC(18,2) DEFAULT 0",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS doc_total NUMERIC(18,2) DEFAULT 0",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS open_qty NUMERIC(18,3) DEFAULT 0",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'USD'",
+    "ALTER TABLE purchase_module_docs_cache ADD COLUMN IF NOT EXISTS synced_at TIMESTAMP DEFAULT NOW()",
+  ]:
+    await dbQuery(stmt)
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_purchase_module_docs_norm ON purchase_module_docs_cache(item_code_norm, doc_date DESC)`);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS purchase_module_sync_runs (
+      id BIGSERIAL PRIMARY KEY,
+      started_at TIMESTAMP DEFAULT NOW(),
+      ended_at TIMESTAMP,
+      days_back INT DEFAULT 5,
+      items_detected INT DEFAULT 0,
+      items_cached INT DEFAULT 0,
+      status TEXT DEFAULT 'RUNNING',
+      message TEXT DEFAULT ''
+    );
+  `);
+}
+__extraBootTasks.push(purchaseModuleEnsureTables);
+
+async function purchaseModuleGetSummaryCache(itemCode = '') {
+  if (!hasDb()) return null;
+  const raw = String(itemCode || '').trim();
+  const norm = purchaseModuleNormCode(raw);
+  const q = await dbQuery(`
+    SELECT item_code, item_desc, supplier_code, supplier_name, saldo_cuenta, deuda_abs,
+           fecha_ultima_compra, invoice_doc_entry, invoice_doc_num, invoice_doc_total,
+           invoice_currency, source, synced_at
+    FROM purchase_module_summary_cache
+    WHERE item_code = $1 OR item_code_norm = $2
+    ORDER BY synced_at DESC NULLS LAST
+    LIMIT 1
+  `, [raw, norm]);
+  return q.rows?.[0] || null;
+}
+
+async function purchaseModuleGetDocsCache(itemCode = '', top = 10) {
+  if (!hasDb()) return [];
+  const raw = String(itemCode || '').trim();
+  const norm = purchaseModuleNormCode(raw);
+  const q = await dbQuery(`
+    SELECT source_doc_type, doc_entry, doc_num, doc_date, due_date, supplier_code, supplier_name,
+           document_status, quantity, line_total, doc_total, open_qty, currency, synced_at
+    FROM purchase_module_docs_cache
+    WHERE item_code = $1 OR item_code_norm = $2
+    ORDER BY doc_date DESC NULLS LAST, doc_num DESC NULLS LAST
+    LIMIT $3
+  `, [raw, norm, Math.max(1, Math.min(20, Number(top || 10)))]);
+  return q.rows || [];
+}
+
+async function purchaseModuleUpsertSummary(summary = {}) {
+  if (!hasDb() || !summary?.itemCode) return;
+  await dbQuery(`
+    INSERT INTO purchase_module_summary_cache (
+      item_code, item_code_norm, item_desc, supplier_code, supplier_name, saldo_cuenta, deuda_abs,
+      fecha_ultima_compra, invoice_doc_entry, invoice_doc_num, invoice_doc_total,
+      invoice_currency, source, synced_at
+    ) VALUES (
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW()
+    )
+    ON CONFLICT (item_code)
+    DO UPDATE SET
+      item_code_norm = EXCLUDED.item_code_norm,
+      item_desc = EXCLUDED.item_desc,
+      supplier_code = EXCLUDED.supplier_code,
+      supplier_name = EXCLUDED.supplier_name,
+      saldo_cuenta = EXCLUDED.saldo_cuenta,
+      deuda_abs = EXCLUDED.deuda_abs,
+      fecha_ultima_compra = EXCLUDED.fecha_ultima_compra,
+      invoice_doc_entry = EXCLUDED.invoice_doc_entry,
+      invoice_doc_num = EXCLUDED.invoice_doc_num,
+      invoice_doc_total = EXCLUDED.invoice_doc_total,
+      invoice_currency = EXCLUDED.invoice_currency,
+      source = EXCLUDED.source,
+      synced_at = NOW()
+  `, [
+    String(summary.itemCode || '').trim(),
+    purchaseModuleNormCode(summary.itemCode || ''),
+    String(summary.itemDesc || '').trim(),
+    String(summary.supplierCode || '').trim(),
+    String(summary.supplierName || '').trim(),
+    prodRound(prodNum(summary.saldoCuenta || 0), 2),
+    prodRound(prodNum(summary.deudaAbs || 0), 2),
+    purchaseModuleDateOnly(summary.fechaUltimaCompra),
+    Number(summary.invoiceDocEntry || 0) || null,
+    Number(summary.invoiceDocNum || 0) || null,
+    prodRound(prodNum(summary.invoiceDocTotal || 0), 2),
+    String(summary.invoiceCurrency || 'USD'),
+    String(summary.source || 'LIVE'),
+  ]);
+}
+
+async function purchaseModuleReplaceDocs(itemCode = '', docs = []) {
+  if (!hasDb()) return;
+  const raw = String(itemCode || '').trim();
+  const norm = purchaseModuleNormCode(raw);
+  await dbQuery(`DELETE FROM purchase_module_docs_cache WHERE item_code = $1 OR item_code_norm = $2`, [raw, norm]);
+  for (const d of Array.isArray(docs) ? docs : []) {
+    await dbQuery(`
+      INSERT INTO purchase_module_docs_cache (
+        item_code, item_code_norm, source_doc_type, doc_entry, doc_num, doc_date, due_date,
+        supplier_code, supplier_name, document_status, quantity, line_total, doc_total,
+        open_qty, currency, synced_at
+      ) VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW()
+      )
+    `, [
+      raw,
+      norm,
+      String(d.sourceDocType || ''),
+      Number(d.docEntry || 0) || null,
+      Number(d.docNum || 0) || null,
+      purchaseModuleDateOnly(d.docDate),
+      purchaseModuleDateOnly(d.dueDate),
+      String(d.supplierCode || ''),
+      String(d.supplierName || ''),
+      String(d.documentStatus || ''),
+      prodRound(prodNum(d.quantity || 0), 3),
+      prodRound(prodNum(d.lineTotal || 0), 2),
+      prodRound(prodNum(d.docTotal || 0), 2),
+      prodRound(prodNum(d.openQty || 0), 3),
+      String(d.currency || 'USD'),
+    ]);
+  }
+}
+
+function purchaseModuleLineMatches(lineCode = '', lineDesc = '', variants = {}) {
+  return prodLineMatchesProcurementSearch(lineCode, lineDesc, variants);
+}
+
+async function purchaseModuleFetchBusinessPartnerBalance(cardCode = '', fallbackName = '') {
+  const code = String(cardCode || '').trim();
+  if (!code) {
+    return { supplierCode: '', supplierName: String(fallbackName || ''), saldoCuenta: 0, deudaAbs: 0, rawBusinessPartner: null };
+  }
+  const safe = prodSapEscapeLiteral(code);
+  const paths = [
+    `/BusinessPartners?$select=CardCode,CardName,Balance,CurrentAccountBalance,DebitBalance&$filter=CardCode eq '${safe}'&$top=1`,
+    `/BusinessPartners('${encodeURIComponent(code)}')?$select=CardCode,CardName,Balance,CurrentAccountBalance,DebitBalance`,
+  ];
+  let bp = null;
+  for (const path of paths) {
+    try {
+      const raw = await slFetchFreshSession(path);
+      const row = raw?.CardCode ? raw : (prodAsArray(raw)[0] || null);
+      if (row) { bp = row; break; }
+    } catch {}
+  }
+  const balance = prodNum(bp?.CurrentAccountBalance);
+  const fallbackBal = prodNum(bp?.Balance);
+  const debitBal = prodNum(bp?.DebitBalance);
+  const chosen = balance || fallbackBal || debitBal || 0;
+  return {
+    supplierCode: code,
+    supplierName: String(bp?.CardName || fallbackName || ''),
+    saldoCuenta: prodRound(chosen, 2),
+    deudaAbs: purchaseModuleAbsMoney(chosen),
+    rawBusinessPartner: bp,
+  };
+}
+
+function purchaseModuleSortDocs(rows = []) {
+  return [...(Array.isArray(rows) ? rows : [])].sort((a, b) => {
+    const aDate = String(a?.docDate || '');
+    const bDate = String(b?.docDate || '');
+    if (aDate !== bDate) return bDate.localeCompare(aDate);
+    return Number(b?.docNum || 0) - Number(a?.docNum || 0);
+  });
+}
+
+async function purchaseModuleFetchLatestInvoiceLive(itemCode = '', itemDesc = '') {
+  const code = String(itemCode || '').trim();
+  const desc = String(itemDesc || '').trim();
+  if (!code && !desc) return null;
+  const variants = prodBuildItemSearchVariants(code, desc);
+  const anyFilter = prodBuildProcurementItemAnyFilter(code);
+  const paths = [];
+  if (anyFilter) {
+    paths.push(`/PurchaseInvoices?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocTotal,DocCurrency,DocumentStatus,Cancelled&$filter=${anyFilter}&$orderby=DocDate desc&$top=8&$expand=DocumentLines`);
+  }
+  paths.push(`/PurchaseInvoices?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocTotal,DocCurrency,DocumentStatus,Cancelled&$orderby=DocDate desc&$top=20&$expand=DocumentLines`);
+  for (const path of paths) {
+    try {
+      const docs = prodAsArray(await slFetchFreshSession(path));
+      const matches = [];
+      for (const doc of docs) {
+        if (String(doc?.Cancelled || '').toUpperCase() === 'Y') continue;
+        for (const ln of prodAsArray(doc?.DocumentLines)) {
+          const lineCode = String(ln?.ItemCode || '').trim();
+          const lineDesc = String(ln?.ItemDescription || ln?.ItemDetails || '');
+          if (!purchaseModuleLineMatches(lineCode, lineDesc, variants)) continue;
+          matches.push({
+            itemCode: lineCode || code,
+            itemDesc: lineDesc || desc,
+            supplierCode: String(doc?.CardCode || ''),
+            supplierName: String(doc?.CardName || ''),
+            fechaUltimaCompra: purchaseModuleDateOnly(doc?.DocDate),
+            invoiceDocEntry: Number(doc?.DocEntry || 0),
+            invoiceDocNum: Number(doc?.DocNum || 0),
+            invoiceDocTotal: prodRound(prodNum(doc?.DocTotal || 0), 2),
+            invoiceCurrency: String(doc?.DocCurrency || 'USD'),
+            lineQuantity: prodRound(prodNum(ln?.Quantity || 0), 3),
+            lineTotal: prodRound(prodNum(ln?.LineTotal || 0), 2),
+          });
+        }
+      }
+      if (matches.length) {
+        return purchaseModuleSortDocs(matches.map((x) => ({ ...x, docDate: x.fechaUltimaCompra, docNum: x.invoiceDocNum }))) [0];
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function purchaseModuleFetchDocsLive(itemCode = '', itemDesc = '', top = 10) {
+  const code = String(itemCode || '').trim();
+  const desc = String(itemDesc || '').trim();
+  if (!code && !desc) return [];
+  const variants = prodBuildItemSearchVariants(code, desc);
+  const out = [];
+  const seen = new Set();
+
+  const collect = (doc, typeLabel) => {
+    if (!doc) return;
+    if (String(doc?.Cancelled || '').toUpperCase() === 'Y') return;
+    for (const ln of prodAsArray(doc?.DocumentLines)) {
+      const lineCode = String(ln?.ItemCode || '').trim();
+      const lineDesc = String(ln?.ItemDescription || ln?.ItemDetails || '');
+      if (!purchaseModuleLineMatches(lineCode, lineDesc, variants)) continue;
+      const key = `${typeLabel}::${Number(doc?.DocEntry || 0)}::${Number(ln?.LineNum || 0)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        sourceDocType: typeLabel,
+        docEntry: Number(doc?.DocEntry || 0),
+        docNum: Number(doc?.DocNum || 0),
+        docDate: purchaseModuleDateOnly(doc?.DocDate),
+        dueDate: purchaseModuleDateOnly(doc?.DocDueDate || doc?.TaxDate),
+        supplierCode: String(doc?.CardCode || ''),
+        supplierName: String(doc?.CardName || ''),
+        documentStatus: String(doc?.DocumentStatus || doc?.Status || ''),
+        quantity: prodRound(prodNum(ln?.Quantity || 0), 3),
+        lineTotal: prodRound(prodNum(ln?.LineTotal || 0), 2),
+        docTotal: prodRound(prodNum(doc?.DocTotal || 0), 2),
+        openQty: prodRound(prodNum(ln?.OpenQuantity || ln?.OpenQty || 0), 3),
+        currency: String(doc?.DocCurrency || 'USD'),
+      });
+    }
+  };
+
+  const requests = [
+    { entity: 'PurchaseInvoices', label: 'FACTURA_PROVEEDOR' },
+    { entity: 'PurchaseOrders', label: 'ORDEN_COMPRA' },
+  ];
+  for (const req of requests) {
+    const anyFilter = prodBuildProcurementItemAnyFilter(code);
+    const paths = [];
+    if (anyFilter) {
+      paths.push(`/${req.entity}?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocTotal,DocCurrency,DocumentStatus,Cancelled&$filter=${anyFilter}&$orderby=DocDate desc&$top=${Math.max(4, Math.min(12, Number(top || 10)))}&$expand=DocumentLines`);
+    }
+    paths.push(`/${req.entity}?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocTotal,DocCurrency,DocumentStatus,Cancelled&$orderby=DocDate desc&$top=15&$expand=DocumentLines`);
+    for (const path of paths) {
+      try {
+        const docs = prodAsArray(await slFetchFreshSession(path));
+        for (const doc of docs) collect(doc, req.label);
+        if (out.length >= top) break;
+      } catch {}
+    }
+  }
+  return purchaseModuleSortDocs(out).slice(0, Math.max(1, Math.min(20, Number(top || 10))));
+}
+
+async function purchaseModuleBuildItemSnapshot(itemCode = '', itemDesc = '', top = 10) {
+  const latest = await purchaseModuleFetchLatestInvoiceLive(itemCode, itemDesc);
+  const docs = await purchaseModuleFetchDocsLive(itemCode, itemDesc, top);
+  let bp = null;
+  if (latest?.supplierCode) {
+    bp = await purchaseModuleFetchBusinessPartnerBalance(latest.supplierCode, latest.supplierName);
+  }
+  const summary = latest ? {
+    itemCode: String(latest.itemCode || itemCode || '').trim(),
+    itemDesc: String(latest.itemDesc || itemDesc || '').trim(),
+    supplierCode: String(bp?.supplierCode || latest.supplierCode || ''),
+    supplierName: String(bp?.supplierName || latest.supplierName || ''),
+    saldoCuenta: prodRound(prodNum(bp?.saldoCuenta || 0), 2),
+    deudaAbs: prodRound(prodNum(bp?.deudaAbs || 0), 2),
+    fechaUltimaCompra: purchaseModuleDateOnly(latest.fechaUltimaCompra),
+    invoiceDocEntry: Number(latest.invoiceDocEntry || 0),
+    invoiceDocNum: Number(latest.invoiceDocNum || 0),
+    invoiceDocTotal: prodRound(prodNum(latest.invoiceDocTotal || 0), 2),
+    invoiceCurrency: String(latest.invoiceCurrency || 'USD'),
+    source: 'LIVE_SAP',
+  } : {
+    itemCode: String(itemCode || '').trim(),
+    itemDesc: String(itemDesc || '').trim(),
+    supplierCode: '',
+    supplierName: '',
+    saldoCuenta: 0,
+    deudaAbs: 0,
+    fechaUltimaCompra: '',
+    invoiceDocEntry: null,
+    invoiceDocNum: null,
+    invoiceDocTotal: 0,
+    invoiceCurrency: 'USD',
+    source: 'LIVE_SAP_EMPTY',
+  };
+  return { summary, docs };
+}
+
+async function purchaseModuleRefreshItemCache(itemCode = '', itemDesc = '', top = 10) {
+  const snapshot = await purchaseModuleBuildItemSnapshot(itemCode, itemDesc, top);
+  if (hasDb() && snapshot?.summary?.itemCode) {
+    await purchaseModuleUpsertSummary(snapshot.summary);
+    await purchaseModuleReplaceDocs(snapshot.summary.itemCode, snapshot.docs || []);
+  }
+  return snapshot;
+}
+
+async function purchaseModuleCollectRecentItemCodes(daysBack = 5) {
+  const days = Math.max(1, Math.min(30, Number(daysBack || 5)));
+  const from = new Date();
+  from.setUTCDate(from.getUTCDate() - days);
+  const fromIso = from.toISOString().slice(0, 10);
+  const codes = new Set();
+  const entities = ['PurchaseInvoices', 'PurchaseOrders'];
+  for (const entity of entities) {
+    for (let skip = 0; skip < 240; skip += 80) {
+      try {
+        const path = `/${entity}?$select=DocEntry,DocDate,Cancelled&$filter=DocDate ge '${fromIso}'&$orderby=DocDate desc&$top=80&$skip=${skip}&$expand=DocumentLines`;
+        const docs = prodAsArray(await slFetchFreshSession(path));
+        if (!docs.length) break;
+        for (const doc of docs) {
+          if (String(doc?.Cancelled || '').toUpperCase() === 'Y') continue;
+          for (const ln of prodAsArray(doc?.DocumentLines)) {
+            const code = String(ln?.ItemCode || '').trim();
+            if (code) codes.add(code);
+          }
+        }
+        if (docs.length < 80) break;
+      } catch {
+        break;
+      }
+    }
+  }
+  return Array.from(codes);
+}
+
+async function purchaseModuleRunSync(daysBack = 5) {
+  const startedAt = purchaseModuleNowIso();
+  let runId = null;
+  if (hasDb()) {
+    const ins = await dbQuery(`INSERT INTO purchase_module_sync_runs (started_at, days_back, status) VALUES (NOW(), $1, 'RUNNING') RETURNING id`, [Math.max(1, Math.min(30, Number(daysBack || 5)))]);
+    runId = ins.rows?.[0]?.id || null;
+  }
+  try {
+    const itemCodes = await purchaseModuleCollectRecentItemCodes(daysBack);
+    let cached = 0;
+    await prodMapLimit(itemCodes, 4, async (itemCode) => {
+      const snap = await purchaseModuleRefreshItemCache(itemCode, '', 10).catch(() => null);
+      if (snap?.summary?.itemCode) cached += 1;
+      return snap;
+    });
+    if (hasDb() && runId) {
+      await dbQuery(`UPDATE purchase_module_sync_runs SET ended_at = NOW(), items_detected = $2, items_cached = $3, status = 'DONE', message = '' WHERE id = $1`, [runId, itemCodes.length, cached]);
+    }
+    return {
+      ok: true,
+      startedAt,
+      endedAt: purchaseModuleNowIso(),
+      daysBack: Math.max(1, Math.min(30, Number(daysBack || 5))),
+      itemsDetected: itemCodes.length,
+      itemsCached: cached,
+    };
+  } catch (e) {
+    if (hasDb() && runId) {
+      await dbQuery(`UPDATE purchase_module_sync_runs SET ended_at = NOW(), status = 'ERROR', message = $2 WHERE id = $1`, [runId, String(e?.message || e || 'Error')]);
+    }
+    throw e;
+  }
+}
+
+async function purchaseModuleDashboardData() {
+  if (!hasDb()) {
+    return { ok: true, stats: { cachedItems: 0, withBalance: 0, lastSyncAt: '', lastSyncStatus: 'SIN_DB' }, topSuppliers: [], recentItems: [] };
+  }
+  const [countQ, recentQ, suppliersQ, syncQ] = await Promise.all([
+    dbQuery(`SELECT COUNT(*)::INT AS total, COALESCE(SUM(CASE WHEN ABS(COALESCE(saldo_cuenta,0)) > 0.009 THEN 1 ELSE 0 END),0)::INT AS with_balance FROM purchase_module_summary_cache`),
+    dbQuery(`SELECT item_code, item_desc, supplier_code, supplier_name, saldo_cuenta, fecha_ultima_compra, synced_at FROM purchase_module_summary_cache ORDER BY synced_at DESC NULLS LAST LIMIT 8`),
+    dbQuery(`SELECT supplier_code, supplier_name, MAX(saldo_cuenta) AS saldo_max, MAX(deuda_abs) AS deuda_abs FROM purchase_module_summary_cache WHERE supplier_code <> '' GROUP BY supplier_code, supplier_name ORDER BY MAX(deuda_abs) DESC NULLS LAST LIMIT 8`),
+    dbQuery(`SELECT started_at, ended_at, status, items_detected, items_cached, days_back, message FROM purchase_module_sync_runs ORDER BY id DESC LIMIT 1`),
+  ]);
+  const stats = countQ.rows?.[0] || { total: 0, with_balance: 0 };
+  const lastSync = syncQ.rows?.[0] || null;
+  return {
+    ok: true,
+    stats: {
+      cachedItems: Number(stats.total || 0),
+      withBalance: Number(stats.with_balance || 0),
+      lastSyncAt: String(lastSync?.ended_at || lastSync?.started_at || ''),
+      lastSyncStatus: String(lastSync?.status || 'SIN_SYNC'),
+      lastSyncDays: Number(lastSync?.days_back || 0),
+      lastSyncDetected: Number(lastSync?.items_detected || 0),
+      lastSyncCached: Number(lastSync?.items_cached || 0),
+      lastSyncMessage: String(lastSync?.message || ''),
+    },
+    topSuppliers: (suppliersQ.rows || []).map((r) => ({
+      supplierCode: String(r.supplier_code || ''),
+      supplierName: String(r.supplier_name || ''),
+      saldoCuenta: prodRound(prodNum(r.saldo_max || 0), 2),
+      deudaAbs: prodRound(prodNum(r.deuda_abs || 0), 2),
+    })),
+    recentItems: (recentQ.rows || []).map((r) => ({
+      itemCode: String(r.item_code || ''),
+      itemDesc: String(r.item_desc || ''),
+      supplierCode: String(r.supplier_code || ''),
+      supplierName: String(r.supplier_name || ''),
+      saldoCuenta: prodRound(prodNum(r.saldo_cuenta || 0), 2),
+      fechaUltimaCompra: purchaseModuleDateOnly(r.fecha_ultima_compra),
+      syncedAt: String(r.synced_at || ''),
+    })),
+  };
+}
+
+app.get('/compras-module', verifyAdmin, async (_req, res) => {
+  const candidate = path.resolve(process.cwd(), 'compras-dashboard.html');
+  if (!fs.existsSync(candidate)) return res.status(404).type('text/plain').send('No se encontró compras-dashboard.html en el despliegue');
+  return res.sendFile(candidate);
+});
+
+app.get('/api/admin/purchases/dashboard', verifyAdmin, async (_req, res) => {
+  try {
+    return safeJson(res, 200, await purchaseModuleDashboardData());
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/purchases/item', verifyAdmin, async (req, res) => {
+  try {
+    const itemCode = String(req.query?.itemCode || req.query?.code || '').trim();
+    const itemDesc = String(req.query?.itemDesc || req.query?.desc || '').trim();
+    const refresh = ['1','true','yes','si'].includes(String(req.query?.refresh || req.query?.live || '').trim().toLowerCase());
+    const top = Math.max(1, Math.min(20, Number(req.query?.top || 10)));
+    if (!itemCode && !itemDesc) return safeJson(res, 400, { ok: false, message: 'Falta itemCode' });
+
+    if (!refresh && hasDb()) {
+      const summary = await purchaseModuleGetSummaryCache(itemCode);
+      const docs = await purchaseModuleGetDocsCache(itemCode, top);
+      if (summary) {
+        return safeJson(res, 200, {
+          ok: true,
+          fromCache: true,
+          summary: {
+            itemCode: String(summary.item_code || itemCode),
+            itemDesc: String(summary.item_desc || itemDesc || ''),
+            supplierCode: String(summary.supplier_code || ''),
+            supplierName: String(summary.supplier_name || ''),
+            saldoCuenta: prodRound(prodNum(summary.saldo_cuenta || 0), 2),
+            deudaAbs: prodRound(prodNum(summary.deuda_abs || 0), 2),
+            fechaUltimaCompra: purchaseModuleDateOnly(summary.fecha_ultima_compra),
+            invoiceDocEntry: Number(summary.invoice_doc_entry || 0),
+            invoiceDocNum: Number(summary.invoice_doc_num || 0),
+            invoiceDocTotal: prodRound(prodNum(summary.invoice_doc_total || 0), 2),
+            invoiceCurrency: String(summary.invoice_currency || 'USD'),
+            source: String(summary.source || 'CACHE_DB'),
+            syncedAt: String(summary.synced_at || ''),
+          },
+          docs: (docs || []).map((d) => ({
+            sourceDocType: String(d.source_doc_type || ''),
+            docEntry: Number(d.doc_entry || 0),
+            docNum: Number(d.doc_num || 0),
+            docDate: purchaseModuleDateOnly(d.doc_date),
+            dueDate: purchaseModuleDateOnly(d.due_date),
+            supplierCode: String(d.supplier_code || ''),
+            supplierName: String(d.supplier_name || ''),
+            documentStatus: String(d.document_status || ''),
+            quantity: prodRound(prodNum(d.quantity || 0), 3),
+            lineTotal: prodRound(prodNum(d.line_total || 0), 2),
+            docTotal: prodRound(prodNum(d.doc_total || 0), 2),
+            openQty: prodRound(prodNum(d.open_qty || 0), 3),
+            currency: String(d.currency || 'USD'),
+          })),
+        });
+      }
+    }
+
+    const snapshot = await purchaseModuleRefreshItemCache(itemCode, itemDesc, top);
+    return safeJson(res, 200, {
+      ok: true,
+      fromCache: false,
+      summary: { ...(snapshot.summary || {}), syncedAt: purchaseModuleNowIso() },
+      docs: snapshot.docs || [],
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/purchases/sync', verifyAdmin, async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(30, Number(req.query?.days || req.query?.daysBack || 5)));
+    return safeJson(res, 200, await purchaseModuleRunSync(days));
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+app.post('/api/admin/purchases/sync', verifyAdmin, async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(30, Number(req.body?.days || req.body?.daysBack || req.query?.days || 5)));
+    return safeJson(res, 200, await purchaseModuleRunSync(days));
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
