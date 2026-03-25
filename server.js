@@ -11009,6 +11009,22 @@ function prodCompactItemForAi(x) {
 
 
 
+async function productionBuildItemPlanCached(params = {}) {
+  const key = JSON.stringify({
+    itemCode: String(params.itemCode || "").trim(),
+    toDate: String(params.toDate || ""),
+    avgMonths: Number(params.avgMonths || 5),
+    horizonMonths: Number(params.horizonMonths || 3),
+    shiftHours: Number(params.shiftHours || 8),
+    plannedQtyOverride: Number(params.plannedQtyOverride || 0),
+  });
+  const hit = prodRuntimeGet(PROD_PLAN_RUNTIME_CACHE, key, PROD_PLAN_TTL_MS);
+  if (hit) return hit;
+  const plan = await productionBuildItemPlan(params);
+  prodRuntimeSet(PROD_PLAN_RUNTIME_CACHE, key, plan);
+  return plan;
+}
+
 
 function prodPlanRuntimeCacheKey(params = {}) {
   return JSON.stringify({
@@ -11021,15 +11037,6 @@ function prodPlanRuntimeCacheKey(params = {}) {
   });
 }
 
-async function productionBuildItemPlanCached(params = {}) {
-  const key = prodPlanRuntimeCacheKey(params);
-  const hit = prodRuntimeGet(PROD_PLAN_RUNTIME_CACHE, key, PROD_PLAN_TTL_MS);
-  if (hit) return hit;
-  const plan = await productionBuildItemPlan(params);
-  prodRuntimeSet(PROD_PLAN_RUNTIME_CACHE, key, plan);
-  return plan;
-}
-
 let PROD_AB_SUBPLAN_WARM_STATE = {
   running: false,
   startedAt: '',
@@ -11040,20 +11047,8 @@ let PROD_AB_SUBPLAN_WARM_STATE = {
   sample: [],
 };
 
-function prodIsAbLabel(label = '') {
-  return /(^|[^A-Z])AB([^A-Z]|$)|\bAB\b/i.test(String(label || '').toUpperCase());
-}
-
-async function prodWarmAbItemPlanCache(opts = {}) {
+async function prodWarmAbItemPlanCache({ toDate, avgMonths = 3, horizonMonths = 3, shiftHours = 8, limit = 80, concurrency = 2 } = {}) {
   if (PROD_AB_SUBPLAN_WARM_STATE.running) return PROD_AB_SUBPLAN_WARM_STATE;
-  const today = getDateISOInOffset(TZ_OFFSET_MIN);
-  const toDate = String(opts?.toDate || today).slice(0, 10);
-  const avgMonths = Math.max(1, Math.min(12, prodNum(opts?.avgMonths, 3)));
-  const horizonMonths = Math.max(1, Math.min(12, prodNum(opts?.horizonMonths, 3)));
-  const shiftHours = Math.max(1, Math.min(24, prodNum(opts?.shiftHours, 8)));
-  const concurrency = Math.max(1, Math.min(4, prodNum(opts?.concurrency, 2)));
-  const limit = Math.max(1, Math.min(150, prodNum(opts?.limit, 120)));
-
   PROD_AB_SUBPLAN_WARM_STATE = {
     running: true,
     startedAt: new Date().toISOString(),
@@ -11063,48 +11058,46 @@ async function prodWarmAbItemPlanCache(opts = {}) {
     completed: 0,
     sample: [],
   };
-
   try {
     const dash = await productionDashboardFromDb({
       from: '2025-01-01',
-      to: today,
+      to: String(toDate || getDateISOInOffset(TZ_OFFSET_MIN)),
       area: '__ALL__',
       grupo: '__ALL__',
+      abc: 'AB Crítico',
+      typeFilter: 'Se fabrica en planta',
       q: '',
-      avgMonths,
-      horizonMonths,
+      avgMonths: Math.max(1, Number(avgMonths || 3)),
+      horizonMonths: Math.max(1, Number(horizonMonths || 3)),
     });
-
-    const items = (Array.isArray(dash?.items) ? dash.items : [])
-      .filter((x) => prodIsAbLabel(x?.totalLabel || ''))
-      .sort((a, b) =>
-        prodNum(b?.revenue) - prodNum(a?.revenue) ||
-        prodNum(b?.productionNeeded) - prodNum(a?.productionNeeded) ||
-        String(a?.itemCode || '').localeCompare(String(b?.itemCode || ''))
-      )
-      .slice(0, limit);
-
+    const items = (dash.items || []).filter((x) => String(x?.itemCode || '').trim()).slice(0, Math.max(1, Math.min(200, Number(limit || 80))));
     PROD_AB_SUBPLAN_WARM_STATE.planned = items.length;
-    PROD_AB_SUBPLAN_WARM_STATE.sample = items.slice(0, 20).map((x) => String(x?.itemCode || '').trim()).filter(Boolean);
-
-    await prodMapLimit(items, concurrency, async (row) => {
+    PROD_AB_SUBPLAN_WARM_STATE.sample = items.slice(0, 12).map((x) => String(x?.itemCode || ''));
+    await prodMapLimit(items, Math.max(1, Math.min(4, Number(concurrency || 2))), async (row) => {
       const itemCode = String(row?.itemCode || '').trim();
       if (!itemCode) {
         PROD_AB_SUBPLAN_WARM_STATE.completed += 1;
         return null;
       }
       try {
-        const params = {
+        const plan = await productionBuildItemPlan({
           itemCode,
-          toDate,
+          toDate: String(toDate || getDateISOInOffset(TZ_OFFSET_MIN)),
           avgMonths,
           horizonMonths,
           shiftHours,
           plannedQtyOverride: 0,
-        };
-        const plan = await productionBuildItemPlan(params);
+        });
         if (row?.totalLabel) plan.abcHint = String(row.totalLabel || '');
-        prodRuntimeSet(PROD_PLAN_RUNTIME_CACHE, prodPlanRuntimeCacheKey(params), plan);
+        const key = prodPlanRuntimeCacheKey({
+          itemCode,
+          toDate: String(toDate || getDateISOInOffset(TZ_OFFSET_MIN)),
+          avgMonths,
+          horizonMonths,
+          shiftHours,
+          plannedQtyOverride: 0,
+        });
+        prodRuntimeSet(PROD_PLAN_RUNTIME_CACHE, key, plan);
       } catch (e) {
         PROD_AB_SUBPLAN_WARM_STATE.lastError = e?.message || String(e);
       } finally {
@@ -11122,6 +11115,7 @@ async function prodWarmAbItemPlanCache(opts = {}) {
 }
 
 function prodStartAbItemPlanWarm(opts = {}) {
+  if (PROD_AB_SUBPLAN_WARM_STATE.running) return false;
   setImmediate(async () => {
     try {
       await prodWarmAbItemPlanCache(opts);
@@ -11131,6 +11125,7 @@ function prodStartAbItemPlanWarm(opts = {}) {
       PROD_AB_SUBPLAN_WARM_STATE.finishedAt = new Date().toISOString();
     }
   });
+  return true;
 }
 
 
@@ -12706,244 +12701,6 @@ async function prodFetchRecentPurchaseOrdersForItem(itemCode, itemDesc = "", top
   return prodSortProcurementRows(out).slice(0, Math.max(1, Number(top || 5)));
 }
 
-
-async function prodFetchLatestProcurementDocFast(itemCode, itemDesc = "") {
-  const code = String(itemCode || "").trim();
-  const desc = String(itemDesc || "").trim();
-  if (!code && !desc) return null;
-  const variants = prodBuildItemSearchVariants(code, desc);
-
-  const collectFirstMatch = (doc, sourceDocType = "") => {
-    if (!doc) return null;
-    const lines = prodAsArray(doc?.DocumentLines);
-    for (const ln of lines) {
-      const lineCode = String(ln?.ItemCode || "").trim();
-      const lineDesc = String(ln?.ItemDescription || ln?.ItemDetails || "");
-      if (!lineCode && !lineDesc) continue;
-      if (!prodLineMatchesProcurementSearch(lineCode, lineDesc, variants)) continue;
-      return {
-        docEntry: Number(doc?.DocEntry || 0),
-        docNum: Number(doc?.DocNum || 0),
-        docDate: prodDateOnly(doc?.DocDate),
-        dueDate: prodDateOnly(doc?.DocDueDate || doc?.TaxDate),
-        quantity: prodRound(prodNum(ln?.Quantity || 0), 3),
-        lineTotal: prodRound(prodNum(ln?.LineTotal || 0), 2),
-        docTotal: prodRound(prodNum(doc?.DocTotal || 0), 2),
-        currency: String(doc?.DocCurrency || "USD"),
-        supplierCode: String(doc?.CardCode || ""),
-        supplierName: String(doc?.CardName || ""),
-        documentStatus: String(doc?.DocumentStatus || doc?.Status || ""),
-        openQty: prodRound(prodNum(ln?.OpenQuantity || ln?.OpenQty || 0), 3),
-        lineNum: Number(ln?.LineNum || 0),
-        itemCode: lineCode,
-        itemDesc: lineDesc,
-        sourceDocType,
-      };
-    }
-    return null;
-  };
-
-  const fastAnyFilter = prodBuildProcurementItemAnyFilter(code);
-  const fetchFast = async (entity, sourceDocType) => {
-    if (!fastAnyFilter) return null;
-    try {
-      const path = `/${entity}?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,DocumentStatus,DocTotal,DocCurrency&$filter=${fastAnyFilter}&$orderby=DocDate desc&$top=5&$expand=DocumentLines`;
-      const docs = prodAsArray(await slFetchFreshSession(path));
-      const rows = [];
-      for (const doc of docs) {
-        const row = collectFirstMatch(doc, sourceDocType);
-        if (row) rows.push(row);
-      }
-      return prodSortProcurementRows(rows)[0] || null;
-    } catch {
-      return null;
-    }
-  };
-
-  const inv = await fetchFast('PurchaseInvoices', 'FACTURA_PROVEEDOR');
-  if (inv) return inv;
-  return await fetchFast('PurchaseOrders', 'ORDEN_COMPRA');
-}
-
-async function prodBuildPurchasedItemQuickPlan({ itemCode, itemDesc = "", toDate, avgMonths = 3, horizonMonths = 3, shiftHours = 8, plannedQtyOverride = 0, abcHint = "" }) {
-  const code = String(itemCode || "").trim();
-  if (!code) throw new Error("Falta itemCode");
-  const today = getDateISOInOffset(TZ_OFFSET_MIN);
-  const invRows = await dbQuery(
-    `SELECT warehouse, stock, stock_min, stock_max, committed, ordered, available
-       FROM production_inv_wh_cache
-      WHERE item_code = $1`,
-    [code]
-  );
-  const byWh = { "01": 0, "03": 0, "10": 0, "12": 0, "200": 0, "300": 0, "500": 0 };
-  let stockTotal = 0;
-  let stockMin = 0;
-  let stockMax = 0;
-  for (const r of invRows.rows || []) {
-    const wh = String(r.warehouse || "").trim();
-    if (Object.prototype.hasOwnProperty.call(byWh, wh)) byWh[wh] = prodNum(r.stock);
-    stockTotal += prodNum(r.stock);
-    stockMin += prodNum(r.stock_min);
-    stockMax += prodNum(r.stock_max);
-  }
-
-  const itemRows = await dbQuery(
-    `SELECT item_desc, weighted_cost, procurement_method, planning_system, lead_time_days, min_order_qty, multiple_qty
-       FROM production_item_cache
-      WHERE item_code = $1
-      LIMIT 1`,
-    [code]
-  );
-  const itemDb = itemRows.rows?.[0] || {};
-  const mrpRows = await dbQuery(
-    `SELECT procurement_method, lead_time_days, min_order_qty, multiple_qty, planning_system
-       FROM production_mrp_cache
-      WHERE item_code = $1
-      LIMIT 1`,
-    [code]
-  );
-  const mrpDb = mrpRows.rows?.[0] || {};
-  const finalDesc = String(itemDesc || itemDb.item_desc || "").trim();
-
-  let avgQty = 0;
-  let projectedQty = 0;
-  let dashRow = null;
-  try {
-    const dash = await productionDashboardFromDb({
-      from: '2025-01-01',
-      to: today,
-      area: '__ALL__',
-      grupo: '__ALL__',
-      q: code,
-      avgMonths,
-      horizonMonths,
-    });
-    dashRow = (dash.items || []).find((x) => String(x?.itemCode || '') === code) || null;
-    avgQty = prodNum(dashRow?.avgMonthlyQty || 0);
-    projectedQty = prodNum(dashRow?.projectedQty || 0);
-  } catch {}
-
-  const latestDoc = await prodFetchLatestProcurementDocFast(code, finalDesc).catch(() => null);
-  const vendorStatus = latestDoc?.supplierCode
-    ? await prodFetchVendorCreditTerms(latestDoc.supplierCode, latestDoc.supplierName).catch(() => null)
-    : null;
-
-  const balanceDebt = prodRound(Math.abs(prodNum(vendorStatus?.balanceDebt || 0)), 2);
-  const balanceRaw = prodRound(prodNum(vendorStatus?.balanceRaw || 0), 2);
-  const paymentStatus = balanceDebt > 0.009 ? "SE_DEBE" : "PAZ_Y_SALVO";
-  const supplierName = String(latestDoc?.supplierName || vendorStatus?.supplierName || "").trim();
-  const supplierCode = String(latestDoc?.supplierCode || vendorStatus?.supplierCode || "").trim();
-  const paymentTermsName = String(vendorStatus?.paymentTermsName || "").trim();
-  const creditDays = Number(vendorStatus?.creditDays || 0);
-
-  const supplierSummary = supplierCode
-    ? `${supplierCode}${supplierName ? ' · ' + supplierName : ''}`
-    : 'Sin proveedor reciente';
-  const debtText = paymentStatus === "SE_DEBE"
-    ? `Saldo pendiente: ${balanceDebt.toFixed(2)}`
-    : "Paz y salvo";
-  const lastDocLabel = latestDoc
-    ? `${latestDoc.sourceDocType === 'FACTURA_PROVEEDOR' ? 'Última factura' : 'Última compra'} ${latestDoc.docNum || ''}${latestDoc.docDate ? ' · ' + latestDoc.docDate : ''}${latestDoc.documentStatus ? ' · ' + (prodProcurementRowIsOpen(latestDoc) ? 'Abierta' : 'Cerrada') : ''}`
-    : 'Sin documento reciente';
-
-  const weightedCost = prodNum(itemDb.weighted_cost || 0);
-  const practicalRule = `Artículo comprado. ${supplierSummary}. ${debtText}${paymentTermsName ? ' · Condición: ' + paymentTermsName : ''}${creditDays > 0 ? ' · Crédito ' + creditDays + ' día(s)' : ''}.`;
-  const laborRecommendation = `${lastDocLabel}${latestDoc?.currency ? ' · Moneda ' + latestDoc.currency : ''}${latestDoc?.lineTotal ? ' · Monto línea ' + prodRound(latestDoc.lineTotal, 2).toFixed(2) : ''}${latestDoc?.docTotal ? ' · Total doc ' + prodRound(latestDoc.docTotal, 2).toFixed(2) : ''}.`;
-
-  return {
-    itemCode: code,
-    itemDesc: finalDesc || code,
-    grupo: String(dashRow?.grupo || ""),
-    area: String(dashRow?.area || ""),
-    machine: "",
-    machineLabel: "Compra",
-    procurementMethodLabel: "No se fabrica en planta",
-    period: {
-      toDate: String(toDate || today).slice(0, 10),
-      avgMonths: Math.max(1, Number(avgMonths || 3)),
-      horizonMonths: Math.max(1, Number(horizonMonths || 3)),
-    },
-    avgMonthlyQty: prodRound(avgQty, 1),
-    projectedQty: prodRound(projectedQty, 1),
-    inventory: {
-      total: prodRound(stockTotal, 3),
-      byWarehouse: byWh,
-      stockMin: prodRound(stockMin, 3),
-      stockMax: prodRound(stockMax, 3),
-    },
-    production: {
-      manualPlanQty: Math.max(0, prodNum(plannedQtyOverride || 0)),
-      neededQty: 0,
-      adjustedQty: 0,
-      recommendedLotQty: 0,
-      lotBaseQty: 0,
-      practicalRule,
-      maxUnitsToday: 0,
-    },
-    costing: {
-      weightedCost,
-      stockValue: prodRound(stockTotal * weightedCost, 2),
-      projectedDemandCost: prodRound(projectedQty * weightedCost, 2),
-      adjustedProductionCost: 0,
-    },
-    mrp: {
-      procurementMethod: String(mrpDb.procurement_method || itemDb.procurement_method || ""),
-      procurementMethodLabel: "No se fabrica en planta",
-      planningSystem: String(mrpDb.planning_system || itemDb.planning_system || ""),
-      leadTimeDays: prodNum(mrpDb.lead_time_days || itemDb.lead_time_days || 0),
-      minOrderQty: prodNum(mrpDb.min_order_qty || itemDb.min_order_qty || 0),
-      multipleQty: prodNum(mrpDb.multiple_qty || itemDb.multiple_qty || 0),
-    },
-    requirements: {
-      rawMaterials: [{
-        code: supplierCode || code,
-        description: `${supplierSummary}${latestDoc ? ' · ' + lastDocLabel : ''}`,
-        requiredQty: prodRound(latestDoc?.quantity || 0, 3),
-        stockQty: balanceDebt,
-        shortageQty: 0,
-        unit: String(latestDoc?.currency || "USD"),
-        supplier: supplierSummary,
-        status: paymentStatus,
-        componentType: "PURCHASED_ITEM",
-        procurementMethodLabel: "No se fabrica en planta",
-        subPlanQty: 0,
-      }],
-      packaging: [],
-      bottlenecks: [],
-      resources: [],
-      all: [],
-    },
-    recentProductionOrders: [],
-    sapProduction: {
-      source: "Saldo de cuenta proveedor / consulta rápida",
-      bomLinesCount: 0,
-      usingLocalFallback: false,
-    },
-    capacity: {
-      machineLabel: "Compra",
-      unitsPerHour: 0,
-      hoursNeeded: 0,
-      businessDays: 0,
-      singleCapHours: 0,
-      saturdayCapHours: 0,
-      doubleShiftHours: 0,
-      laborRecommendation,
-    },
-    supplierStatus: {
-      supplierCode,
-      supplierName,
-      paymentStatus,
-      amountDue: balanceDebt,
-      balanceRaw,
-      paymentTermsName,
-      creditDays,
-      lastDocument: latestDoc || null,
-    },
-    abcHint: String(abcHint || dashRow?.totalLabel || ""),
-    isPurchasedQuickView: true,
-  };
-}
-
 async function prodFetchVendorCreditTerms(cardCode, fallbackName = "") {
   const code = String(cardCode || "").trim();
   if (!code) return {
@@ -13252,7 +13009,6 @@ app.get("/api/admin/production/component-procurement", verifyAdmin, async (req, 
 
 
 
-
 app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
@@ -13265,67 +13021,31 @@ app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
     const avgMonths = Math.max(1, Math.min(12, prodNum(req.query?.avgMonths, horizonMonths)));
     const shiftHours = Math.max(1, Math.min(24, prodNum(req.query?.shiftHours, 8)));
     const plannedQty = Math.max(0, prodNum(req.query?.plannedQty, 0));
-    const forceRefresh = String(req.query?.forceRefresh || req.query?.force || "0") === "1";
-
-    const mrpRows = await dbQuery(
-      `SELECT procurement_method, item_desc
-         FROM production_mrp_cache
-        WHERE item_code = $1
-        LIMIT 1`,
-      [itemCode]
-    );
-    const itemRows = await dbQuery(
-      `SELECT item_desc, procurement_method
-         FROM production_item_cache
-        WHERE item_code = $1
-        LIMIT 1`,
-      [itemCode]
-    );
-    const mrpRow = mrpRows.rows?.[0] || {};
-    const itemRow = itemRows.rows?.[0] || {};
-    const procurementMethod = String(mrpRow.procurement_method || itemRow.procurement_method || "");
-    const procurementMethodLabel = prodProcurementMethodLabel(procurementMethod);
-
-    let dashRow = null;
-    try {
-      const dash = await productionDashboardFromDb({
-        from: "2025-01-01",
-        to: today,
-        area: "__ALL__",
-        grupo: "__ALL__",
-        q: itemCode,
-        avgMonths,
-        horizonMonths,
-      });
-      dashRow = (dash.items || []).find((x) => String(x.itemCode || "") === itemCode) || null;
-    } catch {}
-
-    if (procurementMethodLabel === "No se fabrica en planta") {
-      const params = { itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty };
-      const key = prodPlanRuntimeCacheKey(params);
-      if (!forceRefresh) {
-        const cached = prodRuntimeGet(PROD_PLAN_RUNTIME_CACHE, key, PROD_PLAN_TTL_MS);
-        if (cached) return safeJson(res, 200, cached);
-      }
-      const quickPlan = await prodBuildPurchasedItemQuickPlan({
-        itemCode,
-        itemDesc: String(itemRow.item_desc || mrpRow.item_desc || dashRow?.itemDesc || ""),
-        toDate,
-        avgMonths,
-        horizonMonths,
-        shiftHours,
-        plannedQtyOverride: plannedQty,
-        abcHint: dashRow?.totalLabel || "",
-      });
-      prodRuntimeSet(PROD_PLAN_RUNTIME_CACHE, key, quickPlan);
-      return safeJson(res, 200, quickPlan);
-    }
+    const forceRefresh = String(req.query?.forceRefresh || req.body?.forceRefresh || "0") === "1";
 
     if (forceRefresh) {
       await prodRefreshInventoryForCodes([itemCode]).catch(() => {});
     }
-    const plan = await productionBuildItemPlanCached({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty });
-    if (dashRow) plan.abcHint = dashRow.totalLabel || "";
+    const plan = forceRefresh
+      ? await productionBuildItemPlan({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty })
+      : await productionBuildItemPlanCached({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty });
+
+    const dash = await productionDashboardFromDb({
+      from: "2025-01-01",
+      to: today,
+      area: "__ALL__",
+      grupo: "__ALL__",
+      q: itemCode,
+      avgMonths,
+      horizonMonths,
+    });
+    const row = (dash.items || []).find((x) => String(x.itemCode || "") === itemCode);
+    if (row) plan.abcHint = row.totalLabel || "";
+
+    if (forceRefresh) {
+      const key = prodPlanRuntimeCacheKey({ itemCode, toDate, avgMonths, horizonMonths, shiftHours, plannedQtyOverride: plannedQty });
+      prodRuntimeSet(PROD_PLAN_RUNTIME_CACHE, key, plan);
+    }
 
     return safeJson(res, 200, plan);
   } catch (e) {
@@ -13333,21 +13053,6 @@ app.get("/api/admin/production/item-plan", verifyAdmin, async (req, res) => {
   }
 });
 
-
-
-
-
-app.get("/api/admin/production/subplan-cache-status", verifyAdmin, async (_req, res) => {
-  try {
-    return safeJson(res, 200, {
-      ok: true,
-      runtimePlanCacheSize: PROD_PLAN_RUNTIME_CACHE.size,
-      abWarm: PROD_AB_SUBPLAN_WARM_STATE,
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
 
 app.post("/api/admin/production/simulate", verifyAdmin, async (req, res) => {
   try {
@@ -13523,37 +13228,49 @@ async function handleProductionSync(req, res) {
       syncErrors.push({ step: "mrp", message: e.message || String(e) });
     }
 
-const syncFinishedAt = new Date().toISOString();
-await setState("production_last_sync_at", syncFinishedAt);
-prodClearDashboardCache();
-prodClearSimulationCache();
-prodClearProductionRuntimeCaches();
+    await setState("production_last_sync_at", new Date().toISOString());
+    prodClearDashboardCache();
+    prodClearSimulationCache();
+    prodClearProductionRuntimeCaches();
 
-prodStartAbItemPlanWarm({
-  toDate: today,
-  avgMonths: 3,
-  horizonMonths: 3,
-  shiftHours: 8,
-  concurrency: 2,
-  limit: 120,
-});
+    prodStartAbItemPlanWarm({
+      toDate: to,
+      avgMonths: 3,
+      horizonMonths: 3,
+      shiftHours: 8,
+      limit: 80,
+      concurrency: 2,
+    });
 
-return safeJson(res, 200, {
-  ok: true,
-  from, to, maxDocs,
-  salesSaved, demandSaved, groupsSaved, invSaved, invWhSaved, mrpSaved,
-  syncErrors,
-  formulasLoaded: Object.keys(loadProductionLocalData().formulas?.products || {}).length,
-  materialsLoaded: Object.keys(loadProductionLocalData().materials?.materials || {}).length,
-  subplanWarmStarted: true,
-  syncFinishedAt,
-});
+    return safeJson(res, 200, {
+      ok: true,
+      from, to, maxDocs,
+      salesSaved, demandSaved, groupsSaved, invSaved, invWhSaved, mrpSaved,
+      syncErrors,
+      formulasLoaded: Object.keys(loadProductionLocalData().formulas?.products || {}).length,
+      materialsLoaded: Object.keys(loadProductionLocalData().materials?.materials || {}).length,
+      abWarmStarted: true,
+    });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
 }
 app.get("/api/admin/production/sync", verifyAdmin, handleProductionSync);
 app.post("/api/admin/production/sync", verifyAdmin, handleProductionSync);
+
+app.get("/api/admin/production/subplan-cache-status", verifyAdmin, async (_req, res) => {
+  try {
+    return safeJson(res, 200, {
+      ok: true,
+      memory: PROD_AB_SUBPLAN_WARM_STATE,
+      runtimePlanCacheSize: PROD_PLAN_RUNTIME_CACHE.size,
+      lastSyncAt: await getState("production_last_sync_at"),
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 
 app.get("/api/admin/production/health", verifyAdmin, async (_req, res) => {
   try {
