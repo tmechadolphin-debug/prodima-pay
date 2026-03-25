@@ -11695,8 +11695,57 @@ function prodIsoDateTimeByProductiveOffset(dateStr, productiveOffset = 0, baseHo
 function prodTimeRangeLabelFromProductiveOffsets(startProd = 0, endProd = 0, baseHour = PROD_PLAN_DAY_START_HOUR) {
   return `${prodClockLabelFromOffset(prodClockOffsetFromProductiveOffset(startProd, 'start'), baseHour)} → ${prodClockLabelFromOffset(prodClockOffsetFromProductiveOffset(endProd, 'end'), baseHour)}`;
 }
+function prodPlanPolicy(capacity = {}) {
+  const raw = capacity?.planPolicy || capacity?.rules || {};
+  return {
+    excludeCategoryD: raw.excludeCategoryD !== false,
+    nonAbPreventOverstock: raw.nonAbPreventOverstock !== false,
+    nonAbRequireHalfShift: raw.nonAbRequireHalfShift !== false,
+    nonAbHalfShiftPct: Math.max(0.25, Math.min(1, prodNum(raw.nonAbHalfShiftPct || 0.5, 0.5))),
+    cMinFillPctOfStockMax: Math.max(0.5, Math.min(1, prodNum(raw.cMinFillPctOfStockMax || 0.8, 0.8))),
+    abMinRunQty: Math.max(0, prodNum(raw.abMinRunQty || 2000, 2000)),
+  };
+}
+function prodIsPlanAb(label) {
+  return String(label || '').trim().toUpperCase().startsWith('AB');
+}
+function prodIsPlanC(label) {
+  return String(label || '').trim().toUpperCase().startsWith('C');
+}
+function prodIsPlanD(label) {
+  return String(label || '').trim().toUpperCase() === 'D';
+}
+function prodBuildPolicyBlockedItem({ row, familyKey = '', familyMeta = {}, laneKey = '', laneMeta = {}, neededQty = 0, possibleQty = 0, directMaterials = [], dispatchDemand = null, reason = '' }) {
+  return {
+    itemCode: row?.itemCode,
+    itemDesc: row?.itemDesc,
+    sizeUom: row?.sizeUom,
+    abc: row?.totalLabel,
+    familyKey,
+    familyLabel: familyMeta?.label || 'Producción',
+    laneKey,
+    laneLabel: laneMeta?.label || '',
+    neededQty: prodRound(neededQty || 0, 2),
+    objectiveQty: prodRound(neededQty || 0, 2),
+    possibleQty: prodRound(possibleQty || 0, 2),
+    pendingQty: prodRound(Math.max(0, prodNum(neededQty) - prodNum(possibleQty)), 2),
+    mainConstraint: String(reason || 'Regla de planificación automática'),
+    currentStockQty: prodRound(row?.stockTotal || 0, 3),
+    materials: directMaterials,
+    dispatchDemand: dispatchDemand ? {
+      qtyPending: prodRound(dispatchDemand.qtyPending || 0, 2),
+      qtyOverdue: prodRound(dispatchDemand.qtyOverdue || 0, 2),
+      maxDaysLate: prodNum(dispatchDemand.maxDaysLate),
+      earliestDueDate: String(dispatchDemand.earliestDueDate || ''),
+      docNums: Array.isArray(dispatchDemand.docNums) ? dispatchDemand.docNums.slice(0, 6) : [],
+      priorityState: String(dispatchDemand.priorityState || ''),
+    } : null,
+  };
+}
+
 async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '__ALL__', abc = '__ALL__', typeFilter = 'Se fabrica en planta', q = '', avgMonths = 0, horizonMonths = 1, shiftHours = 8, startDate = '', fullMaterials = false }) {
   const local = loadProductionLocalData();
+  const planPolicy = prodPlanPolicy(local.capacity || {});
   const planningHorizonMonths = Math.max(1, Number(horizonMonths || 1));
   const planningAvgMonths = Math.max(3, Number(avgMonths || planningHorizonMonths || 3));
   const dash = await productionDashboardFromDb({ from, to, area, grupo, sizeUom, abc, typeFilter, q, avgMonths: planningAvgMonths, horizonMonths: planningHorizonMonths });
@@ -11744,22 +11793,12 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     const dispatchDemand = prodDispatchItemLookup(dispatchInfo?.byItemMap || dispatchInfo?.byItemIndex || dispatchInfo?.byItem, String(row?.itemCode || '').trim()) || null;
     const dispatchGapQty = Math.max(0, prodNum(dispatchDemand?.qtyPending) - Math.max(0, prodNum(row?.stockTotal)));
     const rawFinishedQtyNeeded = Math.max(0, Math.ceil(Math.max(prodNum(row?.productionAdjusted), dispatchGapQty)));
-    const configuredMinRunQty = Math.max(1, Math.floor(prodNum(local.capacity?.minimumRunQty || local.capacity?.minRunQty || 600, 600)));
-    const practicalMinRunQty = Math.max(1, Math.min(configuredMinRunQty, Math.max(1, Math.floor(unitsPerShift))));
-    const minBatchQty = Math.max(
-      prodNum(plan?.production?.lotBaseQty || 0),
-      prodNum(plan?.mrp?.sapLotSize || 0),
-      practicalMinRunQty
-    );
-    const smallTopUpVsMax = Math.max(0, prodNum(row?.stockMax) - prodNum(row?.stockTotal));
-    const smallTopUpCanWait = rawFinishedQtyNeeded > 0
-      && rawFinishedQtyNeeded < practicalMinRunQty
-      && prodNum(row?.stockTotal) >= prodNum(row?.stockMin)
-      && smallTopUpVsMax < practicalMinRunQty;
-    if (smallTopUpCanWait) continue;
-    const finishedQtyNeeded = minBatchQty > 0 && rawFinishedQtyNeeded > 0
-      ? Math.ceil(rawFinishedQtyNeeded / minBatchQty) * minBatchQty
-      : rawFinishedQtyNeeded;
+    const abcLabel = String(row?.totalLabel || '');
+    const isAbCritical = prodIsPlanAb(abcLabel);
+    const isCImportant = prodIsPlanC(abcLabel);
+    const isCategoryD = prodIsPlanD(abcLabel);
+    const machineBatchQty = Math.max(1, Math.floor(prodNum(plan?.capacity?.unitsPerShift || 0) || Math.max(1, unitsPerHour * effectiveDayHours)));
+    const gapToMax = Math.max(0, prodNum(row?.stockMax) - prodNum(row?.stockTotal));
 
     const directMaterials = [
       ...(Array.isArray(plan?.requirements?.rawMaterials) ? plan.requirements.rawMaterials : []),
@@ -11779,6 +11818,70 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
       .sort((a, b) => prodNum(b?.shortageQty) - prodNum(a?.shortageQty) || prodNum(b?.requiredQty) - prodNum(a?.requiredQty))
       .slice(0, 14);
 
+    if (planPolicy.excludeCategoryD && isCategoryD) {
+      blockedItems.push(prodBuildPolicyBlockedItem({
+        row,
+        familyKey,
+        familyMeta,
+        laneKey,
+        laneMeta,
+        neededQty: rawFinishedQtyNeeded,
+        possibleQty: 0,
+        directMaterials,
+        dispatchDemand,
+        reason: 'Regla automática: no fabricar productos categoría D.',
+      }));
+      continue;
+    }
+
+    let planningTargetQty = rawFinishedQtyNeeded;
+    let policyReason = '';
+    if (!isAbCritical) {
+      planningTargetQty = gapToMax > 0 ? Math.min(rawFinishedQtyNeeded, gapToMax) : rawFinishedQtyNeeded;
+      if (planPolicy.nonAbPreventOverstock && !(gapToMax > 0)) {
+        policyReason = 'Regla automática: no sobre stockear; el artículo ya está en o por encima del stock máximo SAP.';
+      } else if (isCImportant && prodNum(row?.stockMax) > 0) {
+        const cThreshold = prodNum(row?.stockMax) * prodNum(planPolicy.cMinFillPctOfStockMax || 0.8);
+        if (gapToMax < cThreshold) {
+          policyReason = `Regla automática: categoría C solo se fabrica si falta al menos ${prodRound((planPolicy.cMinFillPctOfStockMax || 0.8) * 100, 0)}% del stock máximo SAP.`;
+        }
+      }
+      if (!policyReason && planPolicy.nonAbRequireHalfShift && machineBatchQty > 0) {
+        const halfShiftQty = machineBatchQty * prodNum(planPolicy.nonAbHalfShiftPct || 0.5);
+        if (planningTargetQty > 0 && planningTargetQty < halfShiftQty) {
+          policyReason = `Regla automática: no producir menos de ${prodRound((planPolicy.nonAbHalfShiftPct || 0.5) * 100, 0)}% del lote práctico de la máquina.`;
+        }
+      }
+    } else if (planPolicy.abMinRunQty > 0 && rawFinishedQtyNeeded > 0) {
+      planningTargetQty = Math.max(planningTargetQty, prodNum(planPolicy.abMinRunQty));
+    }
+
+    if (policyReason) {
+      blockedItems.push(prodBuildPolicyBlockedItem({
+        row,
+        familyKey,
+        familyMeta,
+        laneKey,
+        laneMeta,
+        neededQty: rawFinishedQtyNeeded,
+        possibleQty: 0,
+        directMaterials,
+        dispatchDemand,
+        reason: policyReason,
+      }));
+      continue;
+    }
+
+    planningTargetQty = Math.max(0, Math.ceil(planningTargetQty));
+    const sapLotSize = Math.max(0, prodNum(plan?.mrp?.sapLotSize || 0));
+    const minBatchQty = isAbCritical
+      ? Math.max(1, prodNum(planPolicy.abMinRunQty || 0), sapLotSize)
+      : Math.max(1, sapLotSize || 1);
+    const finishedQtyNeeded = isAbCritical && sapLotSize > 0 && planningTargetQty > 0
+      ? Math.ceil(planningTargetQty / sapLotSize) * sapLotSize
+      : planningTargetQty;
+    if (!(finishedQtyNeeded > 0)) continue;
+
     candidates.push({
       row,
       plan,
@@ -11791,6 +11894,9 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
       finishedQtyNeeded,
       minBatchQty,
       directMaterials,
+      isAbCritical,
+      gapToMax: prodRound(gapToMax, 2),
+      machineBatchQty: prodRound(machineBatchQty, 2),
       sharedSemiCode: String((Array.isArray(plan?.requirements?.all) ? plan.requirements.all : []).find((x) => String(x?.procurementMethodLabel || '') === 'Se fabrica en planta')?.code || '').trim(),
       dispatchDemand,
       dispatchGapQty: prodRound(dispatchGapQty, 2),
@@ -11798,8 +11904,12 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
   }
 
   candidates.sort((a, b) => {
-    const lane = prodNum(b?.laneMeta?.priority) - prodNum(a?.laneMeta?.priority);
-    if (lane) return lane;
+    const ab = prodAbcPriority(b?.row?.totalLabel) - prodAbcPriority(a?.row?.totalLabel);
+    if (ab) return ab;
+    const stockLow = prodNum(a?.row?.stockTotal) - prodNum(b?.row?.stockTotal);
+    if (stockLow) return stockLow;
+    const gapVsMax = prodNum(b?.gapToMax) - prodNum(a?.gapToMax);
+    if (gapVsMax) return gapVsMax;
     const dispatchPrio = prodNum(b?.dispatchDemand?.priorityScore) - prodNum(a?.dispatchDemand?.priorityScore);
     if (dispatchPrio) return dispatchPrio;
     const dispatchLate = prodNum(b?.dispatchDemand?.maxDaysLate) - prodNum(a?.dispatchDemand?.maxDaysLate);
@@ -11808,8 +11918,8 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     if (dispatchPending) return dispatchPending;
     const urgent = prodUrgentFinishedPriority(b?.row) - prodUrgentFinishedPriority(a?.row);
     if (urgent) return urgent;
-    const ab = prodAbcPriority(b?.row?.totalLabel) - prodAbcPriority(a?.row?.totalLabel);
-    if (ab) return ab;
+    const lane = prodNum(b?.laneMeta?.priority) - prodNum(a?.laneMeta?.priority);
+    if (lane) return lane;
     const fam = prodNum(b?.familyMeta?.priority) - prodNum(a?.familyMeta?.priority);
     if (fam) return fam;
     const deficit = prodNum(b?.row?.productionAdjusted) - prodNum(a?.row?.productionAdjusted);
@@ -11837,7 +11947,7 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
   };
 
   for (const candidate of candidates) {
-    const { row, plan, familyKey, familyMeta, laneKey, laneMeta, unitsPerHour, rawFinishedQtyNeeded, finishedQtyNeeded, minBatchQty, directMaterials, dispatchDemand, dispatchGapQty } = candidate;
+    const { row, plan, familyKey, familyMeta, laneKey, laneMeta, unitsPerHour, rawFinishedQtyNeeded, finishedQtyNeeded, minBatchQty, directMaterials, dispatchDemand, dispatchGapQty, isAbCritical } = candidate;
     if (!(finishedQtyNeeded > 0)) continue;
 
     const laneState = getLaneState(laneKey, laneMeta);
@@ -11860,8 +11970,10 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     let possibleQty = prodNum(possibleInfo?.possibleQty);
     const mainConstraint = String(possibleInfo?.mainConstraint || '');
 
-    if (minBatchQty > 0) {
+    if (isAbCritical && minBatchQty > 0) {
       possibleQty = possibleQty >= minBatchQty ? Math.floor(possibleQty / minBatchQty) * minBatchQty : 0;
+    } else {
+      possibleQty = Math.floor(possibleQty);
     }
     possibleQty = Math.max(0, Math.min(finishedQtyNeeded, Math.floor(possibleQty)));
 
@@ -12077,6 +12189,13 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
       priorityDispatchItems: prodNum(dispatchInfo?.summary?.pendingItems),
       priorityDispatchOverdue: prodNum(dispatchInfo?.summary?.overdueItems),
       priorityDispatchQty: prodRound(dispatchInfo?.summary?.pendingQty || 0, 2),
+      rulesApplied: {
+        excludeCategoryD: !!planPolicy.excludeCategoryD,
+        nonAbPreventOverstock: !!planPolicy.nonAbPreventOverstock,
+        nonAbRequireHalfShift: !!planPolicy.nonAbRequireHalfShift,
+        cMinFillPctOfStockMax: prodRound(planPolicy.cMinFillPctOfStockMax || 0.8, 2),
+        abMinRunQty: prodRound(planPolicy.abMinRunQty || 0, 0),
+      },
     },
   };
 }
@@ -13982,6 +14101,7 @@ async function prodSavedPlanSetCurrent(adminUser, payload) {
   return normalized;
 }
 async function prodSavedPlanGetCurrent(adminUser) {
+  let payload = null;
   if (hasDb()) {
     const q = await dbQuery(`
       select id, admin_user, payload, created_at, updated_at
@@ -13991,14 +14111,37 @@ async function prodSavedPlanGetCurrent(adminUser) {
       limit 1
     `, [adminUser]);
     const row = q.rows?.[0];
-    if (!row) return null;
-    return prodNormalizeSavedPlanPayload(row.payload || {}, { adminUser, persistedAt: row.updated_at, id: row.id });
+    if (row) {
+      payload = prodNormalizeSavedPlanPayload(row.payload || {}, { adminUser, persistedAt: row.updated_at, id: row.id });
+    }
+  } else {
+    const store = prodReadSavedPlanFile();
+    const activeId = String(store.activeByUser?.[adminUser] || '');
+    const row = (store.records || []).find((x) => String(x?.id || '') === activeId && String(x?.adminUser || '') === adminUser) || null;
+    if (row) payload = prodNormalizeSavedPlanPayload(row.payload || {}, { adminUser, persistedAt: row.updatedAt, id: row.id });
   }
-  const store = prodReadSavedPlanFile();
-  const activeId = String(store.activeByUser?.[adminUser] || '');
-  const row = (store.records || []).find((x) => String(x?.id || '') === activeId && String(x?.adminUser || '') === adminUser) || null;
-  if (!row) return null;
-  return prodNormalizeSavedPlanPayload(row.payload || {}, { adminUser, persistedAt: row.updatedAt, id: row.id });
+
+  const history = await prodDayClosureList(adminUser, 180).catch(() => []);
+  if (!payload) {
+    if (!history.length) return null;
+    payload = prodNormalizeSavedPlanPayload({
+      ok: true,
+      dayClosures: history,
+      latestDaySummary: history[0] || null,
+      items: [],
+      blockedItems: [],
+      calendarDays: [],
+      summary: {},
+      filters: {},
+      scenario: {},
+      workRule: null,
+    }, { adminUser, persistedAt: new Date().toISOString(), id: prodSavedPlanId() });
+    return payload;
+  }
+
+  payload.dayClosures = prodMergeDayClosures(payload.dayClosures, history);
+  if (!payload.latestDaySummary && payload.dayClosures.length) payload.latestDaySummary = payload.dayClosures[0];
+  return payload;
 }
 async function prodSavedPlanUpdateById(adminUser, planId, updater) {
   const current = await prodSavedPlanGetCurrent(adminUser);
@@ -14136,15 +14279,31 @@ app.post('/api/admin/production/plans/day-close', verifyAdmin, async (req, res) 
     if (!payload) return safeJson(res, 404, { ok: false, message: 'No hay plan guardado' });
     if (planId && String(payload.planRecordId || '') !== planId) return safeJson(res, 409, { ok: false, message: 'El plan cambió; vuelve a cargar el plan actual' });
     const summary = await prodBuildPlanDayCloseSummary(payload, date, { forceFresh: true });
+    await prodDayClosureUpsert(adminUser, payload.planRecordId, summary).catch(() => {});
+    const history = await prodDayClosureList(adminUser, 180).catch(() => [summary]);
     const updated = await prodSavedPlanUpdateById(adminUser, payload.planRecordId, (plan) => {
-      const list = Array.isArray(plan?.dayClosures) ? plan.dayClosures.filter((x) => String(x?.date || '') !== date) : [];
-      list.unshift(summary);
-      plan.dayClosures = list.slice(0, 30);
+      plan.dayClosures = prodMergeDayClosures([summary], plan?.dayClosures, history);
       plan.lastSapSyncAt = new Date().toISOString();
       plan.latestDaySummary = summary;
       return plan;
     });
-    return safeJson(res, 200, { ok: true, summary, plan: updated });
+    return safeJson(res, 200, { ok: true, summary, plan: updated || payload });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/production/plans/day-close', verifyAdmin, async (req, res) => {
+  try {
+    const adminUser = prodSavedPlanUser(req);
+    const date = String(req.query?.date || '').slice(0, 10);
+    if (date) {
+      const hit = await prodDayClosureGet(adminUser, date);
+      if (!hit) return safeJson(res, 404, { ok: false, message: 'No existe cierre guardado para esa fecha' });
+      return safeJson(res, 200, { ok: true, summary: hit });
+    }
+    const items = await prodDayClosureList(adminUser, 180);
+    return safeJson(res, 200, { ok: true, items });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
