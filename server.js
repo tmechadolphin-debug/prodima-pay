@@ -11703,6 +11703,7 @@ function prodPlanPolicy(capacity = {}) {
     nonAbRequireHalfShift: raw.nonAbRequireHalfShift !== false,
     nonAbHalfShiftPct: Math.max(0.25, Math.min(1, prodNum(raw.nonAbHalfShiftPct || 0.5, 0.5))),
     cMinFillPctOfStockMax: Math.max(0.5, Math.min(1, prodNum(raw.cMinFillPctOfStockMax || 0.8, 0.8))),
+    cMinRunQty: Math.max(0, prodNum(raw.cMinRunQty || raw.nonAbMinRunQty || 2000, 2000)),
     abMinRunQty: Math.max(0, prodNum(raw.abMinRunQty || 2000, 2000)),
     abMaxDailyOvertimeFactor: Math.max(1, Math.min(2, prodNum(raw.abMaxDailyOvertimeFactor || 1.5, 1.5))),
   };
@@ -11923,6 +11924,12 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
           policyReason = `Regla automática: categoría C solo se fabrica si falta al menos ${prodRound((planPolicy.cMinFillPctOfStockMax || 0.8) * 100, 0)}% del stock máximo SAP.`;
         } else if (cTargetQty > 0) {
           planningTargetQty = Math.max(planningTargetQty, cTargetQty);
+        }
+      }
+      if (!policyReason && isCImportant && prodNum(planPolicy.cMinRunQty || 0) > 0) {
+        const cMinRunQty = prodNum(planPolicy.cMinRunQty || 0);
+        if (planningTargetQty > 0 && planningTargetQty < cMinRunQty) {
+          policyReason = `Regla automática: categoría C no se fabrica por debajo de ${prodRound(cMinRunQty, 0)} unidades.`;
         }
       }
       if (!policyReason && planPolicy.nonAbRequireHalfShift && machineBatchQty > 0) {
@@ -12259,6 +12266,7 @@ totalScheduledHours += effectiveDayHours;
         nonAbPreventOverstock: !!planPolicy.nonAbPreventOverstock,
         nonAbRequireHalfShift: !!planPolicy.nonAbRequireHalfShift,
         cMinFillPctOfStockMax: prodRound(planPolicy.cMinFillPctOfStockMax || 0.8, 2),
+        cMinRunQty: prodRound(planPolicy.cMinRunQty || 0, 0),
         abMinRunQty: prodRound(planPolicy.abMinRunQty || 0, 0),
         abMaxDailyOvertimeFactor: prodRound(planPolicy.abMaxDailyOvertimeFactor || 1.5, 2),
       },
@@ -14184,6 +14192,26 @@ function prodNormalizeDayClosureSummary(summary = {}, meta = {}) {
   out.neededQtyContext = prodRound(out.neededQtyContext || 0, 2);
   out.possibleQtyContext = prodRound(out.possibleQtyContext || 0, 2);
   return out;
+}
+function prodMergeDayClosures(...lists) {
+  const byDate = new Map();
+  for (const list of lists) {
+    for (const raw of (Array.isArray(list) ? list : [])) {
+      const item = prodNormalizeDayClosureSummary(raw || {}, {
+        adminUser: raw?.adminUser,
+        planId: raw?.planId,
+        date: raw?.date,
+        persistedAt: raw?.persistedAt || raw?.updatedAt || raw?.closedAt || raw?.createdAt,
+      });
+      const date = String(item?.date || '').slice(0,10);
+      if (!date) continue;
+      const prev = byDate.get(date);
+      const prevTs = String(prev?.persistedAt || prev?.closedAt || prev?.updatedAt || prev?.createdAt || '');
+      const nextTs = String(item?.persistedAt || item?.closedAt || item?.updatedAt || item?.createdAt || '');
+      if (!prev || nextTs >= prevTs) byDate.set(date, { ...(prev || {}), ...(item || {}), date });
+    }
+  }
+  return Array.from(byDate.values()).sort((a, b) => String(b?.date || '').localeCompare(String(a?.date || '')));
 }
 async function prodDayClosureUpsert(adminUser, planId, summary) {
   const normalized = prodNormalizeDayClosureSummary(summary, { adminUser, planId, date: summary?.date, persistedAt: new Date().toISOString() });
