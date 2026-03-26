@@ -8399,6 +8399,8 @@ async function ensureProductionDb() {
   await dbQuery(`ALTER TABLE production_orders_cache ADD COLUMN IF NOT EXISTS unit_cost NUMERIC(18,6) NOT NULL DEFAULT 0;`);
   await dbQuery(`ALTER TABLE production_orders_cache ADD COLUMN IF NOT EXISTS total_cost NUMERIC(18,6) NOT NULL DEFAULT 0;`);
   await dbQuery(`ALTER TABLE production_orders_cache ADD COLUMN IF NOT EXISTS cost_source TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_orders_cache ADD COLUMN IF NOT EXISTS receipt_date DATE;`);
+  await dbQuery(`ALTER TABLE production_orders_cache ADD COLUMN IF NOT EXISTS receipt_qty NUMERIC(18,4) NOT NULL DEFAULT 0;`);
 
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_item_cache_updated ON production_item_cache(updated_at);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_orders_item_date ON production_orders_cache(item_code, post_date DESC);`);
@@ -8893,12 +8895,111 @@ function prodNormalizeProductionOrderRow(r) {
     completedQty: prodRound(r?.CompletedQuantity ?? r?.CmpltQty ?? r?.CompletedQty ?? 0, 3),
     rejectedQty: prodRound(r?.RejectedQuantity ?? r?.RejectedQty ?? 0, 3),
     postDate,
+    receiptDate: prodToIsoDate(r?.ReceiptDate ?? r?.receiptDate ?? r?.LastReceiptDate ?? "") || "",
+    receiptQty: prodRound(r?.ReceiptQuantity ?? r?.receiptQty ?? 0, 3),
     status: String(r?.ProductionOrderStatus ?? r?.Status ?? "").trim(),
     warehouse: String(r?.Warehouse ?? r?.WarehouseCode ?? r?.WhsCode ?? "").trim(),
     origin: String(r?.ProductionOrderOrigin ?? r?.Origin ?? "").trim(),
     unitCost: costInfo.unitCost,
     totalCost: costInfo.totalCost,
     costSource: costInfo.costSource,
+  };
+}
+
+function prodIsClosedProductionStatus(status) {
+  const s = String(status || "").trim().toUpperCase();
+  return s === 'L' || s === 'C' || s === 'CLOSED' || s === 'BOPOSCLOSED' || s === 'BOPS_CLOSED';
+}
+
+function prodNormalizeDocumentLines(doc) {
+  if (Array.isArray(doc?.DocumentLines)) return doc.DocumentLines;
+  if (Array.isArray(doc?.DocumentLines?.value)) return doc.DocumentLines.value;
+  if (Array.isArray(doc?.Lines)) return doc.Lines;
+  if (Array.isArray(doc?.lines)) return doc.lines;
+  return [];
+}
+
+function prodInventoryLineMatchesOrder(line, absoluteEntry, itemCode, forReceipt = false) {
+  const baseEntry = Number(line?.BaseEntry ?? line?.BaseAbs ?? line?.BaseRefEntry ?? 0) || 0;
+  const baseTypeRaw = line?.BaseType ?? line?.BaseObjectType ?? line?.BaseObjType ?? '';
+  const baseType = String(baseTypeRaw).trim();
+  const baseTypeOk = !baseType || baseType === '202' || baseType === '0xCA' || Number(baseTypeRaw) === 202;
+  if (absoluteEntry && baseEntry !== absoluteEntry) return false;
+  if (!baseTypeOk) return false;
+  if (forReceipt && itemCode) {
+    const lineCode = String(line?.ItemCode ?? line?.ItemNo ?? '').trim();
+    if (lineCode && lineCode !== String(itemCode || '').trim()) return false;
+  }
+  return true;
+}
+
+function prodExtractInventoryLineQty(line) {
+  return prodNum(line?.Quantity ?? line?.Qty ?? line?.BaseQuantity ?? 0);
+}
+
+function prodExtractInventoryLineAmount(line) {
+  const qty = prodExtractInventoryLineQty(line);
+  const direct = prodNum(line?.LineTotal ?? line?.RowTotal ?? line?.Total ?? line?.TotalLC ?? line?.OpenSum ?? 0);
+  if (direct > 0) return direct;
+  const stockPrice = prodNum(line?.StockPrice ?? line?.AvgPrice ?? line?.Price ?? line?.GrossBuyPrice ?? line?.UnitPrice ?? 0);
+  if (stockPrice > 0 && qty > 0) return stockPrice * qty;
+  return 0;
+}
+
+async function prodFetchInventoryDocsByBase(entitySet, absoluteEntry, itemCode, { forReceipt = false, top = 20 } = {}) {
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs || missingSapEnv()) return [];
+  const lineSelect = 'BaseEntry,BaseType,ItemCode,Quantity,LineTotal,RowTotal,StockPrice,Price,GrossBuyPrice';
+  const docSelect = 'DocEntry,DocNum,DocDate';
+  const paths = [
+    `/${entitySet}?$select=${docSelect}&$expand=DocumentLines($select=${lineSelect})&$filter=DocumentLines/any(d:d/BaseEntry eq ${abs} and d/BaseType eq 202)&$orderby=DocDate desc&$top=${Math.max(5, Number(top || 20))}`,
+    `/${entitySet}?$select=${docSelect}&$expand=DocumentLines($select=${lineSelect})&$filter=DocumentLines/any(d:d/BaseEntry eq ${abs})&$orderby=DocDate desc&$top=${Math.max(5, Number(top || 20))}`,
+    `/${entitySet}?$select=${docSelect}&$expand=DocumentLines($select=${lineSelect})&$orderby=DocDate desc&$top=${Math.max(40, Number(top || 20) * 4)}`,
+  ];
+  for (const path of paths) {
+    try {
+      const res = await slFetch(path, { timeoutMs: 120000 });
+      const docs = prodNormalizeSlCollection(res);
+      const hits = [];
+      for (const doc of docs || []) {
+        const lines = prodNormalizeDocumentLines(doc).filter((line) => prodInventoryLineMatchesOrder(line, abs, itemCode, forReceipt));
+        if (lines.length) hits.push({ ...doc, __matchedLines: lines });
+      }
+      if (hits.length) return hits;
+    } catch {}
+  }
+  return [];
+}
+
+async function prodFetchProductionOrderActualsFromSap(order) {
+  const abs = Number(order?.absoluteEntry || order?.docEntry || 0) || 0;
+  const itemCode = String(order?.itemCode || '').trim();
+  if (!abs || missingSapEnv()) return null;
+  const [receipts, issues] = await Promise.all([
+    prodFetchInventoryDocsByBase('InventoryGenEntries', abs, itemCode, { forReceipt: true, top: 20 }).catch(() => []),
+    prodFetchInventoryDocsByBase('InventoryGenExits', abs, itemCode, { forReceipt: false, top: 20 }).catch(() => []),
+  ]);
+  let receiptQty = 0;
+  let receiptDate = '';
+  for (const doc of receipts || []) {
+    const docDate = prodToIsoDate(doc?.DocDate || doc?.TaxDate || doc?.DocDueDate || '');
+    if (docDate && (!receiptDate || docDate > receiptDate)) receiptDate = docDate;
+    for (const line of doc.__matchedLines || []) receiptQty += prodExtractInventoryLineQty(line);
+  }
+  let totalCost = 0;
+  for (const doc of issues || []) {
+    for (const line of doc.__matchedLines || []) totalCost += prodExtractInventoryLineAmount(line);
+  }
+  receiptQty = prodRound(receiptQty || 0, 3);
+  totalCost = prodRound(totalCost || 0, 6);
+  const unitCost = receiptQty > 0 && totalCost > 0 ? prodRound(totalCost / receiptQty, 6) : 0;
+  if (!(receiptQty > 0) && !(totalCost > 0) && !receiptDate) return null;
+  return {
+    receiptDate,
+    receiptQty,
+    totalCost,
+    unitCost,
+    costSource: totalCost > 0 ? 'SAP issue/receipt actual' : '',
   };
 }
 
@@ -8935,8 +9036,8 @@ async function prodEnrichProductionOrdersCostsFromSap(orders, maxLookups = 40) {
   const out = [];
   for (const order of src) {
     const current = { ...(order || {}) };
-    const hasCost = prodNum(current.unitCost) > 0 || prodNum(current.totalCost) > 0;
-    if (!hasCost && lookups < Math.max(1, Number(maxLookups || 40))) {
+    const needsDetail = !(prodNum(current.unitCost) > 0 || prodNum(current.totalCost) > 0);
+    if (needsDetail && lookups < Math.max(1, Number(maxLookups || 40))) {
       lookups += 1;
       const detail = await prodFetchProductionOrderDetailFromSap(current).catch(() => null);
       if (detail) {
@@ -8947,6 +9048,20 @@ async function prodEnrichProductionOrdersCostsFromSap(orders, maxLookups = 40) {
         current.costSource = normalized.costSource || current.costSource || '';
         if (!current.prodName && normalized.prodName) current.prodName = normalized.prodName;
         if (!current.postDate && normalized.postDate) current.postDate = normalized.postDate;
+        if (!current.receiptDate && normalized.receiptDate) current.receiptDate = normalized.receiptDate;
+        if (!(prodNum(current.receiptQty) > 0) && prodNum(normalized.receiptQty) > 0) current.receiptQty = normalized.receiptQty;
+      }
+    }
+    const needsActuals = prodIsClosedProductionStatus(current.status) && (!(prodNum(current.totalCost) > 0) || !(prodNum(current.receiptQty) > 0) || !prodIsIsoDate(current.receiptDate));
+    if (needsActuals && lookups < Math.max(1, Number(maxLookups || 40))) {
+      lookups += 1;
+      const actuals = await prodFetchProductionOrderActualsFromSap(current).catch(() => null);
+      if (actuals) {
+        if (prodIsIsoDate(actuals.receiptDate)) current.receiptDate = actuals.receiptDate;
+        if (prodNum(actuals.receiptQty) > 0) current.receiptQty = prodNum(actuals.receiptQty);
+        if (prodNum(actuals.totalCost) > 0) current.totalCost = prodNum(actuals.totalCost);
+        if (prodNum(actuals.unitCost) > 0) current.unitCost = prodNum(actuals.unitCost);
+        if (actuals.costSource) current.costSource = actuals.costSource;
       }
     }
     out.push(current);
@@ -8998,15 +9113,15 @@ function prodOrdersToResponse(orders) {
   const monthlyCostAgg = new Map();
   const monthlyAvgCost = new Map();
   for (const o of orders || []) {
-    const ym = prodYm(o.postDate || new Date());
-    const completedQty = prodNum(o.completedQty);
+    const ym = prodYm(o.receiptDate || o.postDate || new Date());
+    const producedQty = prodNum(o.receiptQty) > 0 ? prodNum(o.receiptQty) : prodNum(o.completedQty);
     const prev = monthly.get(ym) || 0;
-    monthly.set(ym, prodRound(prev + completedQty, 3));
+    monthly.set(ym, prodRound(prev + producedQty, 3));
 
-    const qtyForCost = completedQty > 0 ? completedQty : 0;
+    const qtyForCost = producedQty > 0 ? producedQty : 0;
     const unitCost = prodNum(o.unitCost);
     const totalCost = prodNum(o.totalCost);
-    if (qtyForCost > 0 && (unitCost > 0 || totalCost > 0)) {
+    if (prodIsClosedProductionStatus(o.status) && qtyForCost > 0 && (unitCost > 0 || totalCost > 0)) {
       const agg = monthlyCostAgg.get(ym) || { totalCost: 0, qty: 0 };
       agg.totalCost += totalCost > 0 ? totalCost : unitCost * qtyForCost;
       agg.qty += qtyForCost;
@@ -9025,7 +9140,7 @@ async function prodReadOrdersCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS, top = 
   if (!updatedAt || !prodCacheFresh(updatedAt, ttlMs)) return null;
   const r = await dbQuery(
     `SELECT item_code, doc_num, absolute_entry, prod_name, planned_qty, completed_qty, rejected_qty,
-            post_date, status, warehouse, origin, unit_cost, total_cost, cost_source
+            post_date, receipt_date, receipt_qty, status, warehouse, origin, unit_cost, total_cost, cost_source
        FROM production_orders_cache
       WHERE item_code = $1
       ORDER BY post_date DESC NULLS LAST, doc_num DESC
@@ -9041,6 +9156,8 @@ async function prodReadOrdersCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS, top = 
     completedQty: prodRound(x.completed_qty || 0, 3),
     rejectedQty: prodRound(x.rejected_qty || 0, 3),
     postDate: prodToIsoDate(x.post_date),
+    receiptDate: prodToIsoDate(x.receipt_date),
+    receiptQty: prodRound(x.receipt_qty || 0, 3),
     status: String(x.status || ""),
     warehouse: String(x.warehouse || ""),
     origin: String(x.origin || ""),
@@ -9058,8 +9175,8 @@ async function prodUpsertOrdersCacheDb(itemCode, orders) {
     await dbQuery(
       `INSERT INTO production_orders_cache(
          item_code, doc_num, absolute_entry, prod_name, planned_qty, completed_qty, rejected_qty,
-         post_date, status, warehouse, origin, unit_cost, total_cost, cost_source, updated_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
+         post_date, receipt_date, receipt_qty, status, warehouse, origin, unit_cost, total_cost, cost_source, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
        ON CONFLICT (item_code, doc_num) DO UPDATE SET
          absolute_entry = EXCLUDED.absolute_entry,
          prod_name = EXCLUDED.prod_name,
@@ -9067,6 +9184,8 @@ async function prodUpsertOrdersCacheDb(itemCode, orders) {
          completed_qty = EXCLUDED.completed_qty,
          rejected_qty = EXCLUDED.rejected_qty,
          post_date = EXCLUDED.post_date,
+         receipt_date = EXCLUDED.receipt_date,
+         receipt_qty = EXCLUDED.receipt_qty,
          status = EXCLUDED.status,
          warehouse = EXCLUDED.warehouse,
          origin = EXCLUDED.origin,
@@ -9083,6 +9202,8 @@ async function prodUpsertOrdersCacheDb(itemCode, orders) {
         prodNum(o.completedQty),
         prodNum(o.rejectedQty),
         prodToIsoDate(o.postDate) || null,
+        prodToIsoDate(o.receiptDate) || null,
+        prodNum(o.receiptQty),
         String(o.status || ""),
         String(o.warehouse || ""),
         String(o.origin || ""),
