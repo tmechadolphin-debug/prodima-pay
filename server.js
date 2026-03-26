@@ -14247,6 +14247,28 @@ async function prodDayClosureGet(adminUser, date) {
   const row = (prodReadDayClosureFile().records || []).find((x) => String(x?.adminUser || '') === String(adminUser || '') && String(x?.date || '').slice(0,10) === day);
   return row ? prodNormalizeDayClosureSummary(row.summary || {}, { adminUser, date: day, persistedAt: row.updatedAt }) : null;
 }
+async function prodDayClosureDelete(adminUser, date) {
+  const day = String(date || '').slice(0,10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error('Fecha inválida para abrir el día');
+  if (hasDb()) {
+    const q = await dbQuery(`
+      delete from admin_production_day_closures_v1
+      where admin_user=$1 and closure_date=$2
+      returning summary, updated_at
+    `, [adminUser, day]);
+    const row = q.rows?.[0];
+    return row ? prodNormalizeDayClosureSummary(row.summary || {}, { adminUser, date: day, persistedAt: row.updated_at }) : null;
+  }
+  const store = prodReadDayClosureFile();
+  let removed = null;
+  store.records = (store.records || []).filter((x) => {
+    const hit = String(x?.adminUser || '') === String(adminUser || '') && String(x?.date || '').slice(0,10) === day;
+    if (hit && !removed) removed = x;
+    return !hit;
+  });
+  prodWriteDayClosureFile(store);
+  return removed ? prodNormalizeDayClosureSummary(removed.summary || {}, { adminUser, date: day, persistedAt: removed.updatedAt }) : null;
+}
 async function prodDayClosureList(adminUser, limit = 180) {
   const max = Math.max(1, Math.min(365, Number(limit || 180)));
   if (hasDb()) {
@@ -14512,6 +14534,31 @@ app.get('/api/admin/production/plans/day-close', verifyAdmin, async (req, res) =
   }
 });
 
+app.post('/api/admin/production/plans/day-open', verifyAdmin, async (req, res) => {
+  try {
+    const adminUser = prodSavedPlanUser(req);
+    const planId = String(req.body?.planId || '').trim();
+    const date = String(req.body?.date || req.query?.date || '').slice(0,10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return safeJson(res, 400, { ok: false, message: 'Fecha inválida' });
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    if (date !== today) return safeJson(res, 400, { ok: false, message: 'Solo se puede abrir nuevamente el día de hoy' });
+    const payload = await prodSavedPlanGetCurrent(adminUser);
+    if (!payload) return safeJson(res, 404, { ok: false, message: 'No hay plan guardado' });
+    if (planId && String(payload.planRecordId || '') !== planId) return safeJson(res, 409, { ok: false, message: 'El plan cambió; vuelve a cargar el plan actual' });
+    await prodDayClosureDelete(adminUser, date).catch(() => null);
+    const history = await prodDayClosureList(adminUser, 180).catch(() => []);
+    const updated = await prodSavedPlanUpdateById(adminUser, payload.planRecordId, (plan) => {
+      const nextClosures = prodMergeDayClosures((Array.isArray(plan?.dayClosures) ? plan.dayClosures : []).filter((x) => String(x?.date || '').slice(0,10) !== date), history);
+      plan.dayClosures = nextClosures;
+      plan.latestDaySummary = nextClosures[0] || null;
+      plan.lastSapSyncAt = new Date().toISOString();
+      return plan;
+    });
+    return safeJson(res, 200, { ok: true, reopened: true, date, plan: updated || payload });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
 
 
 /* =========================================================
