@@ -8418,6 +8418,7 @@ async function ensureProductionDb() {
       produced_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
       weighted_cost NUMERIC(18,6) NOT NULL DEFAULT 0,
       avg_production_cost NUMERIC(18,6),
+      total_cost_month NUMERIC(18,2),
       abc_label TEXT NOT NULL DEFAULT '',
       source TEXT NOT NULL DEFAULT 'sql_manual',
       updated_at TIMESTAMP DEFAULT NOW(),
@@ -8428,6 +8429,7 @@ async function ensureProductionDb() {
   await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS produced_qty NUMERIC(18,4) NOT NULL DEFAULT 0;`);
   await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS weighted_cost NUMERIC(18,6) NOT NULL DEFAULT 0;`);
   await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS avg_production_cost NUMERIC(18,6);`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS total_cost_month NUMERIC(18,2);`);
   await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS abc_label TEXT NOT NULL DEFAULT '';`);
   await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'sql_manual';`);
   await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();`);
@@ -9269,7 +9271,7 @@ async function prodReadMonthlySummaryDb(itemCode, fromDate, toDate) {
   }
   try {
     const r = await dbQuery(
-      `SELECT ym, sales_qty, produced_qty, weighted_cost, avg_production_cost, source
+      `SELECT ym, sales_qty, produced_qty, weighted_cost, avg_production_cost, total_cost_month, source
          FROM production_item_monthly_summary
         WHERE item_code = $1
           AND ym >= $2
@@ -9279,11 +9281,12 @@ async function prodReadMonthlySummaryDb(itemCode, fromDate, toDate) {
     );
     const rows = Array.isArray(r.rows) ? r.rows : [];
     if (!rows.length) {
-      return { found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), weightedCost: 0, source: '' };
+      return { found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), totalCostMonth: new Map(), weightedCost: 0, source: '' };
     }
     const sales = new Map();
     const produced = new Map();
     const avgCost = new Map();
+    const totalCostMonth = new Map();
     let weightedCost = 0;
     let source = '';
     for (const row of rows) {
@@ -9292,19 +9295,21 @@ async function prodReadMonthlySummaryDb(itemCode, fromDate, toDate) {
       sales.set(ym, prodNum(row.sales_qty));
       produced.set(ym, prodNum(row.produced_qty));
       avgCost.set(ym, prodNum(row.avg_production_cost));
+      totalCostMonth.set(ym, prodNum(row.total_cost_month));
       if (!(weightedCost > 0) && prodNum(row.weighted_cost) > 0) weightedCost = prodNum(row.weighted_cost);
       if (!source && String(row.source || '').trim()) source = String(row.source || '').trim();
     }
     return {
-      found: sales.size > 0 || produced.size > 0 || avgCost.size > 0,
+      found: sales.size > 0 || produced.size > 0 || avgCost.size > 0 || totalCostMonth.size > 0,
       sales,
       produced,
       avgCost,
+      totalCostMonth,
       weightedCost,
       source: source || 'production_item_monthly_summary',
     };
   } catch {
-    return { found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), weightedCost: 0, source: '' };
+    return { found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), totalCostMonth: new Map(), weightedCost: 0, source: '' };
   }
 }
 
@@ -10947,6 +10952,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
   const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map(), monthlyAvgCost: new Map() }));
   const prodMonthMap = prodOrders?.monthly instanceof Map ? new Map(prodOrders.monthly) : new Map();
   const prodMonthAvgCostMap = prodOrders?.monthlyAvgCost instanceof Map ? new Map(prodOrders.monthlyAvgCost) : new Map();
+  const totalCostMonthMap = monthlySummary?.totalCostMonth instanceof Map ? new Map(monthlySummary.totalCostMonth) : new Map();
   if (monthlySummary?.found) {
     for (const [ym, qty] of (monthlySummary.produced || new Map()).entries()) {
       prodMonthMap.set(String(ym || ''), prodNum(qty));
@@ -10966,6 +10972,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       producedQty: prodRound(prodMonthMap.get(ym) || 0, 2),
       weightedCost: prodRound(weightedCost || 0, 4),
       avgProductionCost: prodRound(prodMonthAvgCostMap.get(ym) || 0, 4),
+      totalCostMonth: prodRound(totalCostMonthMap.get(ym) || 0, 2),
       source: (monthlySummary?.found ? `Resumen mensual cargado (${monthlySummary.source || 'production_item_monthly_summary'})` : itemDemandSourceLabel),
     });
   }
