@@ -8902,6 +8902,57 @@ function prodNormalizeProductionOrderRow(r) {
   };
 }
 
+async function prodFetchProductionOrderDetailFromSap(order) {
+  const abs = Number(order?.absoluteEntry || order?.absoluteentry || order?.docEntry || 0) || null;
+  const docNum = Number(order?.docNum || order?.DocumentNumber || 0) || null;
+  if ((!abs && !docNum) || missingSapEnv()) return null;
+
+  const tryPaths = [];
+  if (abs) {
+    tryPaths.push(`/ProductionOrders(${abs})`);
+    tryPaths.push(`/ProductionOrders?$filter=AbsoluteEntry eq ${abs}&$top=1`);
+    tryPaths.push(`/ProductionOrders?$filter=DocEntry eq ${abs}&$top=1`);
+  }
+  if (docNum) {
+    tryPaths.push(`/ProductionOrders?$filter=DocumentNumber eq ${docNum}&$top=1`);
+    tryPaths.push(`/ProductionOrders?$filter=DocNum eq ${docNum}&$top=1`);
+  }
+
+  for (const path of tryPaths) {
+    try {
+      const res = await slFetch(path, { timeoutMs: 120000 });
+      const row = Array.isArray(res?.value) ? (res.value[0] || null) : (Array.isArray(res) ? (res[0] || null) : res);
+      if (row && typeof row === 'object') return row;
+    } catch {}
+  }
+  return null;
+}
+
+async function prodEnrichProductionOrdersCostsFromSap(orders, maxLookups = 40) {
+  const src = Array.isArray(orders) ? orders : [];
+  if (!src.length || missingSapEnv()) return src;
+  let lookups = 0;
+  const out = [];
+  for (const order of src) {
+    const current = { ...(order || {}) };
+    const hasCost = prodNum(current.unitCost) > 0 || prodNum(current.totalCost) > 0;
+    if (!hasCost && lookups < Math.max(1, Number(maxLookups || 40))) {
+      lookups += 1;
+      const detail = await prodFetchProductionOrderDetailFromSap(current).catch(() => null);
+      if (detail) {
+        const merged = { ...detail, ...current, AbsoluteEntry: current.absoluteEntry || detail.AbsoluteEntry || detail.DocEntry, DocumentNumber: current.docNum || detail.DocumentNumber || detail.DocNum, ItemNo: current.itemCode || detail.ItemNo || detail.ItemCode, ItemCode: current.itemCode || detail.ItemCode || detail.ItemNo, ProductDescription: current.prodName || detail.ProductDescription || detail.ProdName || detail.ItemName, PostingDate: current.postDate || detail.PostingDate || detail.PostDate, PostDate: current.postDate || detail.PostDate || detail.PostingDate, PlannedQuantity: prodNum(current.plannedQty) || detail.PlannedQuantity || detail.PlannedQty, CompletedQuantity: prodNum(current.completedQty) || detail.CompletedQuantity || detail.CmpltQty || detail.CompletedQty, RejectedQuantity: prodNum(current.rejectedQty) || detail.RejectedQuantity || detail.RejectedQty };
+        const normalized = prodNormalizeProductionOrderRow(merged);
+        current.unitCost = normalized.unitCost;
+        current.totalCost = normalized.totalCost;
+        current.costSource = normalized.costSource || current.costSource || '';
+        if (!current.prodName && normalized.prodName) current.prodName = normalized.prodName;
+        if (!current.postDate && normalized.postDate) current.postDate = normalized.postDate;
+      }
+    }
+    out.push(current);
+  }
+  return out;
+}
 
 async function prodFetchProductionOrdersFromSap(itemCode, top = 80) {
   const code = String(itemCode || "").trim();
@@ -8931,10 +8982,14 @@ async function prodFetchProductionOrdersFromSap(itemCode, top = 80) {
     return { orders: [], monthly: new Map(), monthlyAvgCost: new Map(), warning: lastErr.message || String(lastErr) };
   }
 
-  const orders = raw
+  let orders = raw
     .map(prodNormalizeProductionOrderRow)
     .filter((x) => String(x.itemCode || "") === code || !x.itemCode)
     .sort((a, b) => String(b.postDate || "").localeCompare(String(a.postDate || "")) || Number(b.docNum || 0) - Number(a.docNum || 0));
+
+  if (orders.some((x) => !(prodNum(x.unitCost) > 0 || prodNum(x.totalCost) > 0))) {
+    orders = await prodEnrichProductionOrdersCostsFromSap(orders, Math.min(topSafe, 40));
+  }
 
   return prodOrdersToResponse(orders);
 }
