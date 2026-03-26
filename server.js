@@ -8409,6 +8409,29 @@ async function ensureProductionDb() {
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_date ON production_demand_lines(doc_date DESC);`);
 
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_inv_wh_item ON production_inv_wh_cache(item_code);`);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_item_monthly_summary (
+      item_code TEXT NOT NULL,
+      ym TEXT NOT NULL,
+      sales_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      produced_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      weighted_cost NUMERIC(18,6) NOT NULL DEFAULT 0,
+      avg_production_cost NUMERIC(18,6),
+      abc_label TEXT NOT NULL DEFAULT '',
+      source TEXT NOT NULL DEFAULT 'sql_manual',
+      updated_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY(item_code, ym)
+    );
+  `);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS sales_qty NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS produced_qty NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS weighted_cost NUMERIC(18,6) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS avg_production_cost NUMERIC(18,6);`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS abc_label TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'sql_manual';`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_item_monthly_summary_item ON production_item_monthly_summary(item_code, ym DESC);`);
 }
 __extraBootTasks.push(async () => {
   try {
@@ -9231,6 +9254,58 @@ async function prodFetchProductionOrders(itemCode, top = 80, { forceFresh = fals
   prodRuntimeSet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, { orders: sapHit.orders, monthly: Object.fromEntries((sapHit.monthly || new Map()).entries()), monthlyAvgCost: Object.fromEntries((sapHit.monthlyAvgCost || new Map()).entries()) });
   await prodUpsertOrdersCacheDb(code, sapHit.orders).catch(() => {});
   return sapHit;
+}
+
+
+async function prodReadMonthlySummaryDb(itemCode, fromDate, toDate) {
+  const code = String(itemCode || '').trim();
+  if (!code || !hasDb()) {
+    return { found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), weightedCost: 0, source: '' };
+  }
+  const fromYm = String(fromDate || '').slice(0, 7);
+  const toYm = String(toDate || '').slice(0, 7);
+  if (!fromYm || !toYm) {
+    return { found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), weightedCost: 0, source: '' };
+  }
+  try {
+    const r = await dbQuery(
+      `SELECT ym, sales_qty, produced_qty, weighted_cost, avg_production_cost, source
+         FROM production_item_monthly_summary
+        WHERE item_code = $1
+          AND ym >= $2
+          AND ym <= $3
+        ORDER BY ym`,
+      [code, fromYm, toYm]
+    );
+    const rows = Array.isArray(r.rows) ? r.rows : [];
+    if (!rows.length) {
+      return { found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), weightedCost: 0, source: '' };
+    }
+    const sales = new Map();
+    const produced = new Map();
+    const avgCost = new Map();
+    let weightedCost = 0;
+    let source = '';
+    for (const row of rows) {
+      const ym = String(row.ym || '').slice(0, 7);
+      if (!ym) continue;
+      sales.set(ym, prodNum(row.sales_qty));
+      produced.set(ym, prodNum(row.produced_qty));
+      avgCost.set(ym, prodNum(row.avg_production_cost));
+      if (!(weightedCost > 0) && prodNum(row.weighted_cost) > 0) weightedCost = prodNum(row.weighted_cost);
+      if (!source && String(row.source || '').trim()) source = String(row.source || '').trim();
+    }
+    return {
+      found: sales.size > 0 || produced.size > 0 || avgCost.size > 0,
+      sales,
+      produced,
+      avgCost,
+      weightedCost,
+      source: source || 'production_item_monthly_summary',
+    };
+  } catch {
+    return { found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), weightedCost: 0, source: '' };
+  }
 }
 
 function prodLooksLikeResource({ code, description = "", item = null, line = null }) {
@@ -10837,6 +10912,12 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     [code, histFrom, end]
   );
   const monthMap = new Map((monthlyRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
+  const monthlySummary = await prodReadMonthlySummaryDb(code, histFrom, end).catch(() => ({ found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), weightedCost: 0, source: '' }));
+  if (monthlySummary?.found) {
+    for (const [ym, qty] of (monthlySummary.sales || new Map()).entries()) {
+      monthMap.set(String(ym || ''), prodNum(qty));
+    }
+  }
 
   let weightedCost = prodExtractWeightedCostFromItem(sapItem);
   if (!(weightedCost > 0)) {
@@ -10860,9 +10941,20 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       if (freshWeighted > 0) weightedCost = freshWeighted;
     } catch {}
   }
+  if (!(weightedCost > 0) && prodNum(monthlySummary?.weightedCost) > 0) {
+    weightedCost = prodNum(monthlySummary.weightedCost);
+  }
   const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map(), monthlyAvgCost: new Map() }));
-  const prodMonthMap = prodOrders?.monthly instanceof Map ? prodOrders.monthly : new Map();
-  const prodMonthAvgCostMap = prodOrders?.monthlyAvgCost instanceof Map ? prodOrders.monthlyAvgCost : new Map();
+  const prodMonthMap = prodOrders?.monthly instanceof Map ? new Map(prodOrders.monthly) : new Map();
+  const prodMonthAvgCostMap = prodOrders?.monthlyAvgCost instanceof Map ? new Map(prodOrders.monthlyAvgCost) : new Map();
+  if (monthlySummary?.found) {
+    for (const [ym, qty] of (monthlySummary.produced || new Map()).entries()) {
+      prodMonthMap.set(String(ym || ''), prodNum(qty));
+    }
+    for (const [ym, avgCost] of (monthlySummary.avgCost || new Map()).entries()) {
+      prodMonthAvgCostMap.set(String(ym || ''), prodNum(avgCost));
+    }
+  }
 
   const salesHistory = [];
   for (let i = 11; i >= 0; i--) {
@@ -10874,7 +10966,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       producedQty: prodRound(prodMonthMap.get(ym) || 0, 2),
       weightedCost: prodRound(weightedCost || 0, 4),
       avgProductionCost: prodRound(prodMonthAvgCostMap.get(ym) || 0, 4),
-      source: itemDemandSourceLabel,
+      source: (monthlySummary?.found ? `Resumen mensual cargado (${monthlySummary.source || 'production_item_monthly_summary'})` : itemDemandSourceLabel),
     });
   }
 
