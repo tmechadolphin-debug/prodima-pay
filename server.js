@@ -8396,6 +8396,9 @@ async function ensureProductionDb() {
 
   await dbQuery(`ALTER TABLE production_demand_lines ADD COLUMN IF NOT EXISTS num_per_msr NUMERIC(18,4) NOT NULL DEFAULT 1;`);
   await dbQuery(`ALTER TABLE production_demand_lines ADD COLUMN IF NOT EXISTS quantity_base NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_orders_cache ADD COLUMN IF NOT EXISTS unit_cost NUMERIC(18,6) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_orders_cache ADD COLUMN IF NOT EXISTS total_cost NUMERIC(18,6) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_orders_cache ADD COLUMN IF NOT EXISTS cost_source TEXT NOT NULL DEFAULT '';`);
 
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_item_cache_updated ON production_item_cache(updated_at);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_orders_item_date ON production_orders_cache(item_code, post_date DESC);`);
@@ -8799,9 +8802,88 @@ function prodToIsoDate(value) {
   return "";
 }
 
+function prodExtractProductionOrderCosts(r) {
+  const plannedQty = prodNum(r?.PlannedQuantity ?? r?.PlannedQty ?? r?.PlannedQtty ?? 0);
+  const completedQty = prodNum(r?.CompletedQuantity ?? r?.CmpltQty ?? r?.CompletedQty ?? 0);
+  const qtyBase = completedQty > 0 ? completedQty : plannedQty;
+  const readNum = (...vals) => {
+    for (const v of vals) {
+      const n = prodNum(v);
+      if (n > 0) return n;
+    }
+    return 0;
+  };
+
+  const directUnit = readNum(
+    r?.ActualUnitCost,
+    r?.AvgUnitCost,
+    r?.AverageUnitCost,
+    r?.UnitCost,
+    r?.AvgCost,
+    r?.AverageCost,
+    r?.CalcPrice,
+    r?.Price
+  );
+
+  const componentCost = readNum(
+    r?.ActualComponentCost,
+    r?.ActComponentCost,
+    r?.ComponentCost,
+    r?.CompCost
+  );
+  const additionalCost = readNum(
+    r?.ActualAdditionalCost,
+    r?.ActAdditionalCost,
+    r?.AdditionalCost,
+    r?.AddCost
+  );
+  const productCost = readNum(
+    r?.ActualProductCost,
+    r?.ActProductCost,
+    r?.ProductCost,
+    r?.ProdCost,
+    r?.TotalProductCost
+  );
+  const explicitTotal = readNum(
+    r?.ActualTotalCost,
+    r?.TotalActualCost,
+    r?.TotalCost,
+    r?.ProductionCost,
+    r?.ActualCost,
+    r?.CmpltCost
+  );
+
+  let totalCost = 0;
+  let costSource = "";
+  if (componentCost > 0 || additionalCost > 0 || productCost > 0) {
+    totalCost = componentCost + additionalCost + productCost;
+    costSource = "SAP ProductionOrder cost components";
+  } else if (explicitTotal > 0) {
+    totalCost = explicitTotal;
+    costSource = "SAP ProductionOrder total cost";
+  }
+
+  let unitCost = directUnit > 0 ? directUnit : 0;
+  if (!(unitCost > 0) && totalCost > 0 && qtyBase > 0) {
+    unitCost = totalCost / qtyBase;
+  }
+  if (!(totalCost > 0) && unitCost > 0 && qtyBase > 0) {
+    totalCost = unitCost * qtyBase;
+    if (!costSource) costSource = "SAP ProductionOrder unit cost";
+  }
+  if (directUnit > 0 && !costSource) costSource = "SAP ProductionOrder unit cost";
+
+  return {
+    unitCost: prodRound(unitCost || 0, 6),
+    totalCost: prodRound(totalCost || 0, 6),
+    costSource: String(costSource || "").trim(),
+  };
+}
+
 function prodNormalizeProductionOrderRow(r) {
   const postDateRaw = r?.PostingDate ?? r?.PostDate ?? r?.StartDate ?? r?.DueDate ?? "";
   const postDate = prodToIsoDate(postDateRaw);
+  const costInfo = prodExtractProductionOrderCosts(r || {});
   return {
     docNum: Number(r?.DocumentNumber ?? r?.DocNum ?? r?.AbsoluteEntry ?? r?.Absoluteentry ?? 0) || null,
     absoluteEntry: Number(r?.AbsoluteEntry ?? r?.Absoluteentry ?? r?.DocEntry ?? 0) || null,
@@ -8814,13 +8896,16 @@ function prodNormalizeProductionOrderRow(r) {
     status: String(r?.ProductionOrderStatus ?? r?.Status ?? "").trim(),
     warehouse: String(r?.Warehouse ?? r?.WarehouseCode ?? r?.WhsCode ?? "").trim(),
     origin: String(r?.ProductionOrderOrigin ?? r?.Origin ?? "").trim(),
+    unitCost: costInfo.unitCost,
+    totalCost: costInfo.totalCost,
+    costSource: costInfo.costSource,
   };
 }
 
 
 async function prodFetchProductionOrdersFromSap(itemCode, top = 80) {
   const code = String(itemCode || "").trim();
-  if (!code || missingSapEnv()) return { orders: [], monthly: new Map() };
+  if (!code || missingSapEnv()) return { orders: [], monthly: new Map(), monthlyAvgCost: new Map() };
 
   const safeCode = code.replace(/'/g, "''");
   const topSafe = Math.max(20, Math.min(200, Number(top || 80)));
@@ -8843,7 +8928,7 @@ async function prodFetchProductionOrdersFromSap(itemCode, top = 80) {
     }
   }
   if (!raw.length && lastErr) {
-    return { orders: [], monthly: new Map(), warning: lastErr.message || String(lastErr) };
+    return { orders: [], monthly: new Map(), monthlyAvgCost: new Map(), warning: lastErr.message || String(lastErr) };
   }
 
   const orders = raw
@@ -8855,12 +8940,28 @@ async function prodFetchProductionOrdersFromSap(itemCode, top = 80) {
 }
 function prodOrdersToResponse(orders) {
   const monthly = new Map();
+  const monthlyCostAgg = new Map();
+  const monthlyAvgCost = new Map();
   for (const o of orders || []) {
     const ym = prodYm(o.postDate || new Date());
+    const completedQty = prodNum(o.completedQty);
     const prev = monthly.get(ym) || 0;
-    monthly.set(ym, prodRound(prev + prodNum(o.completedQty), 3));
+    monthly.set(ym, prodRound(prev + completedQty, 3));
+
+    const qtyForCost = completedQty > 0 ? completedQty : 0;
+    const unitCost = prodNum(o.unitCost);
+    const totalCost = prodNum(o.totalCost);
+    if (qtyForCost > 0 && (unitCost > 0 || totalCost > 0)) {
+      const agg = monthlyCostAgg.get(ym) || { totalCost: 0, qty: 0 };
+      agg.totalCost += totalCost > 0 ? totalCost : unitCost * qtyForCost;
+      agg.qty += qtyForCost;
+      monthlyCostAgg.set(ym, agg);
+    }
   }
-  return { orders: Array.isArray(orders) ? orders : [], monthly };
+  for (const [ym, agg] of monthlyCostAgg.entries()) {
+    monthlyAvgCost.set(ym, agg.qty > 0 ? prodRound(agg.totalCost / agg.qty, 4) : 0);
+  }
+  return { orders: Array.isArray(orders) ? orders : [], monthly, monthlyAvgCost };
 }
 async function prodReadOrdersCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS, top = 80) {
   if (!hasDb()) return null;
@@ -8869,7 +8970,7 @@ async function prodReadOrdersCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS, top = 
   if (!updatedAt || !prodCacheFresh(updatedAt, ttlMs)) return null;
   const r = await dbQuery(
     `SELECT item_code, doc_num, absolute_entry, prod_name, planned_qty, completed_qty, rejected_qty,
-            post_date, status, warehouse, origin
+            post_date, status, warehouse, origin, unit_cost, total_cost, cost_source
        FROM production_orders_cache
       WHERE item_code = $1
       ORDER BY post_date DESC NULLS LAST, doc_num DESC
@@ -8888,6 +8989,9 @@ async function prodReadOrdersCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS, top = 
     status: String(x.status || ""),
     warehouse: String(x.warehouse || ""),
     origin: String(x.origin || ""),
+    unitCost: prodRound(x.unit_cost || 0, 6),
+    totalCost: prodRound(x.total_cost || 0, 6),
+    costSource: String(x.cost_source || ""),
   }));
   if (orders.length && orders.every((o) => !prodIsIsoDate(o.postDate))) return null;
   return prodOrdersToResponse(orders);
@@ -8899,8 +9003,8 @@ async function prodUpsertOrdersCacheDb(itemCode, orders) {
     await dbQuery(
       `INSERT INTO production_orders_cache(
          item_code, doc_num, absolute_entry, prod_name, planned_qty, completed_qty, rejected_qty,
-         post_date, status, warehouse, origin, updated_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+         post_date, status, warehouse, origin, unit_cost, total_cost, cost_source, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
        ON CONFLICT (item_code, doc_num) DO UPDATE SET
          absolute_entry = EXCLUDED.absolute_entry,
          prod_name = EXCLUDED.prod_name,
@@ -8911,6 +9015,9 @@ async function prodUpsertOrdersCacheDb(itemCode, orders) {
          status = EXCLUDED.status,
          warehouse = EXCLUDED.warehouse,
          origin = EXCLUDED.origin,
+         unit_cost = EXCLUDED.unit_cost,
+         total_cost = EXCLUDED.total_cost,
+         cost_source = EXCLUDED.cost_source,
          updated_at = NOW()`,
       [
         itemCode,
@@ -8924,25 +9031,28 @@ async function prodUpsertOrdersCacheDb(itemCode, orders) {
         String(o.status || ""),
         String(o.warehouse || ""),
         String(o.origin || ""),
+        prodNum(o.unitCost),
+        prodNum(o.totalCost),
+        String(o.costSource || ""),
       ]
     );
   }
 }
 async function prodFetchProductionOrders(itemCode, top = 80, { forceFresh = false, ttlMs = PROD_CACHE_TTL_MS } = {}) {
   const code = String(itemCode || "").trim();
-  if (!code) return { orders: [], monthly: new Map() };
+  if (!code) return { orders: [], monthly: new Map(), monthlyAvgCost: new Map() };
   const runtimeKey = `orders::${code}::${Math.max(20, Math.min(200, Number(top || 80)))}`;
   if (!forceFresh) {
     const hit = prodRuntimeGet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, ttlMs);
-    if (hit) return { orders: hit.orders || [], monthly: new Map(Object.entries(hit.monthly || {})) };
+    if (hit) return { orders: hit.orders || [], monthly: new Map(Object.entries(hit.monthly || {})), monthlyAvgCost: new Map(Object.entries(hit.monthlyAvgCost || {})) };
     const dbHit = await prodReadOrdersCacheDb(code, ttlMs, top).catch(() => null);
     if (dbHit) {
-      prodRuntimeSet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, { orders: dbHit.orders, monthly: Object.fromEntries(dbHit.monthly.entries()) });
+      prodRuntimeSet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, { orders: dbHit.orders, monthly: Object.fromEntries(dbHit.monthly.entries()), monthlyAvgCost: Object.fromEntries((dbHit.monthlyAvgCost || new Map()).entries()) });
       return dbHit;
     }
   }
   const sapHit = await prodFetchProductionOrdersFromSap(code, top);
-  prodRuntimeSet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, { orders: sapHit.orders, monthly: Object.fromEntries((sapHit.monthly || new Map()).entries()) });
+  prodRuntimeSet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, { orders: sapHit.orders, monthly: Object.fromEntries((sapHit.monthly || new Map()).entries()), monthlyAvgCost: Object.fromEntries((sapHit.monthlyAvgCost || new Map()).entries()) });
   await prodUpsertOrdersCacheDb(code, sapHit.orders).catch(() => {});
   return sapHit;
 }
@@ -10574,8 +10684,9 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       if (freshWeighted > 0) weightedCost = freshWeighted;
     } catch {}
   }
-  const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map() }));
+  const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map(), monthlyAvgCost: new Map() }));
   const prodMonthMap = prodOrders?.monthly instanceof Map ? prodOrders.monthly : new Map();
+  const prodMonthAvgCostMap = prodOrders?.monthlyAvgCost instanceof Map ? prodOrders.monthlyAvgCost : new Map();
 
   const salesHistory = [];
   for (let i = 11; i >= 0; i--) {
@@ -10586,6 +10697,7 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       qty: prodRound(monthMap.get(ym) || 0, 2),
       producedQty: prodRound(prodMonthMap.get(ym) || 0, 2),
       weightedCost: prodRound(weightedCost || 0, 4),
+      avgProductionCost: prodRound(prodMonthAvgCostMap.get(ym) || 0, 4),
       source: itemDemandSourceLabel,
     });
   }
@@ -11434,6 +11546,7 @@ function prodAiCompactPlan(plan) {
       ventasUnidades: x.qty,
       produccionUnidades: x.producedQty || 0,
       costoPonderado: x.weightedCost || 0,
+      costoPromedio: x.avgProductionCost || 0,
     })),
     costo: {
       costoPonderadoUnitario: cost.weightedCost || 0,
