@@ -15939,28 +15939,214 @@ async function poCloseLogEvent(payload = {}) {
     String(p.adminUser || ''),
   ]);
 }
-async function poCloseFetchOrderDetail(absoluteEntry, docNum = 0) {
+
+function poCloseGetOrderLinesProp(raw = {}) {
+  if (Array.isArray(raw?.ProductionOrderLines)) return 'ProductionOrderLines';
+  if (Array.isArray(raw?.Lines)) return 'Lines';
+  if (Array.isArray(raw?.DocumentLines)) return 'DocumentLines';
+  return 'ProductionOrderLines';
+}
+function poCloseLooksLikeResourceLine(line = {}) {
+  const rawType = String(line?.ItemType ?? line?.itemType ?? line?.Type ?? '').trim().toLowerCase();
+  if (['290', 'pit_resource', 'resource', 'r'].includes(rawType)) return true;
+  const desc = String(line?.ItemName ?? line?.ItemDescription ?? line?.ProductDescription ?? line?.LineText ?? '').toLowerCase();
+  if (desc.includes('recurso')) return true;
+  return false;
+}
+function poCloseNormalizeOrderLine(line = {}, order = {}) {
+  const lineNumber = Number(line?.LineNumber ?? line?.LineNum ?? line?.VisOrder ?? line?.VisualOrder ?? 0) || 0;
+  const code = String(line?.ItemNo ?? line?.ItemCode ?? line?.ResourceCode ?? line?.Code ?? '').trim();
+  const name = String(line?.ItemName ?? line?.ItemDescription ?? line?.ProductDescription ?? line?.LineText ?? '').trim();
+  const baseQuantity = Number(line?.BaseQuantity ?? line?.BaseQty ?? 0) || 0;
+  const plannedQuantity = Number(line?.PlannedQuantity ?? line?.PlannedQty ?? line?.RequiredQuantity ?? 0) || 0;
+  const additionalQuantity = Number(line?.AdditionalQuantity ?? line?.AdditQty ?? 0) || 0;
+  const issuedQuantity = Number(line?.IssuedQuantity ?? line?.IssuedQty ?? 0) || 0;
+  const warehouse = String(line?.Warehouse ?? line?.WarehouseCode ?? line?.WhsCode ?? order?.warehouse ?? '').trim();
+  const rawType = String(line?.ItemType ?? line?.itemType ?? line?.Type ?? '').trim();
+  return {
+    lineNumber,
+    itemCode: code,
+    itemName: name,
+    warehouse,
+    baseQuantity,
+    plannedQuantity,
+    additionalQuantity,
+    issuedQuantity,
+    issueMethod: String(line?.ProductionOrderIssueType ?? line?.IssueType ?? '').trim(),
+    itemType: rawType,
+    isResource: poCloseLooksLikeResourceLine(line),
+    raw: line,
+  };
+}
+function poCloseOrderFromRaw(raw = {}) {
+  const normalized = poCloseNormalizeOrderRow(raw);
+  const linesPropKey = poCloseGetOrderLinesProp(raw);
+  const rawLines = Array.isArray(raw?.[linesPropKey]) ? raw[linesPropKey] : [];
+  const lines = rawLines.map((line) => poCloseNormalizeOrderLine(line, normalized));
+  return {
+    ...normalized,
+    linesPropKey,
+    lines,
+    resourceLines: lines.filter((x) => x.isResource),
+    componentLines: lines.filter((x) => !x.isResource),
+    rawOrder: raw,
+  };
+}
+async function poCloseFetchOrderRaw(absoluteEntry, docNum = 0, { includeLines = true } = {}) {
   const abs = Number(absoluteEntry || 0) || 0;
   const num = Number(docNum || 0) || 0;
+  const expand = includeLines ? '?$expand=ProductionOrderLines' : '';
   const tries = [];
   if (abs) {
+    tries.push(`/ProductionOrders(${abs})${expand}`);
+    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`AbsoluteEntry eq ${abs}`)}${includeLines ? '&$expand=ProductionOrderLines' : ''}&$top=1`);
+    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`DocEntry eq ${abs}`)}${includeLines ? '&$expand=ProductionOrderLines' : ''}&$top=1`);
     tries.push(`/ProductionOrders(${abs})`);
-    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`AbsoluteEntry eq ${abs}`)}&$top=1`);
-    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`DocEntry eq ${abs}`)}&$top=1`);
   }
   if (num) {
-    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`DocumentNumber eq ${num}`)}&$top=1`);
-    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`DocNum eq ${num}`)}&$top=1`);
+    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`DocumentNumber eq ${num}`)}${includeLines ? '&$expand=ProductionOrderLines' : ''}&$top=1`);
+    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`DocNum eq ${num}`)}${includeLines ? '&$expand=ProductionOrderLines' : ''}&$top=1`);
   }
   for (const pathTry of tries) {
     try {
       const res = await slFetchFreshSession(pathTry);
       const row = Array.isArray(res?.value) ? (res.value[0] || null) : res;
-      if (row && typeof row === 'object') return poCloseNormalizeOrderRow(row);
+      if (row && typeof row === 'object') return row;
     } catch {}
   }
   return null;
 }
+async function poCloseFetchOrderDetail(absoluteEntry, docNum = 0) {
+  const raw = await poCloseFetchOrderRaw(absoluteEntry, docNum, { includeLines: true });
+  return raw ? poCloseOrderFromRaw(raw) : null;
+}
+async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], adminUser = 'admin', note = '') {
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs) throw new Error('AbsoluteEntry inválido');
+  const detailBefore = await poCloseFetchOrderDetail(abs);
+  if (!detailBefore) throw new Error('Orden no encontrada');
+  const raw = detailBefore.rawOrder || await poCloseFetchOrderRaw(abs, detailBefore.docNum, { includeLines: true });
+  if (!raw) throw new Error('No se pudo leer la orden completa');
+  const prop = detailBefore.linesPropKey || poCloseGetOrderLinesProp(raw);
+  const originalLines = Array.isArray(raw?.[prop]) ? raw[prop] : [];
+  const normalizedBefore = originalLines.map((line) => poCloseNormalizeOrderLine(line, detailBefore));
+  const updates = Array.isArray(resourceLines) ? resourceLines : [];
+
+  const existingByLine = new Map();
+  for (const row of updates) {
+    const ln = Number(row?.lineNumber || 0) || 0;
+    const normalized = {
+      lineNumber: ln,
+      itemCode: String(row?.itemCode || '').trim(),
+      itemName: String(row?.itemName || '').trim(),
+      warehouse: String(row?.warehouse || detailBefore.warehouse || '').trim(),
+      baseQuantity: Number(row?.baseQuantity ?? 0) || 0,
+      plannedQuantity: Number(row?.plannedQuantity ?? 0) || 0,
+      additionalQuantity: Number(row?.additionalQuantity ?? 0) || 0,
+      _delete: !!row?._delete,
+      _isNew: !!row?._isNew || !(ln > 0),
+    };
+    if (ln > 0) existingByLine.set(String(ln), normalized);
+  }
+  const additions = updates
+    .map((row) => ({
+      lineNumber: Number(row?.lineNumber || 0) || 0,
+      itemCode: String(row?.itemCode || '').trim(),
+      itemName: String(row?.itemName || '').trim(),
+      warehouse: String(row?.warehouse || detailBefore.warehouse || '').trim(),
+      baseQuantity: Number(row?.baseQuantity ?? 0) || 0,
+      plannedQuantity: Number(row?.plannedQuantity ?? 0) || 0,
+      additionalQuantity: Number(row?.additionalQuantity ?? 0) || 0,
+      _delete: !!row?._delete,
+      _isNew: !!row?._isNew || !(Number(row?.lineNumber || 0) > 0),
+    }))
+    .filter((row) => row._isNew && !row._delete && row.itemCode);
+
+  const updatedLines = [];
+  for (let i = 0; i < originalLines.length; i++) {
+    const rawLine = originalLines[i];
+    const normLine = normalizedBefore[i];
+    if (!normLine?.isResource) {
+      updatedLines.push(rawLine);
+      continue;
+    }
+    const desired = existingByLine.get(String(normLine.lineNumber));
+    if (!desired) continue; // recurso eliminado
+    if (desired._delete) continue;
+    const merged = { ...rawLine };
+    if (desired.itemCode) {
+      merged.ItemNo = desired.itemCode;
+      merged.ItemCode = desired.itemCode;
+    }
+    if (desired.itemName) {
+      merged.ItemName = desired.itemName;
+      merged.ItemDescription = desired.itemName;
+      merged.ProductDescription = desired.itemName;
+      merged.LineText = desired.itemName;
+    }
+    merged.ItemType = merged.ItemType ?? 290;
+    merged.BaseQuantity = Number(desired.baseQuantity || 0);
+    merged.PlannedQuantity = Number(desired.plannedQuantity || 0);
+    merged.AdditionalQuantity = Number(desired.additionalQuantity || 0);
+    if (desired.warehouse) {
+      merged.Warehouse = desired.warehouse;
+      merged.WarehouseCode = desired.warehouse;
+    }
+    updatedLines.push(merged);
+  }
+
+  const templateLine = originalLines.find((line) => poCloseNormalizeOrderLine(line, detailBefore).isResource) || {};
+  for (const desired of additions) {
+    const merged = { ...templateLine };
+    delete merged.LineNumber;
+    delete merged.LineNum;
+    delete merged.VisualOrder;
+    delete merged.VisOrder;
+    delete merged.DocumentAbsoluteEntry;
+    delete merged.DocEntry;
+    merged.ItemType = merged.ItemType ?? 290;
+    merged.ItemNo = desired.itemCode;
+    merged.ItemCode = desired.itemCode;
+    if (desired.itemName) {
+      merged.ItemName = desired.itemName;
+      merged.ItemDescription = desired.itemName;
+      merged.ProductDescription = desired.itemName;
+      merged.LineText = desired.itemName;
+    }
+    merged.BaseQuantity = Number(desired.baseQuantity || 0);
+    merged.PlannedQuantity = Number(desired.plannedQuantity || 0);
+    merged.AdditionalQuantity = Number(desired.additionalQuantity || 0);
+    const wh = desired.warehouse || detailBefore.warehouse || '';
+    if (wh) {
+      merged.Warehouse = wh;
+      merged.WarehouseCode = wh;
+    }
+    updatedLines.push(merged);
+  }
+
+  await slFetchFreshSession(`/ProductionOrders(${abs})`, {
+    method: 'PATCH',
+    headers: { 'B1S-ReplaceCollectionsOnPatch': 'true' },
+    body: JSON.stringify({ [prop]: updatedLines }),
+  });
+
+  const detailAfter = await poCloseFetchOrderDetail(abs);
+  await poCloseLogEvent({
+    action: 'SAVE_RESOURCES',
+    absoluteEntry: detailAfter?.absoluteEntry || detailBefore.absoluteEntry,
+    docNum: detailAfter?.docNum || detailBefore.docNum,
+    itemCode: detailAfter?.itemCode || detailBefore.itemCode,
+    itemName: detailAfter?.itemName || detailBefore.itemName,
+    warehouse: detailAfter?.warehouse || detailBefore.warehouse,
+    statusBefore: detailBefore.status,
+    statusAfter: detailAfter?.status || detailBefore.status,
+    note: String(note || ''),
+    orderPayload: { before: detailBefore, after: detailAfter, resourceLines: updates },
+    adminUser,
+  }).catch(() => {});
+  return detailAfter || detailBefore;
+}
+
 async function poCloseFetchOpenOrdersFromSap({ q = '', top = 250 } = {}) {
   if (missingSapEnv()) throw new Error('SAP no configurado');
   const select = [
@@ -16047,51 +16233,103 @@ async function poCloseFetchItemFlags(itemCode) {
     return { batchManaged: false, serialManaged: false };
   }
 }
+
 async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate = '', expiryDate = '', batchNumber = '', note = '', adminUser = '' } = {}) {
   const abs = Number(order?.absoluteEntry || 0) || 0;
   if (!abs) throw new Error('Orden inválida');
   const qty = Number(quantity || order?.remainingQty || 0);
   if (!(qty > 0)) throw new Error('No hay cantidad pendiente para reportar');
+
   const orderWarehouse = String(order?.warehouse || '').trim();
   const itemCode = String(order?.itemCode || '').trim();
   const flags = await poCloseFetchItemFlags(itemCode);
   let lot = String(batchNumber || '').trim();
   if (flags.batchManaged && !lot) lot = await poCloseTakeNextLotNumber();
+
   const postDate = poCloseIso(postingDate || getDateISOInOffset(TZ_OFFSET_MIN));
-  const payload = {
+  const commonLine = {
+    BaseType: 202,
+    BaseEntry: abs,
+    BaseLine: 0,
+    BaseLineNumber: 0,
+    ItemCode: itemCode,
+    WarehouseCode: orderWarehouse,
+    Quantity: qty,
+    TransactionType: 'botrntComplete',
+  };
+  const batchNumbers = flags.batchManaged ? [{
+    BatchNumber: lot,
+    Quantity: qty,
+    BaseLineNumber: 0,
+    ...(expiryDate ? { ExpiryDate: poCloseIso(expiryDate) } : {}),
+  }] : undefined;
+
+  const basePayload = {
     DocDate: postDate,
     TaxDate: postDate,
     DocDueDate: postDate,
     Comments: truncate(`[prod-close][user:${adminUser || 'admin'}] Orden ${order?.docNum || abs} cierre web ${note || ''}`.trim(), 250),
     JournalMemo: truncate(`Receipt from Production orden ${order?.docNum || abs}`, 50),
-    DocumentLines: [{
-      BaseType: 202,
-      BaseEntry: abs,
-      ItemCode: itemCode,
-      WarehouseCode: orderWarehouse,
-      Quantity: qty,
-      ...(flags.batchManaged ? {
-        BatchNumbers: [{
-          BatchNumber: lot,
-          Quantity: qty,
-          ...(expiryDate ? { ExpiryDate: poCloseIso(expiryDate) } : {})
-        }]
-      } : {})
-    }]
   };
-  const created = await slFetchFreshSession('/InventoryGenEntries', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
+
+  const payloadVariants = [
+    {
+      ...basePayload,
+      DocumentLines: [{
+        ...commonLine,
+        ...(batchNumbers ? { BatchNumbers: batchNumbers } : {}),
+      }],
+    },
+    {
+      ...basePayload,
+      DocumentLines: [{
+        BaseType: 202,
+        BaseEntry: abs,
+        BaseLine: 0,
+        BaseLineNumber: 0,
+        Quantity: qty,
+        TransactionType: 'botrntComplete',
+        ...(batchNumbers ? { BatchNumbers: batchNumbers } : {}),
+      }],
+    },
+    {
+      ...basePayload,
+      TransactionType: 'botrntComplete',
+      DocumentLines: [{
+        ...commonLine,
+        ...(batchNumbers ? { BatchNumbers: batchNumbers } : {}),
+      }],
+    },
+  ];
+
+  let created = null;
+  let usedPayload = null;
+  let lastErr = null;
+  for (const payload of payloadVariants) {
+    try {
+      created = await slFetchFreshSession('/InventoryGenEntries', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      usedPayload = payload;
+      break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!created) throw lastErr || new Error('No se pudo crear el recibo de producción');
+
   return {
     receipt: created || {},
     receiptDocEntry: Number(created?.DocEntry || 0) || null,
     receiptDocNum: Number(created?.DocNum || 0) || null,
     batchNumber: lot,
     batchManaged: !!flags.batchManaged,
-    payload,
+    payload: usedPayload || payloadVariants[0],
   };
 }
+
+
 async function poCloseProcessOrder(absoluteEntry, body = {}, adminUser = 'admin') {
   const abs = Number(absoluteEntry || 0) || 0;
   if (!abs) throw new Error('AbsoluteEntry inválido');
@@ -16099,6 +16337,12 @@ async function poCloseProcessOrder(absoluteEntry, body = {}, adminUser = 'admin'
   if (!order) throw new Error('No se encontró la orden en SAP');
   const before = poCloseStatus(order.status);
   const steps = [];
+
+  if (Array.isArray(body?.resourceLines) && body.resourceLines.length) {
+    order = await poCloseSaveResourceLines(abs, body.resourceLines, adminUser, body?.note || '');
+    steps.push('save_resources');
+  }
+
   if (before === 'PLANNED') {
     order = await poClosePatchStatus(abs, 'RELEASED');
     steps.push('release');
@@ -16116,6 +16360,7 @@ async function poCloseProcessOrder(absoluteEntry, body = {}, adminUser = 'admin'
       adminUser,
     }).catch(() => {});
   }
+
   const qty = Number(body?.quantity || order.remainingQty || 0);
   const receiptInfo = await poCloseCreateReceiptFromProduction(order, {
     quantity: qty,
@@ -16126,6 +16371,7 @@ async function poCloseProcessOrder(absoluteEntry, body = {}, adminUser = 'admin'
     adminUser,
   });
   steps.push('report_completion');
+
   await poCloseLogEvent({
     action: 'REPORT_COMPLETION',
     absoluteEntry: order.absoluteEntry,
@@ -16145,8 +16391,10 @@ async function poCloseProcessOrder(absoluteEntry, body = {}, adminUser = 'admin'
     receiptPayload: receiptInfo.payload,
     adminUser,
   }).catch(() => {});
+
   order = await poClosePatchStatus(abs, 'CLOSED');
   steps.push('close');
+
   await poCloseLogEvent({
     action: 'CLOSE',
     absoluteEntry: order.absoluteEntry,
@@ -16166,8 +16414,10 @@ async function poCloseProcessOrder(absoluteEntry, body = {}, adminUser = 'admin'
     receiptPayload: receiptInfo.payload,
     adminUser,
   }).catch(() => {});
+
   return { order, receiptInfo, steps };
 }
+
 
 app.get('/production-close', async (_req, res) => {
   try {
@@ -16241,6 +16491,27 @@ app.get('/api/admin/production-close/next-lot', verifyAdmin, async (_req, res) =
   }
 });
 
+app.get('/api/admin/production-close/orders/:absoluteEntry/detail', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const order = await poCloseFetchOrderDetail(abs, req.query?.docNum || 0);
+    if (!order) return safeJson(res, 404, { ok: false, message: 'Orden no encontrada' });
+    return safeJson(res, 200, { ok: true, order, nextLot: await poCloseGetNextLotPreview() });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/resources/save', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const order = await poCloseSaveResourceLines(abs, req.body?.resourceLines || [], String(req.admin?.user || 'admin'), String(req.body?.note || ''));
+    return safeJson(res, 200, { ok: true, order, message: 'Recursos actualizados' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 app.post('/api/admin/production-close/orders/:absoluteEntry/release', verifyAdmin, async (req, res) => {
   try {
     const abs = Number(req.params.absoluteEntry || 0);
@@ -16271,6 +16542,9 @@ app.post('/api/admin/production-close/orders/:absoluteEntry/report-completion', 
     const abs = Number(req.params.absoluteEntry || 0);
     let order = await poCloseFetchOrderDetail(abs, req.body?.docNum);
     if (!order) return safeJson(res, 404, { ok: false, message: 'Orden no encontrada' });
+    if (Array.isArray(req.body?.resourceLines) && req.body.resourceLines.length) {
+      order = await poCloseSaveResourceLines(abs, req.body.resourceLines, String(req.admin?.user || 'admin'), String(req.body?.note || ''));
+    }
     if (order.status === 'PLANNED') order = await poClosePatchStatus(abs, 'RELEASED');
     const qty = Number(req.body?.quantity || order.remainingQty || 0);
     const receiptInfo = await poCloseCreateReceiptFromProduction(order, {
