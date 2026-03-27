@@ -8396,6 +8396,11 @@ async function ensureProductionDb() {
 
   await dbQuery(`ALTER TABLE production_demand_lines ADD COLUMN IF NOT EXISTS num_per_msr NUMERIC(18,4) NOT NULL DEFAULT 1;`);
   await dbQuery(`ALTER TABLE production_demand_lines ADD COLUMN IF NOT EXISTS quantity_base NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_orders_cache ADD COLUMN IF NOT EXISTS unit_cost NUMERIC(18,6) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_orders_cache ADD COLUMN IF NOT EXISTS total_cost NUMERIC(18,6) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_orders_cache ADD COLUMN IF NOT EXISTS cost_source TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_orders_cache ADD COLUMN IF NOT EXISTS receipt_date DATE;`);
+  await dbQuery(`ALTER TABLE production_orders_cache ADD COLUMN IF NOT EXISTS receipt_qty NUMERIC(18,4) NOT NULL DEFAULT 0;`);
 
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_item_cache_updated ON production_item_cache(updated_at);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_orders_item_date ON production_orders_cache(item_code, post_date DESC);`);
@@ -8404,6 +8409,31 @@ async function ensureProductionDb() {
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_demand_date ON production_demand_lines(doc_date DESC);`);
 
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_inv_wh_item ON production_inv_wh_cache(item_code);`);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS production_item_monthly_summary (
+      item_code TEXT NOT NULL,
+      ym TEXT NOT NULL,
+      sales_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      produced_qty NUMERIC(18,4) NOT NULL DEFAULT 0,
+      weighted_cost NUMERIC(18,6) NOT NULL DEFAULT 0,
+      avg_production_cost NUMERIC(18,6),
+      total_cost_month NUMERIC(18,2),
+      abc_label TEXT NOT NULL DEFAULT '',
+      source TEXT NOT NULL DEFAULT 'sql_manual',
+      updated_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY(item_code, ym)
+    );
+  `);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS sales_qty NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS produced_qty NUMERIC(18,4) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS weighted_cost NUMERIC(18,6) NOT NULL DEFAULT 0;`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS avg_production_cost NUMERIC(18,6);`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS total_cost_month NUMERIC(18,2);`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS abc_label TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'sql_manual';`);
+  await dbQuery(`ALTER TABLE production_item_monthly_summary ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_prod_item_monthly_summary_item ON production_item_monthly_summary(item_code, ym DESC);`);
 }
 __extraBootTasks.push(async () => {
   try {
@@ -8799,9 +8829,88 @@ function prodToIsoDate(value) {
   return "";
 }
 
+function prodExtractProductionOrderCosts(r) {
+  const plannedQty = prodNum(r?.PlannedQuantity ?? r?.PlannedQty ?? r?.PlannedQtty ?? 0);
+  const completedQty = prodNum(r?.CompletedQuantity ?? r?.CmpltQty ?? r?.CompletedQty ?? 0);
+  const qtyBase = completedQty > 0 ? completedQty : plannedQty;
+  const readNum = (...vals) => {
+    for (const v of vals) {
+      const n = prodNum(v);
+      if (n > 0) return n;
+    }
+    return 0;
+  };
+
+  const directUnit = readNum(
+    r?.ActualUnitCost,
+    r?.AvgUnitCost,
+    r?.AverageUnitCost,
+    r?.UnitCost,
+    r?.AvgCost,
+    r?.AverageCost,
+    r?.CalcPrice,
+    r?.Price
+  );
+
+  const componentCost = readNum(
+    r?.ActualComponentCost,
+    r?.ActComponentCost,
+    r?.ComponentCost,
+    r?.CompCost
+  );
+  const additionalCost = readNum(
+    r?.ActualAdditionalCost,
+    r?.ActAdditionalCost,
+    r?.AdditionalCost,
+    r?.AddCost
+  );
+  const productCost = readNum(
+    r?.ActualProductCost,
+    r?.ActProductCost,
+    r?.ProductCost,
+    r?.ProdCost,
+    r?.TotalProductCost
+  );
+  const explicitTotal = readNum(
+    r?.ActualTotalCost,
+    r?.TotalActualCost,
+    r?.TotalCost,
+    r?.ProductionCost,
+    r?.ActualCost,
+    r?.CmpltCost
+  );
+
+  let totalCost = 0;
+  let costSource = "";
+  if (componentCost > 0 || additionalCost > 0 || productCost > 0) {
+    totalCost = componentCost + additionalCost + productCost;
+    costSource = "SAP ProductionOrder cost components";
+  } else if (explicitTotal > 0) {
+    totalCost = explicitTotal;
+    costSource = "SAP ProductionOrder total cost";
+  }
+
+  let unitCost = directUnit > 0 ? directUnit : 0;
+  if (!(unitCost > 0) && totalCost > 0 && qtyBase > 0) {
+    unitCost = totalCost / qtyBase;
+  }
+  if (!(totalCost > 0) && unitCost > 0 && qtyBase > 0) {
+    totalCost = unitCost * qtyBase;
+    if (!costSource) costSource = "SAP ProductionOrder unit cost";
+  }
+  if (directUnit > 0 && !costSource) costSource = "SAP ProductionOrder unit cost";
+
+  return {
+    unitCost: prodRound(unitCost || 0, 6),
+    totalCost: prodRound(totalCost || 0, 6),
+    costSource: String(costSource || "").trim(),
+  };
+}
+
 function prodNormalizeProductionOrderRow(r) {
   const postDateRaw = r?.PostingDate ?? r?.PostDate ?? r?.StartDate ?? r?.DueDate ?? "";
   const postDate = prodToIsoDate(postDateRaw);
+  const costInfo = prodExtractProductionOrderCosts(r || {});
   return {
     docNum: Number(r?.DocumentNumber ?? r?.DocNum ?? r?.AbsoluteEntry ?? r?.Absoluteentry ?? 0) || null,
     absoluteEntry: Number(r?.AbsoluteEntry ?? r?.Absoluteentry ?? r?.DocEntry ?? 0) || null,
@@ -8811,16 +8920,183 @@ function prodNormalizeProductionOrderRow(r) {
     completedQty: prodRound(r?.CompletedQuantity ?? r?.CmpltQty ?? r?.CompletedQty ?? 0, 3),
     rejectedQty: prodRound(r?.RejectedQuantity ?? r?.RejectedQty ?? 0, 3),
     postDate,
+    receiptDate: prodToIsoDate(r?.ReceiptDate ?? r?.receiptDate ?? r?.LastReceiptDate ?? "") || "",
+    receiptQty: prodRound(r?.ReceiptQuantity ?? r?.receiptQty ?? 0, 3),
     status: String(r?.ProductionOrderStatus ?? r?.Status ?? "").trim(),
     warehouse: String(r?.Warehouse ?? r?.WarehouseCode ?? r?.WhsCode ?? "").trim(),
     origin: String(r?.ProductionOrderOrigin ?? r?.Origin ?? "").trim(),
+    unitCost: costInfo.unitCost,
+    totalCost: costInfo.totalCost,
+    costSource: costInfo.costSource,
   };
 }
 
+function prodIsClosedProductionStatus(status) {
+  const s = String(status || "").trim().toUpperCase();
+  return s === 'L' || s === 'C' || s === 'CLOSED' || s === 'BOPOSCLOSED' || s === 'BOPS_CLOSED';
+}
+
+function prodNormalizeDocumentLines(doc) {
+  if (Array.isArray(doc?.DocumentLines)) return doc.DocumentLines;
+  if (Array.isArray(doc?.DocumentLines?.value)) return doc.DocumentLines.value;
+  if (Array.isArray(doc?.Lines)) return doc.Lines;
+  if (Array.isArray(doc?.lines)) return doc.lines;
+  return [];
+}
+
+function prodInventoryLineMatchesOrder(line, absoluteEntry, itemCode, forReceipt = false) {
+  const baseEntry = Number(line?.BaseEntry ?? line?.BaseAbs ?? line?.BaseRefEntry ?? 0) || 0;
+  const baseTypeRaw = line?.BaseType ?? line?.BaseObjectType ?? line?.BaseObjType ?? '';
+  const baseType = String(baseTypeRaw).trim();
+  const baseTypeOk = !baseType || baseType === '202' || baseType === '0xCA' || Number(baseTypeRaw) === 202;
+  if (absoluteEntry && baseEntry !== absoluteEntry) return false;
+  if (!baseTypeOk) return false;
+  if (forReceipt && itemCode) {
+    const lineCode = String(line?.ItemCode ?? line?.ItemNo ?? '').trim();
+    if (lineCode && lineCode !== String(itemCode || '').trim()) return false;
+  }
+  return true;
+}
+
+function prodExtractInventoryLineQty(line) {
+  return prodNum(line?.Quantity ?? line?.Qty ?? line?.BaseQuantity ?? 0);
+}
+
+function prodExtractInventoryLineAmount(line) {
+  const qty = prodExtractInventoryLineQty(line);
+  const direct = prodNum(line?.LineTotal ?? line?.RowTotal ?? line?.Total ?? line?.TotalLC ?? line?.OpenSum ?? 0);
+  if (direct > 0) return direct;
+  const stockPrice = prodNum(line?.StockPrice ?? line?.AvgPrice ?? line?.Price ?? line?.GrossBuyPrice ?? line?.UnitPrice ?? 0);
+  if (stockPrice > 0 && qty > 0) return stockPrice * qty;
+  return 0;
+}
+
+async function prodFetchInventoryDocsByBase(entitySet, absoluteEntry, itemCode, { forReceipt = false, top = 20 } = {}) {
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs || missingSapEnv()) return [];
+  const lineSelect = 'BaseEntry,BaseType,ItemCode,Quantity,LineTotal,RowTotal,StockPrice,Price,GrossBuyPrice';
+  const docSelect = 'DocEntry,DocNum,DocDate';
+  const paths = [
+    `/${entitySet}?$select=${docSelect}&$expand=DocumentLines($select=${lineSelect})&$filter=DocumentLines/any(d:d/BaseEntry eq ${abs} and d/BaseType eq 202)&$orderby=DocDate desc&$top=${Math.max(5, Number(top || 20))}`,
+    `/${entitySet}?$select=${docSelect}&$expand=DocumentLines($select=${lineSelect})&$filter=DocumentLines/any(d:d/BaseEntry eq ${abs})&$orderby=DocDate desc&$top=${Math.max(5, Number(top || 20))}`,
+    `/${entitySet}?$select=${docSelect}&$expand=DocumentLines($select=${lineSelect})&$orderby=DocDate desc&$top=${Math.max(40, Number(top || 20) * 4)}`,
+  ];
+  for (const path of paths) {
+    try {
+      const res = await slFetch(path, { timeoutMs: 120000 });
+      const docs = prodNormalizeSlCollection(res);
+      const hits = [];
+      for (const doc of docs || []) {
+        const lines = prodNormalizeDocumentLines(doc).filter((line) => prodInventoryLineMatchesOrder(line, abs, itemCode, forReceipt));
+        if (lines.length) hits.push({ ...doc, __matchedLines: lines });
+      }
+      if (hits.length) return hits;
+    } catch {}
+  }
+  return [];
+}
+
+async function prodFetchProductionOrderActualsFromSap(order) {
+  const abs = Number(order?.absoluteEntry || order?.docEntry || 0) || 0;
+  const itemCode = String(order?.itemCode || '').trim();
+  if (!abs || missingSapEnv()) return null;
+  const [receipts, issues] = await Promise.all([
+    prodFetchInventoryDocsByBase('InventoryGenEntries', abs, itemCode, { forReceipt: true, top: 20 }).catch(() => []),
+    prodFetchInventoryDocsByBase('InventoryGenExits', abs, itemCode, { forReceipt: false, top: 20 }).catch(() => []),
+  ]);
+  let receiptQty = 0;
+  let receiptDate = '';
+  for (const doc of receipts || []) {
+    const docDate = prodToIsoDate(doc?.DocDate || doc?.TaxDate || doc?.DocDueDate || '');
+    if (docDate && (!receiptDate || docDate > receiptDate)) receiptDate = docDate;
+    for (const line of doc.__matchedLines || []) receiptQty += prodExtractInventoryLineQty(line);
+  }
+  let totalCost = 0;
+  for (const doc of issues || []) {
+    for (const line of doc.__matchedLines || []) totalCost += prodExtractInventoryLineAmount(line);
+  }
+  receiptQty = prodRound(receiptQty || 0, 3);
+  totalCost = prodRound(totalCost || 0, 6);
+  const unitCost = receiptQty > 0 && totalCost > 0 ? prodRound(totalCost / receiptQty, 6) : 0;
+  if (!(receiptQty > 0) && !(totalCost > 0) && !receiptDate) return null;
+  return {
+    receiptDate,
+    receiptQty,
+    totalCost,
+    unitCost,
+    costSource: totalCost > 0 ? 'SAP issue/receipt actual' : '',
+  };
+}
+
+async function prodFetchProductionOrderDetailFromSap(order) {
+  const abs = Number(order?.absoluteEntry || order?.absoluteentry || order?.docEntry || 0) || null;
+  const docNum = Number(order?.docNum || order?.DocumentNumber || 0) || null;
+  if ((!abs && !docNum) || missingSapEnv()) return null;
+
+  const tryPaths = [];
+  if (abs) {
+    tryPaths.push(`/ProductionOrders(${abs})`);
+    tryPaths.push(`/ProductionOrders?$filter=AbsoluteEntry eq ${abs}&$top=1`);
+    tryPaths.push(`/ProductionOrders?$filter=DocEntry eq ${abs}&$top=1`);
+  }
+  if (docNum) {
+    tryPaths.push(`/ProductionOrders?$filter=DocumentNumber eq ${docNum}&$top=1`);
+    tryPaths.push(`/ProductionOrders?$filter=DocNum eq ${docNum}&$top=1`);
+  }
+
+  for (const path of tryPaths) {
+    try {
+      const res = await slFetch(path, { timeoutMs: 120000 });
+      const row = Array.isArray(res?.value) ? (res.value[0] || null) : (Array.isArray(res) ? (res[0] || null) : res);
+      if (row && typeof row === 'object') return row;
+    } catch {}
+  }
+  return null;
+}
+
+async function prodEnrichProductionOrdersCostsFromSap(orders, maxLookups = 40) {
+  const src = Array.isArray(orders) ? orders : [];
+  if (!src.length || missingSapEnv()) return src;
+  let lookups = 0;
+  const out = [];
+  for (const order of src) {
+    const current = { ...(order || {}) };
+    const needsDetail = !(prodNum(current.unitCost) > 0 || prodNum(current.totalCost) > 0);
+    if (needsDetail && lookups < Math.max(1, Number(maxLookups || 40))) {
+      lookups += 1;
+      const detail = await prodFetchProductionOrderDetailFromSap(current).catch(() => null);
+      if (detail) {
+        const merged = { ...detail, ...current, AbsoluteEntry: current.absoluteEntry || detail.AbsoluteEntry || detail.DocEntry, DocumentNumber: current.docNum || detail.DocumentNumber || detail.DocNum, ItemNo: current.itemCode || detail.ItemNo || detail.ItemCode, ItemCode: current.itemCode || detail.ItemCode || detail.ItemNo, ProductDescription: current.prodName || detail.ProductDescription || detail.ProdName || detail.ItemName, PostingDate: current.postDate || detail.PostingDate || detail.PostDate, PostDate: current.postDate || detail.PostDate || detail.PostingDate, PlannedQuantity: prodNum(current.plannedQty) || detail.PlannedQuantity || detail.PlannedQty, CompletedQuantity: prodNum(current.completedQty) || detail.CompletedQuantity || detail.CmpltQty || detail.CompletedQty, RejectedQuantity: prodNum(current.rejectedQty) || detail.RejectedQuantity || detail.RejectedQty };
+        const normalized = prodNormalizeProductionOrderRow(merged);
+        current.unitCost = normalized.unitCost;
+        current.totalCost = normalized.totalCost;
+        current.costSource = normalized.costSource || current.costSource || '';
+        if (!current.prodName && normalized.prodName) current.prodName = normalized.prodName;
+        if (!current.postDate && normalized.postDate) current.postDate = normalized.postDate;
+        if (!current.receiptDate && normalized.receiptDate) current.receiptDate = normalized.receiptDate;
+        if (!(prodNum(current.receiptQty) > 0) && prodNum(normalized.receiptQty) > 0) current.receiptQty = normalized.receiptQty;
+      }
+    }
+    const needsActuals = prodIsClosedProductionStatus(current.status) && (!(prodNum(current.totalCost) > 0) || !(prodNum(current.receiptQty) > 0) || !prodIsIsoDate(current.receiptDate));
+    if (needsActuals && lookups < Math.max(1, Number(maxLookups || 40))) {
+      lookups += 1;
+      const actuals = await prodFetchProductionOrderActualsFromSap(current).catch(() => null);
+      if (actuals) {
+        if (prodIsIsoDate(actuals.receiptDate)) current.receiptDate = actuals.receiptDate;
+        if (prodNum(actuals.receiptQty) > 0) current.receiptQty = prodNum(actuals.receiptQty);
+        if (prodNum(actuals.totalCost) > 0) current.totalCost = prodNum(actuals.totalCost);
+        if (prodNum(actuals.unitCost) > 0) current.unitCost = prodNum(actuals.unitCost);
+        if (actuals.costSource) current.costSource = actuals.costSource;
+      }
+    }
+    out.push(current);
+  }
+  return out;
+}
 
 async function prodFetchProductionOrdersFromSap(itemCode, top = 80) {
   const code = String(itemCode || "").trim();
-  if (!code || missingSapEnv()) return { orders: [], monthly: new Map() };
+  if (!code || missingSapEnv()) return { orders: [], monthly: new Map(), monthlyAvgCost: new Map() };
 
   const safeCode = code.replace(/'/g, "''");
   const topSafe = Math.max(20, Math.min(200, Number(top || 80)));
@@ -8843,24 +9119,44 @@ async function prodFetchProductionOrdersFromSap(itemCode, top = 80) {
     }
   }
   if (!raw.length && lastErr) {
-    return { orders: [], monthly: new Map(), warning: lastErr.message || String(lastErr) };
+    return { orders: [], monthly: new Map(), monthlyAvgCost: new Map(), warning: lastErr.message || String(lastErr) };
   }
 
-  const orders = raw
+  let orders = raw
     .map(prodNormalizeProductionOrderRow)
     .filter((x) => String(x.itemCode || "") === code || !x.itemCode)
     .sort((a, b) => String(b.postDate || "").localeCompare(String(a.postDate || "")) || Number(b.docNum || 0) - Number(a.docNum || 0));
+
+  if (orders.some((x) => !(prodNum(x.unitCost) > 0 || prodNum(x.totalCost) > 0))) {
+    orders = await prodEnrichProductionOrdersCostsFromSap(orders, Math.min(topSafe, 40));
+  }
 
   return prodOrdersToResponse(orders);
 }
 function prodOrdersToResponse(orders) {
   const monthly = new Map();
+  const monthlyCostAgg = new Map();
+  const monthlyAvgCost = new Map();
   for (const o of orders || []) {
-    const ym = prodYm(o.postDate || new Date());
+    const ym = prodYm(o.receiptDate || o.postDate || new Date());
+    const producedQty = prodNum(o.receiptQty) > 0 ? prodNum(o.receiptQty) : prodNum(o.completedQty);
     const prev = monthly.get(ym) || 0;
-    monthly.set(ym, prodRound(prev + prodNum(o.completedQty), 3));
+    monthly.set(ym, prodRound(prev + producedQty, 3));
+
+    const qtyForCost = producedQty > 0 ? producedQty : 0;
+    const unitCost = prodNum(o.unitCost);
+    const totalCost = prodNum(o.totalCost);
+    if (prodIsClosedProductionStatus(o.status) && qtyForCost > 0 && (unitCost > 0 || totalCost > 0)) {
+      const agg = monthlyCostAgg.get(ym) || { totalCost: 0, qty: 0 };
+      agg.totalCost += totalCost > 0 ? totalCost : unitCost * qtyForCost;
+      agg.qty += qtyForCost;
+      monthlyCostAgg.set(ym, agg);
+    }
   }
-  return { orders: Array.isArray(orders) ? orders : [], monthly };
+  for (const [ym, agg] of monthlyCostAgg.entries()) {
+    monthlyAvgCost.set(ym, agg.qty > 0 ? prodRound(agg.totalCost / agg.qty, 4) : 0);
+  }
+  return { orders: Array.isArray(orders) ? orders : [], monthly, monthlyAvgCost };
 }
 async function prodReadOrdersCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS, top = 80) {
   if (!hasDb()) return null;
@@ -8869,7 +9165,7 @@ async function prodReadOrdersCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS, top = 
   if (!updatedAt || !prodCacheFresh(updatedAt, ttlMs)) return null;
   const r = await dbQuery(
     `SELECT item_code, doc_num, absolute_entry, prod_name, planned_qty, completed_qty, rejected_qty,
-            post_date, status, warehouse, origin
+            post_date, receipt_date, receipt_qty, status, warehouse, origin, unit_cost, total_cost, cost_source
        FROM production_orders_cache
       WHERE item_code = $1
       ORDER BY post_date DESC NULLS LAST, doc_num DESC
@@ -8885,9 +9181,14 @@ async function prodReadOrdersCacheDb(itemCode, ttlMs = PROD_CACHE_TTL_MS, top = 
     completedQty: prodRound(x.completed_qty || 0, 3),
     rejectedQty: prodRound(x.rejected_qty || 0, 3),
     postDate: prodToIsoDate(x.post_date),
+    receiptDate: prodToIsoDate(x.receipt_date),
+    receiptQty: prodRound(x.receipt_qty || 0, 3),
     status: String(x.status || ""),
     warehouse: String(x.warehouse || ""),
     origin: String(x.origin || ""),
+    unitCost: prodRound(x.unit_cost || 0, 6),
+    totalCost: prodRound(x.total_cost || 0, 6),
+    costSource: String(x.cost_source || ""),
   }));
   if (orders.length && orders.every((o) => !prodIsIsoDate(o.postDate))) return null;
   return prodOrdersToResponse(orders);
@@ -8899,8 +9200,8 @@ async function prodUpsertOrdersCacheDb(itemCode, orders) {
     await dbQuery(
       `INSERT INTO production_orders_cache(
          item_code, doc_num, absolute_entry, prod_name, planned_qty, completed_qty, rejected_qty,
-         post_date, status, warehouse, origin, updated_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+         post_date, receipt_date, receipt_qty, status, warehouse, origin, unit_cost, total_cost, cost_source, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
        ON CONFLICT (item_code, doc_num) DO UPDATE SET
          absolute_entry = EXCLUDED.absolute_entry,
          prod_name = EXCLUDED.prod_name,
@@ -8908,9 +9209,14 @@ async function prodUpsertOrdersCacheDb(itemCode, orders) {
          completed_qty = EXCLUDED.completed_qty,
          rejected_qty = EXCLUDED.rejected_qty,
          post_date = EXCLUDED.post_date,
+         receipt_date = EXCLUDED.receipt_date,
+         receipt_qty = EXCLUDED.receipt_qty,
          status = EXCLUDED.status,
          warehouse = EXCLUDED.warehouse,
          origin = EXCLUDED.origin,
+         unit_cost = EXCLUDED.unit_cost,
+         total_cost = EXCLUDED.total_cost,
+         cost_source = EXCLUDED.cost_source,
          updated_at = NOW()`,
       [
         itemCode,
@@ -8921,30 +9227,90 @@ async function prodUpsertOrdersCacheDb(itemCode, orders) {
         prodNum(o.completedQty),
         prodNum(o.rejectedQty),
         prodToIsoDate(o.postDate) || null,
+        prodToIsoDate(o.receiptDate) || null,
+        prodNum(o.receiptQty),
         String(o.status || ""),
         String(o.warehouse || ""),
         String(o.origin || ""),
+        prodNum(o.unitCost),
+        prodNum(o.totalCost),
+        String(o.costSource || ""),
       ]
     );
   }
 }
 async function prodFetchProductionOrders(itemCode, top = 80, { forceFresh = false, ttlMs = PROD_CACHE_TTL_MS } = {}) {
   const code = String(itemCode || "").trim();
-  if (!code) return { orders: [], monthly: new Map() };
+  if (!code) return { orders: [], monthly: new Map(), monthlyAvgCost: new Map() };
   const runtimeKey = `orders::${code}::${Math.max(20, Math.min(200, Number(top || 80)))}`;
   if (!forceFresh) {
     const hit = prodRuntimeGet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, ttlMs);
-    if (hit) return { orders: hit.orders || [], monthly: new Map(Object.entries(hit.monthly || {})) };
+    if (hit) return { orders: hit.orders || [], monthly: new Map(Object.entries(hit.monthly || {})), monthlyAvgCost: new Map(Object.entries(hit.monthlyAvgCost || {})) };
     const dbHit = await prodReadOrdersCacheDb(code, ttlMs, top).catch(() => null);
     if (dbHit) {
-      prodRuntimeSet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, { orders: dbHit.orders, monthly: Object.fromEntries(dbHit.monthly.entries()) });
+      prodRuntimeSet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, { orders: dbHit.orders, monthly: Object.fromEntries(dbHit.monthly.entries()), monthlyAvgCost: Object.fromEntries((dbHit.monthlyAvgCost || new Map()).entries()) });
       return dbHit;
     }
   }
   const sapHit = await prodFetchProductionOrdersFromSap(code, top);
-  prodRuntimeSet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, { orders: sapHit.orders, monthly: Object.fromEntries((sapHit.monthly || new Map()).entries()) });
+  prodRuntimeSet(PROD_ORDERS_RUNTIME_CACHE, runtimeKey, { orders: sapHit.orders, monthly: Object.fromEntries((sapHit.monthly || new Map()).entries()), monthlyAvgCost: Object.fromEntries((sapHit.monthlyAvgCost || new Map()).entries()) });
   await prodUpsertOrdersCacheDb(code, sapHit.orders).catch(() => {});
   return sapHit;
+}
+
+
+async function prodReadMonthlySummaryDb(itemCode, fromDate, toDate) {
+  const code = String(itemCode || '').trim();
+  if (!code || !hasDb()) {
+    return { found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), weightedCost: 0, source: '' };
+  }
+  const fromYm = String(fromDate || '').slice(0, 7);
+  const toYm = String(toDate || '').slice(0, 7);
+  if (!fromYm || !toYm) {
+    return { found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), weightedCost: 0, source: '' };
+  }
+  try {
+    const r = await dbQuery(
+      `SELECT ym, sales_qty, produced_qty, weighted_cost, avg_production_cost, total_cost_month, source
+         FROM production_item_monthly_summary
+        WHERE item_code = $1
+          AND ym >= $2
+          AND ym <= $3
+        ORDER BY ym`,
+      [code, fromYm, toYm]
+    );
+    const rows = Array.isArray(r.rows) ? r.rows : [];
+    if (!rows.length) {
+      return { found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), totalCostMonth: new Map(), weightedCost: 0, source: '' };
+    }
+    const sales = new Map();
+    const produced = new Map();
+    const avgCost = new Map();
+    const totalCostMonth = new Map();
+    let weightedCost = 0;
+    let source = '';
+    for (const row of rows) {
+      const ym = String(row.ym || '').slice(0, 7);
+      if (!ym) continue;
+      sales.set(ym, prodNum(row.sales_qty));
+      produced.set(ym, prodNum(row.produced_qty));
+      avgCost.set(ym, prodNum(row.avg_production_cost));
+      totalCostMonth.set(ym, prodNum(row.total_cost_month));
+      if (!(weightedCost > 0) && prodNum(row.weighted_cost) > 0) weightedCost = prodNum(row.weighted_cost);
+      if (!source && String(row.source || '').trim()) source = String(row.source || '').trim();
+    }
+    return {
+      found: sales.size > 0 || produced.size > 0 || avgCost.size > 0 || totalCostMonth.size > 0,
+      sales,
+      produced,
+      avgCost,
+      totalCostMonth,
+      weightedCost,
+      source: source || 'production_item_monthly_summary',
+    };
+  } catch {
+    return { found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), totalCostMonth: new Map(), weightedCost: 0, source: '' };
+  }
 }
 
 function prodLooksLikeResource({ code, description = "", item = null, line = null }) {
@@ -10551,6 +10917,12 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
     [code, histFrom, end]
   );
   const monthMap = new Map((monthlyRows.rows || []).map((r) => [String(r.ym || ""), prodNum(r.qty)]));
+  const monthlySummary = await prodReadMonthlySummaryDb(code, histFrom, end).catch(() => ({ found: false, sales: new Map(), produced: new Map(), avgCost: new Map(), weightedCost: 0, source: '' }));
+  if (monthlySummary?.found) {
+    for (const [ym, qty] of (monthlySummary.sales || new Map()).entries()) {
+      monthMap.set(String(ym || ''), prodNum(qty));
+    }
+  }
 
   let weightedCost = prodExtractWeightedCostFromItem(sapItem);
   if (!(weightedCost > 0)) {
@@ -10574,8 +10946,21 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       if (freshWeighted > 0) weightedCost = freshWeighted;
     } catch {}
   }
-  const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map() }));
-  const prodMonthMap = prodOrders?.monthly instanceof Map ? prodOrders.monthly : new Map();
+  if (!(weightedCost > 0) && prodNum(monthlySummary?.weightedCost) > 0) {
+    weightedCost = prodNum(monthlySummary.weightedCost);
+  }
+  const prodOrders = await prodFetchProductionOrders(code, 120).catch(() => ({ orders: [], monthly: new Map(), monthlyAvgCost: new Map() }));
+  const prodMonthMap = prodOrders?.monthly instanceof Map ? new Map(prodOrders.monthly) : new Map();
+  const prodMonthAvgCostMap = prodOrders?.monthlyAvgCost instanceof Map ? new Map(prodOrders.monthlyAvgCost) : new Map();
+  const totalCostMonthMap = monthlySummary?.totalCostMonth instanceof Map ? new Map(monthlySummary.totalCostMonth) : new Map();
+  if (monthlySummary?.found) {
+    for (const [ym, qty] of (monthlySummary.produced || new Map()).entries()) {
+      prodMonthMap.set(String(ym || ''), prodNum(qty));
+    }
+    for (const [ym, avgCost] of (monthlySummary.avgCost || new Map()).entries()) {
+      prodMonthAvgCostMap.set(String(ym || ''), prodNum(avgCost));
+    }
+  }
 
   const salesHistory = [];
   for (let i = 11; i >= 0; i--) {
@@ -10586,7 +10971,9 @@ async function productionBuildItemPlan({ itemCode, toDate, avgMonths = 5, horizo
       qty: prodRound(monthMap.get(ym) || 0, 2),
       producedQty: prodRound(prodMonthMap.get(ym) || 0, 2),
       weightedCost: prodRound(weightedCost || 0, 4),
-      source: itemDemandSourceLabel,
+      avgProductionCost: prodRound(prodMonthAvgCostMap.get(ym) || 0, 4),
+      totalCostMonth: prodRound(totalCostMonthMap.get(ym) || 0, 2),
+      source: (monthlySummary?.found ? `Resumen mensual cargado (${monthlySummary.source || 'production_item_monthly_summary'})` : itemDemandSourceLabel),
     });
   }
 
@@ -11434,6 +11821,7 @@ function prodAiCompactPlan(plan) {
       ventasUnidades: x.qty,
       produccionUnidades: x.producedQty || 0,
       costoPonderado: x.weightedCost || 0,
+      costoPromedio: x.avgProductionCost || 0,
     })),
     costo: {
       costoPonderadoUnitario: cost.weightedCost || 0,
@@ -11703,6 +12091,7 @@ function prodPlanPolicy(capacity = {}) {
     nonAbRequireHalfShift: raw.nonAbRequireHalfShift !== false,
     nonAbHalfShiftPct: Math.max(0.25, Math.min(1, prodNum(raw.nonAbHalfShiftPct || 0.5, 0.5))),
     cMinFillPctOfStockMax: Math.max(0.5, Math.min(1, prodNum(raw.cMinFillPctOfStockMax || 0.8, 0.8))),
+    cMinRunQty: Math.max(0, prodNum(raw.cMinRunQty || raw.nonAbMinRunQty || 2000, 2000)),
     abMinRunQty: Math.max(0, prodNum(raw.abMinRunQty || 2000, 2000)),
     abMaxDailyOvertimeFactor: Math.max(1, Math.min(2, prodNum(raw.abMaxDailyOvertimeFactor || 1.5, 1.5))),
   };
@@ -11925,6 +12314,12 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
           planningTargetQty = Math.max(planningTargetQty, cTargetQty);
         }
       }
+      if (!policyReason && isCImportant && prodNum(planPolicy.cMinRunQty || 0) > 0) {
+        const cMinRunQty = prodNum(planPolicy.cMinRunQty || 0);
+        if (planningTargetQty > 0 && planningTargetQty < cMinRunQty) {
+          policyReason = `Regla automática: categoría C no se fabrica por debajo de ${prodRound(cMinRunQty, 0)} unidades.`;
+        }
+      }
       if (!policyReason && planPolicy.nonAbRequireHalfShift && machineBatchQty > 0) {
         const halfShiftQty = machineBatchQty * prodNum(planPolicy.nonAbHalfShiftPct || 0.5);
         if (planningTargetQty > 0 && planningTargetQty < halfShiftQty) {
@@ -11985,18 +12380,16 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
   candidates.sort((a, b) => {
     const ab = prodAbcPriority(b?.row?.totalLabel) - prodAbcPriority(a?.row?.totalLabel);
     if (ab) return ab;
-    const rev = prodNum(b?.row?.revenue) - prodNum(a?.row?.revenue);
-    if (rev) return rev;
+    const stockLow = prodNum(a?.row?.stockTotal) - prodNum(b?.row?.stockTotal);
+    if (stockLow) return stockLow;
+    const gapVsMax = prodNum(b?.gapToMax) - prodNum(a?.gapToMax);
+    if (gapVsMax) return gapVsMax;
     const dispatchPrio = prodNum(b?.dispatchDemand?.priorityScore) - prodNum(a?.dispatchDemand?.priorityScore);
     if (dispatchPrio) return dispatchPrio;
     const dispatchLate = prodNum(b?.dispatchDemand?.maxDaysLate) - prodNum(a?.dispatchDemand?.maxDaysLate);
     if (dispatchLate) return dispatchLate;
     const dispatchPending = prodNum(b?.dispatchDemand?.qtyPending) - prodNum(a?.dispatchDemand?.qtyPending);
     if (dispatchPending) return dispatchPending;
-    const stockLow = prodNum(a?.row?.stockTotal) - prodNum(b?.row?.stockTotal);
-    if (stockLow) return stockLow;
-    const gapVsMax = prodNum(b?.gapToMax) - prodNum(a?.gapToMax);
-    if (gapVsMax) return gapVsMax;
     const urgent = prodUrgentFinishedPriority(b?.row) - prodUrgentFinishedPriority(a?.row);
     if (urgent) return urgent;
     const lane = prodNum(b?.laneMeta?.priority) - prodNum(a?.laneMeta?.priority);
@@ -12009,7 +12402,7 @@ async function prodBuildLaneAwareGanttPlan({ from, to, area, grupo, sizeUom = '_
     if (s) return s;
     const p = prodNum(b?.finishedQtyNeeded) - prodNum(a?.finishedQtyNeeded);
     if (p) return p;
-    return String(a?.row?.itemCode || '').localeCompare(String(b?.row?.itemCode || ''));
+    return prodNum(b?.row?.revenue) - prodNum(a?.row?.revenue);
   });
 
   const getLaneState = (laneKey, laneMeta) => {
@@ -12261,6 +12654,7 @@ totalScheduledHours += effectiveDayHours;
         nonAbPreventOverstock: !!planPolicy.nonAbPreventOverstock,
         nonAbRequireHalfShift: !!planPolicy.nonAbRequireHalfShift,
         cMinFillPctOfStockMax: prodRound(planPolicy.cMinFillPctOfStockMax || 0.8, 2),
+        cMinRunQty: prodRound(planPolicy.cMinRunQty || 0, 0),
         abMinRunQty: prodRound(planPolicy.abMinRunQty || 0, 0),
         abMaxDailyOvertimeFactor: prodRound(planPolicy.abMaxDailyOvertimeFactor || 1.5, 2),
       },
@@ -12318,24 +12712,6 @@ function prodPlanConsumePool(plan, qty, pool) {
   }
 }
 
-function prodPlanChildHasNestedRequirements(plan = null) {
-  return !!(
-    (Array.isArray(plan?.requirements?.rawMaterials) && plan.requirements.rawMaterials.length) ||
-    (Array.isArray(plan?.requirements?.packaging) && plan.requirements.packaging.length) ||
-    (Array.isArray(plan?.requirements?.resources) && plan.requirements.resources.length)
-  );
-}
-
-function prodPlanChildShouldBeProduced(req = {}, childPlan = null, availableComponentQty = 0) {
-  const reqMethod = String(req?.procurementMethodLabel || '').trim();
-  const childMethod = String(childPlan?.mrp?.procurementMethodLabel || childPlan?.procurementMethodLabel || '').trim();
-  const shortageQty = Math.max(0, prodNum(req?.shortageQty));
-  const hasNested = prodPlanChildHasNestedRequirements(childPlan);
-  if (reqMethod === 'Se fabrica en planta' || childMethod === 'Se fabrica en planta') return true;
-  if (hasNested && (shortageQty > 0 || prodNum(availableComponentQty) <= 0.0001)) return true;
-  return false;
-}
-
 async function prodPlanPossibleQtyFromPoolDeep(plan, neededQty, pool, depth = 0, trail = []) {
   const requirements = Array.isArray(plan?.requirements?.all)
     ? plan.requirements.all.filter((x) => String(x?.componentType || '').toUpperCase() !== 'RESOURCE')
@@ -12354,9 +12730,10 @@ async function prodPlanPossibleQtyFromPoolDeep(plan, neededQty, pool, depth = 0,
     if (!(perUnit > 0)) continue;
 
     let availableComponentQty = prodNum(pool.get(code));
+    const isMake = String(req?.procurementMethodLabel || '') === 'Se fabrica en planta';
     const normalizedCode = prodNormalizeItemCodeLoose(code);
 
-    if (depth < 2 && !trail.includes(normalizedCode)) {
+    if (isMake && depth < 2 && !trail.includes(normalizedCode)) {
       try {
         const childNeedQty = Math.max(prodNum(req?.requiredQty), prodNum(req?.subPlanQty), perUnit * Math.max(1, prodNum(neededQty)));
         const childPlan = await productionBuildItemPlanCached({
@@ -12367,13 +12744,10 @@ async function prodPlanPossibleQtyFromPoolDeep(plan, neededQty, pool, depth = 0,
           shiftHours: plan?.capacity?.shiftHours || 8,
           plannedQtyOverride: childNeedQty,
         });
-        const shouldProduceChild = prodPlanChildShouldBeProduced(req, childPlan, availableComponentQty);
-        if (shouldProduceChild) {
-          prodPlanMaterialPoolSeed(pool, childPlan?.requirements?.all || [], childNeedQty);
-          const childInfo = await prodPlanPossibleQtyFromPoolDeep(childPlan, childNeedQty, pool, depth + 1, [...trail, normalizedCode]);
-          availableComponentQty += prodNum(childInfo?.possibleQty);
-          if (!mainConstraint && childInfo?.mainConstraint) mainConstraint = String(childInfo.mainConstraint || '');
-        }
+        prodPlanMaterialPoolSeed(pool, childPlan?.requirements?.all || [], childNeedQty);
+        const childInfo = await prodPlanPossibleQtyFromPoolDeep(childPlan, childNeedQty, pool, depth + 1, [...trail, normalizedCode]);
+        availableComponentQty += prodNum(childInfo?.possibleQty);
+        if (!mainConstraint && childInfo?.mainConstraint) mainConstraint = String(childInfo.mainConstraint || '');
       } catch {}
     }
 
@@ -12405,33 +12779,31 @@ async function prodPlanConsumePoolDeep(plan, qty, pool, depth = 0, trail = []) {
     const perUnit = prodNum(req?.requiredQty) / baseQty;
     if (!(perUnit > 0)) continue;
     const neededComponentQty = prodRound(perUnit * prodNum(qty), 6);
+    const isMake = String(req?.procurementMethodLabel || '') === 'Se fabrica en planta';
     const normalizedCode = prodNormalizeItemCodeLoose(code);
 
-    if (depth < 2 && !trail.includes(normalizedCode)) {
-      try {
-        const childPlan = await productionBuildItemPlanCached({
-          itemCode: code,
-          toDate: plan?.period?.endDate || getDateISOInOffset(TZ_OFFSET_MIN),
-          avgMonths: plan?.period?.avgMonths || 3,
-          horizonMonths: plan?.period?.horizonMonths || 1,
-          shiftHours: plan?.capacity?.shiftHours || 8,
-          plannedQtyOverride: neededComponentQty,
-        });
-        const currentStock = prodNum(pool.get(code));
-        const shouldProduceChild = prodPlanChildShouldBeProduced(req, childPlan, currentStock);
-        if (shouldProduceChild) {
-          const fromStock = Math.min(currentStock, neededComponentQty);
-          if (fromStock > 0) {
-            pool.set(code, prodRound(currentStock - fromStock, 6));
-          }
-          const remainingChildQty = Math.max(0, neededComponentQty - fromStock);
-          if (remainingChildQty > 0) {
-            prodPlanMaterialPoolSeed(pool, childPlan?.requirements?.all || [], remainingChildQty);
-            await prodPlanConsumePoolDeep(childPlan, remainingChildQty, pool, depth + 1, [...trail, normalizedCode]);
-          }
-          continue;
-        }
-      } catch {}
+    if (isMake && depth < 2 && !trail.includes(normalizedCode)) {
+      const currentStock = prodNum(pool.get(code));
+      const fromStock = Math.min(currentStock, neededComponentQty);
+      if (fromStock > 0) {
+        pool.set(code, prodRound(currentStock - fromStock, 6));
+      }
+      const remainingChildQty = Math.max(0, neededComponentQty - fromStock);
+      if (remainingChildQty > 0) {
+        try {
+          const childPlan = await productionBuildItemPlanCached({
+            itemCode: code,
+            toDate: plan?.period?.endDate || getDateISOInOffset(TZ_OFFSET_MIN),
+            avgMonths: plan?.period?.avgMonths || 3,
+            horizonMonths: plan?.period?.horizonMonths || 1,
+            shiftHours: plan?.capacity?.shiftHours || 8,
+            plannedQtyOverride: remainingChildQty,
+          });
+          prodPlanMaterialPoolSeed(pool, childPlan?.requirements?.all || [], remainingChildQty);
+          await prodPlanConsumePoolDeep(childPlan, remainingChildQty, pool, depth + 1, [...trail, normalizedCode]);
+        } catch {}
+      }
+      continue;
     }
 
     const next = Math.max(0, prodNum(pool.get(code)) - neededComponentQty);
@@ -14209,6 +14581,26 @@ function prodNormalizeDayClosureSummary(summary = {}, meta = {}) {
   out.possibleQtyContext = prodRound(out.possibleQtyContext || 0, 2);
   return out;
 }
+function prodMergeDayClosures(...lists) {
+  const byDate = new Map();
+  for (const list of lists) {
+    for (const raw of (Array.isArray(list) ? list : [])) {
+      const item = prodNormalizeDayClosureSummary(raw || {}, {
+        adminUser: raw?.adminUser,
+        planId: raw?.planId,
+        date: raw?.date,
+        persistedAt: raw?.persistedAt || raw?.updatedAt || raw?.closedAt || raw?.createdAt,
+      });
+      const date = String(item?.date || '').slice(0,10);
+      if (!date) continue;
+      const prev = byDate.get(date);
+      const prevTs = String(prev?.persistedAt || prev?.closedAt || prev?.updatedAt || prev?.createdAt || '');
+      const nextTs = String(item?.persistedAt || item?.closedAt || item?.updatedAt || item?.createdAt || '');
+      if (!prev || nextTs >= prevTs) byDate.set(date, { ...(prev || {}), ...(item || {}), date });
+    }
+  }
+  return Array.from(byDate.values()).sort((a, b) => String(b?.date || '').localeCompare(String(a?.date || '')));
+}
 async function prodDayClosureUpsert(adminUser, planId, summary) {
   const normalized = prodNormalizeDayClosureSummary(summary, { adminUser, planId, date: summary?.date, persistedAt: new Date().toISOString() });
   const date = String(normalized.date || '').slice(0,10);
@@ -14242,6 +14634,28 @@ async function prodDayClosureGet(adminUser, date) {
   }
   const row = (prodReadDayClosureFile().records || []).find((x) => String(x?.adminUser || '') === String(adminUser || '') && String(x?.date || '').slice(0,10) === day);
   return row ? prodNormalizeDayClosureSummary(row.summary || {}, { adminUser, date: day, persistedAt: row.updatedAt }) : null;
+}
+async function prodDayClosureDelete(adminUser, date) {
+  const day = String(date || '').slice(0,10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error('Fecha inválida para abrir el día');
+  if (hasDb()) {
+    const q = await dbQuery(`
+      delete from admin_production_day_closures_v1
+      where admin_user=$1 and closure_date=$2
+      returning summary, updated_at
+    `, [adminUser, day]);
+    const row = q.rows?.[0];
+    return row ? prodNormalizeDayClosureSummary(row.summary || {}, { adminUser, date: day, persistedAt: row.updated_at }) : null;
+  }
+  const store = prodReadDayClosureFile();
+  let removed = null;
+  store.records = (store.records || []).filter((x) => {
+    const hit = String(x?.adminUser || '') === String(adminUser || '') && String(x?.date || '').slice(0,10) === day;
+    if (hit && !removed) removed = x;
+    return !hit;
+  });
+  prodWriteDayClosureFile(store);
+  return removed ? prodNormalizeDayClosureSummary(removed.summary || {}, { adminUser, date: day, persistedAt: removed.updatedAt }) : null;
 }
 async function prodDayClosureList(adminUser, limit = 180) {
   const max = Math.max(1, Math.min(365, Number(limit || 180)));
@@ -14508,6 +14922,31 @@ app.get('/api/admin/production/plans/day-close', verifyAdmin, async (req, res) =
   }
 });
 
+app.post('/api/admin/production/plans/day-open', verifyAdmin, async (req, res) => {
+  try {
+    const adminUser = prodSavedPlanUser(req);
+    const planId = String(req.body?.planId || '').trim();
+    const date = String(req.body?.date || req.query?.date || '').slice(0,10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return safeJson(res, 400, { ok: false, message: 'Fecha inválida' });
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    if (date !== today) return safeJson(res, 400, { ok: false, message: 'Solo se puede abrir nuevamente el día de hoy' });
+    const payload = await prodSavedPlanGetCurrent(adminUser);
+    if (!payload) return safeJson(res, 404, { ok: false, message: 'No hay plan guardado' });
+    if (planId && String(payload.planRecordId || '') !== planId) return safeJson(res, 409, { ok: false, message: 'El plan cambió; vuelve a cargar el plan actual' });
+    await prodDayClosureDelete(adminUser, date).catch(() => null);
+    const history = await prodDayClosureList(adminUser, 180).catch(() => []);
+    const updated = await prodSavedPlanUpdateById(adminUser, payload.planRecordId, (plan) => {
+      const nextClosures = prodMergeDayClosures((Array.isArray(plan?.dayClosures) ? plan.dayClosures : []).filter((x) => String(x?.date || '').slice(0,10) !== date), history);
+      plan.dayClosures = nextClosures;
+      plan.latestDaySummary = nextClosures[0] || null;
+      plan.lastSapSyncAt = new Date().toISOString();
+      return plan;
+    });
+    return safeJson(res, 200, { ok: true, reopened: true, date, plan: updated || payload });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
 
 
 /* =========================================================
