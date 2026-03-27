@@ -15779,6 +15779,586 @@ app.get('/api/admin/compras/recent', verifyAdmin, async (_req, res) => {
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
+
+/* =========================================================
+   Producción — Cierre de órdenes de fabricación (tablets)
+========================================================= */
+const PROD_CLOSE_HTML_FILE = path.join(process.cwd(), 'production-close.html');
+
+function poCloseBool(v) {
+  const s = String(v ?? '').trim().toLowerCase();
+  return s === 'true' || s === '1' || s === 'yes' || s === 'tyes' || s === 'y' || s === 'si';
+}
+function poCloseIso(v) {
+  return String(v || '').slice(0, 10);
+}
+function poCloseStatus(raw) {
+  const s = String(raw || '').trim().toUpperCase();
+  if (!s) return '';
+  if (['BOPOSPLANNED', 'PLANNED', 'PLANIFICADO', 'P', '0'].includes(s)) return 'PLANNED';
+  if (['BOPOSRELEASED', 'RELEASED', 'LIBERADO', 'R', '1'].includes(s)) return 'RELEASED';
+  if (['BOPOSCLOSED', 'BOPS_CLOSED', 'CLOSED', 'CERRADO', 'C', 'L', '2'].includes(s)) return 'CLOSED';
+  if (['BOPOSCANCELLED', 'BOPS_CANCELLED', 'CANCELLED', 'CANCELED', 'CANCELADO', '3'].includes(s)) return 'CANCELLED';
+  return s;
+}
+function poCloseStatusLabel(raw) {
+  const s = poCloseStatus(raw);
+  if (s === 'PLANNED') return 'Planificado';
+  if (s === 'RELEASED') return 'Liberado';
+  if (s === 'CLOSED') return 'Cerrado';
+  if (s === 'CANCELLED') return 'Cancelado';
+  return String(raw || '—');
+}
+function poCloseRemainingQty(row = {}) {
+  const planned = Number(row?.plannedQty ?? row?.PlannedQuantity ?? 0) || 0;
+  const completed = Number(row?.completedQty ?? row?.CompletedQuantity ?? 0) || 0;
+  const rejected = Number(row?.rejectedQty ?? row?.RejectedQuantity ?? 0) || 0;
+  return Math.max(0, Math.round((planned - completed - rejected) * 1000) / 1000);
+}
+function poCloseNormalizeOrderRow(row = {}) {
+  const normalized = {
+    absoluteEntry: Number(row?.AbsoluteEntry ?? row?.absoluteEntry ?? row?.DocEntry ?? 0) || 0,
+    docNum: Number(row?.DocumentNumber ?? row?.DocNum ?? row?.docNum ?? 0) || 0,
+    itemCode: String(row?.ItemNo ?? row?.ItemCode ?? row?.itemCode ?? '').trim(),
+    itemName: String(row?.ProductDescription ?? row?.ProdName ?? row?.ItemName ?? row?.itemName ?? '').trim(),
+    plannedQty: Number(row?.PlannedQuantity ?? row?.PlannedQty ?? row?.plannedQty ?? 0) || 0,
+    completedQty: Number(row?.CompletedQuantity ?? row?.CmpltQty ?? row?.CompletedQty ?? row?.completedQty ?? 0) || 0,
+    rejectedQty: Number(row?.RejectedQuantity ?? row?.RejectedQty ?? row?.rejectedQty ?? 0) || 0,
+    postDate: poCloseIso(row?.PostingDate ?? row?.PostDate ?? row?.postDate ?? ''),
+    dueDate: poCloseIso(row?.DueDate ?? row?.ClosingDate ?? row?.dueDate ?? ''),
+    startDate: poCloseIso(row?.StartDate ?? row?.startDate ?? ''),
+    warehouse: String(row?.Warehouse ?? row?.WarehouseCode ?? row?.WhsCode ?? row?.warehouse ?? '').trim(),
+    status: poCloseStatus(row?.ProductionOrderStatus ?? row?.Status ?? row?.status ?? ''),
+    statusLabel: poCloseStatusLabel(row?.ProductionOrderStatus ?? row?.Status ?? row?.status ?? ''),
+    origin: String(row?.ProductionOrderOrigin ?? row?.Origin ?? row?.origin ?? '').trim(),
+    series: String(row?.Series ?? row?.series ?? '').trim(),
+  };
+  normalized.remainingQty = poCloseRemainingQty(normalized);
+  return normalized;
+}
+async function poCloseEnsureTables() {
+  if (!hasDb()) return;
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS admin_production_close_events (
+      id BIGSERIAL PRIMARY KEY,
+      action TEXT NOT NULL DEFAULT '',
+      absolute_entry BIGINT NOT NULL DEFAULT 0,
+      doc_num BIGINT NOT NULL DEFAULT 0,
+      item_code TEXT NOT NULL DEFAULT '',
+      item_name TEXT NOT NULL DEFAULT '',
+      warehouse TEXT NOT NULL DEFAULT '',
+      status_before TEXT NOT NULL DEFAULT '',
+      status_after TEXT NOT NULL DEFAULT '',
+      batch_number TEXT NOT NULL DEFAULT '',
+      expiry_date DATE,
+      reported_qty NUMERIC(19,6) NOT NULL DEFAULT 0,
+      receipt_doc_entry BIGINT,
+      receipt_doc_num BIGINT,
+      note TEXT NOT NULL DEFAULT '',
+      order_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      receipt_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      admin_user TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_events_created ON admin_production_close_events(created_at DESC)`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_events_order ON admin_production_close_events(absolute_entry, doc_num, created_at DESC)`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_events_item ON admin_production_close_events(item_code, created_at DESC)`);
+  await dbQuery(`
+    INSERT INTO app_state(k, v, updated_at)
+    VALUES ('production_close_next_batch_seq', '3000', NOW())
+    ON CONFLICT (k) DO NOTHING
+  `).catch(() => {});
+}
+__extraBootTasks.push(poCloseEnsureTables);
+
+async function poCloseGetNextLotPreview() {
+  if (!hasDb()) return '3000';
+  const r = await dbQuery(`SELECT v FROM app_state WHERE k='production_close_next_batch_seq' LIMIT 1`);
+  const raw = String(r.rows?.[0]?.v || '3000').trim();
+  const n = Number(raw);
+  return String(Number.isFinite(n) && n > 0 ? Math.floor(n) : 3000);
+}
+async function poCloseTakeNextLotNumber() {
+  if (!hasDb()) return String(Date.now());
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const sel = await client.query(`SELECT v FROM app_state WHERE k='production_close_next_batch_seq' FOR UPDATE`);
+    let current = Number(sel.rows?.[0]?.v || 3000);
+    if (!Number.isFinite(current) || current < 1) current = 3000;
+    const nextBatch = String(Math.floor(current));
+    await client.query(
+      `INSERT INTO app_state(k, v, updated_at)
+       VALUES ('production_close_next_batch_seq', $1, NOW())
+       ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, updated_at = NOW()`,
+      [String(Math.floor(current + 1))]
+    );
+    await client.query('COMMIT');
+    return nextBatch;
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+async function poCloseLogEvent(payload = {}) {
+  if (!hasDb()) return;
+  const p = payload || {};
+  await dbQuery(`
+    INSERT INTO admin_production_close_events(
+      action, absolute_entry, doc_num, item_code, item_name, warehouse,
+      status_before, status_after, batch_number, expiry_date, reported_qty,
+      receipt_doc_entry, receipt_doc_num, note, order_payload, receipt_payload,
+      admin_user, created_at
+    )
+    VALUES (
+      $1,$2,$3,$4,$5,$6,
+      $7,$8,$9,$10,$11,
+      $12,$13,$14,$15::jsonb,$16::jsonb,
+      $17,NOW()
+    )
+  `, [
+    String(p.action || ''),
+    Number(p.absoluteEntry || 0),
+    Number(p.docNum || 0),
+    String(p.itemCode || ''),
+    String(p.itemName || ''),
+    String(p.warehouse || ''),
+    String(p.statusBefore || ''),
+    String(p.statusAfter || ''),
+    String(p.batchNumber || ''),
+    p.expiryDate ? String(p.expiryDate).slice(0, 10) : null,
+    Number(p.reportedQty || 0),
+    p.receiptDocEntry != null ? Number(p.receiptDocEntry) : null,
+    p.receiptDocNum != null ? Number(p.receiptDocNum) : null,
+    String(p.note || ''),
+    JSON.stringify(p.orderPayload || {}),
+    JSON.stringify(p.receiptPayload || {}),
+    String(p.adminUser || ''),
+  ]);
+}
+async function poCloseFetchOrderDetail(absoluteEntry, docNum = 0) {
+  const abs = Number(absoluteEntry || 0) || 0;
+  const num = Number(docNum || 0) || 0;
+  const tries = [];
+  if (abs) {
+    tries.push(`/ProductionOrders(${abs})`);
+    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`AbsoluteEntry eq ${abs}`)}&$top=1`);
+    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`DocEntry eq ${abs}`)}&$top=1`);
+  }
+  if (num) {
+    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`DocumentNumber eq ${num}`)}&$top=1`);
+    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`DocNum eq ${num}`)}&$top=1`);
+  }
+  for (const pathTry of tries) {
+    try {
+      const res = await slFetchFreshSession(pathTry);
+      const row = Array.isArray(res?.value) ? (res.value[0] || null) : res;
+      if (row && typeof row === 'object') return poCloseNormalizeOrderRow(row);
+    } catch {}
+  }
+  return null;
+}
+async function poCloseFetchOpenOrdersFromSap({ q = '', top = 250 } = {}) {
+  if (missingSapEnv()) throw new Error('SAP no configurado');
+  const select = [
+    'AbsoluteEntry','DocumentNumber','ItemNo','ProductDescription',
+    'PlannedQuantity','CompletedQuantity','RejectedQuantity',
+    'PostingDate','DueDate','StartDate','Warehouse','ProductionOrderStatus','ProductionOrderOrigin'
+  ].join(',');
+  const tries = [
+    `/ProductionOrders?$select=${select}&$filter=${encodeURIComponent(`(ProductionOrderStatus eq 'boposPlanned' or ProductionOrderStatus eq 'boposReleased')`)}&$orderby=DueDate asc,DocumentNumber desc&$top=${Math.max(20, Math.min(400, Number(top || 250)))}`,
+    `/ProductionOrders?$select=${select}&$filter=${encodeURIComponent(`(ProductionOrderStatus eq 'P' or ProductionOrderStatus eq 'R')`)}&$orderby=DueDate asc,DocumentNumber desc&$top=${Math.max(20, Math.min(400, Number(top || 250)))}`,
+    `/ProductionOrders?$select=${select}&$orderby=DueDate asc,DocumentNumber desc&$top=${Math.max(50, Math.min(600, Number(top || 250) * 2))}`
+  ];
+  let rows = [];
+  for (const p of tries) {
+    try {
+      const res = await slFetchFreshSession(p);
+      const batch = Array.isArray(res?.value) ? res.value : (Array.isArray(res) ? res : []);
+      if (batch.length) {
+        rows = batch;
+        if (tries.indexOf(p) < 2) break;
+      }
+    } catch {}
+  }
+  let orders = rows.map(poCloseNormalizeOrderRow).filter((x) => {
+    const s = poCloseStatus(x.status);
+    return s === 'PLANNED' || s === 'RELEASED';
+  });
+  const qq = String(q || '').trim().toLowerCase();
+  if (qq) {
+    orders = orders.filter((x) =>
+      String(x.itemCode || '').toLowerCase().includes(qq) ||
+      String(x.itemName || '').toLowerCase().includes(qq) ||
+      String(x.docNum || '').includes(qq)
+    );
+  }
+  orders.sort((a, b) => {
+    const ad = String(a.dueDate || a.postDate || '');
+    const bd = String(b.dueDate || b.postDate || '');
+    if (ad && bd && ad !== bd) return ad < bd ? -1 : 1;
+    return Number(b.docNum || 0) - Number(a.docNum || 0);
+  });
+  return orders.slice(0, Math.max(20, Math.min(500, Number(top || 250))));
+}
+async function poClosePatchStatus(absoluteEntry, targetStatus) {
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs) throw new Error('AbsoluteEntry inválido');
+  const options = [];
+  if (targetStatus === 'RELEASED') {
+    options.push('boposReleased', 1, 'R');
+  } else if (targetStatus === 'CLOSED') {
+    options.push('boposClosed', 2, 'L', 'C');
+  } else if (targetStatus === 'PLANNED') {
+    options.push('boposPlanned', 0, 'P');
+  } else {
+    options.push(targetStatus);
+  }
+  let lastErr = null;
+  for (const val of options) {
+    try {
+      await slFetchFreshSession(`/ProductionOrders(${abs})`, {
+        method: 'PATCH',
+        body: JSON.stringify({ ProductionOrderStatus: val }),
+      });
+      const after = await poCloseFetchOrderDetail(abs);
+      if (after) return after;
+      return { absoluteEntry: abs, status: targetStatus, statusLabel: poCloseStatusLabel(targetStatus) };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('No se pudo actualizar el estado de la orden');
+}
+async function poCloseFetchItemFlags(itemCode) {
+  const code = String(itemCode || '').trim();
+  if (!code) return { batchManaged: false, serialManaged: false };
+  try {
+    const item = await slFetchFreshSession(`/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,ManageBatchNumbers,ManageSerialNumbers`);
+    return {
+      batchManaged: poCloseBool(item?.ManageBatchNumbers),
+      serialManaged: poCloseBool(item?.ManageSerialNumbers),
+      itemName: String(item?.ItemName || '').trim(),
+    };
+  } catch {
+    return { batchManaged: false, serialManaged: false };
+  }
+}
+async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate = '', expiryDate = '', batchNumber = '', note = '', adminUser = '' } = {}) {
+  const abs = Number(order?.absoluteEntry || 0) || 0;
+  if (!abs) throw new Error('Orden inválida');
+  const qty = Number(quantity || order?.remainingQty || 0);
+  if (!(qty > 0)) throw new Error('No hay cantidad pendiente para reportar');
+  const orderWarehouse = String(order?.warehouse || '').trim();
+  const itemCode = String(order?.itemCode || '').trim();
+  const flags = await poCloseFetchItemFlags(itemCode);
+  let lot = String(batchNumber || '').trim();
+  if (flags.batchManaged && !lot) lot = await poCloseTakeNextLotNumber();
+  const postDate = poCloseIso(postingDate || getDateISOInOffset(TZ_OFFSET_MIN));
+  const payload = {
+    DocDate: postDate,
+    TaxDate: postDate,
+    DocDueDate: postDate,
+    Comments: truncate(`[prod-close][user:${adminUser || 'admin'}] Orden ${order?.docNum || abs} cierre web ${note || ''}`.trim(), 250),
+    JournalMemo: truncate(`Receipt from Production orden ${order?.docNum || abs}`, 50),
+    DocumentLines: [{
+      BaseType: 202,
+      BaseEntry: abs,
+      ItemCode: itemCode,
+      WarehouseCode: orderWarehouse,
+      Quantity: qty,
+      ...(flags.batchManaged ? {
+        BatchNumbers: [{
+          BatchNumber: lot,
+          Quantity: qty,
+          ...(expiryDate ? { ExpiryDate: poCloseIso(expiryDate) } : {})
+        }]
+      } : {})
+    }]
+  };
+  const created = await slFetchFreshSession('/InventoryGenEntries', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+  return {
+    receipt: created || {},
+    receiptDocEntry: Number(created?.DocEntry || 0) || null,
+    receiptDocNum: Number(created?.DocNum || 0) || null,
+    batchNumber: lot,
+    batchManaged: !!flags.batchManaged,
+    payload,
+  };
+}
+async function poCloseProcessOrder(absoluteEntry, body = {}, adminUser = 'admin') {
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs) throw new Error('AbsoluteEntry inválido');
+  let order = await poCloseFetchOrderDetail(abs, body?.docNum);
+  if (!order) throw new Error('No se encontró la orden en SAP');
+  const before = poCloseStatus(order.status);
+  const steps = [];
+  if (before === 'PLANNED') {
+    order = await poClosePatchStatus(abs, 'RELEASED');
+    steps.push('release');
+    await poCloseLogEvent({
+      action: 'RELEASE',
+      absoluteEntry: order.absoluteEntry,
+      docNum: order.docNum,
+      itemCode: order.itemCode,
+      itemName: order.itemName,
+      warehouse: order.warehouse,
+      statusBefore: before,
+      statusAfter: poCloseStatus(order.status),
+      note: String(body?.note || ''),
+      orderPayload: order,
+      adminUser,
+    }).catch(() => {});
+  }
+  const qty = Number(body?.quantity || order.remainingQty || 0);
+  const receiptInfo = await poCloseCreateReceiptFromProduction(order, {
+    quantity: qty,
+    postingDate: body?.postingDate,
+    expiryDate: body?.expiryDate,
+    batchNumber: body?.batchNumber,
+    note: body?.note,
+    adminUser,
+  });
+  steps.push('report_completion');
+  await poCloseLogEvent({
+    action: 'REPORT_COMPLETION',
+    absoluteEntry: order.absoluteEntry,
+    docNum: order.docNum,
+    itemCode: order.itemCode,
+    itemName: order.itemName,
+    warehouse: order.warehouse,
+    statusBefore: poCloseStatus(order.status),
+    statusAfter: 'RELEASED',
+    batchNumber: receiptInfo.batchNumber || '',
+    expiryDate: body?.expiryDate || '',
+    reportedQty: qty,
+    receiptDocEntry: receiptInfo.receiptDocEntry,
+    receiptDocNum: receiptInfo.receiptDocNum,
+    note: String(body?.note || ''),
+    orderPayload: order,
+    receiptPayload: receiptInfo.payload,
+    adminUser,
+  }).catch(() => {});
+  order = await poClosePatchStatus(abs, 'CLOSED');
+  steps.push('close');
+  await poCloseLogEvent({
+    action: 'CLOSE',
+    absoluteEntry: order.absoluteEntry,
+    docNum: order.docNum,
+    itemCode: order.itemCode,
+    itemName: order.itemName,
+    warehouse: order.warehouse,
+    statusBefore: 'RELEASED',
+    statusAfter: poCloseStatus(order.status),
+    batchNumber: receiptInfo.batchNumber || '',
+    expiryDate: body?.expiryDate || '',
+    reportedQty: qty,
+    receiptDocEntry: receiptInfo.receiptDocEntry,
+    receiptDocNum: receiptInfo.receiptDocNum,
+    note: String(body?.note || ''),
+    orderPayload: order,
+    receiptPayload: receiptInfo.payload,
+    adminUser,
+  }).catch(() => {});
+  return { order, receiptInfo, steps };
+}
+
+app.get('/production-close', async (_req, res) => {
+  try {
+    const htmlPath = PROD_CLOSE_HTML_FILE;
+    if (!fs.existsSync(htmlPath)) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(200).send('<!doctype html><html><body style="font-family:Arial;padding:24px"><h2>production-close.html no encontrado</h2><p>Coloca el archivo en la misma carpeta del server.js.</p></body></html>');
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(200).send(fs.readFileSync(htmlPath, 'utf8'));
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+app.get('/production-close.html', async (_req, res) => {
+  try {
+    const htmlPath = PROD_CLOSE_HTML_FILE;
+    if (!fs.existsSync(htmlPath)) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(200).send('<!doctype html><html><body style="font-family:Arial;padding:24px"><h2>production-close.html no encontrado</h2><p>Coloca el archivo en la misma carpeta del server.js.</p></body></html>');
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(200).send(fs.readFileSync(htmlPath, 'utf8'));
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/production-close/open-orders', verifyAdmin, async (req, res) => {
+  try {
+    const q = String(req.query?.q || '').trim();
+    const top = Math.max(20, Math.min(500, Number(req.query?.top || 250)));
+    const orders = await poCloseFetchOpenOrdersFromSap({ q, top });
+    const planned = orders.filter((x) => x.status === 'PLANNED').length;
+    const released = orders.filter((x) => x.status === 'RELEASED').length;
+    return safeJson(res, 200, {
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      counts: { total: orders.length, planned, released },
+      nextLot: await poCloseGetNextLotPreview(),
+      orders,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/production-close/history', verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 200, { ok: true, rows: [], message: 'DB no configurada' });
+    const limit = Math.max(10, Math.min(500, Number(req.query?.limit || 120)));
+    const rows = await dbQuery(`
+      SELECT id, action, absolute_entry, doc_num, item_code, item_name, warehouse,
+             status_before, status_after, batch_number, expiry_date, reported_qty,
+             receipt_doc_entry, receipt_doc_num, note, admin_user, created_at
+      FROM admin_production_close_events
+      ORDER BY created_at DESC
+      LIMIT $1
+    `, [limit]);
+    return safeJson(res, 200, { ok: true, rows: rows.rows || [] });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/production-close/next-lot', verifyAdmin, async (_req, res) => {
+  try {
+    return safeJson(res, 200, { ok: true, nextLot: await poCloseGetNextLotPreview() });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/release', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const before = await poCloseFetchOrderDetail(abs, req.body?.docNum);
+    if (!before) return safeJson(res, 404, { ok: false, message: 'Orden no encontrada' });
+    const after = before.status === 'RELEASED' ? before : await poClosePatchStatus(abs, 'RELEASED');
+    await poCloseLogEvent({
+      action: 'RELEASE',
+      absoluteEntry: after.absoluteEntry,
+      docNum: after.docNum,
+      itemCode: after.itemCode,
+      itemName: after.itemName,
+      warehouse: after.warehouse,
+      statusBefore: before.status,
+      statusAfter: after.status,
+      note: String(req.body?.note || ''),
+      orderPayload: after,
+      adminUser: String(req.admin?.user || 'admin'),
+    }).catch(() => {});
+    return safeJson(res, 200, { ok: true, order: after, message: 'Orden liberada' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/report-completion', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    let order = await poCloseFetchOrderDetail(abs, req.body?.docNum);
+    if (!order) return safeJson(res, 404, { ok: false, message: 'Orden no encontrada' });
+    if (order.status === 'PLANNED') order = await poClosePatchStatus(abs, 'RELEASED');
+    const qty = Number(req.body?.quantity || order.remainingQty || 0);
+    const receiptInfo = await poCloseCreateReceiptFromProduction(order, {
+      quantity: qty,
+      postingDate: req.body?.postingDate,
+      expiryDate: req.body?.expiryDate,
+      batchNumber: req.body?.batchNumber,
+      note: req.body?.note,
+      adminUser: String(req.admin?.user || 'admin'),
+    });
+    await poCloseLogEvent({
+      action: 'REPORT_COMPLETION',
+      absoluteEntry: order.absoluteEntry,
+      docNum: order.docNum,
+      itemCode: order.itemCode,
+      itemName: order.itemName,
+      warehouse: order.warehouse,
+      statusBefore: order.status,
+      statusAfter: order.status,
+      batchNumber: receiptInfo.batchNumber || '',
+      expiryDate: req.body?.expiryDate || '',
+      reportedQty: qty,
+      receiptDocEntry: receiptInfo.receiptDocEntry,
+      receiptDocNum: receiptInfo.receiptDocNum,
+      note: String(req.body?.note || ''),
+      orderPayload: order,
+      receiptPayload: receiptInfo.payload,
+      adminUser: String(req.admin?.user || 'admin'),
+    }).catch(() => {});
+    const refreshed = await poCloseFetchOrderDetail(abs, req.body?.docNum);
+    return safeJson(res, 200, {
+      ok: true,
+      message: 'Terminación de reporte creada',
+      order: refreshed || order,
+      batchNumber: receiptInfo.batchNumber || '',
+      receiptDocEntry: receiptInfo.receiptDocEntry,
+      receiptDocNum: receiptInfo.receiptDocNum,
+      nextLot: await poCloseGetNextLotPreview(),
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/close', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const before = await poCloseFetchOrderDetail(abs, req.body?.docNum);
+    if (!before) return safeJson(res, 404, { ok: false, message: 'Orden no encontrada' });
+    const after = before.status === 'CLOSED' ? before : await poClosePatchStatus(abs, 'CLOSED');
+    await poCloseLogEvent({
+      action: 'CLOSE',
+      absoluteEntry: after.absoluteEntry,
+      docNum: after.docNum,
+      itemCode: after.itemCode,
+      itemName: after.itemName,
+      warehouse: after.warehouse,
+      statusBefore: before.status,
+      statusAfter: after.status,
+      note: String(req.body?.note || ''),
+      orderPayload: after,
+      adminUser: String(req.admin?.user || 'admin'),
+    }).catch(() => {});
+    return safeJson(res, 200, { ok: true, order: after, message: 'Orden cerrada' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/process', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const out = await poCloseProcessOrder(abs, req.body || {}, String(req.admin?.user || 'admin'));
+    return safeJson(res, 200, {
+      ok: true,
+      message: 'Proceso completado: liberada, terminación creada y orden cerrada',
+      order: out.order,
+      receiptDocEntry: out.receiptInfo?.receiptDocEntry || null,
+      receiptDocNum: out.receiptInfo?.receiptDocNum || null,
+      batchNumber: out.receiptInfo?.batchNumber || '',
+      nextLot: await poCloseGetNextLotPreview(),
+      steps: out.steps || [],
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 (async () => {
   try {
     await ensureDb();
