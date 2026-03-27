@@ -15774,778 +15774,590 @@ app.get('/api/admin/compras/recent', verifyAdmin, async (_req, res) => {
 
 
 /* =========================================================
-   Módulo integrado: Cierre de órdenes de fabricación
-========================================================= */
-{
-  const OFC_LOT_START = Math.max(1, Number(process.env.OF_LOT_START || 3000) || 3000);
-  const OFC_DEFAULT_SHELF_LIFE_YEARS = Math.max(1, Number(process.env.OF_DEFAULT_SHELF_LIFE_YEARS || 3) || 3);
-  const OFC_DEFAULT_WAREHOUSE = String(process.env.OF_DEFAULT_WAREHOUSE || SAP_WAREHOUSE || '').trim();
-  const OFC_JSON_DIR = path.join(process.cwd(), 'data');
-  const OFC_JSON_FILE = path.join(OFC_JSON_DIR, 'of-closing-store.json');
-  const ofcFs = fs.promises;
-
-  function ofcNum(v, fallback = 0) {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : fallback;
-  }
-
-  function ofcNowIso() {
-    return new Date().toISOString();
-  }
-
-  function ofcIsoDate(v) {
-    if (!v) return '';
-    const raw = String(v).trim();
-    const m = raw.match(/^(\d{4}-\d{2}-\d{2})/);
-    if (m) return m[1];
-    const d = new Date(raw);
-    if (Number.isNaN(d.getTime())) return '';
-    return d.toISOString().slice(0, 10);
-  }
-
-  function ofcAddYearsIso(dateIso, years) {
-    const d = new Date(`${String(dateIso || '').slice(0, 10)}T00:00:00`);
-    if (Number.isNaN(d.getTime())) return '';
-    d.setFullYear(d.getFullYear() + ofcNum(years, 0));
-    return d.toISOString().slice(0, 10);
-  }
-
-  function ofcFirst(...values) {
-    for (const value of values) {
-      if (value !== undefined && value !== null && String(value).trim() !== '') return value;
-    }
-    return '';
-  }
-
-  function ofcSapYes(value) {
-    const s = String(value || '').trim().toLowerCase();
-    return s === 'tyes' || s === 'yes' || s === 'true' || s === 'y';
-  }
-
-  async function ofcEnsureJsonStore() {
-    await ofcFs.mkdir(OFC_JSON_DIR, { recursive: true });
-    try {
-      await ofcFs.access(OFC_JSON_FILE);
-    } catch {
-      await ofcFs.writeFile(
-        OFC_JSON_FILE,
-        JSON.stringify({ lotCurrent: OFC_LOT_START - 1, history: [] }, null, 2),
-        'utf8'
-      );
-    }
-  }
-
-  async function ofcReadJsonStore() {
-    await ofcEnsureJsonStore();
-    const raw = await ofcFs.readFile(OFC_JSON_FILE, 'utf8');
-    let parsed = {};
-    try {
-      parsed = JSON.parse(raw || '{}');
-    } catch {
-      parsed = {};
-    }
-    return {
-      lotCurrent: ofcNum(parsed?.lotCurrent, OFC_LOT_START - 1),
-      history: Array.isArray(parsed?.history) ? parsed.history : [],
-    };
-  }
-
-  async function ofcWriteJsonStore(store) {
-    await ofcEnsureJsonStore();
-    await ofcFs.writeFile(OFC_JSON_FILE, JSON.stringify(store || {}, null, 2), 'utf8');
-  }
-
-  async function ofcEnsureDb() {
-    if (!hasDb()) {
-      await ofcEnsureJsonStore();
-      return;
-    }
-
-    await dbQuery(`
-      CREATE TABLE IF NOT EXISTS of_lot_sequence (
-        id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-        current_value BIGINT NOT NULL,
-        updated_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-
-    await dbQuery(
-      `INSERT INTO of_lot_sequence(id, current_value, updated_at)
-       VALUES (1, $1, NOW())
-       ON CONFLICT (id) DO NOTHING`,
-      [OFC_LOT_START - 1]
-    );
-
-    await dbQuery(`
-      CREATE TABLE IF NOT EXISTS of_closure_history (
-        id BIGSERIAL PRIMARY KEY,
-        doc_entry BIGINT NOT NULL,
-        doc_num BIGINT,
-        item_code TEXT DEFAULT '',
-        item_name TEXT DEFAULT '',
-        warehouse_code TEXT DEFAULT '',
-        old_status TEXT DEFAULT '',
-        new_status TEXT DEFAULT '',
-        action_type TEXT NOT NULL,
-        lot_number TEXT DEFAULT '',
-        sequence_value BIGINT,
-        qty NUMERIC(19,6) DEFAULT 0,
-        manufacture_date DATE,
-        expiration_date DATE,
-        sap_receipt_docentry BIGINT,
-        sap_receipt_docnum BIGINT,
-        performed_by TEXT DEFAULT '',
-        notes TEXT DEFAULT '',
-        payload_json JSONB DEFAULT '{}'::jsonb,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-
-    const alters = [
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS doc_num BIGINT`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS item_code TEXT DEFAULT ''`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS item_name TEXT DEFAULT ''`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS warehouse_code TEXT DEFAULT ''`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS old_status TEXT DEFAULT ''`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS new_status TEXT DEFAULT ''`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS action_type TEXT DEFAULT ''`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS lot_number TEXT DEFAULT ''`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS sequence_value BIGINT`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS qty NUMERIC(19,6) DEFAULT 0`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS manufacture_date DATE`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS expiration_date DATE`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS sap_receipt_docentry BIGINT`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS sap_receipt_docnum BIGINT`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS performed_by TEXT DEFAULT ''`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT ''`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS payload_json JSONB DEFAULT '{}'::jsonb`,
-      `ALTER TABLE of_closure_history ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()`
-    ];
-    for (const q of alters) {
-      try { await dbQuery(q); } catch {}
-    }
-
-    const indexes = [
-      `CREATE INDEX IF NOT EXISTS idx_of_history_doc_entry ON of_closure_history(doc_entry)`,
-      `CREATE INDEX IF NOT EXISTS idx_of_history_created_at ON of_closure_history(created_at DESC)`,
-      `CREATE INDEX IF NOT EXISTS idx_of_history_action_type ON of_closure_history(action_type)`
-    ];
-    for (const q of indexes) {
-      try { await dbQuery(q); } catch {}
-    }
-  }
-
-  async function ofcGetHistory(limit = 200) {
-    const safeLimit = Math.max(1, Math.min(1000, ofcNum(limit, 200)));
-    if (hasDb()) {
-      const r = await dbQuery(
-        `SELECT *
-           FROM of_closure_history
-          ORDER BY created_at DESC, id DESC
-          LIMIT $1`,
-        [safeLimit]
-      );
-      return r.rows || [];
-    }
-    const store = await ofcReadJsonStore();
-    return store.history.slice(0, safeLimit);
-  }
-
-  async function ofcGetHistoryCount() {
-    if (hasDb()) {
-      const r = await dbQuery(`SELECT COUNT(*)::bigint AS total FROM of_closure_history`);
-      return ofcNum(r.rows?.[0]?.total, 0);
-    }
-    const store = await ofcReadJsonStore();
-    return Array.isArray(store.history) ? store.history.length : 0;
-  }
-
-  async function ofcGetNextLotPreview() {
-    if (hasDb()) {
-      const r = await dbQuery(`SELECT current_value FROM of_lot_sequence WHERE id = 1 LIMIT 1`);
-      return ofcNum(r.rows?.[0]?.current_value, OFC_LOT_START - 1) + 1;
-    }
-    const store = await ofcReadJsonStore();
-    return ofcNum(store.lotCurrent, OFC_LOT_START - 1) + 1;
-  }
-
-  async function ofcReserveNextLot() {
-    if (hasDb()) {
-      const r = await dbQuery(
-        `UPDATE of_lot_sequence
-            SET current_value = current_value + 1,
-                updated_at = NOW()
-          WHERE id = 1
-        RETURNING current_value`
-      );
-      return ofcNum(r.rows?.[0]?.current_value, OFC_LOT_START);
-    }
-    const store = await ofcReadJsonStore();
-    store.lotCurrent = ofcNum(store.lotCurrent, OFC_LOT_START - 1) + 1;
-    await ofcWriteJsonStore(store);
-    return store.lotCurrent;
-  }
-
-  async function ofcAddHistory(entry) {
-    const normalized = {
-      doc_entry: ofcNum(entry?.doc_entry, 0),
-      doc_num: entry?.doc_num != null ? ofcNum(entry.doc_num, 0) : null,
-      item_code: String(entry?.item_code || ''),
-      item_name: String(entry?.item_name || ''),
-      warehouse_code: String(entry?.warehouse_code || ''),
-      old_status: String(entry?.old_status || ''),
-      new_status: String(entry?.new_status || ''),
-      action_type: String(entry?.action_type || ''),
-      lot_number: String(entry?.lot_number || ''),
-      sequence_value: entry?.sequence_value != null ? ofcNum(entry.sequence_value, 0) : null,
-      qty: ofcNum(entry?.qty, 0),
-      manufacture_date: ofcIsoDate(entry?.manufacture_date) || null,
-      expiration_date: ofcIsoDate(entry?.expiration_date) || null,
-      sap_receipt_docentry: entry?.sap_receipt_docentry != null ? ofcNum(entry.sap_receipt_docentry, 0) : null,
-      sap_receipt_docnum: entry?.sap_receipt_docnum != null ? ofcNum(entry.sap_receipt_docnum, 0) : null,
-      performed_by: String(entry?.performed_by || ''),
-      notes: String(entry?.notes || ''),
-      payload_json: entry?.payload_json || {},
-      created_at: entry?.created_at || ofcNowIso(),
-    };
-
-    if (hasDb()) {
-      const r = await dbQuery(
-        `INSERT INTO of_closure_history(
-           doc_entry, doc_num, item_code, item_name, warehouse_code,
-           old_status, new_status, action_type, lot_number, sequence_value,
-           qty, manufacture_date, expiration_date, sap_receipt_docentry,
-           sap_receipt_docnum, performed_by, notes, payload_json, created_at
-         ) VALUES(
-           $1,$2,$3,$4,$5,
-           $6,$7,$8,$9,$10,
-           $11,$12,$13,$14,
-           $15,$16,$17,$18,NOW()
-         )
-         RETURNING *`,
-        [
-          normalized.doc_entry,
-          normalized.doc_num,
-          normalized.item_code,
-          normalized.item_name,
-          normalized.warehouse_code,
-          normalized.old_status,
-          normalized.new_status,
-          normalized.action_type,
-          normalized.lot_number,
-          normalized.sequence_value,
-          normalized.qty,
-          normalized.manufacture_date,
-          normalized.expiration_date,
-          normalized.sap_receipt_docentry,
-          normalized.sap_receipt_docnum,
-          normalized.performed_by,
-          normalized.notes,
-          JSON.stringify(normalized.payload_json || {}),
-        ]
-      );
-      return r.rows?.[0] || normalized;
-    }
-
-    const store = await ofcReadJsonStore();
-    const row = { id: Date.now(), ...normalized };
-    store.history.unshift(row);
-    store.history = store.history.slice(0, 2000);
-    await ofcWriteJsonStore(store);
-    return row;
-  }
-
-  function ofcMapProdOrder(raw = {}) {
-    const plannedQty = ofcNum(ofcFirst(raw.PlannedQuantity, raw.ProductQuantity, raw.ProductionQuantity), 0);
-    const completedQty = ofcNum(raw.CompletedQuantity, 0);
-    const rejectedQty = ofcNum(raw.RejectedQuantity, 0);
-    const remainingQty = Math.max(plannedQty - completedQty - rejectedQty, 0);
-    return {
-      docEntry: ofcNum(ofcFirst(raw.AbsoluteEntry, raw.DocEntry), 0),
-      docNum: ofcNum(ofcFirst(raw.DocumentNumber, raw.DocNum), 0),
-      itemCode: String(ofcFirst(raw.ItemNo, raw.ItemCode, raw.ProductNo)).trim(),
-      itemName: String(ofcFirst(raw.ProductDescription, raw.ItemName, raw.ProductDescription1)).trim(),
-      plannedQty,
-      completedQty,
-      rejectedQty,
-      remainingQty,
-      status: String(ofcFirst(raw.ProductionOrderStatus, raw.Status)).trim(),
-      dueDate: ofcIsoDate(ofcFirst(raw.DueDate, raw.CloseDate, raw.RequiredDate)),
-      postingDate: ofcIsoDate(ofcFirst(raw.PostingDate, raw.PostDate)),
-      startDate: ofcIsoDate(ofcFirst(raw.StartDate)),
-      warehouseCode: String(ofcFirst(raw.Warehouse, raw.WarehouseCode, OFC_DEFAULT_WAREHOUSE)).trim(),
-      remarks: String(ofcFirst(raw.Remarks, raw.Comments)).trim(),
-      raw,
-    };
-  }
-
-  async function ofcSapGetProductionOrder(docEntry) {
-    const raw = await slFetchFreshSession(`/ProductionOrders(${encodeURIComponent(docEntry)})`);
-    return ofcMapProdOrder(raw);
-  }
-
-  async function ofcSapListOpenProductionOrders() {
-    const filter = encodeURIComponent("ProductionOrderStatus eq 'boposPlanned' or ProductionOrderStatus eq 'boposReleased'");
-    const attempts = [
-      `/ProductionOrders?$filter=${filter}&$orderby=DueDate asc&$top=500`,
-      `/ProductionOrders?$filter=${filter}&$top=500`,
-      `/ProductionOrders?$top=500`
-    ];
-    let payload = null;
-    let lastErr = null;
-    for (const apiPath of attempts) {
-      try {
-        payload = await slFetchFreshSession(apiPath);
-        if (payload) break;
-      } catch (err) {
-        lastErr = err;
-      }
-    }
-    if (!payload) throw lastErr || new Error('No se pudo leer ProductionOrders desde SAP.');
-
-    const rows = Array.isArray(payload?.value) ? payload.value : [];
-    return rows
-      .map(ofcMapProdOrder)
-      .filter((row) => row.docEntry > 0)
-      .filter((row) => row.status === 'boposPlanned' || row.status === 'boposReleased')
-      .sort((a, b) => {
-        const ad = a.dueDate || '9999-12-31';
-        const bd = b.dueDate || '9999-12-31';
-        if (ad !== bd) return ad.localeCompare(bd);
-        return a.docNum - b.docNum;
-      });
-  }
-
-  async function ofcSapPatchProductionOrderStatus(docEntry, status) {
-    await slFetchFreshSession(`/ProductionOrders(${encodeURIComponent(docEntry)})`, {
-      method: 'PATCH',
-      body: JSON.stringify({ ProductionOrderStatus: status }),
-    });
-    return ofcSapGetProductionOrder(docEntry);
-  }
-
-  async function ofcSapGetItem(itemCode) {
-    return slFetchFreshSession(`/Items('${encodeURIComponent(String(itemCode || ''))}')`);
-  }
-
-  function ofcBuildReceiptPayload({ order, quantity, lotNumber, manufactureDate, expirationDate, notes, isBatchManaged, warehouseCode }) {
-    const qty = ofcNum(quantity, 0);
-    const today = getDateISOInOffset ? getDateISOInOffset(TZ_OFFSET_MIN) : ofcIsoDate(new Date().toISOString());
-    const whs = String(warehouseCode || order?.warehouseCode || OFC_DEFAULT_WAREHOUSE).trim();
-    const line = {
-      BaseEntry: order.docEntry,
-      BaseType: 202,
-      Quantity: qty,
-      TransactionType: 'botrntComplete',
-    };
-    if (whs) line.WarehouseCode = whs;
-    if (isBatchManaged) {
-      line.BatchNumbers = [{
-        BatchNumber: String(lotNumber),
-        Quantity: qty,
-        ...(manufactureDate ? { ManufacturingDate: manufactureDate } : {}),
-        ...(manufactureDate ? { AddmisionDate: manufactureDate } : {}),
-        ...(expirationDate ? { ExpiryDate: expirationDate } : {}),
-      }];
-    }
-    return {
-      DocDate: today,
-      DocDueDate: today,
-      TaxDate: today,
-      Comments: String(notes || '').trim(),
-      Reference2: String(lotNumber || ''),
-      DocumentLines: [line],
-    };
-  }
-
-  async function ofcSapCreateReceiptFromProduction({ order, quantity, lotNumber, manufactureDate, expirationDate, notes }) {
-    const item = order?.itemCode ? await ofcSapGetItem(order.itemCode) : {};
-    const managesBatch = ofcSapYes(ofcFirst(item?.ManageBatchNumbers, item?.ManageBatchNumbersOnReleaseOnly));
-    const managesSerial = ofcSapYes(ofcFirst(item?.ManageSerialNumbers, item?.ManageSerialNumbersOnReleaseOnly));
-    if (managesSerial) {
-      throw new Error(`El artículo ${order.itemCode} maneja números de serie. Este flujo quedó preparado para lotes; para series hay que ampliar el payload de SAP.`);
-    }
-
-    const payload = ofcBuildReceiptPayload({
-      order,
-      quantity,
-      lotNumber,
-      manufactureDate,
-      expirationDate,
-      notes,
-      isBatchManaged: managesBatch,
-      warehouseCode: order?.warehouseCode,
-    });
-
-    const created = await slFetchFreshSession('/InventoryGenEntries', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
-
-    return {
-      docEntry: ofcNum(ofcFirst(created?.DocEntry, created?.DocumentEntry), 0),
-      docNum: ofcNum(ofcFirst(created?.DocNum, created?.DocumentNumber), 0),
-      managesBatch,
-      payload,
-      raw: created,
-    };
-  }
-
-  function ofcBuildHistoryBase(order, req, body) {
-    return {
-      doc_entry: order?.docEntry,
-      doc_num: order?.docNum,
-      item_code: order?.itemCode,
-      item_name: order?.itemName,
-      warehouse_code: order?.warehouseCode,
-      qty: ofcNum(body?.quantity, order?.remainingQty || order?.plannedQty || 0),
-      manufacture_date: ofcIsoDate(body?.manufactureDate),
-      expiration_date: ofcIsoDate(body?.expirationDate),
-      performed_by: String(req?.user?.username || req?.admin?.user || ''),
-      notes: String(body?.notes || ''),
-    };
-  }
-
-  async function ofcRunFullClosingProcess({ req, order, body }) {
-    const historyBase = ofcBuildHistoryBase(order, req, body || {});
-    const requestedQty = ofcNum(body?.quantity, order?.remainingQty || order?.plannedQty || 0);
-    if (!(requestedQty > 0)) throw new Error('La cantidad a reportar debe ser mayor que cero.');
-
-    let currentOrder = order;
-    if (currentOrder?.status === 'boposClosed') {
-      throw new Error(`La orden ${currentOrder.docNum} ya está cerrada en SAP.`);
-    }
-
-    if (currentOrder?.status === 'boposPlanned') {
-      currentOrder = await ofcSapPatchProductionOrderStatus(currentOrder.docEntry, 'boposReleased');
-      await ofcAddHistory({
-        ...historyBase,
-        old_status: order?.status,
-        new_status: currentOrder?.status,
-        action_type: 'release',
-        payload_json: { automatic: true, docEntry: order?.docEntry },
-      });
-    }
-
-    const sequenceValue = await ofcReserveNextLot();
-    const lotNumber = String(sequenceValue);
-    const manufactureDate = ofcIsoDate(body?.manufactureDate) || ofcIsoDate(new Date().toISOString());
-    const expirationDate = ofcIsoDate(body?.expirationDate) || ofcAddYearsIso(manufactureDate, ofcNum(body?.shelfLifeYears, OFC_DEFAULT_SHELF_LIFE_YEARS));
-    const notes = [String(body?.notes || '').trim(), `Lote automático ${lotNumber}`].filter(Boolean).join(' · ');
-
-    let receipt = null;
-    try {
-      receipt = await ofcSapCreateReceiptFromProduction({
-        order: currentOrder,
-        quantity: requestedQty,
-        lotNumber,
-        manufactureDate,
-        expirationDate,
-        notes,
-      });
-
-      const closedOrder = await ofcSapPatchProductionOrderStatus(currentOrder.docEntry, 'boposClosed');
-      const history = await ofcAddHistory({
-        ...historyBase,
-        old_status: currentOrder?.status,
-        new_status: closedOrder?.status,
-        action_type: 'finish_and_close',
-        lot_number: lotNumber,
-        sequence_value: sequenceValue,
-        qty: requestedQty,
-        manufacture_date: manufactureDate,
-        expiration_date: expirationDate,
-        sap_receipt_docentry: receipt?.docEntry,
-        sap_receipt_docnum: receipt?.docNum,
-        notes,
-        payload_json: {
-          receiptPayload: receipt?.payload,
-          receiptDocEntry: receipt?.docEntry,
-          receiptDocNum: receipt?.docNum,
-        },
-      });
-      return { lotNumber, sequenceValue, receipt, orderBefore: currentOrder, orderAfter: closedOrder, history };
-    } catch (err) {
-      if (receipt?.docEntry) {
-        await ofcAddHistory({
-          ...historyBase,
-          old_status: currentOrder?.status,
-          new_status: currentOrder?.status,
-          action_type: 'report_completion_only',
-          lot_number: lotNumber,
-          sequence_value: sequenceValue,
-          qty: requestedQty,
-          manufacture_date: manufactureDate,
-          expiration_date: expirationDate,
-          sap_receipt_docentry: receipt?.docEntry,
-          sap_receipt_docnum: receipt?.docNum,
-          notes: `${notes} · Error al cerrar la OF después de crear la terminación.`,
-          payload_json: {
-            receiptPayload: receipt?.payload,
-            receiptDocEntry: receipt?.docEntry,
-            receiptDocNum: receipt?.docNum,
-            error: String(err?.message || err),
-          },
-        });
-        throw new Error(`La terminación de reporte sí se creó en SAP (doc. ${receipt?.docNum || receipt?.docEntry}), pero el cierre final falló: ${err?.message || err}`);
-      }
-      throw err;
-    }
-  }
-
-  async function ofcHandleOpenOrders(req, res) {
-    try {
-      if (missingSapEnv()) return safeJson(res, 500, { ok: false, message: 'Faltan variables de SAP en el server.' });
-      const search = String(req.query?.search || '').trim().toLowerCase();
-      let rows = await ofcSapListOpenProductionOrders();
-      if (search) {
-        rows = rows.filter((row) => [row.docNum, row.itemCode, row.itemName, row.status, row.warehouseCode, row.remarks, row.dueDate].join(' ').toLowerCase().includes(search));
-      }
-      const summary = {
-        total: rows.length,
-        planned: rows.filter((x) => x.status === 'boposPlanned').length,
-        released: rows.filter((x) => x.status === 'boposReleased').length,
-        pendingQty: rows.reduce((acc, row) => acc + ofcNum(row?.remainingQty, 0), 0),
-      };
-      return safeJson(res, 200, { ok: true, rows, summary });
-    } catch (err) {
-      return safeJson(res, 500, { ok: false, message: err?.message || String(err) });
-    }
-  }
-
-  async function ofcHandleOrderDetail(req, res) {
-    try {
-      const docEntry = ofcNum(req.params?.docEntry, 0);
-      if (!docEntry) return safeJson(res, 400, { ok: false, message: 'DocEntry inválido.' });
-      const order = await ofcSapGetProductionOrder(docEntry);
-      if (!order?.docEntry) return safeJson(res, 404, { ok: false, message: 'Orden no encontrada.' });
-      let itemFlags = null;
-      if (order?.itemCode) {
-        try {
-          const item = await ofcSapGetItem(order.itemCode);
-          itemFlags = {
-            managesBatch: ofcSapYes(item?.ManageBatchNumbers),
-            managesSerial: ofcSapYes(item?.ManageSerialNumbers),
-          };
-        } catch {
-          itemFlags = null;
-        }
-      }
-      return safeJson(res, 200, {
-        ok: true,
-        order,
-        itemFlags,
-        nextLotPreview: await ofcGetNextLotPreview(),
-        defaultShelfLifeYears: OFC_DEFAULT_SHELF_LIFE_YEARS,
-      });
-    } catch (err) {
-      return safeJson(res, 500, { ok: false, message: err?.message || String(err) });
-    }
-  }
-
-  async function ofcHandleHistory(req, res) {
-    try {
-      const limit = Math.max(1, Math.min(500, ofcNum(req.query?.limit, 200)));
-      const rows = await ofcGetHistory(limit);
-      return safeJson(res, 200, { ok: true, rows });
-    } catch (err) {
-      return safeJson(res, 500, { ok: false, message: err?.message || String(err) });
-    }
-  }
-
-  async function ofcHandleHealth(_req, res) {
-    try {
-      return safeJson(res, 200, {
-        ok: true,
-        storageMode: hasDb() ? 'postgres' : 'json_file',
-        historyCount: await ofcGetHistoryCount(),
-        nextLot: await ofcGetNextLotPreview(),
-        defaultShelfLifeYears: OFC_DEFAULT_SHELF_LIFE_YEARS,
-        serverTime: ofcNowIso(),
-      });
-    } catch (err) {
-      return safeJson(res, 500, { ok: false, message: err?.message || String(err) });
-    }
-  }
-
-  async function ofcHandleNextLot(_req, res) {
-    try {
-      return safeJson(res, 200, { ok: true, nextLot: await ofcGetNextLotPreview() });
-    } catch (err) {
-      return safeJson(res, 500, { ok: false, message: err?.message || String(err) });
-    }
-  }
-
-  async function ofcHandleRelease(req, res) {
-    try {
-      const docEntry = ofcNum(req.params?.docEntry, 0);
-      if (!docEntry) return safeJson(res, 400, { ok: false, message: 'DocEntry inválido.' });
-      const order = await ofcSapGetProductionOrder(docEntry);
-      if (order?.status === 'boposReleased') return safeJson(res, 200, { ok: true, message: 'La orden ya estaba liberada.', order });
-      if (order?.status === 'boposClosed') return safeJson(res, 400, { ok: false, message: 'La orden ya está cerrada.' });
-      const updated = await ofcSapPatchProductionOrderStatus(docEntry, 'boposReleased');
-      const history = await ofcAddHistory({
-        ...ofcBuildHistoryBase(order, req, req.body || {}),
-        old_status: order?.status,
-        new_status: updated?.status,
-        action_type: 'release',
-        payload_json: { manual: true },
-      });
-      return safeJson(res, 200, {
-        ok: true,
-        message: `OF ${updated?.docNum} liberada correctamente.`,
-        order: updated,
-        history,
-        nextLotPreview: await ofcGetNextLotPreview(),
-      });
-    } catch (err) {
-      return safeJson(res, 500, { ok: false, message: err?.message || String(err) });
-    }
-  }
-
-  async function ofcHandleReportCompletion(req, res) {
-    try {
-      const docEntry = ofcNum(req.params?.docEntry, 0);
-      if (!docEntry) return safeJson(res, 400, { ok: false, message: 'DocEntry inválido.' });
-      let order = await ofcSapGetProductionOrder(docEntry);
-      if (order?.status === 'boposClosed') return safeJson(res, 400, { ok: false, message: 'La orden ya está cerrada.' });
-      if (order?.status === 'boposPlanned') {
-        const beforeRelease = order;
-        order = await ofcSapPatchProductionOrderStatus(docEntry, 'boposReleased');
-        await ofcAddHistory({
-          ...ofcBuildHistoryBase(beforeRelease, req, req.body || {}),
-          old_status: beforeRelease?.status,
-          new_status: order?.status,
-          action_type: 'release',
-          payload_json: { automatic: true, reason: 'pre_report_completion' },
-        });
-      }
-      const quantity = ofcNum(req.body?.quantity, order?.remainingQty || order?.plannedQty || 0);
-      if (!(quantity > 0)) return safeJson(res, 400, { ok: false, message: 'La cantidad a reportar debe ser mayor que cero.' });
-      const sequenceValue = await ofcReserveNextLot();
-      const lotNumber = String(sequenceValue);
-      const manufactureDate = ofcIsoDate(req.body?.manufactureDate) || ofcIsoDate(new Date().toISOString());
-      const expirationDate = ofcIsoDate(req.body?.expirationDate) || ofcAddYearsIso(manufactureDate, ofcNum(req.body?.shelfLifeYears, OFC_DEFAULT_SHELF_LIFE_YEARS));
-      const notes = [String(req.body?.notes || '').trim(), `Lote automático ${lotNumber}`].filter(Boolean).join(' · ');
-      const receipt = await ofcSapCreateReceiptFromProduction({ order, quantity, lotNumber, manufactureDate, expirationDate, notes });
-      const history = await ofcAddHistory({
-        ...ofcBuildHistoryBase(order, req, req.body || {}),
-        old_status: order?.status,
-        new_status: order?.status,
-        action_type: 'report_completion',
-        lot_number: lotNumber,
-        sequence_value: sequenceValue,
-        qty: quantity,
-        manufacture_date: manufactureDate,
-        expiration_date: expirationDate,
-        sap_receipt_docentry: receipt?.docEntry,
-        sap_receipt_docnum: receipt?.docNum,
-        notes,
-        payload_json: {
-          receiptPayload: receipt?.payload,
-          receiptDocEntry: receipt?.docEntry,
-          receiptDocNum: receipt?.docNum,
-        },
-      });
-      return safeJson(res, 200, {
-        ok: true,
-        message: `Terminación creada. Lote ${lotNumber}. Documento SAP ${receipt?.docNum || receipt?.docEntry}.`,
-        order,
-        receipt,
-        history,
-        lotNumber,
-        nextLotPreview: await ofcGetNextLotPreview(),
-      });
-    } catch (err) {
-      return safeJson(res, 500, { ok: false, message: err?.message || String(err) });
-    }
-  }
-
-  async function ofcHandleClose(req, res) {
-    try {
-      const docEntry = ofcNum(req.params?.docEntry, 0);
-      if (!docEntry) return safeJson(res, 400, { ok: false, message: 'DocEntry inválido.' });
-      const order = await ofcSapGetProductionOrder(docEntry);
-      if (order?.status === 'boposClosed') return safeJson(res, 200, { ok: true, message: 'La orden ya estaba cerrada.', order });
-      const updated = await ofcSapPatchProductionOrderStatus(docEntry, 'boposClosed');
-      const history = await ofcAddHistory({
-        ...ofcBuildHistoryBase(order, req, req.body || {}),
-        old_status: order?.status,
-        new_status: updated?.status,
-        action_type: 'manual_close',
-        payload_json: { manual: true },
-      });
-      return safeJson(res, 200, {
-        ok: true,
-        message: `OF ${updated?.docNum} cerrada correctamente.`,
-        order: updated,
-        history,
-        nextLotPreview: await ofcGetNextLotPreview(),
-      });
-    } catch (err) {
-      return safeJson(res, 500, { ok: false, message: err?.message || String(err) });
-    }
-  }
-
-  async function ofcHandleFinishAndClose(req, res) {
-    try {
-      const docEntry = ofcNum(req.params?.docEntry, 0);
-      if (!docEntry) return safeJson(res, 400, { ok: false, message: 'DocEntry inválido.' });
-      const order = await ofcSapGetProductionOrder(docEntry);
-      const result = await ofcRunFullClosingProcess({ req, order, body: req.body || {} });
-      return safeJson(res, 200, {
-        ok: true,
-        message: `OF ${result?.orderAfter?.docNum} cerrada. Lote ${result?.lotNumber}. Terminación SAP ${result?.receipt?.docNum || result?.receipt?.docEntry}.`,
-        ...result,
-        nextLotPreview: await ofcGetNextLotPreview(),
-      });
-    } catch (err) {
-      return safeJson(res, 500, { ok: false, message: err?.message || String(err) });
-    }
-  }
-
-  app.get('/api/of/health', ofcHandleHealth);
-  app.get('/api/admin/of/health', verifyUser, ofcHandleHealth);
-
-  app.get('/api/of/open-orders', verifyUser, ofcHandleOpenOrders);
-  app.get('/api/admin/of/open-orders', verifyUser, ofcHandleOpenOrders);
-
-  app.get('/api/of/orders/:docEntry', verifyUser, ofcHandleOrderDetail);
-  app.get('/api/admin/of/orders/:docEntry', verifyUser, ofcHandleOrderDetail);
-
-  app.get('/api/of/history', verifyUser, ofcHandleHistory);
-  app.get('/api/admin/of/history', verifyUser, ofcHandleHistory);
-
-  app.get('/api/of/lot/next', verifyUser, ofcHandleNextLot);
-  app.get('/api/admin/of/lot/next', verifyUser, ofcHandleNextLot);
-
-  app.post('/api/of/orders/:docEntry/release', verifyUser, ofcHandleRelease);
-  app.post('/api/admin/of/orders/:docEntry/release', verifyUser, ofcHandleRelease);
-
-  app.post('/api/of/orders/:docEntry/report-completion', verifyUser, ofcHandleReportCompletion);
-  app.post('/api/admin/of/orders/:docEntry/report-completion', verifyUser, ofcHandleReportCompletion);
-
-  app.post('/api/of/orders/:docEntry/close', verifyUser, ofcHandleClose);
-  app.post('/api/admin/of/orders/:docEntry/close', verifyUser, ofcHandleClose);
-
-  app.post('/api/of/orders/:docEntry/finish-and-close', verifyUser, ofcHandleFinishAndClose);
-  app.post('/api/admin/of/orders/:docEntry/finish-and-close', verifyUser, ofcHandleFinishAndClose);
-
-  __extraBootTasks.push(async () => {
-    try {
-      await ofcEnsureDb();
-    } catch (e) {
-      console.error('OF closing DB init error:', e.message || String(e));
-    }
-  });
-}
-
-
-/* =========================================================
    Start
 ========================================================= */
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+
+
+/* =========================================================
+   Producción — Cierre de órdenes de fabricación (tablets)
+========================================================= */
+const PROD_CLOSE_HTML_FILE = path.join(process.cwd(), 'production-close.html');
+
+function poCloseBool(v) {
+  const s = String(v ?? '').trim().toLowerCase();
+  return s === 'true' || s === '1' || s === 'yes' || s === 'tyes' || s === 'y' || s === 'si';
+}
+function poCloseIso(v) {
+  return String(v || '').slice(0, 10);
+}
+function poCloseStatus(raw) {
+  const s = String(raw || '').trim().toUpperCase();
+  if (!s) return '';
+  if (['BOPOSPLANNED', 'PLANNED', 'PLANIFICADO', 'P', '0'].includes(s)) return 'PLANNED';
+  if (['BOPOSRELEASED', 'RELEASED', 'LIBERADO', 'R', '1'].includes(s)) return 'RELEASED';
+  if (['BOPOSCLOSED', 'BOPS_CLOSED', 'CLOSED', 'CERRADO', 'C', 'L', '2'].includes(s)) return 'CLOSED';
+  if (['BOPOSCANCELLED', 'BOPS_CANCELLED', 'CANCELLED', 'CANCELED', 'CANCELADO', '3'].includes(s)) return 'CANCELLED';
+  return s;
+}
+function poCloseStatusLabel(raw) {
+  const s = poCloseStatus(raw);
+  if (s === 'PLANNED') return 'Planificado';
+  if (s === 'RELEASED') return 'Liberado';
+  if (s === 'CLOSED') return 'Cerrado';
+  if (s === 'CANCELLED') return 'Cancelado';
+  return String(raw || '—');
+}
+function poCloseRemainingQty(row = {}) {
+  const planned = Number(row?.plannedQty ?? row?.PlannedQuantity ?? 0) || 0;
+  const completed = Number(row?.completedQty ?? row?.CompletedQuantity ?? 0) || 0;
+  const rejected = Number(row?.rejectedQty ?? row?.RejectedQuantity ?? 0) || 0;
+  return Math.max(0, Math.round((planned - completed - rejected) * 1000) / 1000);
+}
+function poCloseNormalizeOrderRow(row = {}) {
+  const normalized = {
+    absoluteEntry: Number(row?.AbsoluteEntry ?? row?.absoluteEntry ?? row?.DocEntry ?? 0) || 0,
+    docNum: Number(row?.DocumentNumber ?? row?.DocNum ?? row?.docNum ?? 0) || 0,
+    itemCode: String(row?.ItemNo ?? row?.ItemCode ?? row?.itemCode ?? '').trim(),
+    itemName: String(row?.ProductDescription ?? row?.ProdName ?? row?.ItemName ?? row?.itemName ?? '').trim(),
+    plannedQty: Number(row?.PlannedQuantity ?? row?.PlannedQty ?? row?.plannedQty ?? 0) || 0,
+    completedQty: Number(row?.CompletedQuantity ?? row?.CmpltQty ?? row?.CompletedQty ?? row?.completedQty ?? 0) || 0,
+    rejectedQty: Number(row?.RejectedQuantity ?? row?.RejectedQty ?? row?.rejectedQty ?? 0) || 0,
+    postDate: poCloseIso(row?.PostingDate ?? row?.PostDate ?? row?.postDate ?? ''),
+    dueDate: poCloseIso(row?.DueDate ?? row?.ClosingDate ?? row?.dueDate ?? ''),
+    startDate: poCloseIso(row?.StartDate ?? row?.startDate ?? ''),
+    warehouse: String(row?.Warehouse ?? row?.WarehouseCode ?? row?.WhsCode ?? row?.warehouse ?? '').trim(),
+    status: poCloseStatus(row?.ProductionOrderStatus ?? row?.Status ?? row?.status ?? ''),
+    statusLabel: poCloseStatusLabel(row?.ProductionOrderStatus ?? row?.Status ?? row?.status ?? ''),
+    origin: String(row?.ProductionOrderOrigin ?? row?.Origin ?? row?.origin ?? '').trim(),
+    series: String(row?.Series ?? row?.series ?? '').trim(),
+  };
+  normalized.remainingQty = poCloseRemainingQty(normalized);
+  return normalized;
+}
+async function poCloseEnsureTables() {
+  if (!hasDb()) return;
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS admin_production_close_events (
+      id BIGSERIAL PRIMARY KEY,
+      action TEXT NOT NULL DEFAULT '',
+      absolute_entry BIGINT NOT NULL DEFAULT 0,
+      doc_num BIGINT NOT NULL DEFAULT 0,
+      item_code TEXT NOT NULL DEFAULT '',
+      item_name TEXT NOT NULL DEFAULT '',
+      warehouse TEXT NOT NULL DEFAULT '',
+      status_before TEXT NOT NULL DEFAULT '',
+      status_after TEXT NOT NULL DEFAULT '',
+      batch_number TEXT NOT NULL DEFAULT '',
+      expiry_date DATE,
+      reported_qty NUMERIC(19,6) NOT NULL DEFAULT 0,
+      receipt_doc_entry BIGINT,
+      receipt_doc_num BIGINT,
+      note TEXT NOT NULL DEFAULT '',
+      order_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      receipt_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      admin_user TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_events_created ON admin_production_close_events(created_at DESC)`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_events_order ON admin_production_close_events(absolute_entry, doc_num, created_at DESC)`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_events_item ON admin_production_close_events(item_code, created_at DESC)`);
+  await dbQuery(`
+    INSERT INTO app_state(k, v, updated_at)
+    VALUES ('production_close_next_batch_seq', '3000', NOW())
+    ON CONFLICT (k) DO NOTHING
+  `).catch(() => {});
+}
+__extraBootTasks.push(poCloseEnsureTables);
+
+async function poCloseGetNextLotPreview() {
+  if (!hasDb()) return '3000';
+  const r = await dbQuery(`SELECT v FROM app_state WHERE k='production_close_next_batch_seq' LIMIT 1`);
+  const raw = String(r.rows?.[0]?.v || '3000').trim();
+  const n = Number(raw);
+  return String(Number.isFinite(n) && n > 0 ? Math.floor(n) : 3000);
+}
+async function poCloseTakeNextLotNumber() {
+  if (!hasDb()) return String(Date.now());
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const sel = await client.query(`SELECT v FROM app_state WHERE k='production_close_next_batch_seq' FOR UPDATE`);
+    let current = Number(sel.rows?.[0]?.v || 3000);
+    if (!Number.isFinite(current) || current < 1) current = 3000;
+    const nextBatch = String(Math.floor(current));
+    await client.query(
+      `INSERT INTO app_state(k, v, updated_at)
+       VALUES ('production_close_next_batch_seq', $1, NOW())
+       ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, updated_at = NOW()`,
+      [String(Math.floor(current + 1))]
+    );
+    await client.query('COMMIT');
+    return nextBatch;
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+async function poCloseLogEvent(payload = {}) {
+  if (!hasDb()) return;
+  const p = payload || {};
+  await dbQuery(`
+    INSERT INTO admin_production_close_events(
+      action, absolute_entry, doc_num, item_code, item_name, warehouse,
+      status_before, status_after, batch_number, expiry_date, reported_qty,
+      receipt_doc_entry, receipt_doc_num, note, order_payload, receipt_payload,
+      admin_user, created_at
+    )
+    VALUES (
+      $1,$2,$3,$4,$5,$6,
+      $7,$8,$9,$10,$11,
+      $12,$13,$14,$15::jsonb,$16::jsonb,
+      $17,NOW()
+    )
+  `, [
+    String(p.action || ''),
+    Number(p.absoluteEntry || 0),
+    Number(p.docNum || 0),
+    String(p.itemCode || ''),
+    String(p.itemName || ''),
+    String(p.warehouse || ''),
+    String(p.statusBefore || ''),
+    String(p.statusAfter || ''),
+    String(p.batchNumber || ''),
+    p.expiryDate ? String(p.expiryDate).slice(0, 10) : null,
+    Number(p.reportedQty || 0),
+    p.receiptDocEntry != null ? Number(p.receiptDocEntry) : null,
+    p.receiptDocNum != null ? Number(p.receiptDocNum) : null,
+    String(p.note || ''),
+    JSON.stringify(p.orderPayload || {}),
+    JSON.stringify(p.receiptPayload || {}),
+    String(p.adminUser || ''),
+  ]);
+}
+async function poCloseFetchOrderDetail(absoluteEntry, docNum = 0) {
+  const abs = Number(absoluteEntry || 0) || 0;
+  const num = Number(docNum || 0) || 0;
+  const tries = [];
+  if (abs) {
+    tries.push(`/ProductionOrders(${abs})`);
+    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`AbsoluteEntry eq ${abs}`)}&$top=1`);
+    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`DocEntry eq ${abs}`)}&$top=1`);
+  }
+  if (num) {
+    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`DocumentNumber eq ${num}`)}&$top=1`);
+    tries.push(`/ProductionOrders?$filter=${encodeURIComponent(`DocNum eq ${num}`)}&$top=1`);
+  }
+  for (const pathTry of tries) {
+    try {
+      const res = await slFetchFreshSession(pathTry);
+      const row = Array.isArray(res?.value) ? (res.value[0] || null) : res;
+      if (row && typeof row === 'object') return poCloseNormalizeOrderRow(row);
+    } catch {}
+  }
+  return null;
+}
+async function poCloseFetchOpenOrdersFromSap({ q = '', top = 250 } = {}) {
+  if (missingSapEnv()) throw new Error('SAP no configurado');
+  const select = [
+    'AbsoluteEntry','DocumentNumber','ItemNo','ProductDescription',
+    'PlannedQuantity','CompletedQuantity','RejectedQuantity',
+    'PostingDate','DueDate','StartDate','Warehouse','ProductionOrderStatus','ProductionOrderOrigin'
+  ].join(',');
+  const tries = [
+    `/ProductionOrders?$select=${select}&$filter=${encodeURIComponent(`(ProductionOrderStatus eq 'boposPlanned' or ProductionOrderStatus eq 'boposReleased')`)}&$orderby=DueDate asc,DocumentNumber desc&$top=${Math.max(20, Math.min(400, Number(top || 250)))}`,
+    `/ProductionOrders?$select=${select}&$filter=${encodeURIComponent(`(ProductionOrderStatus eq 'P' or ProductionOrderStatus eq 'R')`)}&$orderby=DueDate asc,DocumentNumber desc&$top=${Math.max(20, Math.min(400, Number(top || 250)))}`,
+    `/ProductionOrders?$select=${select}&$orderby=DueDate asc,DocumentNumber desc&$top=${Math.max(50, Math.min(600, Number(top || 250) * 2))}`
+  ];
+  let rows = [];
+  for (const p of tries) {
+    try {
+      const res = await slFetchFreshSession(p);
+      const batch = Array.isArray(res?.value) ? res.value : (Array.isArray(res) ? res : []);
+      if (batch.length) {
+        rows = batch;
+        if (tries.indexOf(p) < 2) break;
+      }
+    } catch {}
+  }
+  let orders = rows.map(poCloseNormalizeOrderRow).filter((x) => {
+    const s = poCloseStatus(x.status);
+    return s === 'PLANNED' || s === 'RELEASED';
+  });
+  const qq = String(q || '').trim().toLowerCase();
+  if (qq) {
+    orders = orders.filter((x) =>
+      String(x.itemCode || '').toLowerCase().includes(qq) ||
+      String(x.itemName || '').toLowerCase().includes(qq) ||
+      String(x.docNum || '').includes(qq)
+    );
+  }
+  orders.sort((a, b) => {
+    const ad = String(a.dueDate || a.postDate || '');
+    const bd = String(b.dueDate || b.postDate || '');
+    if (ad && bd && ad !== bd) return ad < bd ? -1 : 1;
+    return Number(b.docNum || 0) - Number(a.docNum || 0);
+  });
+  return orders.slice(0, Math.max(20, Math.min(500, Number(top || 250))));
+}
+async function poClosePatchStatus(absoluteEntry, targetStatus) {
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs) throw new Error('AbsoluteEntry inválido');
+  const options = [];
+  if (targetStatus === 'RELEASED') {
+    options.push('boposReleased', 1, 'R');
+  } else if (targetStatus === 'CLOSED') {
+    options.push('boposClosed', 2, 'L', 'C');
+  } else if (targetStatus === 'PLANNED') {
+    options.push('boposPlanned', 0, 'P');
+  } else {
+    options.push(targetStatus);
+  }
+  let lastErr = null;
+  for (const val of options) {
+    try {
+      await slFetchFreshSession(`/ProductionOrders(${abs})`, {
+        method: 'PATCH',
+        body: JSON.stringify({ ProductionOrderStatus: val }),
+      });
+      const after = await poCloseFetchOrderDetail(abs);
+      if (after) return after;
+      return { absoluteEntry: abs, status: targetStatus, statusLabel: poCloseStatusLabel(targetStatus) };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('No se pudo actualizar el estado de la orden');
+}
+async function poCloseFetchItemFlags(itemCode) {
+  const code = String(itemCode || '').trim();
+  if (!code) return { batchManaged: false, serialManaged: false };
+  try {
+    const item = await slFetchFreshSession(`/Items('${encodeURIComponent(code)}')?$select=ItemCode,ItemName,ManageBatchNumbers,ManageSerialNumbers`);
+    return {
+      batchManaged: poCloseBool(item?.ManageBatchNumbers),
+      serialManaged: poCloseBool(item?.ManageSerialNumbers),
+      itemName: String(item?.ItemName || '').trim(),
+    };
+  } catch {
+    return { batchManaged: false, serialManaged: false };
+  }
+}
+async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate = '', expiryDate = '', batchNumber = '', note = '', adminUser = '' } = {}) {
+  const abs = Number(order?.absoluteEntry || 0) || 0;
+  if (!abs) throw new Error('Orden inválida');
+  const qty = Number(quantity || order?.remainingQty || 0);
+  if (!(qty > 0)) throw new Error('No hay cantidad pendiente para reportar');
+  const orderWarehouse = String(order?.warehouse || '').trim();
+  const itemCode = String(order?.itemCode || '').trim();
+  const flags = await poCloseFetchItemFlags(itemCode);
+  let lot = String(batchNumber || '').trim();
+  if (flags.batchManaged && !lot) lot = await poCloseTakeNextLotNumber();
+  const postDate = poCloseIso(postingDate || getDateISOInOffset(TZ_OFFSET_MIN));
+  const payload = {
+    DocDate: postDate,
+    TaxDate: postDate,
+    DocDueDate: postDate,
+    Comments: truncate(`[prod-close][user:${adminUser || 'admin'}] Orden ${order?.docNum || abs} cierre web ${note || ''}`.trim(), 250),
+    JournalMemo: truncate(`Receipt from Production orden ${order?.docNum || abs}`, 50),
+    DocumentLines: [{
+      BaseType: 202,
+      BaseEntry: abs,
+      ItemCode: itemCode,
+      WarehouseCode: orderWarehouse,
+      Quantity: qty,
+      ...(flags.batchManaged ? {
+        BatchNumbers: [{
+          BatchNumber: lot,
+          Quantity: qty,
+          ...(expiryDate ? { ExpiryDate: poCloseIso(expiryDate) } : {})
+        }]
+      } : {})
+    }]
+  };
+  const created = await slFetchFreshSession('/InventoryGenEntries', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+  return {
+    receipt: created || {},
+    receiptDocEntry: Number(created?.DocEntry || 0) || null,
+    receiptDocNum: Number(created?.DocNum || 0) || null,
+    batchNumber: lot,
+    batchManaged: !!flags.batchManaged,
+    payload,
+  };
+}
+async function poCloseProcessOrder(absoluteEntry, body = {}, adminUser = 'admin') {
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs) throw new Error('AbsoluteEntry inválido');
+  let order = await poCloseFetchOrderDetail(abs, body?.docNum);
+  if (!order) throw new Error('No se encontró la orden en SAP');
+  const before = poCloseStatus(order.status);
+  const steps = [];
+  if (before === 'PLANNED') {
+    order = await poClosePatchStatus(abs, 'RELEASED');
+    steps.push('release');
+    await poCloseLogEvent({
+      action: 'RELEASE',
+      absoluteEntry: order.absoluteEntry,
+      docNum: order.docNum,
+      itemCode: order.itemCode,
+      itemName: order.itemName,
+      warehouse: order.warehouse,
+      statusBefore: before,
+      statusAfter: poCloseStatus(order.status),
+      note: String(body?.note || ''),
+      orderPayload: order,
+      adminUser,
+    }).catch(() => {});
+  }
+  const qty = Number(body?.quantity || order.remainingQty || 0);
+  const receiptInfo = await poCloseCreateReceiptFromProduction(order, {
+    quantity: qty,
+    postingDate: body?.postingDate,
+    expiryDate: body?.expiryDate,
+    batchNumber: body?.batchNumber,
+    note: body?.note,
+    adminUser,
+  });
+  steps.push('report_completion');
+  await poCloseLogEvent({
+    action: 'REPORT_COMPLETION',
+    absoluteEntry: order.absoluteEntry,
+    docNum: order.docNum,
+    itemCode: order.itemCode,
+    itemName: order.itemName,
+    warehouse: order.warehouse,
+    statusBefore: poCloseStatus(order.status),
+    statusAfter: 'RELEASED',
+    batchNumber: receiptInfo.batchNumber || '',
+    expiryDate: body?.expiryDate || '',
+    reportedQty: qty,
+    receiptDocEntry: receiptInfo.receiptDocEntry,
+    receiptDocNum: receiptInfo.receiptDocNum,
+    note: String(body?.note || ''),
+    orderPayload: order,
+    receiptPayload: receiptInfo.payload,
+    adminUser,
+  }).catch(() => {});
+  order = await poClosePatchStatus(abs, 'CLOSED');
+  steps.push('close');
+  await poCloseLogEvent({
+    action: 'CLOSE',
+    absoluteEntry: order.absoluteEntry,
+    docNum: order.docNum,
+    itemCode: order.itemCode,
+    itemName: order.itemName,
+    warehouse: order.warehouse,
+    statusBefore: 'RELEASED',
+    statusAfter: poCloseStatus(order.status),
+    batchNumber: receiptInfo.batchNumber || '',
+    expiryDate: body?.expiryDate || '',
+    reportedQty: qty,
+    receiptDocEntry: receiptInfo.receiptDocEntry,
+    receiptDocNum: receiptInfo.receiptDocNum,
+    note: String(body?.note || ''),
+    orderPayload: order,
+    receiptPayload: receiptInfo.payload,
+    adminUser,
+  }).catch(() => {});
+  return { order, receiptInfo, steps };
+}
+
+app.get('/production-close', async (_req, res) => {
+  try {
+    const htmlPath = PROD_CLOSE_HTML_FILE;
+    if (!fs.existsSync(htmlPath)) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(200).send('<!doctype html><html><body style="font-family:Arial;padding:24px"><h2>production-close.html no encontrado</h2><p>Coloca el archivo en la misma carpeta del server.js.</p></body></html>');
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(200).send(fs.readFileSync(htmlPath, 'utf8'));
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+app.get('/production-close.html', async (_req, res) => {
+  try {
+    const htmlPath = PROD_CLOSE_HTML_FILE;
+    if (!fs.existsSync(htmlPath)) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(200).send('<!doctype html><html><body style="font-family:Arial;padding:24px"><h2>production-close.html no encontrado</h2><p>Coloca el archivo en la misma carpeta del server.js.</p></body></html>');
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(200).send(fs.readFileSync(htmlPath, 'utf8'));
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/production-close/open-orders', verifyAdmin, async (req, res) => {
+  try {
+    const q = String(req.query?.q || '').trim();
+    const top = Math.max(20, Math.min(500, Number(req.query?.top || 250)));
+    const orders = await poCloseFetchOpenOrdersFromSap({ q, top });
+    const planned = orders.filter((x) => x.status === 'PLANNED').length;
+    const released = orders.filter((x) => x.status === 'RELEASED').length;
+    return safeJson(res, 200, {
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      counts: { total: orders.length, planned, released },
+      nextLot: await poCloseGetNextLotPreview(),
+      orders,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/production-close/history', verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 200, { ok: true, rows: [], message: 'DB no configurada' });
+    const limit = Math.max(10, Math.min(500, Number(req.query?.limit || 120)));
+    const rows = await dbQuery(`
+      SELECT id, action, absolute_entry, doc_num, item_code, item_name, warehouse,
+             status_before, status_after, batch_number, expiry_date, reported_qty,
+             receipt_doc_entry, receipt_doc_num, note, admin_user, created_at
+      FROM admin_production_close_events
+      ORDER BY created_at DESC
+      LIMIT $1
+    `, [limit]);
+    return safeJson(res, 200, { ok: true, rows: rows.rows || [] });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/production-close/next-lot', verifyAdmin, async (_req, res) => {
+  try {
+    return safeJson(res, 200, { ok: true, nextLot: await poCloseGetNextLotPreview() });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/release', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const before = await poCloseFetchOrderDetail(abs, req.body?.docNum);
+    if (!before) return safeJson(res, 404, { ok: false, message: 'Orden no encontrada' });
+    const after = before.status === 'RELEASED' ? before : await poClosePatchStatus(abs, 'RELEASED');
+    await poCloseLogEvent({
+      action: 'RELEASE',
+      absoluteEntry: after.absoluteEntry,
+      docNum: after.docNum,
+      itemCode: after.itemCode,
+      itemName: after.itemName,
+      warehouse: after.warehouse,
+      statusBefore: before.status,
+      statusAfter: after.status,
+      note: String(req.body?.note || ''),
+      orderPayload: after,
+      adminUser: String(req.admin?.user || 'admin'),
+    }).catch(() => {});
+    return safeJson(res, 200, { ok: true, order: after, message: 'Orden liberada' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/report-completion', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    let order = await poCloseFetchOrderDetail(abs, req.body?.docNum);
+    if (!order) return safeJson(res, 404, { ok: false, message: 'Orden no encontrada' });
+    if (order.status === 'PLANNED') order = await poClosePatchStatus(abs, 'RELEASED');
+    const qty = Number(req.body?.quantity || order.remainingQty || 0);
+    const receiptInfo = await poCloseCreateReceiptFromProduction(order, {
+      quantity: qty,
+      postingDate: req.body?.postingDate,
+      expiryDate: req.body?.expiryDate,
+      batchNumber: req.body?.batchNumber,
+      note: req.body?.note,
+      adminUser: String(req.admin?.user || 'admin'),
+    });
+    await poCloseLogEvent({
+      action: 'REPORT_COMPLETION',
+      absoluteEntry: order.absoluteEntry,
+      docNum: order.docNum,
+      itemCode: order.itemCode,
+      itemName: order.itemName,
+      warehouse: order.warehouse,
+      statusBefore: order.status,
+      statusAfter: order.status,
+      batchNumber: receiptInfo.batchNumber || '',
+      expiryDate: req.body?.expiryDate || '',
+      reportedQty: qty,
+      receiptDocEntry: receiptInfo.receiptDocEntry,
+      receiptDocNum: receiptInfo.receiptDocNum,
+      note: String(req.body?.note || ''),
+      orderPayload: order,
+      receiptPayload: receiptInfo.payload,
+      adminUser: String(req.admin?.user || 'admin'),
+    }).catch(() => {});
+    const refreshed = await poCloseFetchOrderDetail(abs, req.body?.docNum);
+    return safeJson(res, 200, {
+      ok: true,
+      message: 'Terminación de reporte creada',
+      order: refreshed || order,
+      batchNumber: receiptInfo.batchNumber || '',
+      receiptDocEntry: receiptInfo.receiptDocEntry,
+      receiptDocNum: receiptInfo.receiptDocNum,
+      nextLot: await poCloseGetNextLotPreview(),
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/close', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const before = await poCloseFetchOrderDetail(abs, req.body?.docNum);
+    if (!before) return safeJson(res, 404, { ok: false, message: 'Orden no encontrada' });
+    const after = before.status === 'CLOSED' ? before : await poClosePatchStatus(abs, 'CLOSED');
+    await poCloseLogEvent({
+      action: 'CLOSE',
+      absoluteEntry: after.absoluteEntry,
+      docNum: after.docNum,
+      itemCode: after.itemCode,
+      itemName: after.itemName,
+      warehouse: after.warehouse,
+      statusBefore: before.status,
+      statusAfter: after.status,
+      note: String(req.body?.note || ''),
+      orderPayload: after,
+      adminUser: String(req.admin?.user || 'admin'),
+    }).catch(() => {});
+    return safeJson(res, 200, { ok: true, order: after, message: 'Orden cerrada' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/process', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const out = await poCloseProcessOrder(abs, req.body || {}, String(req.admin?.user || 'admin'));
+    return safeJson(res, 200, {
+      ok: true,
+      message: 'Proceso completado: liberada, terminación creada y orden cerrada',
+      order: out.order,
+      receiptDocEntry: out.receiptInfo?.receiptDocEntry || null,
+      receiptDocNum: out.receiptInfo?.receiptDocNum || null,
+      batchNumber: out.receiptInfo?.batchNumber || '',
+      nextLot: await poCloseGetNextLotPreview(),
+      steps: out.steps || [],
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
 
 (async () => {
   try {
