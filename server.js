@@ -16032,8 +16032,10 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
   const normalizedBefore = originalLines.map((line) => poCloseNormalizeOrderLine(line, detailBefore));
   const updates = Array.isArray(resourceLines) ? resourceLines : [];
 
-  const normalizeResourceInput = (row = {}) => {
+  const normalizeEditableInput = (row = {}) => {
     const ln = Number(row?.lineNumber || 0) || 0;
+    const rawType = String(row?.itemType || '').trim();
+    const normalizedType = rawType || (poCloseLooksLikeResourceLine(row) ? '290' : '4');
     return {
       lineNumber: ln,
       itemCode: String(row?.itemCode || '').trim(),
@@ -16042,34 +16044,39 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
       baseQuantity: Number(row?.baseQuantity ?? 0) || 0,
       plannedQuantity: Number(row?.plannedQuantity ?? 0) || 0,
       additionalQuantity: Number(row?.additionalQuantity ?? 0) || 0,
+      issueMethod: String(row?.issueMethod || '').trim(),
+      itemType: normalizedType,
+      isResource: ['290', 'pit_resource', 'resource', 'r'].includes(normalizedType.toLowerCase()),
       _delete: !!row?._delete,
       _isNew: !!row?._isNew || !(ln > 0),
     };
   };
 
   const sameNum = (a, b, decimals = 6) => Number((Number(a || 0)).toFixed(decimals)) === Number((Number(b || 0)).toFixed(decimals));
-  const currentResources = normalizedBefore
-    .filter((x) => x?.isResource)
-    .map((x) => ({
-      lineNumber: Number(x.lineNumber || 0) || 0,
-      itemCode: String(x.itemCode || '').trim(),
-      itemName: String(x.itemName || '').trim(),
-      warehouse: String(x.warehouse || detailBefore.warehouse || '').trim(),
-      baseQuantity: Number(x.baseQuantity ?? 0) || 0,
-      plannedQuantity: Number(x.plannedQuantity ?? 0) || 0,
-      additionalQuantity: Number(x.additionalQuantity ?? 0) || 0,
-    }));
+  const currentLines = normalizedBefore.map((x) => ({
+    lineNumber: Number(x.lineNumber || 0) || 0,
+    itemCode: String(x.itemCode || '').trim(),
+    itemName: String(x.itemName || '').trim(),
+    warehouse: String(x.warehouse || detailBefore.warehouse || '').trim(),
+    baseQuantity: Number(x.baseQuantity ?? 0) || 0,
+    plannedQuantity: Number(x.plannedQuantity ?? 0) || 0,
+    additionalQuantity: Number(x.additionalQuantity ?? 0) || 0,
+    issueMethod: String(x.issueMethod || '').trim(),
+    itemType: String(x.itemType || '').trim(),
+    isResource: !!x.isResource,
+  }));
 
-  const normalizedUpdates = updates.map((row) => normalizeResourceInput(row));
+  const normalizedUpdates = updates.map((row) => normalizeEditableInput(row));
   const activeUpdates = normalizedUpdates.filter((row) => !row._delete);
 
-  const currentByLine = new Map(currentResources.map((row) => [String(row.lineNumber), row]));
-  const hasStructuralChanges = activeUpdates.some((row) => row._isNew || !(row.lineNumber > 0)) || activeUpdates.length !== currentResources.length;
+  const currentByLine = new Map(currentLines.map((row) => [String(row.lineNumber), row]));
+  const hasStructuralChanges =
+    normalizedUpdates.some((row) => row._delete || row._isNew || !(row.lineNumber > 0)) ||
+    activeUpdates.length !== currentLines.length;
   const hasValueChanges = activeUpdates.some((row) => {
     const prev = currentByLine.get(String(row.lineNumber));
     if (!prev) return true;
     return (
-      String(prev.itemCode || '') !== String(row.itemCode || '') ||
       String(prev.warehouse || '') !== String(row.warehouse || '') ||
       !sameNum(prev.baseQuantity, row.baseQuantity) ||
       !sameNum(prev.plannedQuantity, row.plannedQuantity) ||
@@ -16094,6 +16101,8 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
     delete copy.WarehouseCode;
     delete copy.ProductDescription;
     delete copy.ItemDescription;
+    delete copy.LineText;
+    delete copy.ItemName;
     return copy;
   };
 
@@ -16101,19 +16110,15 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
   for (let i = 0; i < originalLines.length; i++) {
     const rawLine = originalLines[i];
     const normLine = normalizedBefore[i];
-    if (!normLine?.isResource) {
+    const desired = existingByLine.get(String(normLine.lineNumber));
+
+    if (!desired) {
       updatedLines.push(stripInvalidLineAliases(rawLine));
       continue;
     }
-    const desired = existingByLine.get(String(normLine.lineNumber));
-    if (!desired) continue;
     if (desired._delete) continue;
 
     const merged = stripInvalidLineAliases(rawLine);
-    if (desired.itemCode) {
-      merged.ItemNo = desired.itemCode;
-    }
-    merged.ItemType = merged.ItemType ?? 290;
     merged.BaseQuantity = Number(desired.baseQuantity || 0);
     merged.PlannedQuantity = Number(desired.plannedQuantity || 0);
     merged.AdditionalQuantity = Number(desired.additionalQuantity || 0);
@@ -16123,27 +16128,30 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
     updatedLines.push(merged);
   }
 
-  const templateLine = stripInvalidLineAliases(
-    originalLines.find((line) => poCloseNormalizeOrderLine(line, detailBefore).isResource) || {}
-  );
+  const pickTemplateForAddition = (desired = {}) => {
+    const desiredIsResource = !!desired.isResource;
+    const templateRaw = originalLines.find((line) => {
+      const normalized = poCloseNormalizeOrderLine(line, detailBefore);
+      return !!normalized?.isResource === desiredIsResource;
+    }) || originalLines[0] || {};
+    return stripInvalidLineAliases(templateRaw);
+  };
 
   for (const desired of additions) {
-    const merged = { ...templateLine };
+    const merged = { ...pickTemplateForAddition(desired) };
     delete merged.LineNumber;
     delete merged.LineNum;
     delete merged.VisualOrder;
     delete merged.VisOrder;
     delete merged.DocumentAbsoluteEntry;
     delete merged.DocEntry;
-    merged.ItemType = merged.ItemType ?? 290;
+    merged.ItemType = desired.isResource ? 290 : (merged.ItemType ?? 4);
     merged.ItemNo = desired.itemCode;
     merged.BaseQuantity = Number(desired.baseQuantity || 0);
     merged.PlannedQuantity = Number(desired.plannedQuantity || 0);
     merged.AdditionalQuantity = Number(desired.additionalQuantity || 0);
     const wh = desired.warehouse || detailBefore.warehouse || '';
-    if (wh) {
-      merged.Warehouse = wh;
-    }
+    if (wh) merged.Warehouse = wh;
     updatedLines.push(merged);
   }
 
@@ -16155,7 +16163,7 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
 
   const detailAfter = await poCloseFetchOrderDetail(abs);
   await poCloseLogEvent({
-    action: 'SAVE_RESOURCES',
+    action: 'SAVE_EDITABLE_LINES',
     absoluteEntry: detailAfter?.absoluteEntry || detailBefore.absoluteEntry,
     docNum: detailAfter?.docNum || detailBefore.docNum,
     itemCode: detailAfter?.itemCode || detailBefore.itemCode,
@@ -16164,7 +16172,7 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
     statusBefore: detailBefore.status,
     statusAfter: detailAfter?.status || detailBefore.status,
     note: String(note || ''),
-    orderPayload: { before: detailBefore, after: detailAfter, resourceLines: updates },
+    orderPayload: { before: detailBefore, after: detailAfter, editableLines: updates },
     adminUser,
   }).catch(() => {});
   return detailAfter || detailBefore;
@@ -16608,7 +16616,7 @@ app.post('/api/admin/production-close/orders/:absoluteEntry/resources/save', ver
   try {
     const abs = Number(req.params.absoluteEntry || 0);
     const order = await poCloseSaveResourceLines(abs, req.body?.resourceLines || [], String(req.admin?.user || 'admin'), String(req.body?.note || ''));
-    return safeJson(res, 200, { ok: true, order, message: 'Recursos actualizados' });
+    return safeJson(res, 200, { ok: true, order, message: 'Líneas editables actualizadas' });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
