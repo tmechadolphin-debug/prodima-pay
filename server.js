@@ -16032,10 +16032,9 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
   const normalizedBefore = originalLines.map((line) => poCloseNormalizeOrderLine(line, detailBefore));
   const updates = Array.isArray(resourceLines) ? resourceLines : [];
 
-  const existingByLine = new Map();
-  for (const row of updates) {
+  const normalizeResourceInput = (row = {}) => {
     const ln = Number(row?.lineNumber || 0) || 0;
-    const normalized = {
+    return {
       lineNumber: ln,
       itemCode: String(row?.itemCode || '').trim(),
       itemName: String(row?.itemName || '').trim(),
@@ -16046,42 +16045,77 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
       _delete: !!row?._delete,
       _isNew: !!row?._isNew || !(ln > 0),
     };
-    if (ln > 0) existingByLine.set(String(ln), normalized);
+  };
+
+  const sameNum = (a, b, decimals = 6) => Number((Number(a || 0)).toFixed(decimals)) === Number((Number(b || 0)).toFixed(decimals));
+  const currentResources = normalizedBefore
+    .filter((x) => x?.isResource)
+    .map((x) => ({
+      lineNumber: Number(x.lineNumber || 0) || 0,
+      itemCode: String(x.itemCode || '').trim(),
+      itemName: String(x.itemName || '').trim(),
+      warehouse: String(x.warehouse || detailBefore.warehouse || '').trim(),
+      baseQuantity: Number(x.baseQuantity ?? 0) || 0,
+      plannedQuantity: Number(x.plannedQuantity ?? 0) || 0,
+      additionalQuantity: Number(x.additionalQuantity ?? 0) || 0,
+    }));
+
+  const normalizedUpdates = updates.map((row) => normalizeResourceInput(row));
+  const activeUpdates = normalizedUpdates.filter((row) => !row._delete);
+
+  const currentByLine = new Map(currentResources.map((row) => [String(row.lineNumber), row]));
+  const hasStructuralChanges = activeUpdates.some((row) => row._isNew || !(row.lineNumber > 0)) || activeUpdates.length !== currentResources.length;
+  const hasValueChanges = activeUpdates.some((row) => {
+    const prev = currentByLine.get(String(row.lineNumber));
+    if (!prev) return true;
+    return (
+      String(prev.itemCode || '') !== String(row.itemCode || '') ||
+      String(prev.itemName || '') !== String(row.itemName || '') ||
+      String(prev.warehouse || '') !== String(row.warehouse || '') ||
+      !sameNum(prev.baseQuantity, row.baseQuantity) ||
+      !sameNum(prev.plannedQuantity, row.plannedQuantity) ||
+      !sameNum(prev.additionalQuantity, row.additionalQuantity)
+    );
+  });
+
+  if (!hasStructuralChanges && !hasValueChanges) {
+    return detailBefore;
   }
-  const additions = updates
-    .map((row) => ({
-      lineNumber: Number(row?.lineNumber || 0) || 0,
-      itemCode: String(row?.itemCode || '').trim(),
-      itemName: String(row?.itemName || '').trim(),
-      warehouse: String(row?.warehouse || detailBefore.warehouse || '').trim(),
-      baseQuantity: Number(row?.baseQuantity ?? 0) || 0,
-      plannedQuantity: Number(row?.plannedQuantity ?? 0) || 0,
-      additionalQuantity: Number(row?.additionalQuantity ?? 0) || 0,
-      _delete: !!row?._delete,
-      _isNew: !!row?._isNew || !(Number(row?.lineNumber || 0) > 0),
-    }))
-    .filter((row) => row._isNew && !row._delete && row.itemCode);
+
+  const existingByLine = new Map();
+  for (const row of normalizedUpdates) {
+    if (row.lineNumber > 0) existingByLine.set(String(row.lineNumber), row);
+  }
+
+  const additions = normalizedUpdates.filter((row) => row._isNew && !row._delete && row.itemCode);
+
+  const stripInvalidLineAliases = (line = {}) => {
+    const copy = { ...line };
+    delete copy.ItemCode;
+    delete copy.WarehouseCode;
+    delete copy.ProductDescription;
+    delete copy.ItemDescription;
+    return copy;
+  };
 
   const updatedLines = [];
   for (let i = 0; i < originalLines.length; i++) {
     const rawLine = originalLines[i];
     const normLine = normalizedBefore[i];
     if (!normLine?.isResource) {
-      updatedLines.push(rawLine);
+      updatedLines.push(stripInvalidLineAliases(rawLine));
       continue;
     }
     const desired = existingByLine.get(String(normLine.lineNumber));
-    if (!desired) continue; // recurso eliminado
+    if (!desired) continue;
     if (desired._delete) continue;
-    const merged = { ...rawLine };
+
+    const merged = stripInvalidLineAliases(rawLine);
     if (desired.itemCode) {
       merged.ItemNo = desired.itemCode;
-      merged.ItemCode = desired.itemCode;
     }
     if (desired.itemName) {
       merged.ItemName = desired.itemName;
-      merged.ItemDescription = desired.itemName;
-      merged.ProductDescription = desired.itemName;
       merged.LineText = desired.itemName;
     }
     merged.ItemType = merged.ItemType ?? 290;
@@ -16090,12 +16124,14 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
     merged.AdditionalQuantity = Number(desired.additionalQuantity || 0);
     if (desired.warehouse) {
       merged.Warehouse = desired.warehouse;
-      merged.WarehouseCode = desired.warehouse;
     }
     updatedLines.push(merged);
   }
 
-  const templateLine = originalLines.find((line) => poCloseNormalizeOrderLine(line, detailBefore).isResource) || {};
+  const templateLine = stripInvalidLineAliases(
+    originalLines.find((line) => poCloseNormalizeOrderLine(line, detailBefore).isResource) || {}
+  );
+
   for (const desired of additions) {
     const merged = { ...templateLine };
     delete merged.LineNumber;
@@ -16106,11 +16142,8 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
     delete merged.DocEntry;
     merged.ItemType = merged.ItemType ?? 290;
     merged.ItemNo = desired.itemCode;
-    merged.ItemCode = desired.itemCode;
     if (desired.itemName) {
       merged.ItemName = desired.itemName;
-      merged.ItemDescription = desired.itemName;
-      merged.ProductDescription = desired.itemName;
       merged.LineText = desired.itemName;
     }
     merged.BaseQuantity = Number(desired.baseQuantity || 0);
@@ -16119,7 +16152,6 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
     const wh = desired.warehouse || detailBefore.warehouse || '';
     if (wh) {
       merged.Warehouse = wh;
-      merged.WarehouseCode = wh;
     }
     updatedLines.push(merged);
   }
@@ -16259,7 +16291,7 @@ async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate
   const comments = truncate(`[prod-close][user:${adminUser || 'admin'}] Orden ${docNum || abs} cierre web ${note || ''}`.trim(), 250);
   const journalMemo = truncate(`Receipt from Production orden ${docNum || abs}`, 50);
 
-  const buildBatchNumbers = (includeBaseLineNumber = false, includeExpiry = false) => {
+  const buildBatchNumbers = ({ includeBaseLineNumber = false, includeExpiry = false } = {}) => {
     if (!flags.batchManaged) return undefined;
     const row = {
       BatchNumber: lot,
@@ -16297,7 +16329,7 @@ async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate
       DocumentLines: [
         {
           ...line,
-          ...(batchCfg ? { BatchNumbers: buildBatchNumbers(!!batchCfg.includeBaseLineNumber, !!batchCfg.includeExpiry) } : {}),
+          ...(batchCfg ? { BatchNumbers: buildBatchNumbers(batchCfg) } : {}),
         },
       ],
     });
@@ -16311,45 +16343,60 @@ async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate
     { DocDate: postDate, Comments: comments, JournalMemo: journalMemo },
     { DocDate: postDate, DocDueDate: postDate, Comments: comments, JournalMemo: journalMemo },
   ];
-
-  const txVariants = ['botrntComplete', undefined];
   const whVariants = warehouseCandidates.length ? warehouseCandidates : [''];
+  const txVariants = [0, '0', 'botrntComplete'];
+  const batchVariants = flags.batchManaged
+    ? [
+        { includeBaseLineNumber: false, includeExpiry: true },
+        { includeBaseLineNumber: true, includeExpiry: true },
+        { includeBaseLineNumber: false, includeExpiry: false },
+      ]
+    : [null];
+
+  const makeLinkedLine = ({ baseEntry, wh = '', tx, includeWh = true, includeBaseLine = false, includeBaseLineNumber = false, includeTx = true } = {}) => {
+    return compact({
+      BaseType: 202,
+      BaseEntry: baseEntry,
+      ...(includeBaseLine ? { BaseLine: 0 } : {}),
+      ...(includeBaseLineNumber ? { BaseLineNumber: 0 } : {}),
+      ...(includeWh ? { WarehouseCode: wh } : {}),
+      Quantity: qty,
+      ...(includeTx ? { TransactionType: tx } : {}),
+    });
+  };
 
   for (const baseEntry of baseEntries) {
     for (const wh of whVariants) {
-      for (const tx of txVariants) {
-        const lineFull = compact({
-          BaseType: 202,
-          BaseEntry: baseEntry,
-          BaseLine: 0,
-          BaseLineNumber: 0,
-          ItemCode: itemCode,
-          WarehouseCode: wh,
-          Quantity: qty,
-          TransactionType: tx,
-        });
-        const lineLean = compact({
-          BaseType: 202,
-          BaseEntry: baseEntry,
-          BaseLine: 0,
-          Quantity: qty,
-          TransactionType: tx,
-        });
-        const lineNoWh = compact({
-          BaseType: 202,
-          BaseEntry: baseEntry,
-          BaseLine: 0,
-          ItemCode: itemCode,
-          Quantity: qty,
-          TransactionType: tx,
-        });
+      for (const header of headerVariants) {
+        // Más probable: orden enlazada, sin ItemCode ni TaxDate, usando número de orden en BaseEntry.
+        for (const tx of txVariants) {
+          for (const batchCfg of batchVariants) {
+            pushVariant(`base:${baseEntry}|linked|tx:${String(tx)}|wh:${wh || 'omit'}|doc`, header, makeLinkedLine({ baseEntry, wh, tx, includeWh: !!wh, includeTx: true }), batchCfg);
+            pushVariant(`base:${baseEntry}|linked|tx:${String(tx)}|wh:${wh || 'omit'}|doc|baseline`, header, makeLinkedLine({ baseEntry, wh, tx, includeWh: !!wh, includeBaseLine: true, includeTx: true }), batchCfg);
+            pushVariant(`base:${baseEntry}|linked|tx:${String(tx)}|wh:${wh || 'omit'}|doc|baseline+num`, header, makeLinkedLine({ baseEntry, wh, tx, includeWh: !!wh, includeBaseLine: true, includeBaseLineNumber: true, includeTx: true }), batchCfg);
+            pushVariant(`base:${baseEntry}|linked|tx:${String(tx)}|nowh|doc`, header, makeLinkedLine({ baseEntry, wh, tx, includeWh: false, includeTx: true }), batchCfg);
+          }
+        }
 
-        for (const header of headerVariants) {
-          pushVariant(`base:${baseEntry}|full|tx:${tx || 'omit'}|wh:${wh || 'omit'}|h:doc`, header, lineFull, flags.batchManaged ? { includeBaseLineNumber: true, includeExpiry: true } : null);
-          pushVariant(`base:${baseEntry}|lean|tx:${tx || 'omit'}|h:doc`, header, lineLean, flags.batchManaged ? { includeBaseLineNumber: true, includeExpiry: true } : null);
-          pushVariant(`base:${baseEntry}|nowh|tx:${tx || 'omit'}|h:doc`, header, lineNoWh, flags.batchManaged ? { includeBaseLineNumber: true, includeExpiry: true } : null);
-          pushVariant(`base:${baseEntry}|full|tx:${tx || 'omit'}|wh:${wh || 'omit'}|h:doc|minbatch`, header, lineFull, flags.batchManaged ? { includeBaseLineNumber: false, includeExpiry: true } : null);
-          pushVariant(`base:${baseEntry}|lean|tx:${tx || 'omit'}|h:doc|minbatch`, header, lineLean, flags.batchManaged ? { includeBaseLineNumber: false, includeExpiry: true } : null);
+        // Variante alineada al ejemplo oficial de Service Layer para InventoryGenEntries basado en orden de producción.
+        for (const batchCfg of batchVariants) {
+          pushVariant(`base:${baseEntry}|linked|tx:omit|wh:${wh || 'omit'}|doc|official`, header, makeLinkedLine({ baseEntry, wh, includeWh: !!wh, includeTx: false }), batchCfg);
+          pushVariant(`base:${baseEntry}|linked|tx:omit|wh:${wh || 'omit'}|doc|official|baseline`, header, makeLinkedLine({ baseEntry, wh, includeWh: !!wh, includeBaseLine: true, includeTx: false }), batchCfg);
+          pushVariant(`base:${baseEntry}|linked|tx:omit|nowh|doc|official`, header, makeLinkedLine({ baseEntry, wh, includeWh: false, includeTx: false }), batchCfg);
+        }
+
+        // Fallback final por compatibilidad con ambientes más estrictos.
+        for (const tx of [0, '0', undefined]) {
+          for (const batchCfg of batchVariants) {
+            pushVariant(`base:${baseEntry}|compat|tx:${tx === undefined ? 'omit' : String(tx)}|wh:${wh || 'omit'}|doc`, header, compact({
+              BaseType: 202,
+              BaseEntry: baseEntry,
+              BaseLine: 0,
+              Quantity: qty,
+              WarehouseCode: wh || undefined,
+              TransactionType: tx,
+            }), batchCfg);
+          }
         }
       }
     }
@@ -16392,6 +16439,7 @@ async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate
     payloadLabel: usedLabel,
   };
 }
+
 
 async function poCloseProcessOrder(absoluteEntry, body = {}, adminUser = 'admin') {
   const abs = Number(absoluteEntry || 0) || 0;
