@@ -15903,30 +15903,6 @@ async function poCloseTakeNextLotNumber() {
     client.release();
   }
 }
-async function poCloseCommitLotNumber(usedLot) {
-  const used = Number(String(usedLot || '').trim());
-  if (!hasDb() || !(used > 0)) return;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const sel = await client.query(`SELECT v FROM app_state WHERE k='production_close_next_batch_seq' FOR UPDATE`);
-    let current = Number(sel.rows?.[0]?.v || 3000);
-    if (!Number.isFinite(current) || current < 1) current = 3000;
-    const nextValue = Math.max(current, Math.floor(used) + 1);
-    await client.query(
-      `INSERT INTO app_state(k, v, updated_at)
-       VALUES ('production_close_next_batch_seq', $1, NOW())
-       ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, updated_at = NOW()`,
-      [String(nextValue)]
-    );
-    await client.query('COMMIT');
-  } catch (e) {
-    try { await client.query('ROLLBACK'); } catch {}
-    throw e;
-  } finally {
-    client.release();
-  }
-}
 async function poCloseLogEvent(payload = {}) {
   if (!hasDb()) return;
   const p = payload || {};
@@ -16258,186 +16234,162 @@ async function poCloseFetchItemFlags(itemCode) {
   }
 }
 
-function poCloseReceiptLineMatchesOrder(line, order = {}) {
-  const abs = Number(order?.absoluteEntry || order?.docEntry || 0) || 0;
-  const docNum = Number(order?.docNum || 0) || 0;
-  const baseType = String(line?.BaseType ?? '').trim();
-  const baseEntry = Number(line?.BaseEntry ?? 0) || 0;
-  const itemCode = String(line?.ItemCode || '').trim();
-  const orderItemCode = String(order?.itemCode || '').trim();
-  if (baseType && baseType !== '202' && baseType !== '202.0') return false;
-  if (abs && baseEntry === abs) return !orderItemCode || !itemCode || itemCode === orderItemCode;
-  if (docNum && baseEntry === docNum) return !orderItemCode || !itemCode || itemCode === orderItemCode;
-  return false;
-}
-async function poCloseFindReceiptForOrder(order, { postingDate = '', top = 30 } = {}) {
-  const orderDocNum = Number(order?.docNum || 0) || 0;
-  const orderAbs = Number(order?.absoluteEntry || 0) || 0;
-  if (!(orderDocNum > 0) && !(orderAbs > 0)) return null;
-  const postDate = poCloseIso(postingDate || '');
-  const topSafe = Math.max(10, Math.min(80, Number(top || 30)));
-  const tries = [];
-  if (postDate) {
-    tries.push(`/InventoryGenEntries?$select=DocEntry,DocNum,DocDate,TaxDate,Comments&$filter=${encodeURIComponent(`DocDate ge '${postDate}'`)}&$orderby=DocEntry desc&$expand=DocumentLines&$top=${topSafe}`);
-  }
-  tries.push(`/InventoryGenEntries?$select=DocEntry,DocNum,DocDate,TaxDate,Comments&$orderby=DocEntry desc&$expand=DocumentLines&$top=${topSafe}`);
-  for (const p of tries) {
-    try {
-      const res = await slFetchFreshSession(p);
-      const docs = Array.isArray(res?.value) ? res.value : [];
-      for (const doc of docs) {
-        const lines = Array.isArray(doc?.DocumentLines) ? doc.DocumentLines : [];
-        if (lines.some((line) => poCloseReceiptLineMatchesOrder(line, order))) {
-          return {
-            receipt: doc,
-            receiptDocEntry: Number(doc?.DocEntry || 0) || null,
-            receiptDocNum: Number(doc?.DocNum || 0) || null,
-          };
-        }
-      }
-    } catch {}
-  }
-  return null;
-}
 async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate = '', expiryDate = '', batchNumber = '', note = '', adminUser = '' } = {}) {
-  const abs = Number(order?.absoluteEntry || order?.docEntry || 0) || 0;
-  if (!abs) throw new Error('Orden inválida');
+  const abs = Number(order?.absoluteEntry || 0) || 0;
+  const docNum = Number(order?.docNum || 0) || 0;
+  if (!abs && !docNum) throw new Error('Orden inválida');
+
   const qty = Number(quantity || order?.remainingQty || 0);
   if (!(qty > 0)) throw new Error('No hay cantidad pendiente para reportar');
 
-  const orderWarehouse = String(order?.warehouse || '').trim();
   const itemCode = String(order?.itemCode || '').trim();
+  const rawOrder = order?.rawOrder || {};
+  const warehouseCandidates = Array.from(new Set([
+    String(order?.warehouse || '').trim(),
+    String(rawOrder?.Warehouse || '').trim(),
+    String(rawOrder?.WarehouseCode || '').trim(),
+    String(rawOrder?.WhsCode || '').trim(),
+  ].filter(Boolean)));
   const flags = await poCloseFetchItemFlags(itemCode);
-  const manualLot = String(batchNumber || '').trim();
-  let lot = manualLot;
-  if (flags.batchManaged && !lot) lot = await poCloseGetNextLotPreview();
+  let lot = String(batchNumber || '').trim();
+  if (flags.batchManaged && !lot) lot = await poCloseTakeNextLotNumber();
 
   const postDate = poCloseIso(postingDate || getDateISOInOffset(TZ_OFFSET_MIN));
-  const expiryIso = poCloseIso(expiryDate || '');
-  const orderDocNum = Number(order?.docNum || 0) || 0;
+  const baseEntries = Array.from(new Set([docNum, abs].filter((n) => Number(n) > 0)));
+  const comments = truncate(`[prod-close][user:${adminUser || 'admin'}] Orden ${docNum || abs} cierre web ${note || ''}`.trim(), 250);
+  const journalMemo = truncate(`Receipt from Production orden ${docNum || abs}`, 50);
 
-  // IMPORTANTE:
-  // Cuando el recibo referencia una orden de producción (BaseType 202),
-  // SAP no permite enviar OIGN.TaxDate y en muchos ambientes tampoco
-  // conviene enviar DocDueDate. Por eso se prueban primero payloads
-  // "limpios" y con BaseEntry = AbsoluteEntry únicamente.
-  const basePayload = {
-    DocDate: postDate,
-    Comments: truncate(`[prod-close][user:${adminUser || 'admin'}][ord:${orderDocNum || abs}] ${note || ''}`.trim(), 250),
-    JournalMemo: truncate(`Receipt from Production orden ${orderDocNum || abs}`, 50),
+  const buildBatchNumbers = (includeBaseLineNumber = false, includeExpiry = false) => {
+    if (!flags.batchManaged) return undefined;
+    const row = {
+      BatchNumber: lot,
+      Quantity: qty,
+    };
+    if (includeBaseLineNumber) row.BaseLineNumber = 0;
+    if (includeExpiry && expiryDate) row.ExpiryDate = poCloseIso(expiryDate);
+    return [row];
   };
 
-  const batchVariants = [];
-  if (flags.batchManaged) {
-    batchVariants.push([{
-      BatchNumber: lot,
-      Quantity: qty,
-      ...(expiryIso ? { ExpiryDate: expiryIso } : {}),
-    }]);
-    batchVariants.push([{
-      BatchNumber: lot,
-      Quantity: qty,
-      BaseLineNumber: 0,
-      ...(expiryIso ? { ExpiryDate: expiryIso } : {}),
-    }]);
-    batchVariants.push([{
-      BatchNumber: lot,
-      Quantity: qty,
-    }]);
-  } else {
-    batchVariants.push(undefined);
-  }
-
-  const minimalLine = {
-    BaseType: 202,
-    BaseEntry: abs,
-    Quantity: qty,
-    TransactionType: 'botrntComplete',
+  const compact = (value) => {
+    if (Array.isArray(value)) {
+      return value.map(compact).filter((x) => x !== undefined);
+    }
+    if (value && typeof value === 'object') {
+      const out = {};
+      for (const [k, v] of Object.entries(value)) {
+        const cv = compact(v);
+        if (cv === undefined) continue;
+        if (cv && typeof cv === 'object' && !Array.isArray(cv) && !Object.keys(cv).length) continue;
+        if (Array.isArray(cv) && !cv.length) continue;
+        out[k] = cv;
+      }
+      return out;
+    }
+    if (value === undefined || value === null || value === '') return undefined;
+    return value;
   };
-
-  const lineVariants = [
-    { ...minimalLine },
-    { ...minimalLine, WarehouseCode: orderWarehouse },
-    { ...minimalLine, ItemCode: itemCode },
-    { ...minimalLine, WarehouseCode: orderWarehouse, ItemCode: itemCode },
-    { ...minimalLine, BaseLine: 0 },
-    { ...minimalLine, BaseLineNumber: 0 },
-    { ...minimalLine, BaseLine: 0, WarehouseCode: orderWarehouse },
-    { ...minimalLine, BaseLineNumber: 0, WarehouseCode: orderWarehouse },
-    { ...minimalLine, BaseLine: 0, ItemCode: itemCode },
-    { ...minimalLine, BaseLineNumber: 0, ItemCode: itemCode },
-  ];
 
   const payloadVariants = [];
-  for (const line of lineVariants) {
-    for (const batches of batchVariants) {
-      const payloadLine = { ...line };
-      if (batches) payloadLine.BatchNumbers = batches;
-      payloadVariants.push({
-        ...basePayload,
-        DocumentLines: [payloadLine],
-      });
-    }
-  }
+  const seen = new Set();
+  const pushVariant = (label, header, line, batchCfg = null) => {
+    const payload = compact({
+      ...header,
+      DocumentLines: [
+        {
+          ...line,
+          ...(batchCfg ? { BatchNumbers: buildBatchNumbers(!!batchCfg.includeBaseLineNumber, !!batchCfg.includeExpiry) } : {}),
+        },
+      ],
+    });
+    const key = JSON.stringify(payload);
+    if (seen.has(key)) return;
+    seen.add(key);
+    payloadVariants.push({ label, payload });
+  };
 
-  // Fallbacks adicionales solo si las variantes limpias fallan.
-  for (const line of lineVariants.slice(0, 4)) {
-    for (const batches of batchVariants) {
-      const payloadLine = { ...line };
-      if (batches) payloadLine.BatchNumbers = batches;
-      payloadVariants.push({
-        ...basePayload,
-        DocDueDate: postDate,
-        DocumentLines: [payloadLine],
-      });
+  const headerVariants = [
+    { DocDate: postDate, Comments: comments, JournalMemo: journalMemo },
+    { DocDate: postDate, DocDueDate: postDate, Comments: comments, JournalMemo: journalMemo },
+  ];
+
+  const txVariants = ['botrntComplete', undefined];
+  const whVariants = warehouseCandidates.length ? warehouseCandidates : [''];
+
+  for (const baseEntry of baseEntries) {
+    for (const wh of whVariants) {
+      for (const tx of txVariants) {
+        const lineFull = compact({
+          BaseType: 202,
+          BaseEntry: baseEntry,
+          BaseLine: 0,
+          BaseLineNumber: 0,
+          ItemCode: itemCode,
+          WarehouseCode: wh,
+          Quantity: qty,
+          TransactionType: tx,
+        });
+        const lineLean = compact({
+          BaseType: 202,
+          BaseEntry: baseEntry,
+          BaseLine: 0,
+          Quantity: qty,
+          TransactionType: tx,
+        });
+        const lineNoWh = compact({
+          BaseType: 202,
+          BaseEntry: baseEntry,
+          BaseLine: 0,
+          ItemCode: itemCode,
+          Quantity: qty,
+          TransactionType: tx,
+        });
+
+        for (const header of headerVariants) {
+          pushVariant(`base:${baseEntry}|full|tx:${tx || 'omit'}|wh:${wh || 'omit'}|h:doc`, header, lineFull, flags.batchManaged ? { includeBaseLineNumber: true, includeExpiry: true } : null);
+          pushVariant(`base:${baseEntry}|lean|tx:${tx || 'omit'}|h:doc`, header, lineLean, flags.batchManaged ? { includeBaseLineNumber: true, includeExpiry: true } : null);
+          pushVariant(`base:${baseEntry}|nowh|tx:${tx || 'omit'}|h:doc`, header, lineNoWh, flags.batchManaged ? { includeBaseLineNumber: true, includeExpiry: true } : null);
+          pushVariant(`base:${baseEntry}|full|tx:${tx || 'omit'}|wh:${wh || 'omit'}|h:doc|minbatch`, header, lineFull, flags.batchManaged ? { includeBaseLineNumber: false, includeExpiry: true } : null);
+          pushVariant(`base:${baseEntry}|lean|tx:${tx || 'omit'}|h:doc|minbatch`, header, lineLean, flags.batchManaged ? { includeBaseLineNumber: false, includeExpiry: true } : null);
+        }
+      }
     }
   }
 
   let created = null;
   let usedPayload = null;
-  const errors = [];
-  for (const payload of payloadVariants) {
+  let usedLabel = '';
+  let lastErr = null;
+  const attempts = [];
+
+  for (const attempt of payloadVariants) {
     try {
       created = await slFetchFreshSession('/InventoryGenEntries', {
         method: 'POST',
-        body: JSON.stringify(payload),
+        body: JSON.stringify(attempt.payload),
       });
-      usedPayload = payload;
+      usedPayload = attempt.payload;
+      usedLabel = attempt.label;
       break;
     } catch (e) {
-      const message = String(e?.message || e || '').trim();
-      if (message) errors.push(message);
+      lastErr = e;
+      attempts.push(`${attempt.label}: ${String(e?.message || e)}`);
     }
   }
 
-  let receiptDocEntry = Number(created?.DocEntry || 0) || null;
-  let receiptDocNum = Number(created?.DocNum || 0) || null;
-  if (!receiptDocEntry || !receiptDocNum) {
-    const found = await poCloseFindReceiptForOrder(order, { postingDate: postDate, top: 40 });
-    if (found) {
-      created = found.receipt || created || {};
-      receiptDocEntry = found.receiptDocEntry || receiptDocEntry;
-      receiptDocNum = found.receiptDocNum || receiptDocNum;
-      if (!usedPayload) usedPayload = payloadVariants[0] || {};
-    }
-  }
-  if (!receiptDocEntry && !receiptDocNum) {
-    const detail = errors.length ? ` Detalle SAP: ${errors.slice(-3).join(' | ')}` : '';
-    throw new Error(`No se pudo crear el recibo de producción.${detail}`);
-  }
-
-  if (flags.batchManaged && !manualLot && lot) {
-    await poCloseCommitLotNumber(lot).catch(() => {});
+  if (!created) {
+    const err = new Error((lastErr?.message || 'No se pudo crear el recibo de producción') + (attempts.length ? ` | Intentos: ${attempts.join(' | ')}` : ''));
+    err.attempts = attempts;
+    throw err;
   }
 
   return {
     receipt: created || {},
-    receiptDocEntry,
-    receiptDocNum,
+    receiptDocEntry: Number(created?.DocEntry || 0) || null,
+    receiptDocNum: Number(created?.DocNum || 0) || null,
     batchNumber: lot,
     batchManaged: !!flags.batchManaged,
-    payload: usedPayload || payloadVariants[0] || {},
-    errors,
+    payload: usedPayload || (payloadVariants[0]?.payload || {}),
+    payloadLabel: usedLabel,
   };
 }
 
