@@ -16287,25 +16287,19 @@ async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate
   if (flags.batchManaged && !lot) lot = await poCloseTakeNextLotNumber();
 
   const postDate = poCloseIso(postingDate || getDateISOInOffset(TZ_OFFSET_MIN));
-  const baseEntries = Array.from(new Set([docNum, abs].filter((n) => Number(n) > 0)));
   const comments = truncate(`[prod-close][user:${adminUser || 'admin'}] Orden ${docNum || abs} cierre web ${note || ''}`.trim(), 250);
   const journalMemo = truncate(`Receipt from Production orden ${docNum || abs}`, 50);
 
   const buildBatchNumbers = ({ includeBaseLineNumber = false, includeExpiry = false } = {}) => {
     if (!flags.batchManaged) return undefined;
-    const row = {
-      BatchNumber: lot,
-      Quantity: qty,
-    };
+    const row = { BatchNumber: lot, Quantity: qty };
     if (includeBaseLineNumber) row.BaseLineNumber = 0;
     if (includeExpiry && expiryDate) row.ExpiryDate = poCloseIso(expiryDate);
     return [row];
   };
 
   const compact = (value) => {
-    if (Array.isArray(value)) {
-      return value.map(compact).filter((x) => x !== undefined);
-    }
+    if (Array.isArray(value)) return value.map(compact).filter((x) => x !== undefined);
     if (value && typeof value === 'object') {
       const out = {};
       for (const [k, v] of Object.entries(value)) {
@@ -16321,30 +16315,11 @@ async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate
     return value;
   };
 
-  const payloadVariants = [];
-  const seen = new Set();
-  const pushVariant = (label, header, line, batchCfg = null) => {
-    const payload = compact({
-      ...header,
-      DocumentLines: [
-        {
-          ...line,
-          ...(batchCfg ? { BatchNumbers: buildBatchNumbers(batchCfg) } : {}),
-        },
-      ],
-    });
-    const key = JSON.stringify(payload);
-    if (seen.has(key)) return;
-    seen.add(key);
-    payloadVariants.push({ label, payload });
-  };
-
   const headerVariants = [
     { DocDate: postDate, Comments: comments, JournalMemo: journalMemo },
     { DocDate: postDate, DocDueDate: postDate, Comments: comments, JournalMemo: journalMemo },
   ];
   const whVariants = warehouseCandidates.length ? warehouseCandidates : [''];
-  const txVariants = [0, '0', 'botrntComplete'];
   const batchVariants = flags.batchManaged
     ? [
         { includeBaseLineNumber: false, includeExpiry: true },
@@ -16353,54 +16328,64 @@ async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate
       ]
     : [null];
 
-  const makeLinkedLine = ({ baseEntry, wh = '', tx, includeWh = true, includeBaseLine = false, includeBaseLineNumber = false, includeTx = true } = {}) => {
-    return compact({
-      BaseType: 202,
-      BaseEntry: baseEntry,
-      ...(includeBaseLine ? { BaseLine: 0 } : {}),
-      ...(includeBaseLineNumber ? { BaseLineNumber: 0 } : {}),
-      ...(includeWh ? { WarehouseCode: wh } : {}),
-      Quantity: qty,
-      ...(includeTx ? { TransactionType: tx } : {}),
-    });
+  const payloadVariants = [];
+  const seen = new Set();
+  const pushVariant = (label, payload) => {
+    const compacted = compact(payload);
+    const key = JSON.stringify(compacted);
+    if (seen.has(key)) return;
+    seen.add(key);
+    payloadVariants.push({ label, payload: compacted });
   };
 
-  for (const baseEntry of baseEntries) {
-    for (const wh of whVariants) {
-      for (const header of headerVariants) {
-        // Más probable: orden enlazada, sin ItemCode ni TaxDate, usando número de orden en BaseEntry.
-        for (const tx of txVariants) {
-          for (const batchCfg of batchVariants) {
-            pushVariant(`base:${baseEntry}|linked|tx:${String(tx)}|wh:${wh || 'omit'}|doc`, header, makeLinkedLine({ baseEntry, wh, tx, includeWh: !!wh, includeTx: true }), batchCfg);
-            pushVariant(`base:${baseEntry}|linked|tx:${String(tx)}|wh:${wh || 'omit'}|doc|baseline`, header, makeLinkedLine({ baseEntry, wh, tx, includeWh: !!wh, includeBaseLine: true, includeTx: true }), batchCfg);
-            pushVariant(`base:${baseEntry}|linked|tx:${String(tx)}|wh:${wh || 'omit'}|doc|baseline+num`, header, makeLinkedLine({ baseEntry, wh, tx, includeWh: !!wh, includeBaseLine: true, includeBaseLineNumber: true, includeTx: true }), batchCfg);
-            pushVariant(`base:${baseEntry}|linked|tx:${String(tx)}|nowh|doc`, header, makeLinkedLine({ baseEntry, wh, tx, includeWh: false, includeTx: true }), batchCfg);
-          }
-        }
-
-        // Variante alineada al ejemplo oficial de Service Layer para InventoryGenEntries basado en orden de producción.
+  const pushLinkedVariantsForBase = (baseEntry, baseLabel) => {
+    if (!(Number(baseEntry) > 0)) return;
+    for (const header of headerVariants) {
+      for (const wh of whVariants) {
         for (const batchCfg of batchVariants) {
-          pushVariant(`base:${baseEntry}|linked|tx:omit|wh:${wh || 'omit'}|doc|official`, header, makeLinkedLine({ baseEntry, wh, includeWh: !!wh, includeTx: false }), batchCfg);
-          pushVariant(`base:${baseEntry}|linked|tx:omit|wh:${wh || 'omit'}|doc|official|baseline`, header, makeLinkedLine({ baseEntry, wh, includeWh: !!wh, includeBaseLine: true, includeTx: false }), batchCfg);
-          pushVariant(`base:${baseEntry}|linked|tx:omit|nowh|doc|official`, header, makeLinkedLine({ baseEntry, wh, includeWh: false, includeTx: false }), batchCfg);
-        }
-
-        // Fallback final por compatibilidad con ambientes más estrictos.
-        for (const tx of [0, '0', undefined]) {
-          for (const batchCfg of batchVariants) {
-            pushVariant(`base:${baseEntry}|compat|tx:${tx === undefined ? 'omit' : String(tx)}|wh:${wh || 'omit'}|doc`, header, compact({
+          const batches = batchCfg ? { BatchNumbers: buildBatchNumbers(batchCfg) } : {};
+          // Variante más estable en este ambiente: enlazada a la orden con BaseEntry interno y TransactionType 0.
+          pushVariant(`${baseLabel}:${baseEntry}|linked|tx:0|wh:${wh || 'omit'}|doc`, {
+            ...header,
+            DocumentLines: [{
               BaseType: 202,
               BaseEntry: baseEntry,
-              BaseLine: 0,
+              ...(wh ? { WarehouseCode: wh } : {}),
               Quantity: qty,
-              WarehouseCode: wh || undefined,
-              TransactionType: tx,
-            }), batchCfg);
-          }
+              TransactionType: 0,
+              ...batches,
+            }],
+          });
+          // Fallback oficial sin TransactionType.
+          pushVariant(`${baseLabel}:${baseEntry}|linked|tx:omit|wh:${wh || 'omit'}|doc|official`, {
+            ...header,
+            DocumentLines: [{
+              BaseType: 202,
+              BaseEntry: baseEntry,
+              ...(wh ? { WarehouseCode: wh } : {}),
+              Quantity: qty,
+              ...batches,
+            }],
+          });
+          // Fallback sin bodega por compatibilidad.
+          pushVariant(`${baseLabel}:${baseEntry}|linked|tx:0|nowh|doc`, {
+            ...header,
+            DocumentLines: [{
+              BaseType: 202,
+              BaseEntry: baseEntry,
+              Quantity: qty,
+              TransactionType: 0,
+              ...batches,
+            }],
+          });
         }
       }
     }
-  }
+  };
+
+  // En este ambiente SAP el BaseEntry válido parece ser primero el AbsoluteEntry/DocEntry.
+  pushLinkedVariantsForBase(abs, 'abs');
+  pushLinkedVariantsForBase(docNum, 'docnum');
 
   let created = null;
   let usedPayload = null;
@@ -16420,11 +16405,30 @@ async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate
     } catch (e) {
       lastErr = e;
       attempts.push(`${attempt.label}: ${String(e?.message || e)}`);
+      const msg = String(e?.message || e || '');
+      // Si ya llegamos a una regla de negocio real, no vale seguir probando variantes incompatibles.
+      if (/item's inventory to fall below zero/i.test(msg) || /referenced production order issue type should be manual/i.test(msg)) {
+        break;
+      }
     }
   }
 
   if (!created) {
-    const err = new Error((lastErr?.message || 'No se pudo crear el recibo de producción') + (attempts.length ? ` | Intentos: ${attempts.join(' | ')}` : ''));
+    const rawMsg = String(lastErr?.message || 'No se pudo crear el recibo de producción');
+    if (/item's inventory to fall below zero/i.test(rawMsg)) {
+      const m = rawMsg.match(/Production Order no:\s*(\d+)\s*Line:\s*(\d+)/i);
+      const orderNo = m?.[1] || String(docNum || abs || '');
+      const lineNo = m?.[2] || '?';
+      const err = new Error(`No se pudo crear la terminación de reporte porque SAP intenta consumir automáticamente un componente y el inventario quedaría negativo. Revisa la orden ${orderNo}, línea ${lineNo}, en la bodega correspondiente, o haz primero la emisión manual si aplica.`);
+      err.attempts = attempts;
+      throw err;
+    }
+    if (/referenced production order issue type should be manual/i.test(rawMsg)) {
+      const err = new Error('No se pudo crear la terminación de reporte porque esta orden tiene al menos un componente configurado para emisión manual. Primero debes registrar la Emisión para Producción de esos componentes y luego volver a hacer la terminación de reporte.');
+      err.attempts = attempts;
+      throw err;
+    }
+    const err = new Error(rawMsg + (attempts.length ? ` | Intentos: ${attempts.join(' | ')}` : ''));
     err.attempts = attempts;
     throw err;
   }
