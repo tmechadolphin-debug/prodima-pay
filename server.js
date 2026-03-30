@@ -15963,6 +15963,7 @@ function poCloseNormalizeOrderLine(line = {}, order = {}) {
   const issuedQuantity = Number(line?.IssuedQuantity ?? line?.IssuedQty ?? 0) || 0;
   const warehouse = String(line?.Warehouse ?? line?.WarehouseCode ?? line?.WhsCode ?? order?.warehouse ?? '').trim();
   const rawType = String(line?.ItemType ?? line?.itemType ?? line?.Type ?? '').trim();
+  const isResource = poCloseLooksLikeResourceLine(line);
   return {
     lineNumber,
     itemCode: code,
@@ -15974,7 +15975,8 @@ function poCloseNormalizeOrderLine(line = {}, order = {}) {
     issuedQuantity,
     issueMethod: String(line?.ProductionOrderIssueType ?? line?.IssueType ?? '').trim(),
     itemType: rawType,
-    isResource: poCloseLooksLikeResourceLine(line),
+    isResource,
+    lineKind: isResource ? 'RESOURCE' : 'MATERIAL',
     raw: line,
   };
 }
@@ -15987,6 +15989,7 @@ function poCloseOrderFromRaw(raw = {}) {
     ...normalized,
     linesPropKey,
     lines,
+    editableLines: lines,
     resourceLines: lines.filter((x) => x.isResource),
     componentLines: lines.filter((x) => !x.isResource),
     rawOrder: raw,
@@ -16016,9 +16019,41 @@ async function poCloseFetchOrderRaw(absoluteEntry, docNum = 0, { includeLines = 
   }
   return null;
 }
+async function poCloseFindLastReportCompletion(absoluteEntry, docNum = 0) {
+  if (!hasDb()) return null;
+  const abs = Number(absoluteEntry || 0) || 0;
+  const num = Number(docNum || 0) || 0;
+  const rows = await dbQuery(
+    `SELECT id, absolute_entry, doc_num, receipt_doc_entry, receipt_doc_num, batch_number, reported_qty, created_at
+       FROM admin_production_close_events
+      WHERE action = 'REPORT_COMPLETION'
+        AND ($1 = 0 OR absolute_entry = $1)
+        AND ($2 = 0 OR doc_num = $2)
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [abs, num]
+  ).catch(() => ({ rows: [] }));
+  const row = rows?.rows?.[0] || null;
+  if (!row) return null;
+  return {
+    id: Number(row.id || 0) || 0,
+    absoluteEntry: Number(row.absolute_entry || 0) || 0,
+    docNum: Number(row.doc_num || 0) || 0,
+    receiptDocEntry: row.receipt_doc_entry != null ? Number(row.receipt_doc_entry) : null,
+    receiptDocNum: row.receipt_doc_num != null ? Number(row.receipt_doc_num) : null,
+    batchNumber: String(row.batch_number || '').trim(),
+    reportedQty: Number(row.reported_qty || 0) || 0,
+    createdAt: row.created_at || null,
+  };
+}
 async function poCloseFetchOrderDetail(absoluteEntry, docNum = 0) {
   const raw = await poCloseFetchOrderRaw(absoluteEntry, docNum, { includeLines: true });
-  return raw ? poCloseOrderFromRaw(raw) : null;
+  if (!raw) return null;
+  const order = poCloseOrderFromRaw(raw);
+  const lastReportCompletion = await poCloseFindLastReportCompletion(order.absoluteEntry, order.docNum);
+  order.lastReportCompletion = lastReportCompletion;
+  order.hasReportCompletion = !!(lastReportCompletion?.receiptDocNum || lastReportCompletion?.receiptDocEntry || Number(order.remainingQty || 0) <= 0);
+  return order;
 }
 async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], adminUser = 'admin', note = '') {
   const abs = Number(absoluteEntry || 0) || 0;
@@ -16032,8 +16067,9 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
   const normalizedBefore = originalLines.map((line) => poCloseNormalizeOrderLine(line, detailBefore));
   const updates = Array.isArray(resourceLines) ? resourceLines : [];
 
-  const normalizeResourceInput = (row = {}) => {
+  const normalizeEditableInput = (row = {}) => {
     const ln = Number(row?.lineNumber || 0) || 0;
+    const isResource = !!row?.isResource || String(row?.lineKind || '').toUpperCase() === 'RESOURCE';
     return {
       lineNumber: ln,
       itemCode: String(row?.itemCode || '').trim(),
@@ -16042,29 +16078,33 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
       baseQuantity: Number(row?.baseQuantity ?? 0) || 0,
       plannedQuantity: Number(row?.plannedQuantity ?? 0) || 0,
       additionalQuantity: Number(row?.additionalQuantity ?? 0) || 0,
+      itemType: String(row?.itemType || '').trim(),
+      isResource,
+      lineKind: isResource ? 'RESOURCE' : 'MATERIAL',
       _delete: !!row?._delete,
       _isNew: !!row?._isNew || !(ln > 0),
     };
   };
 
   const sameNum = (a, b, decimals = 6) => Number((Number(a || 0)).toFixed(decimals)) === Number((Number(b || 0)).toFixed(decimals));
-  const currentResources = normalizedBefore
-    .filter((x) => x?.isResource)
-    .map((x) => ({
-      lineNumber: Number(x.lineNumber || 0) || 0,
-      itemCode: String(x.itemCode || '').trim(),
-      itemName: String(x.itemName || '').trim(),
-      warehouse: String(x.warehouse || detailBefore.warehouse || '').trim(),
-      baseQuantity: Number(x.baseQuantity ?? 0) || 0,
-      plannedQuantity: Number(x.plannedQuantity ?? 0) || 0,
-      additionalQuantity: Number(x.additionalQuantity ?? 0) || 0,
-    }));
+  const currentEditable = normalizedBefore.map((x) => ({
+    lineNumber: Number(x.lineNumber || 0) || 0,
+    itemCode: String(x.itemCode || '').trim(),
+    itemName: String(x.itemName || '').trim(),
+    warehouse: String(x.warehouse || detailBefore.warehouse || '').trim(),
+    baseQuantity: Number(x.baseQuantity ?? 0) || 0,
+    plannedQuantity: Number(x.plannedQuantity ?? 0) || 0,
+    additionalQuantity: Number(x.additionalQuantity ?? 0) || 0,
+    itemType: String(x.itemType || '').trim(),
+    isResource: !!x.isResource,
+    lineKind: x.isResource ? 'RESOURCE' : 'MATERIAL',
+  }));
 
-  const normalizedUpdates = updates.map((row) => normalizeResourceInput(row));
+  const normalizedUpdates = updates.map((row) => normalizeEditableInput(row));
   const activeUpdates = normalizedUpdates.filter((row) => !row._delete);
+  const currentByLine = new Map(currentEditable.map((row) => [String(row.lineNumber), row]));
 
-  const currentByLine = new Map(currentResources.map((row) => [String(row.lineNumber), row]));
-  const hasStructuralChanges = activeUpdates.some((row) => row._isNew || !(row.lineNumber > 0)) || activeUpdates.length !== currentResources.length;
+  const hasStructuralChanges = activeUpdates.some((row) => row._isNew || !(row.lineNumber > 0)) || activeUpdates.length !== currentEditable.length;
   const hasValueChanges = activeUpdates.some((row) => {
     const prev = currentByLine.get(String(row.lineNumber));
     if (!prev) return true;
@@ -16072,6 +16112,7 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
       String(prev.itemCode || '') !== String(row.itemCode || '') ||
       String(prev.itemName || '') !== String(row.itemName || '') ||
       String(prev.warehouse || '') !== String(row.warehouse || '') ||
+      String(prev.lineKind || '') !== String(row.lineKind || '') ||
       !sameNum(prev.baseQuantity, row.baseQuantity) ||
       !sameNum(prev.plannedQuantity, row.plannedQuantity) ||
       !sameNum(prev.additionalQuantity, row.additionalQuantity)
@@ -16102,13 +16143,17 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
   for (let i = 0; i < originalLines.length; i++) {
     const rawLine = originalLines[i];
     const normLine = normalizedBefore[i];
-    if (!normLine?.isResource) {
+    const desired = existingByLine.get(String(normLine.lineNumber));
+
+    if (!desired) {
       updatedLines.push(stripInvalidLineAliases(rawLine));
       continue;
     }
-    const desired = existingByLine.get(String(normLine.lineNumber));
-    if (!desired) continue;
-    if (desired._delete) continue;
+    if (desired._delete) {
+      if (normLine?.isResource) continue;
+      updatedLines.push(stripInvalidLineAliases(rawLine));
+      continue;
+    }
 
     const merged = stripInvalidLineAliases(rawLine);
     if (desired.itemCode) {
@@ -16118,7 +16163,11 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
       merged.ItemName = desired.itemName;
       merged.LineText = desired.itemName;
     }
-    merged.ItemType = merged.ItemType ?? 290;
+    if (desired.itemType) {
+      merged.ItemType = desired.itemType;
+    } else if (normLine?.isResource) {
+      merged.ItemType = merged.ItemType ?? 290;
+    }
     merged.BaseQuantity = Number(desired.baseQuantity || 0);
     merged.PlannedQuantity = Number(desired.plannedQuantity || 0);
     merged.AdditionalQuantity = Number(desired.additionalQuantity || 0);
@@ -16129,7 +16178,7 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
   }
 
   const templateLine = stripInvalidLineAliases(
-    originalLines.find((line) => poCloseNormalizeOrderLine(line, detailBefore).isResource) || {}
+    originalLines.find((line) => poCloseNormalizeOrderLine(line, detailBefore).isResource) || originalLines[0] || {}
   );
 
   for (const desired of additions) {
@@ -16140,7 +16189,7 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
     delete merged.VisOrder;
     delete merged.DocumentAbsoluteEntry;
     delete merged.DocEntry;
-    merged.ItemType = merged.ItemType ?? 290;
+    merged.ItemType = desired.itemType || merged.ItemType || 290;
     merged.ItemNo = desired.itemCode;
     if (desired.itemName) {
       merged.ItemName = desired.itemName;
@@ -16449,8 +16498,9 @@ async function poCloseProcessOrder(absoluteEntry, body = {}, adminUser = 'admin'
   const before = poCloseStatus(order.status);
   const steps = [];
 
-  if (Array.isArray(body?.resourceLines) && body.resourceLines.length) {
-    order = await poCloseSaveResourceLines(abs, body.resourceLines, adminUser, body?.note || '');
+  const editableLines = Array.isArray(body?.editableLines) ? body.editableLines : (body?.resourceLines || []);
+  if (Array.isArray(editableLines) && editableLines.length) {
+    order = await poCloseSaveResourceLines(abs, editableLines, adminUser, body?.note || '');
     steps.push('save_resources');
   }
 
@@ -16616,7 +16666,8 @@ app.get('/api/admin/production-close/orders/:absoluteEntry/detail', verifyAdmin,
 app.post('/api/admin/production-close/orders/:absoluteEntry/resources/save', verifyAdmin, async (req, res) => {
   try {
     const abs = Number(req.params.absoluteEntry || 0);
-    const order = await poCloseSaveResourceLines(abs, req.body?.resourceLines || [], String(req.admin?.user || 'admin'), String(req.body?.note || ''));
+    const editableLines = Array.isArray(req.body?.editableLines) ? req.body.editableLines : (req.body?.resourceLines || []);
+    const order = await poCloseSaveResourceLines(abs, editableLines, String(req.admin?.user || 'admin'), String(req.body?.note || ''));
     return safeJson(res, 200, { ok: true, order, message: 'Recursos actualizados' });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
@@ -16653,8 +16704,9 @@ app.post('/api/admin/production-close/orders/:absoluteEntry/report-completion', 
     const abs = Number(req.params.absoluteEntry || 0);
     let order = await poCloseFetchOrderDetail(abs, req.body?.docNum);
     if (!order) return safeJson(res, 404, { ok: false, message: 'Orden no encontrada' });
-    if (Array.isArray(req.body?.resourceLines) && req.body.resourceLines.length) {
-      order = await poCloseSaveResourceLines(abs, req.body.resourceLines, String(req.admin?.user || 'admin'), String(req.body?.note || ''));
+    const editableLines = Array.isArray(req.body?.editableLines) ? req.body.editableLines : (req.body?.resourceLines || []);
+    if (Array.isArray(editableLines) && editableLines.length) {
+      order = await poCloseSaveResourceLines(abs, editableLines, String(req.admin?.user || 'admin'), String(req.body?.note || ''));
     }
     if (order.status === 'PLANNED') order = await poClosePatchStatus(abs, 'RELEASED');
     const qty = Number(req.body?.quantity || order.remainingQty || 0);
@@ -16688,7 +16740,7 @@ app.post('/api/admin/production-close/orders/:absoluteEntry/report-completion', 
     const refreshed = await poCloseFetchOrderDetail(abs, req.body?.docNum);
     return safeJson(res, 200, {
       ok: true,
-      message: 'Terminación de reporte creada',
+      message: `Terminación de reporte creada correctamente${receiptInfo.receiptDocNum ? ` · Recibo #${receiptInfo.receiptDocNum}` : ''}`,
       order: refreshed || order,
       batchNumber: receiptInfo.batchNumber || '',
       receiptDocEntry: receiptInfo.receiptDocEntry,
