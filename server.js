@@ -4603,6 +4603,15 @@ async function ensureDb() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS customer_category_cache (
+      card_code TEXT PRIMARY KEY,
+      category_code INTEGER,
+      category_name TEXT NOT NULL DEFAULT 'Sin categoría',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
 }
 
 async function setState(k, v) {
@@ -4617,6 +4626,151 @@ async function getState(k) {
   if (!hasDb()) return "";
   const r = await dbQuery(`SELECT v FROM sync_state WHERE k=$1 LIMIT 1`, [k]);
   return r.rows?.[0]?.v || "";
+}
+
+function normalizeCustomerCategoryName(v) {
+  const txt = String(v || "").trim();
+  return txt || "Sin categoría";
+}
+
+async function getCachedCustomerCategories(cardCodes = []) {
+  const list = Array.from(new Set((Array.isArray(cardCodes) ? cardCodes : []).map((x) => String(x || "").trim()).filter(Boolean)));
+  if (!list.length) return new Map();
+
+  const r = await dbQuery(
+    `SELECT card_code, category_code, category_name, updated_at
+       FROM customer_category_cache
+      WHERE card_code = ANY($1::text[])`,
+    [list]
+  );
+
+  const map = new Map();
+  for (const row of (r.rows || [])) {
+    map.set(String(row.card_code || "").trim(), {
+      cardCode: String(row.card_code || "").trim(),
+      categoryCode: row.category_code == null ? null : Number(row.category_code),
+      categoryName: normalizeCustomerCategoryName(row.category_name),
+      updatedAt: row.updated_at ? new Date(row.updated_at) : null,
+    });
+  }
+  return map;
+}
+
+async function upsertCustomerCategory(entry = {}) {
+  const cardCode = String(entry.cardCode || "").trim();
+  if (!cardCode) return;
+  await dbQuery(
+    `INSERT INTO customer_category_cache(card_code, category_code, category_name, updated_at)
+     VALUES ($1,$2,$3,NOW())
+     ON CONFLICT (card_code) DO UPDATE SET
+       category_code = EXCLUDED.category_code,
+       category_name = EXCLUDED.category_name,
+       updated_at = NOW()`,
+    [
+      cardCode,
+      entry.categoryCode == null ? null : Number(entry.categoryCode),
+      normalizeCustomerCategoryName(entry.categoryName),
+    ]
+  );
+}
+
+async function getBusinessPartnerCategoryFromSap(cardCode) {
+  const code = String(cardCode || "").trim();
+  if (!code || missingSapEnv()) {
+    return { cardCode: code, categoryCode: null, categoryName: "Sin categoría" };
+  }
+
+  const safeCode = code.replace(/'/g, "''");
+  const encoded = encodeURIComponent(code);
+  let bp = null;
+
+  for (const p of [
+    `/BusinessPartners('${encoded}')?$select=CardCode,CardName,GroupCode`,
+    `/BusinessPartners?$select=CardCode,CardName,GroupCode&$filter=CardCode eq '${safeCode}'&$top=1`,
+    `/BusinessPartners('${encoded}')`,
+  ]) {
+    try {
+      const data = await slFetch(p, { timeoutMs: 45000 });
+      bp = Array.isArray(data?.value) ? data.value[0] : data;
+      if (bp) break;
+    } catch {}
+  }
+
+  const groupCode = Number(bp?.GroupCode ?? bp?.groupCode ?? bp?.GroupNum ?? bp?.groupNum ?? null);
+  if (!Number.isFinite(groupCode) || groupCode <= 0) {
+    return { cardCode: code, categoryCode: null, categoryName: "Sin categoría" };
+  }
+
+  let row = null;
+  for (const p of [
+    `/BusinessPartnerGroups(${groupCode})?$select=Code,Name,Type`,
+    `/BusinessPartnerGroups?$select=Code,Name,Type&$filter=Code eq ${groupCode}&$top=1`,
+    `/BusinessPartnerGroups(${groupCode})`,
+  ]) {
+    try {
+      const data = await slFetch(p, { timeoutMs: 45000 });
+      row = Array.isArray(data?.value) ? data.value[0] : data;
+      if (row) break;
+    } catch {}
+  }
+
+  return {
+    cardCode: code,
+    categoryCode: groupCode,
+    categoryName: normalizeCustomerCategoryName(row?.Name || row?.GroupName || `Grupo ${groupCode}`),
+  };
+}
+
+async function ensureCustomerCategoriesForCardCodes(cardCodes = []) {
+  const uniqueCodes = Array.from(new Set((Array.isArray(cardCodes) ? cardCodes : []).map((x) => String(x || "").trim()).filter(Boolean)));
+  if (!uniqueCodes.length || !hasDb()) return new Map();
+
+  const cache = await getCachedCustomerCategories(uniqueCodes);
+  const now = Date.now();
+  const staleMs = 7 * 24 * 60 * 60 * 1000;
+
+  const pending = uniqueCodes.filter((code) => {
+    const hit = cache.get(code);
+    const ts = hit?.updatedAt instanceof Date && !Number.isNaN(hit.updatedAt.getTime()) ? hit.updatedAt.getTime() : 0;
+    return !hit || !ts || (now - ts) > staleMs;
+  });
+
+  for (const code of pending) {
+    try {
+      const info = await getBusinessPartnerCategoryFromSap(code);
+      await upsertCustomerCategory(info);
+      cache.set(code, {
+        cardCode: code,
+        categoryCode: info.categoryCode,
+        categoryName: normalizeCustomerCategoryName(info.categoryName),
+        updatedAt: new Date(),
+      });
+    } catch {
+      if (!cache.has(code)) {
+        cache.set(code, {
+          cardCode: code,
+          categoryCode: null,
+          categoryName: "Sin categoría",
+          updatedAt: new Date(),
+        });
+      }
+    }
+  }
+
+  return cache;
+}
+
+async function enrichRowsWithCustomerCategory(rows = []) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) return list;
+
+  const cache = await ensureCustomerCategoriesForCardCodes(list.map((r) => r.cardCode));
+  for (const row of list) {
+    row.categoria = normalizeCustomerCategoryName(
+      cache.get(String(row.cardCode || "").trim())?.categoryName
+    );
+  }
+  return list;
 }
 
 /* =========================================================
@@ -6347,7 +6501,7 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "
     ORDER BY l.doc_date DESC, l.doc_num DESC, l.line_num ASC
   `;
   const r = await dbQuery(sql, params);
-  return (r.rows || []).map((x) => {
+  const rows = (r.rows || []).map((x) => {
     const grupo = canonicalInvoiceGroup(x.grupo_raw || "Sin grupo");
     const area = inferInvoiceArea(grupo, x.area_db || "");
     return {
@@ -6366,8 +6520,10 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "
       grossProfit: money2(x.gross_profit),
       grupo,
       area,
+      categoria: "Sin categoría",
     };
   });
+  return enrichRowsWithCustomerCategory(rows);
 }
 
 
@@ -6378,9 +6534,10 @@ function isoDateOnly(v) {
   return String(v).slice(0, 10);
 }
 
-function applyAreaGroupFilters(rows, { area = "__ALL__", grupo = "__ALL__" } = {}) {
+function applyAreaGroupFilters(rows, { area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__" } = {}) {
   const areaSel = String(area || "__ALL__").trim().toUpperCase();
   const grupoSel = String(grupo || "__ALL__").trim();
+  const categoriaSel = normalizeCustomerCategoryName(categoria === "__ALL__" ? "" : categoria);
   let out = Array.isArray(rows) ? rows.slice() : [];
 
   if (areaSel !== "__ALL__") {
@@ -6390,7 +6547,16 @@ function applyAreaGroupFilters(rows, { area = "__ALL__", grupo = "__ALL__" } = {
     const gSel = canonicalInvoiceGroup(grupoSel);
     out = out.filter((r) => canonicalInvoiceGroup(r.grupo) === gSel);
   }
+  if (String(categoria || "__ALL__").trim() !== "__ALL__") {
+    out = out.filter((r) => normalizeCustomerCategoryName(r.categoria) === categoriaSel);
+  }
   return out;
+}
+
+function availableCategoriesFromRows(rows = []) {
+  return Array.from(
+    new Set((Array.isArray(rows) ? rows : []).map((r) => normalizeCustomerCategoryName(r.categoria)).filter(Boolean))
+  ).sort((a, b) => a.localeCompare(b));
 }
 
 function availableGroupsForArea(area) {
@@ -6400,9 +6566,10 @@ function availableGroupsForArea(area) {
 /* =========================================================
    ✅ Dashboard from DB (neto)
 ========================================================= */
-async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo = "__ALL__", q = "" }) {
+async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", q = "" }) {
   const baseRows = await fetchInvoiceRows({ from, to, q });
-  const rows = applyAreaGroupFilters(baseRows, { area, grupo });
+  const scopeRows = applyAreaGroupFilters(baseRows, { area, grupo, categoria: "__ALL__" });
+  const rows = applyAreaGroupFilters(scopeRows, { area: "__ALL__", grupo: "__ALL__", categoria });
 
   const docInvSet = new Set();
   const docCrnSet = new Set();
@@ -6438,6 +6605,7 @@ async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo 
       cardName: r.cardName,
       customer: `${r.cardCode} · ${r.cardName}`,
       warehouse: r.warehouse,
+      categoria: r.categoria,
       dollars: 0,
       grossProfit: 0,
       invSet: new Set(),
@@ -6488,6 +6656,7 @@ async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo 
         cardName: x.cardName,
         customer: x.customer,
         warehouse: x.warehouse,
+        categoria: x.categoria || "Sin categoría",
         dollars: dol,
         grossProfit: gp,
         grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
@@ -6516,8 +6685,10 @@ async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo 
     to,
     area,
     grupo,
+    categoria,
     availableAreas: ["__ALL__", "CONS", "RCI"],
     availableGroups: availableGroupsForArea(area),
+    availableCategories: availableCategoriesFromRows(scopeRows),
     totals: {
       invoices: docInvSet.size,
       creditNotes: docCrnSet.size,
@@ -6535,9 +6706,9 @@ async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo 
 /* =========================================================
    ✅ Details + Top products
 ========================================================= */
-async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", grupo = "__ALL__" }) {
+async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__" }) {
   let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse });
-  rows = applyAreaGroupFilters(rows, { area, grupo });
+  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
 
   const map = new Map();
   for (const r of rows) {
@@ -6565,6 +6736,7 @@ async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", 
       grossPct: r.dollars !== 0 ? num((r.grossProfit / r.dollars) * 100, 2) : 0,
       area: r.area,
       grupo: r.grupo,
+      categoria: r.categoria,
     });
     it.totals.qty += Number(r.quantity || 0);
     it.totals.dollars += Number(r.dollars || 0);
@@ -6602,12 +6774,12 @@ async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", 
   totals.grossProfit = money2(totals.grossProfit);
   totals.grossPct = totals.dollars !== 0 ? num((totals.grossProfit / totals.dollars) * 100, 2) : 0;
 
-  return { ok: true, from, to, area, grupo, cardCode, warehouse, totals, invoices };
+  return { ok: true, from, to, area, grupo, categoria, cardCode, warehouse, totals, invoices };
 }
 
-async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area = "__ALL__", grupo = "__ALL__", limit = 10 }) {
+async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 10 }) {
   let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse });
-  rows = applyAreaGroupFilters(rows, { area, grupo });
+  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
 
   const map = new Map();
   for (const r of rows) {
@@ -6621,6 +6793,7 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
       invSet: new Set(),
       area: r.area,
       grupo: r.grupo,
+      categoria: r.categoria,
     };
     cur.qty += Number(r.quantity || 0);
     cur.dollars += Number(r.dollars || 0);
@@ -6637,6 +6810,7 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
     cardCode: cardCode || null,
     area,
     grupo,
+    categoria,
     top: Array.from(map.values())
       .map((x) => {
         const dol = money2(x.dollars);
@@ -6651,6 +6825,7 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
           invoices: x.invSet.size,
           area: x.area,
           grupo: x.grupo,
+          categoria: x.categoria,
         };
       })
       .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0))
@@ -6658,6 +6833,64 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
   };
 }
 
+
+/* =========================================================
+   ✅ Artículos por categoría
+========================================================= */
+async function articlesFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 500 }) {
+  let rows = await fetchInvoiceRows({ from, to, q: "" });
+  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
+
+  const map = new Map();
+  for (const r of rows) {
+    if (!String(r.itemCode || "").trim()) continue;
+    const key = String(r.itemCode || "").trim();
+    const cur = map.get(key) || {
+      itemCode: key,
+      itemDesc: String(r.itemDesc || ""),
+      qty: 0,
+      dollars: 0,
+      grossProfit: 0,
+      invSet: new Set(),
+      custSet: new Set(),
+    };
+    cur.qty += Number(r.quantity || 0);
+    cur.dollars += Number(r.dollars || 0);
+    cur.grossProfit += Number(r.grossProfit || 0);
+    if (r.docType === "INV") cur.invSet.add(`${r.docType}:${r.docEntry}`);
+    if (r.cardCode) cur.custSet.add(String(r.cardCode));
+    map.set(key, cur);
+  }
+
+  const items = Array.from(map.values())
+    .map((x) => {
+      const dol = money2(x.dollars);
+      const gp = money2(x.grossProfit);
+      return {
+        itemCode: x.itemCode,
+        itemDesc: x.itemDesc,
+        qty: num(x.qty, 4),
+        dollars: dol,
+        grossProfit: gp,
+        grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
+        invoices: x.invSet.size,
+        customers: x.custSet.size,
+      };
+    })
+    .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0))
+    .slice(0, Math.max(1, Math.min(2000, Number(limit || 500))));
+
+  return {
+    ok: true,
+    from,
+    to,
+    area,
+    grupo,
+    categoria,
+    categoriaLabel: categoria === "__ALL__" ? "Todas las categorías" : normalizeCustomerCategoryName(categoria),
+    items,
+  };
+}
 
 /* =========================================================
    ✅ IA (admin-clientes) — contexto rico para análisis mensual
@@ -6742,9 +6975,9 @@ function aiTopChangedItems(sourceBucket, targetBucket, mode = "lost", limit = 8)
     .slice(0, Math.max(1, Math.min(50, Number(limit || 8))));
 }
 
-async function buildAdminClientesAiAnalytics({ from, to, area = "__ALL__", grupo = "__ALL__", q = "" }) {
+async function buildAdminClientesAiAnalytics({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", q = "" }) {
   let rows = await fetchInvoiceRows({ from, to, q });
-  rows = applyAreaGroupFilters(rows, { area, grupo });
+  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
 
   const months = Array.from(
     new Set(
@@ -6981,7 +7214,7 @@ async function buildAdminClientesAiAnalytics({ from, to, area = "__ALL__", grupo
 
   return {
     range: { from, to },
-    filters: { area, grupo, q },
+    filters: { area, grupo, categoria, q },
     months,
     firstMonth,
     lastMonth,
@@ -7008,6 +7241,7 @@ function aiCompactDashboard(dashboard, analytics = {}, focus = {}) {
     filters: {
       area: dashboard?.area || "__ALL__",
       grupo: dashboard?.grupo || "__ALL__",
+      categoria: dashboard?.categoria || "__ALL__",
       q: analytics?.filters?.q || "",
     },
     totals: dashboard?.totals || {},
@@ -7258,9 +7492,9 @@ function adminResolveDashboardFocus({ dashboard = null, question = '', q = '', c
   return null;
 }
 
-async function buildAdminClientesRecommendationAnalytics({ from, to, area = "__ALL__", grupo = "__ALL__", targetCardCode = "", customerLabel = "", question = "" }) {
+async function buildAdminClientesRecommendationAnalytics({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", targetCardCode = "", customerLabel = "", question = "" }) {
   let rows = await fetchInvoiceRows({ from, to, q: "" });
-  rows = applyAreaGroupFilters(rows, { area, grupo });
+  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
   if (!rows.length) return null;
 
   const target = adminClientesExtractTargetFromQuestion(rows, question, { cardCode: targetCardCode, customerLabel });
@@ -7579,9 +7813,10 @@ app.get("/api/admin/invoices/dashboard", verifyAdmin, async (req, res) => {
     const to = isISO(req.query?.to) ? String(req.query.to) : today;
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
     const q = String(req.query?.q || "");
 
-    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
+    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q });
     data.lastSyncAt = await getState("last_sync_at");
     return safeJson(res, 200, data);
   } catch (e) {
@@ -7600,12 +7835,13 @@ app.get("/api/admin/invoices/details", verifyAdmin, async (req, res) => {
     const warehouse = String(req.query?.warehouse || "").trim();
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
 
     if (!cardCode || !warehouse) {
       return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
     }
 
-    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
+    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -7623,9 +7859,29 @@ app.get("/api/admin/invoices/top-products", verifyAdmin, async (req, res) => {
     const cardCode = String(req.query?.cardCode || "").trim();
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
     const limit = Math.max(1, Math.min(200, Number(req.query?.limit || 10)));
 
-    const data = await topProductsFromDb({ from, to, warehouse, cardCode, area, grupo, limit });
+    const data = await topProductsFromDb({ from, to, warehouse, cardCode, area, grupo, categoria, limit });
+    return safeJson(res, 200, data);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+app.get("/api/admin/invoices/articles", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
+    const to = isISO(req.query?.to) ? String(req.query.to) : today;
+    const area = String(req.query?.area || "__ALL__");
+    const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
+    const limit = Math.max(1, Math.min(2000, Number(req.query?.limit || 500)));
+
+    const data = await articlesFromDb({ from, to, area, grupo, categoria, limit });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -7641,9 +7897,10 @@ app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
     const to = isISO(req.query?.to) ? String(req.query.to) : today;
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
     const q = String(req.query?.q || "");
 
-    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
+    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q });
 
     const wb = XLSX.utils.book_new();
     const rows = (data.table || []).map((r) => ({
@@ -7651,6 +7908,7 @@ app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
       "Cliente": r.cardName,
       "Cliente label": r.customer,
       "Bodega": r.warehouse,
+      "Categoría": r.categoria || "Sin categoría",
       "Ventas netas $": r.dollars,
       "Ganancia bruta $": r.grossProfit,
       "% GP": r.grossPct,
@@ -7680,12 +7938,13 @@ app.get("/api/admin/invoices/details/export", verifyAdmin, async (req, res) => {
     const warehouse = String(req.query?.warehouse || "").trim();
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
 
     if (!cardCode || !warehouse) {
       return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
     }
 
-    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
+    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria });
     const wb = XLSX.utils.book_new();
 
     const rows = [];
@@ -7699,6 +7958,7 @@ app.get("/api/admin/invoices/details/export", verifyAdmin, async (req, res) => {
           "Bodega": data.warehouse,
           "Área": ln.area,
           "Grupo": ln.grupo,
+          "Categoría": ln.categoria || "Sin categoría",
           "ItemCode": ln.itemCode,
           "Descripción": ln.itemDesc,
           "Cantidad": ln.quantity,
@@ -7736,6 +7996,7 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
     const customerLabel = String(req.body?.customerLabel || "").trim();
     const area = String(req.body?.area || req.query?.area || "__ALL__");
     const grupo = String(req.body?.grupo || req.query?.grupo || "__ALL__");
+    const categoria = String(req.body?.categoria || req.query?.categoria || "__ALL__");
     const q = String(req.body?.q || req.query?.q || "").trim();
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
@@ -7743,8 +8004,8 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
     const from = isISO(fromQ) ? fromQ : defaultFrom;
     const to = isISO(toQ) ? toQ : today;
 
-    const dashboard = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
-    const analytics = await buildAdminClientesAiAnalytics({ from, to, area, grupo, q });
+    const dashboard = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q });
+    const analytics = await buildAdminClientesAiAnalytics({ from, to, area, grupo, categoria, q });
 
     const resolvedFocus = adminResolveDashboardFocus({
       dashboard,
@@ -7761,7 +8022,7 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
 
     let detail = null;
     if (focusCardCode && focusWarehouse) {
-      detail = await detailsFromDb({ from, to, cardCode: focusCardCode, warehouse: focusWarehouse, area, grupo });
+      detail = await detailsFromDb({ from, to, cardCode: focusCardCode, warehouse: focusWarehouse, area, grupo, categoria });
     }
 
     const recommendationContext = await buildAdminClientesRecommendationAnalytics({
@@ -7769,6 +8030,7 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
       to,
       area,
       grupo,
+      categoria,
       targetCardCode: focusCardCode,
       customerLabel: focusLabel,
       question,
@@ -7789,7 +8051,7 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
       model: out.model,
       source: "db",
       range: { from, to },
-      filters: { area, grupo, q },
+      filters: { area, grupo, categoria, q },
       focus: focusCardCode ? {
         cardCode: focusCardCode,
         warehouse: focusWarehouse,
