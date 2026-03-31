@@ -16279,6 +16279,30 @@ async function poCloseEnsureTables() {
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_events_order ON admin_production_close_events(absolute_entry, doc_num, created_at DESC)`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_events_item ON admin_production_close_events(item_code, created_at DESC)`);
   await dbQuery(`
+    CREATE TABLE IF NOT EXISTS admin_production_close_timers (
+      id BIGSERIAL PRIMARY KEY,
+      absolute_entry BIGINT NOT NULL UNIQUE,
+      doc_num BIGINT NOT NULL DEFAULT 0,
+      item_code TEXT NOT NULL DEFAULT '',
+      item_name TEXT NOT NULL DEFAULT '',
+      warehouse TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'IDLE',
+      accumulated_seconds BIGINT NOT NULL DEFAULT 0,
+      started_at TIMESTAMPTZ,
+      last_started_at TIMESTAMPTZ,
+      finalized_at TIMESTAMPTZ,
+      applied_hours NUMERIC(19,6) NOT NULL DEFAULT 0,
+      affected_lines INT NOT NULL DEFAULT 0,
+      note TEXT NOT NULL DEFAULT '',
+      order_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+      admin_user TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_timers_status ON admin_production_close_timers(status, updated_at DESC)`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_timers_doc ON admin_production_close_timers(doc_num, updated_at DESC)`);
+  await dbQuery(`
     INSERT INTO app_state(k, v, updated_at)
     VALUES ('production_close_next_batch_seq', '3000', NOW())
     ON CONFLICT (k) DO NOTHING
@@ -16352,6 +16376,247 @@ async function poCloseLogEvent(payload = {}) {
     JSON.stringify(p.receiptPayload || {}),
     String(p.adminUser || ''),
   ]);
+}
+
+function poCloseFormatElapsed(totalSeconds = 0) {
+  const sec = Math.max(0, Math.floor(Number(totalSeconds || 0)));
+  const hh = String(Math.floor(sec / 3600)).padStart(2, '0');
+  const mm = String(Math.floor((sec % 3600) / 60)).padStart(2, '0');
+  const ss = String(sec % 60).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+function poCloseTimerElapsedSeconds(row = {}) {
+  const base = Math.max(0, Number(row?.accumulated_seconds ?? row?.accumulatedSeconds ?? 0) || 0);
+  const startedAt = row?.started_at || row?.startedAt;
+  const status = String(row?.status || '').toUpperCase();
+  if (status !== 'RUNNING' || !startedAt) return Math.floor(base);
+  const startedMs = new Date(startedAt).getTime();
+  if (!Number.isFinite(startedMs) || startedMs <= 0) return Math.floor(base);
+  return Math.max(0, Math.floor(base + ((Date.now() - startedMs) / 1000)));
+}
+function poCloseTimerStateFromRow(row = {}, fallback = {}) {
+  const elapsedSeconds = poCloseTimerElapsedSeconds(row);
+  const status = String(row?.status || fallback?.status || 'IDLE').toUpperCase();
+  return {
+    absoluteEntry: Number(row?.absolute_entry ?? row?.absoluteEntry ?? fallback?.absoluteEntry ?? 0) || 0,
+    docNum: Number(row?.doc_num ?? row?.docNum ?? fallback?.docNum ?? 0) || 0,
+    itemCode: String(row?.item_code ?? row?.itemCode ?? fallback?.itemCode ?? ''),
+    itemName: String(row?.item_name ?? row?.itemName ?? fallback?.itemName ?? ''),
+    warehouse: String(row?.warehouse ?? fallback?.warehouse ?? ''),
+    status,
+    elapsedSeconds,
+    elapsedLabel: poCloseFormatElapsed(elapsedSeconds),
+    accumulatedSeconds: Math.max(0, Number(row?.accumulated_seconds ?? row?.accumulatedSeconds ?? 0) || 0),
+    startedAt: row?.started_at || row?.startedAt || null,
+    lastStartedAt: row?.last_started_at || row?.lastStartedAt || null,
+    finalizedAt: row?.finalized_at || row?.finalizedAt || null,
+    appliedHours: Number(row?.applied_hours ?? row?.appliedHours ?? 0) || 0,
+    affectedLines: Number(row?.affected_lines ?? row?.affectedLines ?? 0) || 0,
+    note: String(row?.note || ''),
+    adminUser: String(row?.admin_user ?? row?.adminUser ?? ''),
+    updatedAt: row?.updated_at || row?.updatedAt || null,
+  };
+}
+async function poCloseGetTimerRow(absoluteEntry) {
+  if (!hasDb()) return null;
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs) return null;
+  const r = await dbQuery(`SELECT * FROM admin_production_close_timers WHERE absolute_entry=$1 LIMIT 1`, [abs]);
+  return r.rows?.[0] || null;
+}
+async function poCloseGetTimerState(absoluteEntry, fallback = {}) {
+  const row = await poCloseGetTimerRow(absoluteEntry);
+  return row ? poCloseTimerStateFromRow(row, fallback) : poCloseTimerStateFromRow({ status: 'IDLE' }, fallback);
+}
+function poCloseIsGeneralOperatorLine(line = {}) {
+  const code = String(line?.itemCode ?? line?.ItemNo ?? line?.ItemCode ?? '').trim().toUpperCase();
+  const name = String(line?.itemName ?? line?.ItemName ?? line?.ItemDescription ?? '').trim().toLowerCase();
+  return name.includes('operario general') || ['MO01', 'M001', 'M0O1', 'MOO1'].includes(code);
+}
+async function poCloseStartTimer(absoluteEntry, docNum = 0, adminUser = 'admin', note = '') {
+  if (!hasDb()) throw new Error('DB no configurada para guardar el tiempo de producción');
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs) throw new Error('AbsoluteEntry inválido');
+  const order = await poCloseFetchOrderDetail(abs, docNum);
+  if (!order) throw new Error('Orden no encontrada');
+  const current = await poCloseGetTimerRow(abs);
+  const now = new Date().toISOString();
+
+  if (current && String(current.status || '').toUpperCase() === 'RUNNING') {
+    return { timer: poCloseTimerStateFromRow(current, order), order, message: `El tiempo de la orden #${order.docNum} ya estaba en marcha.` };
+  }
+
+  const reset = current && String(current.status || '').toUpperCase() === 'FINALIZED';
+  const accumulated = reset ? 0 : Math.max(0, Number(current?.accumulated_seconds ?? 0) || 0);
+  await dbQuery(
+    `INSERT INTO admin_production_close_timers(
+      absolute_entry, doc_num, item_code, item_name, warehouse, status,
+      accumulated_seconds, started_at, last_started_at, finalized_at,
+      applied_hours, affected_lines, note, order_snapshot, admin_user, created_at, updated_at
+    ) VALUES (
+      $1,$2,$3,$4,$5,'RUNNING',
+      $6,$7,$7,NULL,
+      0,0,$8,$9::jsonb,$10,NOW(),NOW()
+    )
+    ON CONFLICT (absolute_entry) DO UPDATE SET
+      doc_num=EXCLUDED.doc_num,
+      item_code=EXCLUDED.item_code,
+      item_name=EXCLUDED.item_name,
+      warehouse=EXCLUDED.warehouse,
+      status='RUNNING',
+      accumulated_seconds=$6,
+      started_at=$7,
+      last_started_at=$7,
+      finalized_at=NULL,
+      applied_hours=CASE WHEN $11 THEN 0 ELSE admin_production_close_timers.applied_hours END,
+      affected_lines=CASE WHEN $11 THEN 0 ELSE admin_production_close_timers.affected_lines END,
+      note=$8,
+      order_snapshot=$9::jsonb,
+      admin_user=$10,
+      updated_at=NOW()`,
+    [abs, Number(order.docNum || 0), order.itemCode || '', order.itemName || '', order.warehouse || '', accumulated, now, String(note || ''), JSON.stringify(order || {}), String(adminUser || ''), !!reset]
+  );
+
+  const timer = await poCloseGetTimerState(abs, order);
+  await poCloseLogEvent({
+    action: reset ? 'TIMER_RESTART' : 'TIMER_START',
+    absoluteEntry: order.absoluteEntry,
+    docNum: order.docNum,
+    itemCode: order.itemCode,
+    itemName: order.itemName,
+    warehouse: order.warehouse,
+    statusBefore: current?.status || 'IDLE',
+    statusAfter: 'RUNNING',
+    note: String(note || ''),
+    orderPayload: { order, timer },
+    adminUser,
+  }).catch(() => {});
+  return { timer, order, message: reset ? 'Tiempo reiniciado y en marcha.' : 'Tiempo de producción iniciado.' };
+}
+async function poClosePauseTimer(absoluteEntry, docNum = 0, adminUser = 'admin', note = '') {
+  if (!hasDb()) throw new Error('DB no configurada para guardar el tiempo de producción');
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs) throw new Error('AbsoluteEntry inválido');
+  const order = await poCloseFetchOrderDetail(abs, docNum);
+  const current = await poCloseGetTimerRow(abs);
+  if (!current) {
+    const timer = poCloseTimerStateFromRow({ status: 'IDLE' }, order || { absoluteEntry: abs, docNum });
+    return { timer, order, message: 'La orden no tiene un tiempo iniciado todavía.' };
+  }
+  const wasRunning = String(current.status || '').toUpperCase() === 'RUNNING';
+  let accumulated = Math.max(0, Number(current.accumulated_seconds || 0) || 0);
+  if (wasRunning && current.started_at) {
+    const startedMs = new Date(current.started_at).getTime();
+    if (Number.isFinite(startedMs) && startedMs > 0) accumulated += Math.max(0, Math.floor((Date.now() - startedMs) / 1000));
+  }
+  await dbQuery(
+    `UPDATE admin_production_close_timers
+       SET doc_num=$2,
+           item_code=$3,
+           item_name=$4,
+           warehouse=$5,
+           status='PAUSED',
+           accumulated_seconds=$6,
+           started_at=NULL,
+           note=$7,
+           order_snapshot=$8::jsonb,
+           admin_user=$9,
+           updated_at=NOW()
+     WHERE absolute_entry=$1`,
+    [abs, Number(order?.docNum || current.doc_num || 0), order?.itemCode || current.item_code || '', order?.itemName || current.item_name || '', order?.warehouse || current.warehouse || '', accumulated, String(note || current.note || ''), JSON.stringify(order || {}), String(adminUser || current.admin_user || '')]
+  );
+  const rowAfter = await poCloseGetTimerRow(abs);
+  const timer = poCloseTimerStateFromRow(rowAfter, order || current);
+  await poCloseLogEvent({
+    action: 'TIMER_PAUSE',
+    absoluteEntry: abs,
+    docNum: timer.docNum,
+    itemCode: timer.itemCode,
+    itemName: timer.itemName,
+    warehouse: timer.warehouse,
+    statusBefore: current.status || 'IDLE',
+    statusAfter: 'PAUSED',
+    note: String(note || ''),
+    orderPayload: { order, timer },
+    adminUser,
+  }).catch(() => {});
+  return { timer, order, message: 'Tiempo de producción pausado.' };
+}
+async function poCloseFinalizeTimer(absoluteEntry, docNum = 0, adminUser = 'admin', note = '') {
+  if (!hasDb()) throw new Error('DB no configurada para guardar el tiempo de producción');
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs) throw new Error('AbsoluteEntry inválido');
+  const pauseResult = await poClosePauseTimer(abs, docNum, adminUser, note);
+  const timerPaused = pauseResult.timer;
+  const order = pauseResult.order || await poCloseFetchOrderDetail(abs, docNum);
+  const elapsedSeconds = Math.max(0, Number(timerPaused?.elapsedSeconds || 0) || 0);
+  if (!(elapsedSeconds > 0)) throw new Error('No hay tiempo acumulado para finalizar.');
+  if (!order) throw new Error('Orden no encontrada');
+
+  const appliedHours = Number((elapsedSeconds / 3600).toFixed(6));
+  const operatorLines = (Array.isArray(order.lines) ? order.lines : []).filter((line) => poCloseIsGeneralOperatorLine(line));
+  if (!operatorLines.length) {
+    throw new Error('No se encontraron líneas de Operario General para aplicar el tiempo.');
+  }
+
+  const updates = operatorLines.map((line) => ({
+    lineNumber: Number(line.lineNumber || 0) || 0,
+    itemCode: String(line.itemCode || '').trim(),
+    itemName: String(line.itemName || '').trim(),
+    warehouse: String(line.warehouse || order.warehouse || '').trim(),
+    baseQuantity: Number(line.baseQuantity || 0) || 0,
+    plannedQuantity: appliedHours,
+    additionalQuantity: Number(line.additionalQuantity || 0) || 0,
+    issueMethod: String(line.issueMethod || '').trim(),
+    itemType: String(line.itemType || '').trim(),
+    isResource: !!line.isResource,
+    _delete: false,
+    _isNew: false,
+  }));
+
+  const orderAfter = await poCloseSaveResourceLines(abs, updates, adminUser, `Tiempo aplicado automáticamente. ${note || ''}`.trim());
+  await dbQuery(
+    `UPDATE admin_production_close_timers
+       SET doc_num=$2,
+           item_code=$3,
+           item_name=$4,
+           warehouse=$5,
+           status='FINALIZED',
+           accumulated_seconds=$6,
+           started_at=NULL,
+           finalized_at=NOW(),
+           applied_hours=$7,
+           affected_lines=$8,
+           note=$9,
+           order_snapshot=$10::jsonb,
+           admin_user=$11,
+           updated_at=NOW()
+     WHERE absolute_entry=$1`,
+    [abs, Number(orderAfter?.docNum || order.docNum || 0), orderAfter?.itemCode || order.itemCode || '', orderAfter?.itemName || order.itemName || '', orderAfter?.warehouse || order.warehouse || '', elapsedSeconds, appliedHours, operatorLines.length, String(note || ''), JSON.stringify(orderAfter || order || {}), String(adminUser || '')]
+  );
+  const timer = await poCloseGetTimerState(abs, orderAfter || order);
+  await poCloseLogEvent({
+    action: 'TIMER_FINALIZE',
+    absoluteEntry: abs,
+    docNum: timer.docNum,
+    itemCode: timer.itemCode,
+    itemName: timer.itemName,
+    warehouse: timer.warehouse,
+    statusBefore: pauseResult.timer?.status || 'PAUSED',
+    statusAfter: 'FINALIZED',
+    reportedQty: appliedHours,
+    note: `Tiempo aplicado a ${operatorLines.length} línea(s) de Operario General. ${note || ''}`.trim(),
+    orderPayload: { before: order, after: orderAfter, timer },
+    adminUser,
+  }).catch(() => {});
+  return {
+    timer,
+    order: orderAfter || order,
+    elapsedSeconds,
+    appliedHours,
+    affectedLines: operatorLines.length,
+    message: `Tiempo finalizado (${poCloseFormatElapsed(elapsedSeconds)}) y aplicado en ${operatorLines.length} línea(s) de Operario General.`
+  };
 }
 
 function poCloseGetOrderLinesProp(raw = {}) {
@@ -17021,6 +17286,47 @@ app.get('/api/admin/production-close/orders/:absoluteEntry/detail', verifyAdmin,
     const order = await poCloseFetchOrderDetail(abs, req.query?.docNum || 0);
     if (!order) return safeJson(res, 404, { ok: false, message: 'Orden no encontrada' });
     return safeJson(res, 200, { ok: true, order, nextLot: await poCloseGetNextLotPreview() });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/production-close/orders/:absoluteEntry/timer', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const order = await poCloseFetchOrderDetail(abs, req.query?.docNum || 0).catch(() => null);
+    const timer = await poCloseGetTimerState(abs, order || { absoluteEntry: abs, docNum: req.query?.docNum || 0 });
+    return safeJson(res, 200, { ok: true, timer, order });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/timer/start', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const out = await poCloseStartTimer(abs, req.body?.docNum || 0, String(req.admin?.user || 'admin'), String(req.body?.note || ''));
+    return safeJson(res, 200, { ok: true, timer: out.timer, order: out.order, message: out.message });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/timer/pause', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const out = await poClosePauseTimer(abs, req.body?.docNum || 0, String(req.admin?.user || 'admin'), String(req.body?.note || ''));
+    return safeJson(res, 200, { ok: true, timer: out.timer, order: out.order, message: out.message });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/timer/finalize', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const out = await poCloseFinalizeTimer(abs, req.body?.docNum || 0, String(req.admin?.user || 'admin'), String(req.body?.note || ''));
+    return safeJson(res, 200, { ok: true, timer: out.timer, order: out.order, elapsedSeconds: out.elapsedSeconds, appliedHours: out.appliedHours, affectedLines: out.affectedLines, message: out.message });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
