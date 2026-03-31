@@ -6183,6 +6183,15 @@ async function ensureDb() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS customer_category_cache (
+      card_code TEXT PRIMARY KEY,
+      category_code INTEGER,
+      category_name TEXT NOT NULL DEFAULT 'Sin categoría',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
 }
 
 async function setState(k, v) {
@@ -6197,6 +6206,149 @@ async function getState(k) {
   if (!hasDb()) return "";
   const r = await dbQuery(`SELECT v FROM sync_state WHERE k=$1 LIMIT 1`, [k]);
   return r.rows?.[0]?.v || "";
+}
+
+function normalizeCustomerCategoryName(v) {
+  const txt = String(v || "").trim();
+  return txt || "Sin categoría";
+}
+
+async function getCachedCustomerCategories(cardCodes = []) {
+  const list = Array.from(new Set((Array.isArray(cardCodes) ? cardCodes : []).map((x) => String(x || "").trim()).filter(Boolean)));
+  if (!list.length) return new Map();
+
+  const r = await dbQuery(
+    `SELECT card_code, category_code, category_name, updated_at
+       FROM customer_category_cache
+      WHERE card_code = ANY($1::text[])`,
+    [list]
+  );
+
+  const map = new Map();
+  for (const row of (r.rows || [])) {
+    map.set(String(row.card_code || "").trim(), {
+      cardCode: String(row.card_code || "").trim(),
+      categoryCode: row.category_code == null ? null : Number(row.category_code),
+      categoryName: normalizeCustomerCategoryName(row.category_name),
+      updatedAt: row.updated_at ? new Date(row.updated_at) : null,
+    });
+  }
+  return map;
+}
+
+async function upsertCustomerCategory(entry = {}) {
+  const cardCode = String(entry.cardCode || "").trim();
+  if (!cardCode) return;
+  await dbQuery(
+    `INSERT INTO customer_category_cache(card_code, category_code, category_name, updated_at)
+     VALUES ($1,$2,$3,NOW())
+     ON CONFLICT (card_code) DO UPDATE SET
+       category_code = EXCLUDED.category_code,
+       category_name = EXCLUDED.category_name,
+       updated_at = NOW()`,
+    [
+      cardCode,
+      entry.categoryCode == null ? null : Number(entry.categoryCode),
+      normalizeCustomerCategoryName(entry.categoryName),
+    ]
+  );
+}
+
+async function getBusinessPartnerCategoryFromSap(cardCode) {
+  const code = String(cardCode || "").trim();
+  if (!code || missingSapEnv()) {
+    return { cardCode: code, categoryCode: null, categoryName: "Sin categoría" };
+  }
+
+  const safeCode = code.replace(/'/g, "''");
+  const encoded = encodeURIComponent(code);
+  let bp = null;
+
+  for (const path of [
+    `/BusinessPartners('${encoded}')?$select=CardCode,CardName,GroupCode`,
+    `/BusinessPartners?$select=CardCode,CardName,GroupCode&$filter=CardCode eq '${safeCode}'&$top=1`,
+    `/BusinessPartners('${encoded}')`,
+  ]) {
+    try {
+      const data = await slFetch(path, { timeoutMs: 45000 });
+      bp = Array.isArray(data?.value) ? data.value[0] : data;
+      if (bp) break;
+    } catch {}
+  }
+
+  const groupCode = Number(bp?.GroupCode ?? bp?.groupCode ?? bp?.GroupNum ?? bp?.groupNum ?? null);
+  if (!Number.isFinite(groupCode) || groupCode <= 0) {
+    return { cardCode: code, categoryCode: null, categoryName: "Sin categoría" };
+  }
+
+  let row = null;
+  for (const path of [
+    `/BusinessPartnerGroups(${groupCode})?$select=Code,Name,Type`,
+    `/BusinessPartnerGroups?$select=Code,Name,Type&$filter=Code eq ${groupCode}&$top=1`,
+    `/BusinessPartnerGroups(${groupCode})`,
+  ]) {
+    try {
+      const data = await slFetch(path, { timeoutMs: 45000 });
+      row = Array.isArray(data?.value) ? data.value[0] : data;
+      if (row) break;
+    } catch {}
+  }
+
+  return {
+    cardCode: code,
+    categoryCode: groupCode,
+    categoryName: normalizeCustomerCategoryName(row?.Name || row?.GroupName || `Grupo ${groupCode}`),
+  };
+}
+
+async function ensureCustomerCategoriesForCardCodes(cardCodes = []) {
+  const uniqueCodes = Array.from(new Set((Array.isArray(cardCodes) ? cardCodes : []).map((x) => String(x || "").trim()).filter(Boolean)));
+  if (!uniqueCodes.length || !hasDb()) return new Map();
+
+  const cache = await getCachedCustomerCategories(uniqueCodes);
+  const now = Date.now();
+  const staleMs = 7 * 24 * 60 * 60 * 1000;
+
+  const pending = uniqueCodes.filter((code) => {
+    const hit = cache.get(code);
+    const ts = hit?.updatedAt instanceof Date && !Number.isNaN(hit.updatedAt.getTime()) ? hit.updatedAt.getTime() : 0;
+    return !hit || !ts || (now - ts) > staleMs;
+  });
+
+  for (const code of pending) {
+    try {
+      const info = await getBusinessPartnerCategoryFromSap(code);
+      await upsertCustomerCategory(info);
+      cache.set(code, {
+        cardCode: code,
+        categoryCode: info.categoryCode,
+        categoryName: normalizeCustomerCategoryName(info.categoryName),
+        updatedAt: new Date(),
+      });
+    } catch {
+      if (!cache.has(code)) {
+        cache.set(code, {
+          cardCode: code,
+          categoryCode: null,
+          categoryName: "Sin categoría",
+          updatedAt: new Date(),
+        });
+      }
+    }
+  }
+
+  return cache;
+}
+
+async function enrichRowsWithCustomerCategory(rows = []) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) return list;
+
+  const cache = await ensureCustomerCategoriesForCardCodes(list.map((r) => r.cardCode));
+  for (const row of list) {
+    row.categoria = normalizeCustomerCategoryName(cache.get(String(row.cardCode || "").trim())?.categoryName);
+  }
+  return list;
 }
 
 /* =========================================================
