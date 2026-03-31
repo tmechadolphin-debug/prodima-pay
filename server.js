@@ -16430,8 +16430,7 @@ async function poCloseGetTimerState(absoluteEntry, fallback = {}) {
 }
 function poCloseIsGeneralOperatorLine(line = {}) {
   const code = String(line?.itemCode ?? line?.ItemNo ?? line?.ItemCode ?? '').trim().toUpperCase();
-  const name = String(line?.itemName ?? line?.ItemName ?? line?.ItemDescription ?? '').trim().toLowerCase();
-  return name.includes('operario general') || ['MO01', 'M001', 'M0O1', 'MOO1'].includes(code);
+  return ['MO01', 'M001', 'MOSUP', 'MLIM01', 'MOMEZ'].includes(code);
 }
 async function poCloseStartTimer(absoluteEntry, docNum = 0, adminUser = 'admin', note = '') {
   if (!hasDb()) throw new Error('DB no configurada para guardar el tiempo de producción');
