@@ -16808,7 +16808,7 @@ async function poCloseFinalizeTimer(absoluteEntry, docNum = 0, adminUser = 'admi
   if (!(elapsedSeconds > 0)) throw new Error('No hay tiempo acumulado para finalizar.');
   if (!order) throw new Error('Orden no encontrada');
 
-  const appliedHours = Number((elapsedSeconds / 3600).toFixed(6));
+  const appliedHours = Number((elapsedSeconds / 3600).toFixed(4));
   const operatorLines = (Array.isArray(order.lines) ? order.lines : []).filter((line) => poCloseIsGeneralOperatorLine(line));
   if (!operatorLines.length) {
     throw new Error('No se encontraron líneas de Operario General para aplicar el tiempo.');
@@ -16965,15 +16965,31 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
   const originalLines = Array.isArray(raw?.[prop]) ? raw[prop] : [];
   const normalizedBefore = originalLines.map((line) => poCloseNormalizeOrderLine(line, detailBefore));
   const updates = Array.isArray(resourceLines) ? resourceLines : [];
+  const originalByLine = new Map(normalizedBefore.map((line) => [String(Number(line?.lineNumber ?? 0)), line]));
 
   const normalizeEditableInput = (row = {}) => {
-    const ln = Number(row?.lineNumber || 0) || 0;
+    const ln = Number(row?.lineNumber ?? 0);
+    const safeLineNumber = Number.isFinite(ln) ? ln : 0;
     const rawType = String(row?.itemType || '').trim();
     const normalizedType = rawType || (poCloseLooksLikeResourceLine(row) ? '290' : '4');
+    const itemCode = String(row?.itemCode || '').trim();
+    const itemName = String(row?.itemName || '').trim();
+    const existing = originalByLine.get(String(safeLineNumber));
+    const sameCodeAsExisting = existing
+      ? String(existing?.itemCode || '').trim().toUpperCase() === itemCode.toUpperCase()
+      : false;
+    const sameNameAsExisting = existing
+      ? String(existing?.itemName || '').trim().toUpperCase() === itemName.toUpperCase()
+      : false;
+    const explicitExisting = row?._existing === true || row?._isNew === false;
+    const explicitNew = row?._isNew === true;
+    let isNew = explicitNew;
+    if (explicitExisting) isNew = false;
+    if (existing && (sameCodeAsExisting || (!itemCode && sameNameAsExisting))) isNew = false;
     return {
-      lineNumber: ln,
-      itemCode: String(row?.itemCode || '').trim(),
-      itemName: String(row?.itemName || '').trim(),
+      lineNumber: safeLineNumber,
+      itemCode,
+      itemName,
       warehouse: String(row?.warehouse || detailBefore.warehouse || '').trim(),
       baseQuantity: Number(row?.baseQuantity ?? 0) || 0,
       plannedQuantity: Number(row?.plannedQuantity ?? 0) || 0,
@@ -16982,7 +16998,8 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
       itemType: normalizedType,
       isResource: ['290', 'pit_resource', 'resource', 'r'].includes(normalizedType.toLowerCase()),
       _delete: !!row?._delete,
-      _isNew: !!row?._isNew || !(ln > 0),
+      _existing: !!existing || explicitExisting,
+      _isNew: isNew,
     };
   };
 
@@ -17005,7 +17022,7 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
 
   const currentByLine = new Map(currentLines.map((row) => [String(row.lineNumber), row]));
   const hasStructuralChanges =
-    normalizedUpdates.some((row) => row._delete || row._isNew || !(row.lineNumber > 0)) ||
+    normalizedUpdates.some((row) => row._delete || row._isNew) ||
     activeUpdates.length !== currentLines.length;
   const hasValueChanges = activeUpdates.some((row) => {
     const prev = currentByLine.get(String(row.lineNumber));
@@ -17024,7 +17041,9 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
 
   const existingByLine = new Map();
   for (const row of normalizedUpdates) {
-    if (row.lineNumber > 0) existingByLine.set(String(row.lineNumber), row);
+    if (!row._isNew && currentByLine.has(String(row.lineNumber))) {
+      existingByLine.set(String(row.lineNumber), row);
+    }
   }
 
   const additions = normalizedUpdates.filter((row) => row._isNew && !row._delete && row.itemCode);
