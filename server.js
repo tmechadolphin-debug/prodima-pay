@@ -17292,8 +17292,8 @@ async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate
   };
 
   const headerVariants = [
-    { DocDate: postDate, Comments: comments, JournalMemo: journalMemo },
-    { DocDate: postDate, DocDueDate: postDate, Comments: comments, JournalMemo: journalMemo },
+    compact({ DocDate: postDate, Comments: comments, JournalMemo: journalMemo, ...(lot ? { Reference2: lot } : {}) }),
+    compact({ DocDate: postDate, DocDueDate: postDate, Comments: comments, JournalMemo: journalMemo, ...(lot ? { Reference2: lot } : {}) }),
   ];
   const whVariants = warehouseCandidates.length ? warehouseCandidates : [''];
   const txVariants = [0, '0', 'botrntComplete'];
