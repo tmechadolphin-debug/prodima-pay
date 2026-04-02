@@ -4603,6 +4603,15 @@ async function ensureDb() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS customer_category_cache (
+      card_code TEXT PRIMARY KEY,
+      category_code INTEGER,
+      category_name TEXT NOT NULL DEFAULT 'Sin categoría',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
 }
 
 async function setState(k, v) {
@@ -4617,6 +4626,151 @@ async function getState(k) {
   if (!hasDb()) return "";
   const r = await dbQuery(`SELECT v FROM sync_state WHERE k=$1 LIMIT 1`, [k]);
   return r.rows?.[0]?.v || "";
+}
+
+function normalizeCustomerCategoryName(v) {
+  const txt = String(v || "").trim();
+  return txt || "Sin categoría";
+}
+
+async function getCachedCustomerCategories(cardCodes = []) {
+  const list = Array.from(new Set((Array.isArray(cardCodes) ? cardCodes : []).map((x) => String(x || "").trim()).filter(Boolean)));
+  if (!list.length) return new Map();
+
+  const r = await dbQuery(
+    `SELECT card_code, category_code, category_name, updated_at
+       FROM customer_category_cache
+      WHERE card_code = ANY($1::text[])`,
+    [list]
+  );
+
+  const map = new Map();
+  for (const row of (r.rows || [])) {
+    map.set(String(row.card_code || "").trim(), {
+      cardCode: String(row.card_code || "").trim(),
+      categoryCode: row.category_code == null ? null : Number(row.category_code),
+      categoryName: normalizeCustomerCategoryName(row.category_name),
+      updatedAt: row.updated_at ? new Date(row.updated_at) : null,
+    });
+  }
+  return map;
+}
+
+async function upsertCustomerCategory(entry = {}) {
+  const cardCode = String(entry.cardCode || "").trim();
+  if (!cardCode) return;
+  await dbQuery(
+    `INSERT INTO customer_category_cache(card_code, category_code, category_name, updated_at)
+     VALUES ($1,$2,$3,NOW())
+     ON CONFLICT (card_code) DO UPDATE SET
+       category_code = EXCLUDED.category_code,
+       category_name = EXCLUDED.category_name,
+       updated_at = NOW()`,
+    [
+      cardCode,
+      entry.categoryCode == null ? null : Number(entry.categoryCode),
+      normalizeCustomerCategoryName(entry.categoryName),
+    ]
+  );
+}
+
+async function getBusinessPartnerCategoryFromSap(cardCode) {
+  const code = String(cardCode || "").trim();
+  if (!code || missingSapEnv()) {
+    return { cardCode: code, categoryCode: null, categoryName: "Sin categoría" };
+  }
+
+  const safeCode = code.replace(/'/g, "''");
+  const encoded = encodeURIComponent(code);
+  let bp = null;
+
+  for (const p of [
+    `/BusinessPartners('${encoded}')?$select=CardCode,CardName,GroupCode`,
+    `/BusinessPartners?$select=CardCode,CardName,GroupCode&$filter=CardCode eq '${safeCode}'&$top=1`,
+    `/BusinessPartners('${encoded}')`,
+  ]) {
+    try {
+      const data = await slFetch(p, { timeoutMs: 45000 });
+      bp = Array.isArray(data?.value) ? data.value[0] : data;
+      if (bp) break;
+    } catch {}
+  }
+
+  const groupCode = Number(bp?.GroupCode ?? bp?.groupCode ?? bp?.GroupNum ?? bp?.groupNum ?? null);
+  if (!Number.isFinite(groupCode) || groupCode <= 0) {
+    return { cardCode: code, categoryCode: null, categoryName: "Sin categoría" };
+  }
+
+  let row = null;
+  for (const p of [
+    `/BusinessPartnerGroups(${groupCode})?$select=Code,Name,Type`,
+    `/BusinessPartnerGroups?$select=Code,Name,Type&$filter=Code eq ${groupCode}&$top=1`,
+    `/BusinessPartnerGroups(${groupCode})`,
+  ]) {
+    try {
+      const data = await slFetch(p, { timeoutMs: 45000 });
+      row = Array.isArray(data?.value) ? data.value[0] : data;
+      if (row) break;
+    } catch {}
+  }
+
+  return {
+    cardCode: code,
+    categoryCode: groupCode,
+    categoryName: normalizeCustomerCategoryName(row?.Name || row?.GroupName || `Grupo ${groupCode}`),
+  };
+}
+
+async function ensureCustomerCategoriesForCardCodes(cardCodes = []) {
+  const uniqueCodes = Array.from(new Set((Array.isArray(cardCodes) ? cardCodes : []).map((x) => String(x || "").trim()).filter(Boolean)));
+  if (!uniqueCodes.length || !hasDb()) return new Map();
+
+  const cache = await getCachedCustomerCategories(uniqueCodes);
+  const now = Date.now();
+  const staleMs = 7 * 24 * 60 * 60 * 1000;
+
+  const pending = uniqueCodes.filter((code) => {
+    const hit = cache.get(code);
+    const ts = hit?.updatedAt instanceof Date && !Number.isNaN(hit.updatedAt.getTime()) ? hit.updatedAt.getTime() : 0;
+    return !hit || !ts || (now - ts) > staleMs;
+  });
+
+  for (const code of pending) {
+    try {
+      const info = await getBusinessPartnerCategoryFromSap(code);
+      await upsertCustomerCategory(info);
+      cache.set(code, {
+        cardCode: code,
+        categoryCode: info.categoryCode,
+        categoryName: normalizeCustomerCategoryName(info.categoryName),
+        updatedAt: new Date(),
+      });
+    } catch {
+      if (!cache.has(code)) {
+        cache.set(code, {
+          cardCode: code,
+          categoryCode: null,
+          categoryName: "Sin categoría",
+          updatedAt: new Date(),
+        });
+      }
+    }
+  }
+
+  return cache;
+}
+
+async function enrichRowsWithCustomerCategory(rows = []) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) return list;
+
+  const cache = await ensureCustomerCategoriesForCardCodes(list.map((r) => r.cardCode));
+  for (const row of list) {
+    row.categoria = normalizeCustomerCategoryName(
+      cache.get(String(row.cardCode || "").trim())?.categoryName
+    );
+  }
+  return list;
 }
 
 /* =========================================================
@@ -6029,6 +6183,15 @@ async function ensureDb() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS customer_category_cache (
+      card_code TEXT PRIMARY KEY,
+      category_code INTEGER,
+      category_name TEXT NOT NULL DEFAULT 'Sin categoría',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
 }
 
 async function setState(k, v) {
@@ -6043,6 +6206,149 @@ async function getState(k) {
   if (!hasDb()) return "";
   const r = await dbQuery(`SELECT v FROM sync_state WHERE k=$1 LIMIT 1`, [k]);
   return r.rows?.[0]?.v || "";
+}
+
+function normalizeCustomerCategoryName(v) {
+  const txt = String(v || "").trim();
+  return txt || "Sin categoría";
+}
+
+async function getCachedCustomerCategories(cardCodes = []) {
+  const list = Array.from(new Set((Array.isArray(cardCodes) ? cardCodes : []).map((x) => String(x || "").trim()).filter(Boolean)));
+  if (!list.length) return new Map();
+
+  const r = await dbQuery(
+    `SELECT card_code, category_code, category_name, updated_at
+       FROM customer_category_cache
+      WHERE card_code = ANY($1::text[])`,
+    [list]
+  );
+
+  const map = new Map();
+  for (const row of (r.rows || [])) {
+    map.set(String(row.card_code || "").trim(), {
+      cardCode: String(row.card_code || "").trim(),
+      categoryCode: row.category_code == null ? null : Number(row.category_code),
+      categoryName: normalizeCustomerCategoryName(row.category_name),
+      updatedAt: row.updated_at ? new Date(row.updated_at) : null,
+    });
+  }
+  return map;
+}
+
+async function upsertCustomerCategory(entry = {}) {
+  const cardCode = String(entry.cardCode || "").trim();
+  if (!cardCode) return;
+  await dbQuery(
+    `INSERT INTO customer_category_cache(card_code, category_code, category_name, updated_at)
+     VALUES ($1,$2,$3,NOW())
+     ON CONFLICT (card_code) DO UPDATE SET
+       category_code = EXCLUDED.category_code,
+       category_name = EXCLUDED.category_name,
+       updated_at = NOW()`,
+    [
+      cardCode,
+      entry.categoryCode == null ? null : Number(entry.categoryCode),
+      normalizeCustomerCategoryName(entry.categoryName),
+    ]
+  );
+}
+
+async function getBusinessPartnerCategoryFromSap(cardCode) {
+  const code = String(cardCode || "").trim();
+  if (!code || missingSapEnv()) {
+    return { cardCode: code, categoryCode: null, categoryName: "Sin categoría" };
+  }
+
+  const safeCode = code.replace(/'/g, "''");
+  const encoded = encodeURIComponent(code);
+  let bp = null;
+
+  for (const path of [
+    `/BusinessPartners('${encoded}')?$select=CardCode,CardName,GroupCode`,
+    `/BusinessPartners?$select=CardCode,CardName,GroupCode&$filter=CardCode eq '${safeCode}'&$top=1`,
+    `/BusinessPartners('${encoded}')`,
+  ]) {
+    try {
+      const data = await slFetch(path, { timeoutMs: 45000 });
+      bp = Array.isArray(data?.value) ? data.value[0] : data;
+      if (bp) break;
+    } catch {}
+  }
+
+  const groupCode = Number(bp?.GroupCode ?? bp?.groupCode ?? bp?.GroupNum ?? bp?.groupNum ?? null);
+  if (!Number.isFinite(groupCode) || groupCode <= 0) {
+    return { cardCode: code, categoryCode: null, categoryName: "Sin categoría" };
+  }
+
+  let row = null;
+  for (const path of [
+    `/BusinessPartnerGroups(${groupCode})?$select=Code,Name,Type`,
+    `/BusinessPartnerGroups?$select=Code,Name,Type&$filter=Code eq ${groupCode}&$top=1`,
+    `/BusinessPartnerGroups(${groupCode})`,
+  ]) {
+    try {
+      const data = await slFetch(path, { timeoutMs: 45000 });
+      row = Array.isArray(data?.value) ? data.value[0] : data;
+      if (row) break;
+    } catch {}
+  }
+
+  return {
+    cardCode: code,
+    categoryCode: groupCode,
+    categoryName: normalizeCustomerCategoryName(row?.Name || row?.GroupName || `Grupo ${groupCode}`),
+  };
+}
+
+async function ensureCustomerCategoriesForCardCodes(cardCodes = []) {
+  const uniqueCodes = Array.from(new Set((Array.isArray(cardCodes) ? cardCodes : []).map((x) => String(x || "").trim()).filter(Boolean)));
+  if (!uniqueCodes.length || !hasDb()) return new Map();
+
+  const cache = await getCachedCustomerCategories(uniqueCodes);
+  const now = Date.now();
+  const staleMs = 7 * 24 * 60 * 60 * 1000;
+
+  const pending = uniqueCodes.filter((code) => {
+    const hit = cache.get(code);
+    const ts = hit?.updatedAt instanceof Date && !Number.isNaN(hit.updatedAt.getTime()) ? hit.updatedAt.getTime() : 0;
+    return !hit || !ts || (now - ts) > staleMs;
+  });
+
+  for (const code of pending) {
+    try {
+      const info = await getBusinessPartnerCategoryFromSap(code);
+      await upsertCustomerCategory(info);
+      cache.set(code, {
+        cardCode: code,
+        categoryCode: info.categoryCode,
+        categoryName: normalizeCustomerCategoryName(info.categoryName),
+        updatedAt: new Date(),
+      });
+    } catch {
+      if (!cache.has(code)) {
+        cache.set(code, {
+          cardCode: code,
+          categoryCode: null,
+          categoryName: "Sin categoría",
+          updatedAt: new Date(),
+        });
+      }
+    }
+  }
+
+  return cache;
+}
+
+async function enrichRowsWithCustomerCategory(rows = []) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) return list;
+
+  const cache = await ensureCustomerCategoriesForCardCodes(list.map((r) => r.cardCode));
+  for (const row of list) {
+    row.categoria = normalizeCustomerCategoryName(cache.get(String(row.cardCode || "").trim())?.categoryName);
+  }
+  return list;
 }
 
 /* =========================================================
@@ -6347,7 +6653,7 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "
     ORDER BY l.doc_date DESC, l.doc_num DESC, l.line_num ASC
   `;
   const r = await dbQuery(sql, params);
-  return (r.rows || []).map((x) => {
+  const rows = (r.rows || []).map((x) => {
     const grupo = canonicalInvoiceGroup(x.grupo_raw || "Sin grupo");
     const area = inferInvoiceArea(grupo, x.area_db || "");
     return {
@@ -6366,8 +6672,10 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "
       grossProfit: money2(x.gross_profit),
       grupo,
       area,
+      categoria: "Sin categoría",
     };
   });
+  return enrichRowsWithCustomerCategory(rows);
 }
 
 
@@ -6378,9 +6686,10 @@ function isoDateOnly(v) {
   return String(v).slice(0, 10);
 }
 
-function applyAreaGroupFilters(rows, { area = "__ALL__", grupo = "__ALL__" } = {}) {
+function applyAreaGroupFilters(rows, { area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__" } = {}) {
   const areaSel = String(area || "__ALL__").trim().toUpperCase();
   const grupoSel = String(grupo || "__ALL__").trim();
+  const categoriaSel = normalizeCustomerCategoryName(categoria === "__ALL__" ? "" : categoria);
   let out = Array.isArray(rows) ? rows.slice() : [];
 
   if (areaSel !== "__ALL__") {
@@ -6390,7 +6699,16 @@ function applyAreaGroupFilters(rows, { area = "__ALL__", grupo = "__ALL__" } = {
     const gSel = canonicalInvoiceGroup(grupoSel);
     out = out.filter((r) => canonicalInvoiceGroup(r.grupo) === gSel);
   }
+  if (String(categoria || "__ALL__").trim() !== "__ALL__") {
+    out = out.filter((r) => normalizeCustomerCategoryName(r.categoria) === categoriaSel);
+  }
   return out;
+}
+
+function availableCategoriesFromRows(rows = []) {
+  return Array.from(
+    new Set((Array.isArray(rows) ? rows : []).map((r) => normalizeCustomerCategoryName(r.categoria)).filter(Boolean))
+  ).sort((a, b) => a.localeCompare(b));
 }
 
 function availableGroupsForArea(area) {
@@ -6400,9 +6718,10 @@ function availableGroupsForArea(area) {
 /* =========================================================
    ✅ Dashboard from DB (neto)
 ========================================================= */
-async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo = "__ALL__", q = "" }) {
+async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", q = "" }) {
   const baseRows = await fetchInvoiceRows({ from, to, q });
-  const rows = applyAreaGroupFilters(baseRows, { area, grupo });
+  const scopeRows = applyAreaGroupFilters(baseRows, { area, grupo, categoria: "__ALL__" });
+  const rows = applyAreaGroupFilters(scopeRows, { area: "__ALL__", grupo: "__ALL__", categoria });
 
   const docInvSet = new Set();
   const docCrnSet = new Set();
@@ -6438,6 +6757,7 @@ async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo 
       cardName: r.cardName,
       customer: `${r.cardCode} · ${r.cardName}`,
       warehouse: r.warehouse,
+      categoria: r.categoria,
       dollars: 0,
       grossProfit: 0,
       invSet: new Set(),
@@ -6488,6 +6808,7 @@ async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo 
         cardName: x.cardName,
         customer: x.customer,
         warehouse: x.warehouse,
+        categoria: x.categoria || "Sin categoría",
         dollars: dol,
         grossProfit: gp,
         grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
@@ -6516,8 +6837,10 @@ async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo 
     to,
     area,
     grupo,
+    categoria,
     availableAreas: ["__ALL__", "CONS", "RCI"],
     availableGroups: availableGroupsForArea(area),
+    availableCategories: availableCategoriesFromRows(scopeRows),
     totals: {
       invoices: docInvSet.size,
       creditNotes: docCrnSet.size,
@@ -6535,9 +6858,9 @@ async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo 
 /* =========================================================
    ✅ Details + Top products
 ========================================================= */
-async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", grupo = "__ALL__" }) {
+async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__" }) {
   let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse });
-  rows = applyAreaGroupFilters(rows, { area, grupo });
+  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
 
   const map = new Map();
   for (const r of rows) {
@@ -6565,6 +6888,7 @@ async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", 
       grossPct: r.dollars !== 0 ? num((r.grossProfit / r.dollars) * 100, 2) : 0,
       area: r.area,
       grupo: r.grupo,
+      categoria: r.categoria,
     });
     it.totals.qty += Number(r.quantity || 0);
     it.totals.dollars += Number(r.dollars || 0);
@@ -6602,12 +6926,12 @@ async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", 
   totals.grossProfit = money2(totals.grossProfit);
   totals.grossPct = totals.dollars !== 0 ? num((totals.grossProfit / totals.dollars) * 100, 2) : 0;
 
-  return { ok: true, from, to, area, grupo, cardCode, warehouse, totals, invoices };
+  return { ok: true, from, to, area, grupo, categoria, cardCode, warehouse, totals, invoices };
 }
 
-async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area = "__ALL__", grupo = "__ALL__", limit = 10 }) {
+async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 10 }) {
   let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse });
-  rows = applyAreaGroupFilters(rows, { area, grupo });
+  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
 
   const map = new Map();
   for (const r of rows) {
@@ -6621,6 +6945,7 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
       invSet: new Set(),
       area: r.area,
       grupo: r.grupo,
+      categoria: r.categoria,
     };
     cur.qty += Number(r.quantity || 0);
     cur.dollars += Number(r.dollars || 0);
@@ -6637,6 +6962,7 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
     cardCode: cardCode || null,
     area,
     grupo,
+    categoria,
     top: Array.from(map.values())
       .map((x) => {
         const dol = money2(x.dollars);
@@ -6651,6 +6977,7 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
           invoices: x.invSet.size,
           area: x.area,
           grupo: x.grupo,
+          categoria: x.categoria,
         };
       })
       .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0))
@@ -6658,6 +6985,64 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
   };
 }
 
+
+/* =========================================================
+   ✅ Artículos por categoría
+========================================================= */
+async function articlesFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 500 }) {
+  let rows = await fetchInvoiceRows({ from, to, q: "" });
+  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
+
+  const map = new Map();
+  for (const r of rows) {
+    if (!String(r.itemCode || "").trim()) continue;
+    const key = String(r.itemCode || "").trim();
+    const cur = map.get(key) || {
+      itemCode: key,
+      itemDesc: String(r.itemDesc || ""),
+      qty: 0,
+      dollars: 0,
+      grossProfit: 0,
+      invSet: new Set(),
+      custSet: new Set(),
+    };
+    cur.qty += Number(r.quantity || 0);
+    cur.dollars += Number(r.dollars || 0);
+    cur.grossProfit += Number(r.grossProfit || 0);
+    if (r.docType === "INV") cur.invSet.add(`${r.docType}:${r.docEntry}`);
+    if (r.cardCode) cur.custSet.add(String(r.cardCode));
+    map.set(key, cur);
+  }
+
+  const items = Array.from(map.values())
+    .map((x) => {
+      const dol = money2(x.dollars);
+      const gp = money2(x.grossProfit);
+      return {
+        itemCode: x.itemCode,
+        itemDesc: x.itemDesc,
+        qty: num(x.qty, 4),
+        dollars: dol,
+        grossProfit: gp,
+        grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
+        invoices: x.invSet.size,
+        customers: x.custSet.size,
+      };
+    })
+    .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0))
+    .slice(0, Math.max(1, Math.min(2000, Number(limit || 500))));
+
+  return {
+    ok: true,
+    from,
+    to,
+    area,
+    grupo,
+    categoria,
+    categoriaLabel: categoria === "__ALL__" ? "Todas las categorías" : normalizeCustomerCategoryName(categoria),
+    items,
+  };
+}
 
 /* =========================================================
    ✅ IA (admin-clientes) — contexto rico para análisis mensual
@@ -6742,9 +7127,9 @@ function aiTopChangedItems(sourceBucket, targetBucket, mode = "lost", limit = 8)
     .slice(0, Math.max(1, Math.min(50, Number(limit || 8))));
 }
 
-async function buildAdminClientesAiAnalytics({ from, to, area = "__ALL__", grupo = "__ALL__", q = "" }) {
+async function buildAdminClientesAiAnalytics({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", q = "" }) {
   let rows = await fetchInvoiceRows({ from, to, q });
-  rows = applyAreaGroupFilters(rows, { area, grupo });
+  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
 
   const months = Array.from(
     new Set(
@@ -6981,7 +7366,7 @@ async function buildAdminClientesAiAnalytics({ from, to, area = "__ALL__", grupo
 
   return {
     range: { from, to },
-    filters: { area, grupo, q },
+    filters: { area, grupo, categoria, q },
     months,
     firstMonth,
     lastMonth,
@@ -7008,6 +7393,7 @@ function aiCompactDashboard(dashboard, analytics = {}, focus = {}) {
     filters: {
       area: dashboard?.area || "__ALL__",
       grupo: dashboard?.grupo || "__ALL__",
+      categoria: dashboard?.categoria || "__ALL__",
       q: analytics?.filters?.q || "",
     },
     totals: dashboard?.totals || {},
@@ -7258,9 +7644,9 @@ function adminResolveDashboardFocus({ dashboard = null, question = '', q = '', c
   return null;
 }
 
-async function buildAdminClientesRecommendationAnalytics({ from, to, area = "__ALL__", grupo = "__ALL__", targetCardCode = "", customerLabel = "", question = "" }) {
+async function buildAdminClientesRecommendationAnalytics({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", targetCardCode = "", customerLabel = "", question = "" }) {
   let rows = await fetchInvoiceRows({ from, to, q: "" });
-  rows = applyAreaGroupFilters(rows, { area, grupo });
+  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
   if (!rows.length) return null;
 
   const target = adminClientesExtractTargetFromQuestion(rows, question, { cardCode: targetCardCode, customerLabel });
@@ -7579,9 +7965,10 @@ app.get("/api/admin/invoices/dashboard", verifyAdmin, async (req, res) => {
     const to = isISO(req.query?.to) ? String(req.query.to) : today;
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
     const q = String(req.query?.q || "");
 
-    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
+    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q });
     data.lastSyncAt = await getState("last_sync_at");
     return safeJson(res, 200, data);
   } catch (e) {
@@ -7600,12 +7987,13 @@ app.get("/api/admin/invoices/details", verifyAdmin, async (req, res) => {
     const warehouse = String(req.query?.warehouse || "").trim();
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
 
     if (!cardCode || !warehouse) {
       return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
     }
 
-    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
+    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -7623,9 +8011,29 @@ app.get("/api/admin/invoices/top-products", verifyAdmin, async (req, res) => {
     const cardCode = String(req.query?.cardCode || "").trim();
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
     const limit = Math.max(1, Math.min(200, Number(req.query?.limit || 10)));
 
-    const data = await topProductsFromDb({ from, to, warehouse, cardCode, area, grupo, limit });
+    const data = await topProductsFromDb({ from, to, warehouse, cardCode, area, grupo, categoria, limit });
+    return safeJson(res, 200, data);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+app.get("/api/admin/invoices/articles", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
+    const to = isISO(req.query?.to) ? String(req.query.to) : today;
+    const area = String(req.query?.area || "__ALL__");
+    const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
+    const limit = Math.max(1, Math.min(2000, Number(req.query?.limit || 500)));
+
+    const data = await articlesFromDb({ from, to, area, grupo, categoria, limit });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -7641,9 +8049,10 @@ app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
     const to = isISO(req.query?.to) ? String(req.query.to) : today;
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
     const q = String(req.query?.q || "");
 
-    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
+    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q });
 
     const wb = XLSX.utils.book_new();
     const rows = (data.table || []).map((r) => ({
@@ -7651,6 +8060,7 @@ app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
       "Cliente": r.cardName,
       "Cliente label": r.customer,
       "Bodega": r.warehouse,
+      "Categoría": r.categoria || "Sin categoría",
       "Ventas netas $": r.dollars,
       "Ganancia bruta $": r.grossProfit,
       "% GP": r.grossPct,
@@ -7680,12 +8090,13 @@ app.get("/api/admin/invoices/details/export", verifyAdmin, async (req, res) => {
     const warehouse = String(req.query?.warehouse || "").trim();
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
 
     if (!cardCode || !warehouse) {
       return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
     }
 
-    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo });
+    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria });
     const wb = XLSX.utils.book_new();
 
     const rows = [];
@@ -7699,6 +8110,7 @@ app.get("/api/admin/invoices/details/export", verifyAdmin, async (req, res) => {
           "Bodega": data.warehouse,
           "Área": ln.area,
           "Grupo": ln.grupo,
+          "Categoría": ln.categoria || "Sin categoría",
           "ItemCode": ln.itemCode,
           "Descripción": ln.itemDesc,
           "Cantidad": ln.quantity,
@@ -7736,6 +8148,7 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
     const customerLabel = String(req.body?.customerLabel || "").trim();
     const area = String(req.body?.area || req.query?.area || "__ALL__");
     const grupo = String(req.body?.grupo || req.query?.grupo || "__ALL__");
+    const categoria = String(req.body?.categoria || req.query?.categoria || "__ALL__");
     const q = String(req.body?.q || req.query?.q || "").trim();
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
@@ -7743,8 +8156,8 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
     const from = isISO(fromQ) ? fromQ : defaultFrom;
     const to = isISO(toQ) ? toQ : today;
 
-    const dashboard = await dashboardFromDbAdminClientes({ from, to, area, grupo, q });
-    const analytics = await buildAdminClientesAiAnalytics({ from, to, area, grupo, q });
+    const dashboard = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q });
+    const analytics = await buildAdminClientesAiAnalytics({ from, to, area, grupo, categoria, q });
 
     const resolvedFocus = adminResolveDashboardFocus({
       dashboard,
@@ -7761,7 +8174,7 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
 
     let detail = null;
     if (focusCardCode && focusWarehouse) {
-      detail = await detailsFromDb({ from, to, cardCode: focusCardCode, warehouse: focusWarehouse, area, grupo });
+      detail = await detailsFromDb({ from, to, cardCode: focusCardCode, warehouse: focusWarehouse, area, grupo, categoria });
     }
 
     const recommendationContext = await buildAdminClientesRecommendationAnalytics({
@@ -7769,6 +8182,7 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
       to,
       area,
       grupo,
+      categoria,
       targetCardCode: focusCardCode,
       customerLabel: focusLabel,
       question,
@@ -7789,7 +8203,7 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
       model: out.model,
       source: "db",
       range: { from, to },
-      filters: { area, grupo, q },
+      filters: { area, grupo, categoria, q },
       focus: focusCardCode ? {
         cardCode: focusCardCode,
         warehouse: focusWarehouse,
@@ -15836,6 +16250,262 @@ function poCloseNormalizeOrderRow(row = {}) {
   normalized.remainingQty = poCloseRemainingQty(normalized);
   return normalized;
 }
+function poCloseNum(v, fallback = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : Number(fallback || 0);
+}
+function poCloseRound(v, d = 4) {
+  const n = poCloseNum(v, 0);
+  const p = 10 ** Math.max(0, Number(d || 0));
+  return Math.round(n * p) / p;
+}
+function poCloseHoursToLabel(hours = 0) {
+  const totalSeconds = Math.max(0, Math.round(poCloseNum(hours || 0) * 3600));
+  const hh = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
+  const mm = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, '0');
+  const ss = String(totalSeconds % 60).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+function poCloseDashboardCodeMatch(row = {}, q = '') {
+  const needle = String(q || '').trim().toLowerCase();
+  if (!needle) return true;
+  const hay = `${String(row?.itemCode || '').toLowerCase()} ${String(row?.itemName || '').toLowerCase()}`;
+  return hay.includes(needle);
+}
+function poCloseDashboardExtractPlannedQty(row = {}) {
+  const payload = row?.order_payload || row?.orderPayload || {};
+  const planned = poCloseNum(
+    payload?.plannedQty ?? payload?.PlannedQuantity ?? payload?.rawOrder?.PlannedQuantity ?? payload?.rawOrder?.PlannedQty,
+    0
+  );
+  const completed = poCloseNum(
+    payload?.completedQty ?? payload?.CompletedQuantity ?? payload?.rawOrder?.CompletedQuantity ?? payload?.rawOrder?.CompletedQty,
+    0
+  );
+  const rejected = poCloseNum(
+    payload?.rejectedQty ?? payload?.RejectedQuantity ?? payload?.rawOrder?.RejectedQuantity ?? payload?.rawOrder?.RejectedQty,
+    0
+  );
+  const delivered = Math.max(0, poCloseNum(row?.deliveredQty ?? row?.reported_qty ?? row?.reportedQty, 0));
+  const plannedSafe = Math.max(0, planned);
+  if (plannedSafe > 0) return Math.max(plannedSafe, completed + rejected + delivered);
+  return Math.max(delivered, completed + rejected);
+}
+function poCloseDashboardOrderKey(raw = {}) {
+  const abs = Number(raw?.absolute_entry ?? raw?.absoluteEntry ?? 0) || 0;
+  const docNum = Number(raw?.doc_num ?? raw?.docNum ?? 0) || 0;
+  if (abs) return `ABS:${abs}`;
+  if (docNum) return `DOC:${docNum}`;
+  return '';
+}
+function poCloseDashboardPickMeta(base = {}, extra = {}) {
+  return {
+    absoluteEntry: Number(base?.absoluteEntry ?? extra?.absoluteEntry ?? base?.absolute_entry ?? extra?.absolute_entry ?? 0) || 0,
+    docNum: Number(base?.docNum ?? extra?.docNum ?? base?.doc_num ?? extra?.doc_num ?? 0) || 0,
+    itemCode: String(base?.itemCode ?? extra?.itemCode ?? base?.item_code ?? extra?.item_code ?? '').trim(),
+    itemName: String(base?.itemName ?? extra?.itemName ?? base?.item_name ?? extra?.item_name ?? '').trim(),
+    warehouse: String(base?.warehouse ?? extra?.warehouse ?? '').trim(),
+  };
+}
+async function poCloseBuildDashboard({ itemCode = '__ALL__', q = '' } = {}) {
+  if (!hasDb()) {
+    return {
+      summary: {
+        ordersCount: 0,
+        requestedQty: 0,
+        deliveredQty: 0,
+        fillRatePct: 0,
+        avgAppliedHours: 0,
+        avgAppliedLabel: '00:00:00',
+        totalAppliedHours: 0,
+        timerCount: 0,
+      },
+      rows: [],
+      options: [],
+      selectedItemCode: '__ALL__',
+      q: String(q || '').trim(),
+    };
+  }
+
+  const normalizedItemCode = String(itemCode || '__ALL__').trim() || '__ALL__';
+  const normalizedQ = String(q || '').trim();
+
+  const [eventsRes, timersRes] = await Promise.all([
+    dbQuery(`
+      SELECT absolute_entry, doc_num, item_code, item_name, warehouse, reported_qty, order_payload, created_at
+      FROM admin_production_close_events
+      WHERE action='REPORT_COMPLETION'
+      ORDER BY created_at DESC
+    `),
+    dbQuery(`
+      SELECT absolute_entry, doc_num, item_code, item_name, warehouse, applied_hours, accumulated_seconds,
+             status, affected_lines, finalized_at, updated_at
+      FROM admin_production_close_timers
+      ORDER BY updated_at DESC
+    `),
+  ]);
+
+  const orderMap = new Map();
+
+  for (const raw of (eventsRes.rows || [])) {
+    const key = poCloseDashboardOrderKey(raw);
+    if (!key) continue;
+    const prev = orderMap.get(key) || {
+      ...poCloseDashboardPickMeta(raw),
+      requestedQty: 0,
+      deliveredQty: 0,
+      appliedHours: 0,
+      timerCount: 0,
+      affectedLines: 0,
+      reportCount: 0,
+      lastReportedAt: null,
+    };
+    const requestedQty = poCloseDashboardExtractPlannedQty(raw);
+    prev.absoluteEntry = prev.absoluteEntry || Number(raw.absolute_entry || 0) || 0;
+    prev.docNum = prev.docNum || Number(raw.doc_num || 0) || 0;
+    prev.itemCode = prev.itemCode || String(raw.item_code || '').trim();
+    prev.itemName = prev.itemName || String(raw.item_name || '').trim();
+    prev.warehouse = prev.warehouse || String(raw.warehouse || '').trim();
+    prev.requestedQty = Math.max(prev.requestedQty, requestedQty);
+    prev.deliveredQty = poCloseRound(prev.deliveredQty + Math.max(0, poCloseNum(raw.reported_qty, 0)), 6);
+    prev.reportCount += 1;
+    prev.lastReportedAt = raw.created_at || prev.lastReportedAt || null;
+    orderMap.set(key, prev);
+  }
+
+  for (const raw of (timersRes.rows || [])) {
+    const key = poCloseDashboardOrderKey(raw);
+    if (!key) continue;
+    const prev = orderMap.get(key) || {
+      ...poCloseDashboardPickMeta(raw),
+      requestedQty: 0,
+      deliveredQty: 0,
+      appliedHours: 0,
+      timerCount: 0,
+      affectedLines: 0,
+      reportCount: 0,
+      lastReportedAt: null,
+    };
+    prev.absoluteEntry = prev.absoluteEntry || Number(raw.absolute_entry || 0) || 0;
+    prev.docNum = prev.docNum || Number(raw.doc_num || 0) || 0;
+    prev.itemCode = prev.itemCode || String(raw.item_code || '').trim();
+    prev.itemName = prev.itemName || String(raw.item_name || '').trim();
+    prev.warehouse = prev.warehouse || String(raw.warehouse || '').trim();
+    prev.appliedHours += Math.max(0, poCloseNum(raw.applied_hours, 0));
+    prev.timerCount += Number(raw.finalized_at || raw.applied_hours ? 1 : 0);
+    prev.affectedLines += Number(raw.affected_lines || 0) || 0;
+    orderMap.set(key, prev);
+  }
+
+  const allOrders = Array.from(orderMap.values()).map((row) => {
+    const requestedQty = Math.max(0, poCloseNum(row.requestedQty, 0));
+    const deliveredQty = Math.max(0, poCloseNum(row.deliveredQty, 0));
+    const appliedHours = Math.max(0, poCloseNum(row.appliedHours, 0));
+    return {
+      ...row,
+      requestedQty: poCloseRound(Math.max(requestedQty, deliveredQty), 6),
+      deliveredQty: poCloseRound(deliveredQty, 6),
+      appliedHours: poCloseRound(appliedHours, 6),
+      fillRatePct: requestedQty > 0 ? poCloseRound((deliveredQty / requestedQty) * 100, 2) : 0,
+      appliedLabel: poCloseHoursToLabel(appliedHours),
+    };
+  }).filter((row) => row.itemCode || row.itemName);
+
+  const byCode = new Map();
+  for (const row of allOrders) {
+    const codeKey = String(row.itemCode || '').trim() || '__NO_CODE__';
+    const prev = byCode.get(codeKey) || {
+      itemCode: String(row.itemCode || '').trim(),
+      itemName: String(row.itemName || '').trim(),
+      requestedQty: 0,
+      deliveredQty: 0,
+      totalAppliedHours: 0,
+      timerCount: 0,
+      affectedLines: 0,
+      ordersCount: 0,
+      fillRatePct: 0,
+      avgAppliedHours: 0,
+      avgAppliedLabel: '00:00:00',
+    };
+    prev.itemName = prev.itemName || String(row.itemName || '').trim();
+    prev.requestedQty += Math.max(0, poCloseNum(row.requestedQty, 0));
+    prev.deliveredQty += Math.max(0, poCloseNum(row.deliveredQty, 0));
+    prev.totalAppliedHours += Math.max(0, poCloseNum(row.appliedHours, 0));
+    prev.timerCount += Number(row.timerCount || (row.appliedHours > 0 ? 1 : 0)) || 0;
+    prev.affectedLines += Number(row.affectedLines || 0) || 0;
+    prev.ordersCount += 1;
+    byCode.set(codeKey, prev);
+  }
+
+  const optionRows = Array.from(byCode.values()).map((row) => {
+    const requestedQty = Math.max(0, poCloseNum(row.requestedQty, 0));
+    const deliveredQty = Math.max(0, poCloseNum(row.deliveredQty, 0));
+    const totalAppliedHours = Math.max(0, poCloseNum(row.totalAppliedHours, 0));
+    const avgAppliedHours = row.timerCount > 0 ? totalAppliedHours / row.timerCount : 0;
+    return {
+      itemCode: String(row.itemCode || '').trim(),
+      itemName: String(row.itemName || '').trim(),
+      requestedQty: poCloseRound(requestedQty, 3),
+      deliveredQty: poCloseRound(deliveredQty, 3),
+      fillRatePct: requestedQty > 0 ? poCloseRound((deliveredQty / requestedQty) * 100, 2) : 0,
+      totalAppliedHours: poCloseRound(totalAppliedHours, 4),
+      avgAppliedHours: poCloseRound(avgAppliedHours, 4),
+      avgAppliedLabel: poCloseHoursToLabel(avgAppliedHours),
+      ordersCount: Number(row.ordersCount || 0) || 0,
+      timerCount: Number(row.timerCount || 0) || 0,
+      affectedLines: Number(row.affectedLines || 0) || 0,
+    };
+  }).sort((a, b) => {
+    if (String(a.itemCode || '') !== String(b.itemCode || '')) return String(a.itemCode || '').localeCompare(String(b.itemCode || ''));
+    return String(a.itemName || '').localeCompare(String(b.itemName || ''));
+  });
+
+  let filteredOptions = optionRows.filter((row) => poCloseDashboardCodeMatch(row, normalizedQ));
+  const selectedRows = normalizedItemCode !== '__ALL__'
+    ? optionRows.filter((row) => String(row.itemCode || '').trim().toUpperCase() === normalizedItemCode.toUpperCase())
+    : filteredOptions;
+  if (normalizedItemCode !== '__ALL__' && selectedRows.length) {
+    const exists = filteredOptions.some((row) => String(row.itemCode || '').trim().toUpperCase() === normalizedItemCode.toUpperCase());
+    if (!exists) filteredOptions = [...selectedRows, ...filteredOptions];
+  }
+
+  const selectedSummary = selectedRows.reduce((acc, row) => {
+    acc.requestedQty += Math.max(0, poCloseNum(row.requestedQty, 0));
+    acc.deliveredQty += Math.max(0, poCloseNum(row.deliveredQty, 0));
+    acc.totalAppliedHours += Math.max(0, poCloseNum(row.totalAppliedHours, 0));
+    acc.timerCount += Number(row.timerCount || 0) || 0;
+    acc.ordersCount += Number(row.ordersCount || 0) || 0;
+    return acc;
+  }, { requestedQty: 0, deliveredQty: 0, totalAppliedHours: 0, timerCount: 0, ordersCount: 0 });
+
+  const fillRatePct = selectedSummary.requestedQty > 0
+    ? poCloseRound((selectedSummary.deliveredQty / selectedSummary.requestedQty) * 100, 2)
+    : 0;
+  const avgAppliedHours = selectedSummary.timerCount > 0
+    ? poCloseRound(selectedSummary.totalAppliedHours / selectedSummary.timerCount, 4)
+    : 0;
+
+  return {
+    summary: {
+      ordersCount: selectedSummary.ordersCount,
+      requestedQty: poCloseRound(selectedSummary.requestedQty, 3),
+      deliveredQty: poCloseRound(selectedSummary.deliveredQty, 3),
+      fillRatePct,
+      avgAppliedHours,
+      avgAppliedLabel: poCloseHoursToLabel(avgAppliedHours),
+      totalAppliedHours: poCloseRound(selectedSummary.totalAppliedHours, 4),
+      timerCount: selectedSummary.timerCount,
+    },
+    rows: selectedRows.sort((a, b) => {
+      if (b.fillRatePct !== a.fillRatePct) return b.fillRatePct - a.fillRatePct;
+      return b.deliveredQty - a.deliveredQty;
+    }).slice(0, 20),
+    options: filteredOptions.slice(0, 300),
+    selectedItemCode: normalizedItemCode,
+    q: normalizedQ,
+  };
+}
+
 async function poCloseEnsureTables() {
   if (!hasDb()) return;
   await dbQuery(`
@@ -15864,6 +16534,30 @@ async function poCloseEnsureTables() {
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_events_created ON admin_production_close_events(created_at DESC)`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_events_order ON admin_production_close_events(absolute_entry, doc_num, created_at DESC)`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_events_item ON admin_production_close_events(item_code, created_at DESC)`);
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS admin_production_close_timers (
+      id BIGSERIAL PRIMARY KEY,
+      absolute_entry BIGINT NOT NULL UNIQUE,
+      doc_num BIGINT NOT NULL DEFAULT 0,
+      item_code TEXT NOT NULL DEFAULT '',
+      item_name TEXT NOT NULL DEFAULT '',
+      warehouse TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'IDLE',
+      accumulated_seconds BIGINT NOT NULL DEFAULT 0,
+      started_at TIMESTAMPTZ,
+      last_started_at TIMESTAMPTZ,
+      finalized_at TIMESTAMPTZ,
+      applied_hours NUMERIC(19,6) NOT NULL DEFAULT 0,
+      affected_lines INT NOT NULL DEFAULT 0,
+      note TEXT NOT NULL DEFAULT '',
+      order_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+      admin_user TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_timers_status ON admin_production_close_timers(status, updated_at DESC)`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_production_close_timers_doc ON admin_production_close_timers(doc_num, updated_at DESC)`);
   await dbQuery(`
     INSERT INTO app_state(k, v, updated_at)
     VALUES ('production_close_next_batch_seq', '3000', NOW())
@@ -15940,6 +16634,246 @@ async function poCloseLogEvent(payload = {}) {
   ]);
 }
 
+function poCloseFormatElapsed(totalSeconds = 0) {
+  const sec = Math.max(0, Math.floor(Number(totalSeconds || 0)));
+  const hh = String(Math.floor(sec / 3600)).padStart(2, '0');
+  const mm = String(Math.floor((sec % 3600) / 60)).padStart(2, '0');
+  const ss = String(sec % 60).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+function poCloseTimerElapsedSeconds(row = {}) {
+  const base = Math.max(0, Number(row?.accumulated_seconds ?? row?.accumulatedSeconds ?? 0) || 0);
+  const startedAt = row?.started_at || row?.startedAt;
+  const status = String(row?.status || '').toUpperCase();
+  if (status !== 'RUNNING' || !startedAt) return Math.floor(base);
+  const startedMs = new Date(startedAt).getTime();
+  if (!Number.isFinite(startedMs) || startedMs <= 0) return Math.floor(base);
+  return Math.max(0, Math.floor(base + ((Date.now() - startedMs) / 1000)));
+}
+function poCloseTimerStateFromRow(row = {}, fallback = {}) {
+  const elapsedSeconds = poCloseTimerElapsedSeconds(row);
+  const status = String(row?.status || fallback?.status || 'IDLE').toUpperCase();
+  return {
+    absoluteEntry: Number(row?.absolute_entry ?? row?.absoluteEntry ?? fallback?.absoluteEntry ?? 0) || 0,
+    docNum: Number(row?.doc_num ?? row?.docNum ?? fallback?.docNum ?? 0) || 0,
+    itemCode: String(row?.item_code ?? row?.itemCode ?? fallback?.itemCode ?? ''),
+    itemName: String(row?.item_name ?? row?.itemName ?? fallback?.itemName ?? ''),
+    warehouse: String(row?.warehouse ?? fallback?.warehouse ?? ''),
+    status,
+    elapsedSeconds,
+    elapsedLabel: poCloseFormatElapsed(elapsedSeconds),
+    accumulatedSeconds: Math.max(0, Number(row?.accumulated_seconds ?? row?.accumulatedSeconds ?? 0) || 0),
+    startedAt: row?.started_at || row?.startedAt || null,
+    lastStartedAt: row?.last_started_at || row?.lastStartedAt || null,
+    finalizedAt: row?.finalized_at || row?.finalizedAt || null,
+    appliedHours: Number(row?.applied_hours ?? row?.appliedHours ?? 0) || 0,
+    affectedLines: Number(row?.affected_lines ?? row?.affectedLines ?? 0) || 0,
+    note: String(row?.note || ''),
+    adminUser: String(row?.admin_user ?? row?.adminUser ?? ''),
+    updatedAt: row?.updated_at || row?.updatedAt || null,
+  };
+}
+async function poCloseGetTimerRow(absoluteEntry) {
+  if (!hasDb()) return null;
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs) return null;
+  const r = await dbQuery(`SELECT * FROM admin_production_close_timers WHERE absolute_entry=$1 LIMIT 1`, [abs]);
+  return r.rows?.[0] || null;
+}
+async function poCloseGetTimerState(absoluteEntry, fallback = {}) {
+  const row = await poCloseGetTimerRow(absoluteEntry);
+  return row ? poCloseTimerStateFromRow(row, fallback) : poCloseTimerStateFromRow({ status: 'IDLE' }, fallback);
+}
+function poCloseIsGeneralOperatorLine(line = {}) {
+  const code = String(line?.itemCode ?? line?.ItemNo ?? line?.ItemCode ?? '').trim().toUpperCase();
+  return ['MO01', 'M001', 'MOSUP', 'MLIM01', 'MOMEZ'].includes(code);
+}
+async function poCloseStartTimer(absoluteEntry, docNum = 0, adminUser = 'admin', note = '') {
+  if (!hasDb()) throw new Error('DB no configurada para guardar el tiempo de producción');
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs) throw new Error('AbsoluteEntry inválido');
+  const order = await poCloseFetchOrderDetail(abs, docNum);
+  if (!order) throw new Error('Orden no encontrada');
+  const current = await poCloseGetTimerRow(abs);
+  const now = new Date().toISOString();
+
+  if (current && String(current.status || '').toUpperCase() === 'RUNNING') {
+    return { timer: poCloseTimerStateFromRow(current, order), order, message: `El tiempo de la orden #${order.docNum} ya estaba en marcha.` };
+  }
+
+  const reset = current && String(current.status || '').toUpperCase() === 'FINALIZED';
+  const accumulated = reset ? 0 : Math.max(0, Number(current?.accumulated_seconds ?? 0) || 0);
+  await dbQuery(
+    `INSERT INTO admin_production_close_timers(
+      absolute_entry, doc_num, item_code, item_name, warehouse, status,
+      accumulated_seconds, started_at, last_started_at, finalized_at,
+      applied_hours, affected_lines, note, order_snapshot, admin_user, created_at, updated_at
+    ) VALUES (
+      $1,$2,$3,$4,$5,'RUNNING',
+      $6,$7,$7,NULL,
+      0,0,$8,$9::jsonb,$10,NOW(),NOW()
+    )
+    ON CONFLICT (absolute_entry) DO UPDATE SET
+      doc_num=EXCLUDED.doc_num,
+      item_code=EXCLUDED.item_code,
+      item_name=EXCLUDED.item_name,
+      warehouse=EXCLUDED.warehouse,
+      status='RUNNING',
+      accumulated_seconds=$6,
+      started_at=$7,
+      last_started_at=$7,
+      finalized_at=NULL,
+      applied_hours=CASE WHEN $11 THEN 0 ELSE admin_production_close_timers.applied_hours END,
+      affected_lines=CASE WHEN $11 THEN 0 ELSE admin_production_close_timers.affected_lines END,
+      note=$8,
+      order_snapshot=$9::jsonb,
+      admin_user=$10,
+      updated_at=NOW()`,
+    [abs, Number(order.docNum || 0), order.itemCode || '', order.itemName || '', order.warehouse || '', accumulated, now, String(note || ''), JSON.stringify(order || {}), String(adminUser || ''), !!reset]
+  );
+
+  const timer = await poCloseGetTimerState(abs, order);
+  await poCloseLogEvent({
+    action: reset ? 'TIMER_RESTART' : 'TIMER_START',
+    absoluteEntry: order.absoluteEntry,
+    docNum: order.docNum,
+    itemCode: order.itemCode,
+    itemName: order.itemName,
+    warehouse: order.warehouse,
+    statusBefore: current?.status || 'IDLE',
+    statusAfter: 'RUNNING',
+    note: String(note || ''),
+    orderPayload: { order, timer },
+    adminUser,
+  }).catch(() => {});
+  return { timer, order, message: reset ? 'Tiempo reiniciado y en marcha.' : 'Tiempo de producción iniciado.' };
+}
+async function poClosePauseTimer(absoluteEntry, docNum = 0, adminUser = 'admin', note = '') {
+  if (!hasDb()) throw new Error('DB no configurada para guardar el tiempo de producción');
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs) throw new Error('AbsoluteEntry inválido');
+  const order = await poCloseFetchOrderDetail(abs, docNum);
+  const current = await poCloseGetTimerRow(abs);
+  if (!current) {
+    const timer = poCloseTimerStateFromRow({ status: 'IDLE' }, order || { absoluteEntry: abs, docNum });
+    return { timer, order, message: 'La orden no tiene un tiempo iniciado todavía.' };
+  }
+  const wasRunning = String(current.status || '').toUpperCase() === 'RUNNING';
+  let accumulated = Math.max(0, Number(current.accumulated_seconds || 0) || 0);
+  if (wasRunning && current.started_at) {
+    const startedMs = new Date(current.started_at).getTime();
+    if (Number.isFinite(startedMs) && startedMs > 0) accumulated += Math.max(0, Math.floor((Date.now() - startedMs) / 1000));
+  }
+  await dbQuery(
+    `UPDATE admin_production_close_timers
+       SET doc_num=$2,
+           item_code=$3,
+           item_name=$4,
+           warehouse=$5,
+           status='PAUSED',
+           accumulated_seconds=$6,
+           started_at=NULL,
+           note=$7,
+           order_snapshot=$8::jsonb,
+           admin_user=$9,
+           updated_at=NOW()
+     WHERE absolute_entry=$1`,
+    [abs, Number(order?.docNum || current.doc_num || 0), order?.itemCode || current.item_code || '', order?.itemName || current.item_name || '', order?.warehouse || current.warehouse || '', accumulated, String(note || current.note || ''), JSON.stringify(order || {}), String(adminUser || current.admin_user || '')]
+  );
+  const rowAfter = await poCloseGetTimerRow(abs);
+  const timer = poCloseTimerStateFromRow(rowAfter, order || current);
+  await poCloseLogEvent({
+    action: 'TIMER_PAUSE',
+    absoluteEntry: abs,
+    docNum: timer.docNum,
+    itemCode: timer.itemCode,
+    itemName: timer.itemName,
+    warehouse: timer.warehouse,
+    statusBefore: current.status || 'IDLE',
+    statusAfter: 'PAUSED',
+    note: String(note || ''),
+    orderPayload: { order, timer },
+    adminUser,
+  }).catch(() => {});
+  return { timer, order, message: 'Tiempo de producción pausado.' };
+}
+async function poCloseFinalizeTimer(absoluteEntry, docNum = 0, adminUser = 'admin', note = '') {
+  if (!hasDb()) throw new Error('DB no configurada para guardar el tiempo de producción');
+  const abs = Number(absoluteEntry || 0) || 0;
+  if (!abs) throw new Error('AbsoluteEntry inválido');
+  const pauseResult = await poClosePauseTimer(abs, docNum, adminUser, note);
+  const timerPaused = pauseResult.timer;
+  const order = pauseResult.order || await poCloseFetchOrderDetail(abs, docNum);
+  const elapsedSeconds = Math.max(0, Number(timerPaused?.elapsedSeconds || 0) || 0);
+  if (!(elapsedSeconds > 0)) throw new Error('No hay tiempo acumulado para finalizar.');
+  if (!order) throw new Error('Orden no encontrada');
+
+  const appliedHours = Number((elapsedSeconds / 3600).toFixed(4));
+  const operatorLines = (Array.isArray(order.lines) ? order.lines : []).filter((line) => poCloseIsGeneralOperatorLine(line));
+  if (!operatorLines.length) {
+    throw new Error('No se encontraron líneas de Operario General para aplicar el tiempo.');
+  }
+
+  const updates = operatorLines.map((line) => ({
+    lineNumber: Number(line.lineNumber || 0) || 0,
+    itemCode: String(line.itemCode || '').trim(),
+    itemName: String(line.itemName || '').trim(),
+    warehouse: String(line.warehouse || order.warehouse || '').trim(),
+    baseQuantity: Number(line.baseQuantity || 0) || 0,
+    plannedQuantity: appliedHours,
+    additionalQuantity: Number(line.additionalQuantity || 0) || 0,
+    issueMethod: String(line.issueMethod || '').trim(),
+    itemType: String(line.itemType || '').trim(),
+    isResource: !!line.isResource,
+    _delete: false,
+    _isNew: false,
+  }));
+
+  const orderAfter = await poCloseSaveResourceLines(abs, updates, adminUser, `Tiempo aplicado automáticamente. ${note || ''}`.trim());
+  await dbQuery(
+    `UPDATE admin_production_close_timers
+       SET doc_num=$2,
+           item_code=$3,
+           item_name=$4,
+           warehouse=$5,
+           status='FINALIZED',
+           accumulated_seconds=$6,
+           started_at=NULL,
+           finalized_at=NOW(),
+           applied_hours=$7,
+           affected_lines=$8,
+           note=$9,
+           order_snapshot=$10::jsonb,
+           admin_user=$11,
+           updated_at=NOW()
+     WHERE absolute_entry=$1`,
+    [abs, Number(orderAfter?.docNum || order.docNum || 0), orderAfter?.itemCode || order.itemCode || '', orderAfter?.itemName || order.itemName || '', orderAfter?.warehouse || order.warehouse || '', elapsedSeconds, appliedHours, operatorLines.length, String(note || ''), JSON.stringify(orderAfter || order || {}), String(adminUser || '')]
+  );
+  const timer = await poCloseGetTimerState(abs, orderAfter || order);
+  await poCloseLogEvent({
+    action: 'TIMER_FINALIZE',
+    absoluteEntry: abs,
+    docNum: timer.docNum,
+    itemCode: timer.itemCode,
+    itemName: timer.itemName,
+    warehouse: timer.warehouse,
+    statusBefore: pauseResult.timer?.status || 'PAUSED',
+    statusAfter: 'FINALIZED',
+    reportedQty: appliedHours,
+    note: `Tiempo aplicado a ${operatorLines.length} línea(s) de Operario General. ${note || ''}`.trim(),
+    orderPayload: { before: order, after: orderAfter, timer },
+    adminUser,
+  }).catch(() => {});
+  return {
+    timer,
+    order: orderAfter || order,
+    elapsedSeconds,
+    appliedHours,
+    affectedLines: operatorLines.length,
+    message: `Tiempo finalizado (${poCloseFormatElapsed(elapsedSeconds)}) y aplicado en ${operatorLines.length} línea(s) de Operario General.`
+  };
+}
+
 function poCloseGetOrderLinesProp(raw = {}) {
   if (Array.isArray(raw?.ProductionOrderLines)) return 'ProductionOrderLines';
   if (Array.isArray(raw?.Lines)) return 'Lines';
@@ -15949,17 +16883,20 @@ function poCloseGetOrderLinesProp(raw = {}) {
 function poCloseLooksLikeResourceLine(line = {}) {
   const rawType = String(line?.ItemType ?? line?.itemType ?? line?.Type ?? '').trim().toLowerCase();
   if (['290', 'pit_resource', 'resource', 'r'].includes(rawType)) return true;
-
-  const code = String(line?.ItemNo ?? line?.ItemCode ?? line?.ResourceCode ?? line?.Code ?? '').trim().toUpperCase();
-  if (['MOMEZ', 'MOSUP', 'MLIM01', 'MO01', 'M001'].includes(code)) return true;
+  const code = String(line?.itemCode ?? line?.ItemNo ?? line?.ItemCode ?? line?.ResourceCode ?? line?.Code ?? '').trim().toUpperCase();
   if (/^(OGF|MLI|MLIM|MOSUP|MOMEZ|M00\d|MO\d{2,}|RES)/i.test(code)) return true;
-
-  const desc = String(line?.ItemName ?? line?.ItemDescription ?? line?.ProductDescription ?? line?.LineText ?? '').toLowerCase();
-  if (/(recurso|mezclador|operario|supervisor|linea de produccion|línea de producción|mano de obra|gastos? de fabricaci|horas? hombre|labor|overhead|servicio interno)/i.test(desc)) return true;
-
-  const inventoryFlag = String(line?.InventoryItem ?? line?.InvntItem ?? '').trim().toLowerCase();
-  if (['tno', 'no', 'n', 'f', 'false'].includes(inventoryFlag) && /(mezclador|operario|supervisor|linea|línea|recurso|labor|overhead|servicio)/i.test(desc)) return true;
-
+  if (['MO01', 'M001', 'MOSUP', 'MLIM01', 'MOMEZ'].includes(code)) return true;
+  const desc = String(line?.itemName ?? line?.ItemName ?? line?.ItemDescription ?? line?.ProductDescription ?? line?.LineText ?? '').toLowerCase();
+  if (
+    desc.includes('recurso') ||
+    desc.includes('mezclador') ||
+    desc.includes('operario') ||
+    desc.includes('supervisor') ||
+    desc.includes('supervisora') ||
+    desc.includes('línea de producción') ||
+    desc.includes('linea de produccion') ||
+    desc.includes('linea de producción')
+  ) return true;
   return false;
 }
 function poCloseNormalizeOrderLine(line = {}, order = {}) {
@@ -16041,8 +16978,14 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
   const normalizedBefore = originalLines.map((line) => poCloseNormalizeOrderLine(line, detailBefore));
   const updates = Array.isArray(resourceLines) ? resourceLines : [];
 
-  const normalizeResourceInput = (row = {}) => {
+  const normalizeEditableInput = (row = {}) => {
     const ln = Number(row?.lineNumber || 0) || 0;
+    const rawType = String(row?.itemType || '').trim();
+    const normalizedType = rawType || (poCloseLooksLikeResourceLine(row) ? '290' : '4');
+    const explicitExisting = row?._existing === true || row?._existing === 'true' || row?._existing === 1 || row?._existing === '1';
+    const explicitNew = row?._isNew === true || row?._isNew === 'true' || row?._isNew === 1 || row?._isNew === '1';
+    const isExisting = explicitExisting || (!explicitNew && String(row?.itemCode || '').trim() !== '');
+    const isNew = explicitNew || !isExisting;
     return {
       lineNumber: ln,
       itemCode: String(row?.itemCode || '').trim(),
@@ -16051,35 +16994,40 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
       baseQuantity: Number(row?.baseQuantity ?? 0) || 0,
       plannedQuantity: Number(row?.plannedQuantity ?? 0) || 0,
       additionalQuantity: Number(row?.additionalQuantity ?? 0) || 0,
+      issueMethod: String(row?.issueMethod || '').trim(),
+      itemType: normalizedType,
+      isResource: ['290', 'pit_resource', 'resource', 'r'].includes(normalizedType.toLowerCase()) || poCloseLooksLikeResourceLine(row),
       _delete: !!row?._delete,
-      _isNew: !!row?._isNew || !(ln > 0),
+      _existing: isExisting,
+      _isNew: isNew,
     };
   };
 
   const sameNum = (a, b, decimals = 6) => Number((Number(a || 0)).toFixed(decimals)) === Number((Number(b || 0)).toFixed(decimals));
-  const currentResources = normalizedBefore
-    .filter((x) => x?.isResource)
-    .map((x) => ({
-      lineNumber: Number(x.lineNumber || 0) || 0,
-      itemCode: String(x.itemCode || '').trim(),
-      itemName: String(x.itemName || '').trim(),
-      warehouse: String(x.warehouse || detailBefore.warehouse || '').trim(),
-      baseQuantity: Number(x.baseQuantity ?? 0) || 0,
-      plannedQuantity: Number(x.plannedQuantity ?? 0) || 0,
-      additionalQuantity: Number(x.additionalQuantity ?? 0) || 0,
-    }));
+  const currentLines = normalizedBefore.map((x) => ({
+    lineNumber: Number(x.lineNumber || 0) || 0,
+    itemCode: String(x.itemCode || '').trim(),
+    itemName: String(x.itemName || '').trim(),
+    warehouse: String(x.warehouse || detailBefore.warehouse || '').trim(),
+    baseQuantity: Number(x.baseQuantity ?? 0) || 0,
+    plannedQuantity: Number(x.plannedQuantity ?? 0) || 0,
+    additionalQuantity: Number(x.additionalQuantity ?? 0) || 0,
+    issueMethod: String(x.issueMethod || '').trim(),
+    itemType: String(x.itemType || '').trim(),
+    isResource: !!x.isResource,
+  }));
 
-  const normalizedUpdates = updates.map((row) => normalizeResourceInput(row));
+  const normalizedUpdates = updates.map((row) => normalizeEditableInput(row));
   const activeUpdates = normalizedUpdates.filter((row) => !row._delete);
 
-  const currentByLine = new Map(currentResources.map((row) => [String(row.lineNumber), row]));
-  const hasStructuralChanges = activeUpdates.some((row) => row._isNew || !(row.lineNumber > 0)) || activeUpdates.length !== currentResources.length;
+  const currentByLine = new Map(currentLines.map((row) => [String(row.lineNumber), row]));
+  const hasStructuralChanges =
+    normalizedUpdates.some((row) => row._delete || row._isNew) ||
+    activeUpdates.length !== currentLines.length;
   const hasValueChanges = activeUpdates.some((row) => {
     const prev = currentByLine.get(String(row.lineNumber));
     if (!prev) return true;
     return (
-      String(prev.itemCode || '') !== String(row.itemCode || '') ||
-      String(prev.itemName || '') !== String(row.itemName || '') ||
       String(prev.warehouse || '') !== String(row.warehouse || '') ||
       !sameNum(prev.baseQuantity, row.baseQuantity) ||
       !sameNum(prev.plannedQuantity, row.plannedQuantity) ||
@@ -16093,7 +17041,7 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
 
   const existingByLine = new Map();
   for (const row of normalizedUpdates) {
-    if (row.lineNumber > 0) existingByLine.set(String(row.lineNumber), row);
+    if (row._existing || row.lineNumber > 0) existingByLine.set(String(row.lineNumber), row);
   }
 
   const additions = normalizedUpdates.filter((row) => row._isNew && !row._delete && row.itemCode);
@@ -16104,6 +17052,8 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
     delete copy.WarehouseCode;
     delete copy.ProductDescription;
     delete copy.ItemDescription;
+    delete copy.LineText;
+    delete copy.ItemName;
     return copy;
   };
 
@@ -16111,25 +17061,20 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
   for (let i = 0; i < originalLines.length; i++) {
     const rawLine = originalLines[i];
     const normLine = normalizedBefore[i];
-    if (!normLine?.isResource) {
+    const desired = existingByLine.get(String(normLine.lineNumber));
+
+    if (!desired) {
       updatedLines.push(stripInvalidLineAliases(rawLine));
       continue;
     }
-    const desired = existingByLine.get(String(normLine.lineNumber));
-    if (!desired) continue;
     if (desired._delete) continue;
 
     const merged = stripInvalidLineAliases(rawLine);
-    if (desired.itemCode) {
-      merged.ItemNo = desired.itemCode;
+    merged.ItemType = desired.isResource ? 290 : (merged.ItemType ?? 4);
+    if (desired.isResource) {
+      delete merged.ProductionOrderIssueType;
+      delete merged.IssueType;
     }
-    if (desired.itemName) {
-      merged.ItemName = desired.itemName;
-      merged.LineText = desired.itemName;
-    }
-    merged.ItemType = 290;
-    delete merged.IssueType;
-    delete merged.ProductionOrderIssueType;
     merged.BaseQuantity = Number(desired.baseQuantity || 0);
     merged.PlannedQuantity = Number(desired.plannedQuantity || 0);
     merged.AdditionalQuantity = Number(desired.additionalQuantity || 0);
@@ -16139,33 +17084,34 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
     updatedLines.push(merged);
   }
 
-  const templateLine = stripInvalidLineAliases(
-    originalLines.find((line) => poCloseNormalizeOrderLine(line, detailBefore).isResource) || {}
-  );
+  const pickTemplateForAddition = (desired = {}) => {
+    const desiredIsResource = !!desired.isResource;
+    const templateRaw = originalLines.find((line) => {
+      const normalized = poCloseNormalizeOrderLine(line, detailBefore);
+      return !!normalized?.isResource === desiredIsResource;
+    }) || originalLines[0] || {};
+    return stripInvalidLineAliases(templateRaw);
+  };
 
   for (const desired of additions) {
-    const merged = { ...templateLine };
+    const merged = { ...pickTemplateForAddition(desired) };
     delete merged.LineNumber;
     delete merged.LineNum;
     delete merged.VisualOrder;
     delete merged.VisOrder;
     delete merged.DocumentAbsoluteEntry;
     delete merged.DocEntry;
-    merged.ItemType = 290;
-    delete merged.IssueType;
-    delete merged.ProductionOrderIssueType;
-    merged.ItemNo = desired.itemCode;
-    if (desired.itemName) {
-      merged.ItemName = desired.itemName;
-      merged.LineText = desired.itemName;
+    merged.ItemType = desired.isResource ? 290 : (merged.ItemType ?? 4);
+    if (desired.isResource) {
+      delete merged.ProductionOrderIssueType;
+      delete merged.IssueType;
     }
+    merged.ItemNo = desired.itemCode;
     merged.BaseQuantity = Number(desired.baseQuantity || 0);
     merged.PlannedQuantity = Number(desired.plannedQuantity || 0);
     merged.AdditionalQuantity = Number(desired.additionalQuantity || 0);
     const wh = desired.warehouse || detailBefore.warehouse || '';
-    if (wh) {
-      merged.Warehouse = wh;
-    }
+    if (wh) merged.Warehouse = wh;
     updatedLines.push(merged);
   }
 
@@ -16177,7 +17123,7 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
 
   const detailAfter = await poCloseFetchOrderDetail(abs);
   await poCloseLogEvent({
-    action: 'SAVE_RESOURCES',
+    action: 'SAVE_EDITABLE_LINES',
     absoluteEntry: detailAfter?.absoluteEntry || detailBefore.absoluteEntry,
     docNum: detailAfter?.docNum || detailBefore.docNum,
     itemCode: detailAfter?.itemCode || detailBefore.itemCode,
@@ -16186,7 +17132,7 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
     statusBefore: detailBefore.status,
     statusAfter: detailAfter?.status || detailBefore.status,
     note: String(note || ''),
-    orderPayload: { before: detailBefore, after: detailAfter, resourceLines: updates },
+    orderPayload: { before: detailBefore, after: detailAfter, editableLines: updates },
     adminUser,
   }).catch(() => {});
   return detailAfter || detailBefore;
@@ -16353,8 +17299,8 @@ async function poCloseCreateReceiptFromProduction(order, { quantity, postingDate
   };
 
   const headerVariants = [
-    { DocDate: postDate, Comments: comments, JournalMemo: journalMemo },
-    { DocDate: postDate, DocDueDate: postDate, Comments: comments, JournalMemo: journalMemo },
+    { DocDate: postDate, Comments: comments, JournalMemo: journalMemo, ...(lot ? { Reference2: lot } : {}) },
+    { DocDate: postDate, DocDueDate: postDate, Comments: comments, JournalMemo: journalMemo, ...(lot ? { Reference2: lot } : {}) },
   ];
   const whVariants = warehouseCandidates.length ? warehouseCandidates : [''];
   const txVariants = [0, '0', 'botrntComplete'];
@@ -16607,6 +17553,18 @@ app.get('/api/admin/production-close/history', verifyAdmin, async (req, res) => 
   }
 });
 
+
+app.get('/api/admin/production-close/dashboard', verifyAdmin, async (req, res) => {
+  try {
+    const itemCode = String(req.query?.itemCode || '__ALL__').trim() || '__ALL__';
+    const q = String(req.query?.q || '').trim();
+    const dashboard = await poCloseBuildDashboard({ itemCode, q });
+    return safeJson(res, 200, { ok: true, ...dashboard });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 app.get('/api/admin/production-close/next-lot', verifyAdmin, async (_req, res) => {
   try {
     return safeJson(res, 200, { ok: true, nextLot: await poCloseGetNextLotPreview() });
@@ -16626,11 +17584,52 @@ app.get('/api/admin/production-close/orders/:absoluteEntry/detail', verifyAdmin,
   }
 });
 
+app.get('/api/admin/production-close/orders/:absoluteEntry/timer', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const order = await poCloseFetchOrderDetail(abs, req.query?.docNum || 0).catch(() => null);
+    const timer = await poCloseGetTimerState(abs, order || { absoluteEntry: abs, docNum: req.query?.docNum || 0 });
+    return safeJson(res, 200, { ok: true, timer, order });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/timer/start', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const out = await poCloseStartTimer(abs, req.body?.docNum || 0, String(req.admin?.user || 'admin'), String(req.body?.note || ''));
+    return safeJson(res, 200, { ok: true, timer: out.timer, order: out.order, message: out.message });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/timer/pause', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const out = await poClosePauseTimer(abs, req.body?.docNum || 0, String(req.admin?.user || 'admin'), String(req.body?.note || ''));
+    return safeJson(res, 200, { ok: true, timer: out.timer, order: out.order, message: out.message });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.post('/api/admin/production-close/orders/:absoluteEntry/timer/finalize', verifyAdmin, async (req, res) => {
+  try {
+    const abs = Number(req.params.absoluteEntry || 0);
+    const out = await poCloseFinalizeTimer(abs, req.body?.docNum || 0, String(req.admin?.user || 'admin'), String(req.body?.note || ''));
+    return safeJson(res, 200, { ok: true, timer: out.timer, order: out.order, elapsedSeconds: out.elapsedSeconds, appliedHours: out.appliedHours, affectedLines: out.affectedLines, message: out.message });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 app.post('/api/admin/production-close/orders/:absoluteEntry/resources/save', verifyAdmin, async (req, res) => {
   try {
     const abs = Number(req.params.absoluteEntry || 0);
     const order = await poCloseSaveResourceLines(abs, req.body?.resourceLines || [], String(req.admin?.user || 'admin'), String(req.body?.note || ''));
-    return safeJson(res, 200, { ok: true, order, message: 'Recursos actualizados' });
+    return safeJson(res, 200, { ok: true, order, message: 'Líneas editables actualizadas' });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
