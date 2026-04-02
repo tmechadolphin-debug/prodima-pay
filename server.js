@@ -16250,6 +16250,262 @@ function poCloseNormalizeOrderRow(row = {}) {
   normalized.remainingQty = poCloseRemainingQty(normalized);
   return normalized;
 }
+function poCloseNum(v, fallback = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : Number(fallback || 0);
+}
+function poCloseRound(v, d = 4) {
+  const n = poCloseNum(v, 0);
+  const p = 10 ** Math.max(0, Number(d || 0));
+  return Math.round(n * p) / p;
+}
+function poCloseHoursToLabel(hours = 0) {
+  const totalSeconds = Math.max(0, Math.round(poCloseNum(hours || 0) * 3600));
+  const hh = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
+  const mm = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, '0');
+  const ss = String(totalSeconds % 60).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+function poCloseDashboardCodeMatch(row = {}, q = '') {
+  const needle = String(q || '').trim().toLowerCase();
+  if (!needle) return true;
+  const hay = `${String(row?.itemCode || '').toLowerCase()} ${String(row?.itemName || '').toLowerCase()}`;
+  return hay.includes(needle);
+}
+function poCloseDashboardExtractPlannedQty(row = {}) {
+  const payload = row?.order_payload || row?.orderPayload || {};
+  const planned = poCloseNum(
+    payload?.plannedQty ?? payload?.PlannedQuantity ?? payload?.rawOrder?.PlannedQuantity ?? payload?.rawOrder?.PlannedQty,
+    0
+  );
+  const completed = poCloseNum(
+    payload?.completedQty ?? payload?.CompletedQuantity ?? payload?.rawOrder?.CompletedQuantity ?? payload?.rawOrder?.CompletedQty,
+    0
+  );
+  const rejected = poCloseNum(
+    payload?.rejectedQty ?? payload?.RejectedQuantity ?? payload?.rawOrder?.RejectedQuantity ?? payload?.rawOrder?.RejectedQty,
+    0
+  );
+  const delivered = Math.max(0, poCloseNum(row?.deliveredQty ?? row?.reported_qty ?? row?.reportedQty, 0));
+  const plannedSafe = Math.max(0, planned);
+  if (plannedSafe > 0) return Math.max(plannedSafe, completed + rejected + delivered);
+  return Math.max(delivered, completed + rejected);
+}
+function poCloseDashboardOrderKey(raw = {}) {
+  const abs = Number(raw?.absolute_entry ?? raw?.absoluteEntry ?? 0) || 0;
+  const docNum = Number(raw?.doc_num ?? raw?.docNum ?? 0) || 0;
+  if (abs) return `ABS:${abs}`;
+  if (docNum) return `DOC:${docNum}`;
+  return '';
+}
+function poCloseDashboardPickMeta(base = {}, extra = {}) {
+  return {
+    absoluteEntry: Number(base?.absoluteEntry ?? extra?.absoluteEntry ?? base?.absolute_entry ?? extra?.absolute_entry ?? 0) || 0,
+    docNum: Number(base?.docNum ?? extra?.docNum ?? base?.doc_num ?? extra?.doc_num ?? 0) || 0,
+    itemCode: String(base?.itemCode ?? extra?.itemCode ?? base?.item_code ?? extra?.item_code ?? '').trim(),
+    itemName: String(base?.itemName ?? extra?.itemName ?? base?.item_name ?? extra?.item_name ?? '').trim(),
+    warehouse: String(base?.warehouse ?? extra?.warehouse ?? '').trim(),
+  };
+}
+async function poCloseBuildDashboard({ itemCode = '__ALL__', q = '' } = {}) {
+  if (!hasDb()) {
+    return {
+      summary: {
+        ordersCount: 0,
+        requestedQty: 0,
+        deliveredQty: 0,
+        fillRatePct: 0,
+        avgAppliedHours: 0,
+        avgAppliedLabel: '00:00:00',
+        totalAppliedHours: 0,
+        timerCount: 0,
+      },
+      rows: [],
+      options: [],
+      selectedItemCode: '__ALL__',
+      q: String(q || '').trim(),
+    };
+  }
+
+  const normalizedItemCode = String(itemCode || '__ALL__').trim() || '__ALL__';
+  const normalizedQ = String(q || '').trim();
+
+  const [eventsRes, timersRes] = await Promise.all([
+    dbQuery(`
+      SELECT absolute_entry, doc_num, item_code, item_name, warehouse, reported_qty, order_payload, created_at
+      FROM admin_production_close_events
+      WHERE action='REPORT_COMPLETION'
+      ORDER BY created_at DESC
+    `),
+    dbQuery(`
+      SELECT absolute_entry, doc_num, item_code, item_name, warehouse, applied_hours, accumulated_seconds,
+             status, affected_lines, finalized_at, updated_at
+      FROM admin_production_close_timers
+      ORDER BY updated_at DESC
+    `),
+  ]);
+
+  const orderMap = new Map();
+
+  for (const raw of (eventsRes.rows || [])) {
+    const key = poCloseDashboardOrderKey(raw);
+    if (!key) continue;
+    const prev = orderMap.get(key) || {
+      ...poCloseDashboardPickMeta(raw),
+      requestedQty: 0,
+      deliveredQty: 0,
+      appliedHours: 0,
+      timerCount: 0,
+      affectedLines: 0,
+      reportCount: 0,
+      lastReportedAt: null,
+    };
+    const requestedQty = poCloseDashboardExtractPlannedQty(raw);
+    prev.absoluteEntry = prev.absoluteEntry || Number(raw.absolute_entry || 0) || 0;
+    prev.docNum = prev.docNum || Number(raw.doc_num || 0) || 0;
+    prev.itemCode = prev.itemCode || String(raw.item_code || '').trim();
+    prev.itemName = prev.itemName || String(raw.item_name || '').trim();
+    prev.warehouse = prev.warehouse || String(raw.warehouse || '').trim();
+    prev.requestedQty = Math.max(prev.requestedQty, requestedQty);
+    prev.deliveredQty = poCloseRound(prev.deliveredQty + Math.max(0, poCloseNum(raw.reported_qty, 0)), 6);
+    prev.reportCount += 1;
+    prev.lastReportedAt = raw.created_at || prev.lastReportedAt || null;
+    orderMap.set(key, prev);
+  }
+
+  for (const raw of (timersRes.rows || [])) {
+    const key = poCloseDashboardOrderKey(raw);
+    if (!key) continue;
+    const prev = orderMap.get(key) || {
+      ...poCloseDashboardPickMeta(raw),
+      requestedQty: 0,
+      deliveredQty: 0,
+      appliedHours: 0,
+      timerCount: 0,
+      affectedLines: 0,
+      reportCount: 0,
+      lastReportedAt: null,
+    };
+    prev.absoluteEntry = prev.absoluteEntry || Number(raw.absolute_entry || 0) || 0;
+    prev.docNum = prev.docNum || Number(raw.doc_num || 0) || 0;
+    prev.itemCode = prev.itemCode || String(raw.item_code || '').trim();
+    prev.itemName = prev.itemName || String(raw.item_name || '').trim();
+    prev.warehouse = prev.warehouse || String(raw.warehouse || '').trim();
+    prev.appliedHours += Math.max(0, poCloseNum(raw.applied_hours, 0));
+    prev.timerCount += Number(raw.finalized_at || raw.applied_hours ? 1 : 0);
+    prev.affectedLines += Number(raw.affected_lines || 0) || 0;
+    orderMap.set(key, prev);
+  }
+
+  const allOrders = Array.from(orderMap.values()).map((row) => {
+    const requestedQty = Math.max(0, poCloseNum(row.requestedQty, 0));
+    const deliveredQty = Math.max(0, poCloseNum(row.deliveredQty, 0));
+    const appliedHours = Math.max(0, poCloseNum(row.appliedHours, 0));
+    return {
+      ...row,
+      requestedQty: poCloseRound(Math.max(requestedQty, deliveredQty), 6),
+      deliveredQty: poCloseRound(deliveredQty, 6),
+      appliedHours: poCloseRound(appliedHours, 6),
+      fillRatePct: requestedQty > 0 ? poCloseRound((deliveredQty / requestedQty) * 100, 2) : 0,
+      appliedLabel: poCloseHoursToLabel(appliedHours),
+    };
+  }).filter((row) => row.itemCode || row.itemName);
+
+  const byCode = new Map();
+  for (const row of allOrders) {
+    const codeKey = String(row.itemCode || '').trim() || '__NO_CODE__';
+    const prev = byCode.get(codeKey) || {
+      itemCode: String(row.itemCode || '').trim(),
+      itemName: String(row.itemName || '').trim(),
+      requestedQty: 0,
+      deliveredQty: 0,
+      totalAppliedHours: 0,
+      timerCount: 0,
+      affectedLines: 0,
+      ordersCount: 0,
+      fillRatePct: 0,
+      avgAppliedHours: 0,
+      avgAppliedLabel: '00:00:00',
+    };
+    prev.itemName = prev.itemName || String(row.itemName || '').trim();
+    prev.requestedQty += Math.max(0, poCloseNum(row.requestedQty, 0));
+    prev.deliveredQty += Math.max(0, poCloseNum(row.deliveredQty, 0));
+    prev.totalAppliedHours += Math.max(0, poCloseNum(row.appliedHours, 0));
+    prev.timerCount += Number(row.timerCount || (row.appliedHours > 0 ? 1 : 0)) || 0;
+    prev.affectedLines += Number(row.affectedLines || 0) || 0;
+    prev.ordersCount += 1;
+    byCode.set(codeKey, prev);
+  }
+
+  const optionRows = Array.from(byCode.values()).map((row) => {
+    const requestedQty = Math.max(0, poCloseNum(row.requestedQty, 0));
+    const deliveredQty = Math.max(0, poCloseNum(row.deliveredQty, 0));
+    const totalAppliedHours = Math.max(0, poCloseNum(row.totalAppliedHours, 0));
+    const avgAppliedHours = row.timerCount > 0 ? totalAppliedHours / row.timerCount : 0;
+    return {
+      itemCode: String(row.itemCode || '').trim(),
+      itemName: String(row.itemName || '').trim(),
+      requestedQty: poCloseRound(requestedQty, 3),
+      deliveredQty: poCloseRound(deliveredQty, 3),
+      fillRatePct: requestedQty > 0 ? poCloseRound((deliveredQty / requestedQty) * 100, 2) : 0,
+      totalAppliedHours: poCloseRound(totalAppliedHours, 4),
+      avgAppliedHours: poCloseRound(avgAppliedHours, 4),
+      avgAppliedLabel: poCloseHoursToLabel(avgAppliedHours),
+      ordersCount: Number(row.ordersCount || 0) || 0,
+      timerCount: Number(row.timerCount || 0) || 0,
+      affectedLines: Number(row.affectedLines || 0) || 0,
+    };
+  }).sort((a, b) => {
+    if (String(a.itemCode || '') !== String(b.itemCode || '')) return String(a.itemCode || '').localeCompare(String(b.itemCode || ''));
+    return String(a.itemName || '').localeCompare(String(b.itemName || ''));
+  });
+
+  let filteredOptions = optionRows.filter((row) => poCloseDashboardCodeMatch(row, normalizedQ));
+  const selectedRows = normalizedItemCode !== '__ALL__'
+    ? optionRows.filter((row) => String(row.itemCode || '').trim().toUpperCase() === normalizedItemCode.toUpperCase())
+    : filteredOptions;
+  if (normalizedItemCode !== '__ALL__' && selectedRows.length) {
+    const exists = filteredOptions.some((row) => String(row.itemCode || '').trim().toUpperCase() === normalizedItemCode.toUpperCase());
+    if (!exists) filteredOptions = [...selectedRows, ...filteredOptions];
+  }
+
+  const selectedSummary = selectedRows.reduce((acc, row) => {
+    acc.requestedQty += Math.max(0, poCloseNum(row.requestedQty, 0));
+    acc.deliveredQty += Math.max(0, poCloseNum(row.deliveredQty, 0));
+    acc.totalAppliedHours += Math.max(0, poCloseNum(row.totalAppliedHours, 0));
+    acc.timerCount += Number(row.timerCount || 0) || 0;
+    acc.ordersCount += Number(row.ordersCount || 0) || 0;
+    return acc;
+  }, { requestedQty: 0, deliveredQty: 0, totalAppliedHours: 0, timerCount: 0, ordersCount: 0 });
+
+  const fillRatePct = selectedSummary.requestedQty > 0
+    ? poCloseRound((selectedSummary.deliveredQty / selectedSummary.requestedQty) * 100, 2)
+    : 0;
+  const avgAppliedHours = selectedSummary.timerCount > 0
+    ? poCloseRound(selectedSummary.totalAppliedHours / selectedSummary.timerCount, 4)
+    : 0;
+
+  return {
+    summary: {
+      ordersCount: selectedSummary.ordersCount,
+      requestedQty: poCloseRound(selectedSummary.requestedQty, 3),
+      deliveredQty: poCloseRound(selectedSummary.deliveredQty, 3),
+      fillRatePct,
+      avgAppliedHours,
+      avgAppliedLabel: poCloseHoursToLabel(avgAppliedHours),
+      totalAppliedHours: poCloseRound(selectedSummary.totalAppliedHours, 4),
+      timerCount: selectedSummary.timerCount,
+    },
+    rows: selectedRows.sort((a, b) => {
+      if (b.fillRatePct !== a.fillRatePct) return b.fillRatePct - a.fillRatePct;
+      return b.deliveredQty - a.deliveredQty;
+    }).slice(0, 20),
+    options: filteredOptions.slice(0, 300),
+    selectedItemCode: normalizedItemCode,
+    q: normalizedQ,
+  };
+}
+
 async function poCloseEnsureTables() {
   if (!hasDb()) return;
   await dbQuery(`
@@ -16552,8 +16808,7 @@ async function poCloseFinalizeTimer(absoluteEntry, docNum = 0, adminUser = 'admi
   if (!(elapsedSeconds > 0)) throw new Error('No hay tiempo acumulado para finalizar.');
   if (!order) throw new Error('Orden no encontrada');
 
-  const appliedMinutes = elapsedSeconds / 60;
-  const appliedHours = Number((appliedMinutes / 60).toFixed(4));
+  const appliedHours = Number((elapsedSeconds / 3600).toFixed(6));
   const operatorLines = (Array.isArray(order.lines) ? order.lines : []).filter((line) => poCloseIsGeneralOperatorLine(line));
   if (!operatorLines.length) {
     throw new Error('No se encontraron líneas de Operario General para aplicar el tiempo.');
@@ -16727,8 +16982,7 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
       itemType: normalizedType,
       isResource: ['290', 'pit_resource', 'resource', 'r'].includes(normalizedType.toLowerCase()),
       _delete: !!row?._delete,
-      _existsInOrder: !!row?._existsInOrder,
-      _isNew: !!row?._isNew && !row?._existsInOrder,
+      _isNew: !!row?._isNew || !(ln > 0),
     };
   };
 
@@ -16751,7 +17005,7 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
 
   const currentByLine = new Map(currentLines.map((row) => [String(row.lineNumber), row]));
   const hasStructuralChanges =
-    normalizedUpdates.some((row) => row._delete || row._isNew) ||
+    normalizedUpdates.some((row) => row._delete || row._isNew || !(row.lineNumber > 0)) ||
     activeUpdates.length !== currentLines.length;
   const hasValueChanges = activeUpdates.some((row) => {
     const prev = currentByLine.get(String(row.lineNumber));
@@ -16770,7 +17024,7 @@ async function poCloseSaveResourceLines(absoluteEntry, resourceLines = [], admin
 
   const existingByLine = new Map();
   for (const row of normalizedUpdates) {
-    if (row._existsInOrder) existingByLine.set(String(row.lineNumber), row);
+    if (row.lineNumber > 0) existingByLine.set(String(row.lineNumber), row);
   }
 
   const additions = normalizedUpdates.filter((row) => row._isNew && !row._delete && row.itemCode);
@@ -16866,9 +17120,9 @@ async function poCloseFetchOpenOrdersFromSap({ q = '', top = 250 } = {}) {
     'PostingDate','DueDate','StartDate','Warehouse','ProductionOrderStatus','ProductionOrderOrigin'
   ].join(',');
   const tries = [
-    `/ProductionOrders?$select=${select}&$filter=${encodeURIComponent(`(ProductionOrderStatus eq 'boposPlanned' or ProductionOrderStatus eq 'boposReleased')`)}&$orderby=DueDate asc,DocumentNumber desc&$top=${Math.max(20, Math.min(400, Number(top || 250)))}`,
-    `/ProductionOrders?$select=${select}&$filter=${encodeURIComponent(`(ProductionOrderStatus eq 'P' or ProductionOrderStatus eq 'R')`)}&$orderby=DueDate asc,DocumentNumber desc&$top=${Math.max(20, Math.min(400, Number(top || 250)))}`,
-    `/ProductionOrders?$select=${select}&$orderby=DueDate asc,DocumentNumber desc&$top=${Math.max(50, Math.min(600, Number(top || 250) * 2))}`
+    `/ProductionOrders?$select=${select}&$filter=${encodeURIComponent(`(ProductionOrderStatus eq 'boposPlanned' or ProductionOrderStatus eq 'boposReleased')`)}&$orderby=PostingDate desc,DocumentNumber desc&$top=${Math.max(20, Math.min(400, Number(top || 250)))}`,
+    `/ProductionOrders?$select=${select}&$filter=${encodeURIComponent(`(ProductionOrderStatus eq 'P' or ProductionOrderStatus eq 'R')`)}&$orderby=PostingDate desc,DocumentNumber desc&$top=${Math.max(20, Math.min(400, Number(top || 250)))}`,
+    `/ProductionOrders?$select=${select}&$orderby=PostingDate desc,DocumentNumber desc&$top=${Math.max(50, Math.min(600, Number(top || 250) * 2))}`
   ];
   let rows = [];
   for (const p of tries) {
@@ -16894,9 +17148,9 @@ async function poCloseFetchOpenOrdersFromSap({ q = '', top = 250 } = {}) {
     );
   }
   orders.sort((a, b) => {
-    const ad = String(a.dueDate || a.postDate || '');
-    const bd = String(b.dueDate || b.postDate || '');
-    if (ad && bd && ad !== bd) return ad < bd ? -1 : 1;
+    const bd = String(b.postDate || b.startDate || b.dueDate || '');
+    const ad = String(a.postDate || a.startDate || a.dueDate || '');
+    if (ad !== bd) return bd.localeCompare(ad);
     return Number(b.docNum || 0) - Number(a.docNum || 0);
   });
   return orders.slice(0, Math.max(20, Math.min(500, Number(top || 250))));
@@ -17268,6 +17522,18 @@ app.get('/api/admin/production-close/history', verifyAdmin, async (req, res) => 
       LIMIT $1
     `, [limit]);
     return safeJson(res, 200, { ok: true, rows: rows.rows || [] });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+
+app.get('/api/admin/production-close/dashboard', verifyAdmin, async (req, res) => {
+  try {
+    const itemCode = String(req.query?.itemCode || '__ALL__').trim() || '__ALL__';
+    const q = String(req.query?.q || '').trim();
+    const dashboard = await poCloseBuildDashboard({ itemCode, q });
+    return safeJson(res, 200, { ok: true, ...dashboard });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
