@@ -6806,6 +6806,81 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
 }
 
 
+async function articlesFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 500 }) {
+  let rows = await fetchInvoiceRows({ from, to });
+  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
+
+  const map = new Map();
+  for (const r of rows) {
+    const itemCode = String(r.itemCode || "").trim();
+    const itemDesc = String(r.itemDesc || "").trim();
+    const key = itemCode || itemDesc;
+    if (!key) continue;
+
+    const cur = map.get(key) || {
+      itemCode,
+      itemDesc,
+      qty: 0,
+      dollars: 0,
+      grossProfit: 0,
+      invSet: new Set(),
+      customerSet: new Set(),
+      area: r.area,
+      grupo: r.grupo,
+      categoria: r.categoria || "Sin categoría",
+    };
+
+    cur.qty += Number(r.quantity || 0);
+    cur.dollars += Number(r.dollars || 0);
+    cur.grossProfit += Number(r.grossProfit || 0);
+    if (r.docType === "INV") cur.invSet.add(`${r.docType}:${r.docEntry}`);
+    if (r.cardCode) cur.customerSet.add(String(r.cardCode));
+    map.set(key, cur);
+  }
+
+  const categoriaLabel = categoria === "__ALL__"
+    ? "Todas las categorías"
+    : normalizeCustomerCategoryName(categoria);
+
+  return {
+    ok: true,
+    from,
+    to,
+    area,
+    grupo,
+    categoria,
+    categoriaLabel,
+    items: Array.from(map.values())
+      .map((x) => {
+        const dol = money2(x.dollars);
+        const gp = money2(x.grossProfit);
+        return {
+          itemCode: x.itemCode,
+          itemDesc: x.itemDesc,
+          qty: num(x.qty, 4),
+          dollars: dol,
+          grossProfit: gp,
+          grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
+          invoices: x.invSet.size,
+          customers: x.customerSet.size,
+          area: x.area,
+          grupo: x.grupo,
+          categoria: x.categoria,
+        };
+      })
+      .sort((a, b) => {
+        const byDol = Number(b.dollars || 0) - Number(a.dollars || 0);
+        if (byDol) return byDol;
+        const byQty = Number(b.qty || 0) - Number(a.qty || 0);
+        if (byQty) return byQty;
+        return String(a.itemCode || a.itemDesc || "").localeCompare(String(b.itemCode || b.itemDesc || ""));
+      })
+      .slice(0, Math.max(1, Math.min(2000, Number(limit || 500)))),
+  };
+}
+
+
+
 /* =========================================================
    ✅ IA (admin-clientes) — contexto rico para análisis mensual
 ========================================================= */
@@ -7781,6 +7856,27 @@ app.get("/api/admin/invoices/top-products", verifyAdmin, async (req, res) => {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
+
+app.get("/api/admin/invoices/articles", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
+    const to = isISO(req.query?.to) ? String(req.query.to) : today;
+    const area = String(req.query?.area || "__ALL__");
+    const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
+    const limit = Math.max(1, Math.min(2000, Number(req.query?.limit || 500)));
+
+    const data = await articlesFromDb({ from, to, area, grupo, categoria, limit });
+    return safeJson(res, 200, data);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+
 
 app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
   try {
