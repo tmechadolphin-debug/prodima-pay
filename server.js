@@ -6039,6 +6039,62 @@ async function ensureDb() {
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_type ON fact_invoice_lines(doc_type);`);
 
   await dbQuery(`
+    CREATE TABLE IF NOT EXISTS item_group_cache (
+      item_code TEXT PRIMARY KEY,
+      group_name TEXT NOT NULL DEFAULT '',
+      area TEXT NOT NULL DEFAULT '',
+      grupo TEXT NOT NULL DEFAULT '',
+      item_desc TEXT NOT NULL DEFAULT '',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS group_name TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS area TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS grupo TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS item_desc TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_item_group_area ON item_group_cache(area);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_item_group_grupo ON item_group_cache(grupo);`);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS customer_category_cache (
+      card_code TEXT PRIMARY KEY,
+      categoria TEXT NOT NULL DEFAULT 'Sin categoría',
+      group_code INT,
+      source TEXT NOT NULL DEFAULT 'db',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await dbQuery(`ALTER TABLE customer_category_cache ADD COLUMN IF NOT EXISTS categoria TEXT NOT NULL DEFAULT 'Sin categoría';`);
+  await dbQuery(`ALTER TABLE customer_category_cache ADD COLUMN IF NOT EXISTS group_code INT;`);
+  await dbQuery(`ALTER TABLE customer_category_cache ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'db';`);
+  await dbQuery(`ALTER TABLE customer_category_cache ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_customer_category_updated_at ON customer_category_cache(updated_at DESC);`);
+
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS quotes_cache (
+      id BIGSERIAL PRIMARY KEY,
+      doc_num BIGINT UNIQUE NOT NULL,
+      doc_entry BIGINT,
+      doc_date DATE,
+      doc_time INT,
+      card_code TEXT,
+      card_name TEXT,
+      usuario TEXT,
+      warehouse TEXT,
+      doc_total NUMERIC(19,6) DEFAULT 0,
+      delivered_total NUMERIC(19,6) DEFAULT 0,
+      status TEXT,
+      cancel_status TEXT,
+      comments TEXT,
+      group_name TEXT,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await dbQuery(`ALTER TABLE quotes_cache ADD COLUMN IF NOT EXISTS group_name TEXT;`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_quotes_cache_card_group ON quotes_cache(card_code, group_name);`);
+
+  await dbQuery(`
     CREATE TABLE IF NOT EXISTS sync_state (
       k TEXT PRIMARY KEY,
       v TEXT NOT NULL,
@@ -6280,6 +6336,53 @@ async function upsertLinesToDb(docType, sign, header, docFull) {
   return values.length;
 }
 
+async function syncCustomerCategoriesForInvoiceCustomers({ from, to, maxCustomers = 3000 }) {
+  if (!hasDb()) return 0;
+
+  const r = await dbQuery(
+    `
+    SELECT DISTINCT l.card_code
+    FROM fact_invoice_lines l
+    WHERE l.doc_date >= $1::date
+      AND l.doc_date <= $2::date
+      AND COALESCE(l.card_code,'') <> ''
+    LIMIT $3
+    `,
+    [from, to, Math.max(100, Math.min(12000, Number(maxCustomers || 3000)))]
+  );
+
+  const codes = (r.rows || []).map((x) => String(x.card_code || "").trim()).filter(Boolean);
+  let saved = 0;
+
+  for (let i = 0; i < codes.length; i++) {
+    const code = codes[i];
+    try {
+      let categoria = await getCustomerCategoryFromDb(code);
+
+      if (!categoria || categoria === "Sin categoría") {
+        const fromQuotes = await getCustomerCategoryFromQuotesDb(code);
+        if (fromQuotes && fromQuotes !== "Sin categoría") {
+          categoria = fromQuotes;
+          await setCustomerCategoryInDb(code, categoria, null, "quotes_cache");
+        }
+      }
+
+      if ((!categoria || categoria === "Sin categoría") && !missingSapEnv()) {
+        const fromSap = await getCustomerCategoryFromSap(code);
+        if (fromSap && fromSap !== "Sin categoría") {
+          categoria = fromSap;
+          saved++;
+        }
+      } else if (categoria && categoria !== "Sin categoría") {
+        saved++;
+      }
+    } catch {}
+    if ((i + 1) % 25 === 0) await sleep(15);
+  }
+
+  return saved;
+}
+
 async function syncRangeToDb({ from, to, maxDocs = 6000 }) {
   if (!hasDb()) throw new Error("DB no configurada (DATABASE_URL)");
 
@@ -6311,17 +6414,24 @@ async function syncRangeToDb({ from, to, maxDocs = 6000 }) {
     await sleep(20);
   }
 
+  const customerCategoriesSaved = await syncCustomerCategoriesForInvoiceCustomers({ from, to, maxCustomers: 4000 });
+
   await setState("last_sync_from", from);
   await setState("last_sync_to", to);
   await setState("last_sync_at", new Date().toISOString());
 
-  return { invoices: invHeaders.length, creditNotes: crnHeaders.length, lines: totalLines };
+  return {
+    invoices: invHeaders.length,
+    creditNotes: crnHeaders.length,
+    lines: totalLines,
+    customerCategoriesSaved,
+  };
 }
 
 /* =========================================================
    ✅ Base rows + filters
 ========================================================= */
-async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "", allowSapCategoryFallback = true }) {
+async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "", allowSapCategoryFallback = false }) {
   const params = [from, to];
   const where = [`l.doc_date >= $1::date`, `l.doc_date <= $2::date`];
 
@@ -6355,15 +6465,30 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "
       l.line_total,
       l.gross_profit,
       COALESCE(NULLIF(g.area,''), '') AS area_db,
-      COALESCE(NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo_raw
+      COALESCE(NULLIF(g.grupo,''), NULLIF(g.group_name,''), 'Sin grupo') AS grupo_raw,
+      COALESCE(
+        NULLIF(TRIM(cc.categoria),''),
+        qcat.categoria,
+        'Sin categoría'
+      ) AS categoria_db
     FROM fact_invoice_lines l
     LEFT JOIN item_group_cache g
       ON g.item_code = l.item_code
+    LEFT JOIN customer_category_cache cc
+      ON cc.card_code = l.card_code
+    LEFT JOIN LATERAL (
+      SELECT NULLIF(TRIM(qc.group_name),'') AS categoria
+      FROM quotes_cache qc
+      WHERE qc.card_code = l.card_code
+        AND NULLIF(TRIM(qc.group_name),'') IS NOT NULL
+      ORDER BY qc.doc_date DESC NULLS LAST, qc.updated_at DESC NULLS LAST, qc.doc_num DESC NULLS LAST
+      LIMIT 1
+    ) qcat ON TRUE
     WHERE ${where.join(" AND ")}
     ORDER BY l.doc_date DESC, l.doc_num DESC, l.line_num ASC
   `;
   const r = await dbQuery(sql, params);
-  const mapped = (r.rows || []).map((x) => {
+  let mapped = (r.rows || []).map((x) => {
     const grupo = canonicalInvoiceGroup(x.grupo_raw || "Sin grupo");
     const area = inferInvoiceArea(grupo, x.area_db || "");
     return {
@@ -6382,11 +6507,37 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "
       grossProfit: money2(x.gross_profit),
       grupo,
       area,
+      categoria: normalizeCustomerCategoryName(x.categoria_db),
     };
   });
-  return hydrateCustomerCategories(mapped, { allowSapFallback: allowSapCategoryFallback });
-}
 
+  const missingCodes = Array.from(
+    new Set(
+      mapped
+        .filter((x) => normalizeCustomerCategoryName(x.categoria) === "Sin categoría")
+        .map((x) => String(x.cardCode || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  if (allowSapCategoryFallback && missingCodes.length && !missingSapEnv()) {
+    const fetched = new Map();
+    for (const code of missingCodes) {
+      try {
+        const cat = await getCustomerCategoryFromSap(code);
+        fetched.set(code, normalizeCustomerCategoryName(cat));
+      } catch {
+        fetched.set(code, "Sin categoría");
+      }
+    }
+    mapped = mapped.map((row) => ({
+      ...row,
+      categoria: fetched.get(String(row.cardCode || "").trim()) || row.categoria || "Sin categoría",
+    }));
+  }
+
+  return mapped;
+}
 
 function isoDateOnly(v) {
   if (!v) return "";
@@ -6442,20 +6593,50 @@ function setFreshCategoryCacheValue(map, key, value) {
   map.set(key, { value: normalizeCustomerCategoryName(value), ts: Date.now() });
 }
 
-async function getCustomerCategoryFromDb(cardCode) {
+async function getCustomerCategoryFromQuotesDb(cardCode) {
   const code = String(cardCode || "").trim();
   if (!code || !hasDb()) return "";
+
   try {
     const r = await dbQuery(
-      `SELECT categoria
-         FROM customer_category_cache
+      `SELECT NULLIF(TRIM(group_name),'') AS categoria
+         FROM quotes_cache
         WHERE card_code = $1
+          AND NULLIF(TRIM(group_name),'') IS NOT NULL
+        ORDER BY doc_date DESC NULLS LAST, updated_at DESC NULLS LAST, doc_num DESC NULLS LAST
         LIMIT 1`,
       [code]
     );
     return normalizeCustomerCategoryName(r.rows?.[0]?.categoria || "");
   } catch {
     return "";
+  }
+}
+
+async function getCustomerCategoryFromDb(cardCode) {
+  const code = String(cardCode || "").trim();
+  if (!code || !hasDb()) return "";
+  try {
+    const r = await dbQuery(
+      `SELECT categoria, group_code
+         FROM customer_category_cache
+        WHERE card_code = $1
+        LIMIT 1`,
+      [code]
+    );
+    const cat = normalizeCustomerCategoryName(r.rows?.[0]?.categoria || "");
+    if (cat && cat !== "Sin categoría") return cat;
+
+    const fromQuotes = await getCustomerCategoryFromQuotesDb(code);
+    if (fromQuotes && fromQuotes !== "Sin categoría") {
+      await setCustomerCategoryInDb(code, fromQuotes, r.rows?.[0]?.group_code ?? null, "quotes_cache");
+      return fromQuotes;
+    }
+
+    return cat || "";
+  } catch {
+    const fromQuotes = await getCustomerCategoryFromQuotesDb(code);
+    return fromQuotes || "";
   }
 }
 
@@ -6623,7 +6804,7 @@ function availableCategoriesFromRows(rows = []) {
 /* =========================================================
    ✅ Dashboard from DB (neto)
 ========================================================= */
-async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", q = "", allowSapCategoryFallback = true }) {
+async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", q = "", allowSapCategoryFallback = false }) {
   const baseRows = await fetchInvoiceRows({ from, to, q, allowSapCategoryFallback });
   const rowsForCategories = applyAreaGroupFilters(baseRows, { area, grupo, categoria: "__ALL__" });
   const rows = applyAreaGroupFilters(rowsForCategories, { categoria });
@@ -6761,7 +6942,7 @@ async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo 
 /* =========================================================
    ✅ Details + Top products
 ========================================================= */
-async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", allowSapCategoryFallback = true }) {
+async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", allowSapCategoryFallback = false }) {
   let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse, allowSapCategoryFallback });
   rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
 
@@ -6831,7 +7012,7 @@ async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", 
   return { ok: true, from, to, area, grupo, categoria, cardCode, warehouse, totals, invoices };
 }
 
-async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 10, allowSapCategoryFallback = true }) {
+async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 10, allowSapCategoryFallback = false }) {
   let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse, allowSapCategoryFallback });
   rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
 
@@ -6888,7 +7069,7 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
 
 
 
-async function articlesFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 500, allowSapCategoryFallback = true }) {
+async function articlesFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 500, allowSapCategoryFallback = false }) {
   let rows = await fetchInvoiceRows({ from, to, allowSapCategoryFallback });
   const rowsForCategories = applyAreaGroupFilters(rows, { area, grupo, categoria: "__ALL__" });
   rows = applyAreaGroupFilters(rowsForCategories, { categoria });
@@ -6944,7 +7125,7 @@ async function articlesFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", c
   };
 }
 
-async function articleDetailFromDb({ from, to, itemCode = "", itemDesc = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", allowSapCategoryFallback = true }) {
+async function articleDetailFromDb({ from, to, itemCode = "", itemDesc = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", allowSapCategoryFallback = false }) {
   let rows = await fetchInvoiceRows({ from, to, allowSapCategoryFallback });
   const rowsForCategories = applyAreaGroupFilters(rows, { area, grupo, categoria: "__ALL__" });
   rows = applyAreaGroupFilters(rowsForCategories, { categoria });
@@ -8056,7 +8237,7 @@ app.get("/api/admin/invoices/dashboard", verifyAdmin, async (req, res) => {
     const q = String(req.query?.q || "");
     const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q, allowSapCategoryFallback: !fast });
+    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q, allowSapCategoryFallback: false });
     data.lastSyncAt = await getState("last_sync_at");
     return safeJson(res, 200, data);
   } catch (e) {
@@ -8082,7 +8263,7 @@ app.get("/api/admin/invoices/details", verifyAdmin, async (req, res) => {
       return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
     }
 
-    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria, allowSapCategoryFallback: !fast });
+    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria, allowSapCategoryFallback: false });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -8104,7 +8285,7 @@ app.get("/api/admin/invoices/top-products", verifyAdmin, async (req, res) => {
     const limit = Math.max(1, Math.min(200, Number(req.query?.limit || 10)));
     const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    const data = await topProductsFromDb({ from, to, warehouse, cardCode, area, grupo, categoria, limit, allowSapCategoryFallback: !fast });
+    const data = await topProductsFromDb({ from, to, warehouse, cardCode, area, grupo, categoria, limit, allowSapCategoryFallback: false });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -8124,7 +8305,7 @@ app.get("/api/admin/invoices/articles", verifyAdmin, async (req, res) => {
     const limit = Math.max(1, Math.min(2000, Number(req.query?.limit || 500)));
     const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    const data = await articlesFromDb({ from, to, area, grupo, categoria, limit, allowSapCategoryFallback: !fast });
+    const data = await articlesFromDb({ from, to, area, grupo, categoria, limit, allowSapCategoryFallback: false });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -8149,7 +8330,7 @@ app.get("/api/admin/invoices/article-detail", verifyAdmin, async (req, res) => {
       return safeJson(res, 400, { ok: false, message: "itemCode o itemDesc requerido" });
     }
 
-    const data = await articleDetailFromDb({ from, to, itemCode, itemDesc, area, grupo, categoria, allowSapCategoryFallback: !fast });
+    const data = await articleDetailFromDb({ from, to, itemCode, itemDesc, area, grupo, categoria, allowSapCategoryFallback: false });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -8169,7 +8350,7 @@ app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
     const q = String(req.query?.q || "");
     const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q, allowSapCategoryFallback: !fast });
+    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q, allowSapCategoryFallback: false });
 
     const wb = XLSX.utils.book_new();
     const rows = (data.table || []).map((r) => ({
@@ -8213,7 +8394,7 @@ app.get("/api/admin/invoices/details/export", verifyAdmin, async (req, res) => {
       return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
     }
 
-    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria, allowSapCategoryFallback: !fast });
+    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria, allowSapCategoryFallback: false });
     const wb = XLSX.utils.book_new();
 
     const rows = [];
