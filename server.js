@@ -293,6 +293,17 @@ function norm(s) {
     .replace(/\s+/g, " ");
 }
 
+
+function normGroupName(s) {
+  return String(s || "")
+    .trim()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .toUpperCase();
+}
+globalThis.normGroupName = normGroupName;
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
