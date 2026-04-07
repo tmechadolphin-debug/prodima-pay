@@ -4342,7 +4342,7 @@ globalThis.GROUPS_RCI = new Set([
 /* =========================================================
    ✅ NORMALIZACIÓN + CANONICALIZACIÓN (+ HEURÍSTICA)
 ========================================================= */
-function normGroupName(s) {
+globalThis.normGroupName = function normGroupName(s) {
   return String(s || "")
     .trim()
     .normalize("NFD")
@@ -4355,11 +4355,11 @@ globalThis.GROUPS_CONS_N = new Set(Array.from(globalThis.GROUPS_CONS).map(normGr
 globalThis.GROUPS_RCI_N = new Set(Array.from(globalThis.GROUPS_RCI).map(normGroupName));
 
 const CANON_GROUP = new Map(
-  [...Array.from(globalThis.GROUPS_CONS), ...Array.from(globalThis.GROUPS_RCI)].map((g) => [normGroupName(g), g])
+  [...Array.from(globalThis.GROUPS_CONS), ...Array.from(globalThis.GROUPS_RCI)].map((g) => [globalThis.normGroupName(g), g])
 );
 
 function canonicalGroupName(groupName) {
-  const n = normGroupName(groupName);
+  const n = globalThis.normGroupName(groupName);
   return CANON_GROUP.get(n) || String(groupName || "").trim();
 }
 
@@ -4368,7 +4368,7 @@ function canonicalGroupName(groupName) {
  * (resuelve la mayoría de "Sin grupo" por abreviaturas/puntos/mayúsculas)
  */
 function guessCanonicalGroupName(groupNameRaw) {
-  const n = normGroupName(groupNameRaw);
+  const n = globalThis.normGroupName(groupNameRaw);
   if (!n) return "";
 
   // ---- RCI ----
@@ -4406,7 +4406,7 @@ globalThis.normalizeGrupoFinal = function normalizeGrupoFinal(grupoRaw) {
   if (!raw) return "Sin grupo";
 
   const canon = canonicalGroupName(raw);
-  const canonN = normGroupName(canon);
+  const canonN = globalThis.normGroupName(canon);
 
   // si ya está en tus listas, perfecto
   if (globalThis.GROUPS_CONS_N.has(canonN) || globalThis.GROUPS_RCI_N.has(canonN)) return canon;
@@ -4419,7 +4419,7 @@ globalThis.normalizeGrupoFinal = function normalizeGrupoFinal(grupoRaw) {
 }
 
 globalThis.inferAreaFromGroup = function inferAreaFromGroup(groupName) {
-  const g = normGroupName(groupName);
+  const g = globalThis.normGroupName(groupName);
   if (!g) return "";
   if (globalThis.GROUPS_CONS_N.has(g)) return "CONS";
   if (globalThis.GROUPS_RCI_N.has(g)) return "RCI";
@@ -5187,8 +5187,8 @@ async function dashboardFromDbEstratificacion({ from, to, area, grupo, q }) {
     universe = universe.filter((x) => String(x.area || "") === areaSel);
   }
   if (grupoSel !== "__ALL__") {
-    const gSelN = normGroupName(grupoSel);
-    universe = universe.filter((x) => normGroupName(x.grupo) === gSelN);
+    const gSelN = globalThis.normGroupName(grupoSel);
+    universe = universe.filter((x) => globalThis.normGroupName(x.grupo) === gSelN);
   }
 
   const abcRev = abcByMetric(universe, "revenue");
@@ -5219,8 +5219,8 @@ async function dashboardFromDbEstratificacion({ from, to, area, grupo, q }) {
   // filtros de vista (incluye q)
   if (areaSel !== "__ALL__") outItems = outItems.filter((x) => String(x.area || "") === areaSel);
   if (grupoSel !== "__ALL__") {
-    const gSelN = normGroupName(grupoSel);
-    outItems = outItems.filter((x) => normGroupName(x.grupo) === gSelN);
+    const gSelN = globalThis.normGroupName(grupoSel);
+    outItems = outItems.filter((x) => globalThis.normGroupName(x.grupo) === gSelN);
   }
   if (qq) {
     outItems = outItems.filter(
@@ -5360,8 +5360,8 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
 
     if (areaSel !== "__ALL__") rows = rows.filter((x) => String(x.area || "") === areaSel);
     if (grupoSel !== "__ALL__") {
-      const gSelN = normGroupName(grupoSel);
-      rows = rows.filter((x) => normGroupName(x.grupo) === gSelN);
+      const gSelN = globalThis.normGroupName(grupoSel);
+      rows = rows.filter((x) => globalThis.normGroupName(x.grupo) === gSelN);
     }
 
     return safeJson(res, 200, { ok: true, itemCode, from, to, rows });
@@ -6419,30 +6419,13 @@ function availableGroupsForArea(area) {
   return getAllowedGroupsByArea(area).slice().sort((a, b) => a.localeCompare(b));
 }
 
-
 const CUSTOMER_CATEGORY_CACHE = new Map();
 const CUSTOMER_CATEGORY_GROUP_CACHE = new Map();
 const CUSTOMER_CATEGORY_TTL_MS = 6 * 60 * 60 * 1000;
-const PRODUCT_GROUP_NAMES_FOR_CATEGORY_FILTER_N = new Set(
-  [...Array.from(globalThis.GROUPS_CONS || []), ...Array.from(globalThis.GROUPS_RCI || [])].map((x) => normGroupName(x))
-);
 
 function normalizeCustomerCategoryName(v) {
   const s = String(v || "").trim();
   return s || "Sin categoría";
-}
-
-function looksLikeItemGroupInsteadOfCustomerCategory(v) {
-  const s = normalizeCustomerCategoryName(v);
-  if (!s || s === "Sin categoría") return false;
-  return PRODUCT_GROUP_NAMES_FOR_CATEGORY_FILTER_N.has(normGroupName(s));
-}
-
-function sanitizeCustomerCategoryName(v) {
-  const s = normalizeCustomerCategoryName(v);
-  if (!s || s === "Sin categoría") return "";
-  if (looksLikeItemGroupInsteadOfCustomerCategory(s)) return "";
-  return s;
 }
 
 function getFreshCategoryCacheValue(map, key) {
@@ -6452,28 +6435,11 @@ function getFreshCategoryCacheValue(map, key) {
     map.delete(key);
     return "";
   }
-  return sanitizeCustomerCategoryName(hit.value);
+  return normalizeCustomerCategoryName(hit.value);
 }
 
 function setFreshCategoryCacheValue(map, key, value) {
-  const clean = sanitizeCustomerCategoryName(value);
-  if (!clean) return;
-  map.set(key, { value: clean, ts: Date.now() });
-}
-
-async function invalidateSuspiciousCustomerCategoryInDb(cardCode, categoria = "") {
-  const code = String(cardCode || "").trim();
-  if (!code || !hasDb()) return;
-  try {
-    await dbQuery(
-      `UPDATE customer_category_cache
-          SET categoria = 'Sin categoría',
-              source = 'invalidated_product_group',
-              updated_at = NOW()
-        WHERE card_code = $1`,
-      [code]
-    );
-  } catch {}
+  map.set(key, { value: normalizeCustomerCategoryName(value), ts: Date.now() });
 }
 
 async function getCustomerCategoryFromDb(cardCode) {
@@ -6481,19 +6447,13 @@ async function getCustomerCategoryFromDb(cardCode) {
   if (!code || !hasDb()) return "";
   try {
     const r = await dbQuery(
-      `SELECT categoria, group_code, source
+      `SELECT categoria
          FROM customer_category_cache
         WHERE card_code = $1
         LIMIT 1`,
       [code]
     );
-    const row = r.rows?.[0] || null;
-    const categoria = sanitizeCustomerCategoryName(row?.categoria || "");
-    if (categoria) return categoria;
-    if (row?.categoria && looksLikeItemGroupInsteadOfCustomerCategory(row.categoria)) {
-      await invalidateSuspiciousCustomerCategoryInDb(code, row.categoria);
-    }
-    return "";
+    return normalizeCustomerCategoryName(r.rows?.[0]?.categoria || "");
   } catch {
     return "";
   }
@@ -6502,8 +6462,7 @@ async function getCustomerCategoryFromDb(cardCode) {
 async function setCustomerCategoryInDb(cardCode, categoria, groupCode = null, source = "sap") {
   const code = String(cardCode || "").trim();
   if (!code || !hasDb()) return;
-  const clean = sanitizeCustomerCategoryName(categoria);
-  const cat = clean || "Sin categoría";
+  const cat = normalizeCustomerCategoryName(categoria);
   try {
     await dbQuery(
       `INSERT INTO customer_category_cache(card_code, categoria, group_code, source, updated_at)
@@ -6518,106 +6477,84 @@ async function setCustomerCategoryInDb(cardCode, categoria, groupCode = null, so
   } catch {}
 }
 
-async function getBusinessPartnerGroupNameFromSap(groupCode) {
-  const codeNum = Number(groupCode);
-  if (!Number.isFinite(codeNum)) return "";
-
-  const cached = getFreshCategoryCacheValue(CUSTOMER_CATEGORY_GROUP_CACHE, codeNum);
-  if (cached) return cached;
-
-  for (const path of [
-    `/BusinessPartnerGroups(${codeNum})?$select=Code,Name,GroupName`,
-    `/BusinessPartnerGroups(${codeNum})`,
-    `/BusinessPartnerGroups?$select=Code,Name,GroupName&$filter=Code eq ${codeNum}`,
-    `/BusinessPartnerGroups?$filter=Code eq ${codeNum}`,
-  ]) {
-    try {
-      const resp = await slFetch(path, { timeoutMs: 30000 });
-      const row = Array.isArray(resp?.value) ? (resp.value[0] || null) : resp;
-      const groupName = sanitizeCustomerCategoryName(
-        row?.GroupName || row?.groupName || row?.Name || row?.name || ""
-      );
-      if (groupName) {
-        setFreshCategoryCacheValue(CUSTOMER_CATEGORY_GROUP_CACHE, codeNum, groupName);
-        return groupName;
-      }
-    } catch {}
-  }
-
-  return "";
-}
-
-async function getCustomerCategoryFromSap(cardCode, { forceRefresh = false } = {}) {
+async function getCustomerCategoryFromSap(cardCode) {
   const code = String(cardCode || "").trim();
   if (!code) return "Sin categoría";
 
-  if (!forceRefresh) {
-    const cached = getFreshCategoryCacheValue(CUSTOMER_CATEGORY_CACHE, code);
-    if (cached) return cached;
+  const cached = getFreshCategoryCacheValue(CUSTOMER_CATEGORY_CACHE, code);
+  if (cached) return cached;
 
-    const dbCached = await getCustomerCategoryFromDb(code);
-    if (dbCached) {
-      setFreshCategoryCacheValue(CUSTOMER_CATEGORY_CACHE, code, dbCached);
-      return dbCached;
-    }
-  } else {
-    CUSTOMER_CATEGORY_CACHE.delete(code);
+  const dbCached = await getCustomerCategoryFromDb(code);
+  if (dbCached) {
+    setFreshCategoryCacheValue(CUSTOMER_CATEGORY_CACHE, code, dbCached);
+    return dbCached;
   }
 
   if (missingSapEnv()) {
+    setFreshCategoryCacheValue(CUSTOMER_CATEGORY_CACHE, code, "Sin categoría");
     return "Sin categoría";
   }
 
-  let bp = null;
-  const encoded = encodeURIComponent(code);
   const safe = code.replace(/'/g, "''");
+  let bp = null;
 
   for (const path of [
-    `/BusinessPartners('${encoded}')?$select=CardCode,CardName,GroupCode,GroupNum`,
-    `/BusinessPartners?$select=CardCode,CardName,GroupCode,GroupNum&$filter=CardCode eq '${safe}'&$top=1`,
-    `/BusinessPartners('${encoded}')`,
-    `/BusinessPartners?$filter=CardCode eq '${safe}'&$top=1`,
+    `/BusinessPartners('${safe}')?$select=CardCode,CardName,GroupCode,GroupName`,
+    `/BusinessPartners('${safe}')?$select=CardCode,CardName,GroupCode`,
+    `/BusinessPartners('${safe}')`,
   ]) {
     try {
-      const resp = await slFetch(path, { timeoutMs: 30000 });
-      bp = Array.isArray(resp?.value) ? (resp.value[0] || null) : resp;
+      bp = await slFetch(path, { timeoutMs: 30000 });
       if (bp) break;
     } catch {}
   }
 
+  let category = normalizeCustomerCategoryName(
+    bp?.GroupName ||
+    bp?.groupName ||
+    bp?.CustomerGroup ||
+    bp?.customerGroup ||
+    bp?.Category ||
+    bp?.category ||
+    ""
+  );
+
   const rawGroupCode = bp?.GroupCode ?? bp?.groupCode ?? bp?.GroupNum ?? bp?.groupNum ?? null;
   const groupCode = Number(rawGroupCode);
 
-  let category = "";
-  if (Number.isFinite(groupCode)) {
-    category = await getBusinessPartnerGroupNameFromSap(groupCode);
+  if (category === "Sin categoría" && Number.isFinite(groupCode)) {
+    const cachedGroup = getFreshCategoryCacheValue(CUSTOMER_CATEGORY_GROUP_CACHE, groupCode);
+    if (cachedGroup) {
+      category = cachedGroup;
+    } else {
+      for (const path of [
+        `/BusinessPartnerGroups(${groupCode})?$select=Code,Name,GroupName`,
+        `/BusinessPartnerGroups(${groupCode})`,
+        `/BusinessPartnerGroups?$select=Code,Name,GroupName&$filter=Code eq ${groupCode}`,
+        `/BusinessPartnerGroups?$filter=Code eq ${groupCode}`,
+      ]) {
+        try {
+          const resp = await slFetch(path, { timeoutMs: 30000 });
+          const row = Array.isArray(resp?.value) ? (resp.value[0] || null) : resp;
+          const groupName = normalizeCustomerCategoryName(
+            row?.GroupName || row?.groupName || row?.Name || row?.name || ""
+          );
+          if (groupName !== "Sin categoría") {
+            category = groupName;
+            setFreshCategoryCacheValue(CUSTOMER_CATEGORY_GROUP_CACHE, groupCode, groupName);
+            break;
+          }
+        } catch {}
+      }
+    }
   }
 
-  if (!category) {
-    category = sanitizeCustomerCategoryName(
-      bp?.CustomerGroup ||
-      bp?.customerGroup ||
-      bp?.GroupName ||
-      bp?.groupName ||
-      bp?.Category ||
-      bp?.category ||
-      ""
-    );
-  }
-
-  if (!category && Number.isFinite(groupCode)) {
+  if (category === "Sin categoría" && Number.isFinite(groupCode)) {
     category = `Grupo ${groupCode}`;
   }
 
-  if (!category) category = "Sin categoría";
-
-  if (category !== "Sin categoría") {
-    setFreshCategoryCacheValue(CUSTOMER_CATEGORY_CACHE, code, category);
-  } else {
-    CUSTOMER_CATEGORY_CACHE.delete(code);
-  }
-
-  await setCustomerCategoryInDb(code, category, groupCode, "sap_customer_group");
+  setFreshCategoryCacheValue(CUSTOMER_CATEGORY_CACHE, code, category);
+  await setCustomerCategoryInDb(code, category, groupCode, "sap");
   return category;
 }
 
@@ -8397,65 +8334,6 @@ app.post("/api/admin/invoices/ai-chat", verifyAdmin, async (req, res) => {
   }
 });
 
-
-
-app.post("/api/admin/invoices/customer-categories/backfill", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-    if (missingSapEnv()) return safeJson(res, 500, { ok: false, message: "SAP env incompleto" });
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = isISO(req.query?.from || req.body?.from) ? String(req.query?.from || req.body?.from) : addDaysISO(today, -90);
-    const to = isISO(req.query?.to || req.body?.to) ? String(req.query?.to || req.body?.to) : today;
-    const limit = Math.max(50, Math.min(10000, Number(req.query?.limit || req.body?.limit || 3000)));
-
-    const r = await dbQuery(
-      `
-      SELECT DISTINCT card_code
-      FROM fact_invoice_lines
-      WHERE doc_date >= $1::date AND doc_date <= $2::date
-        AND COALESCE(card_code,'') <> ''
-      ORDER BY card_code
-      LIMIT $3
-      `,
-      [from, to, limit]
-    );
-
-    const codes = (r.rows || []).map((x) => String(x.card_code || "").trim()).filter(Boolean);
-    let updated = 0;
-    let failed = 0;
-    let i = 0;
-    const concurrency = Math.max(1, Math.min(6, codes.length || 1));
-
-    async function worker() {
-      while (i < codes.length) {
-        const idx = i++;
-        const code = codes[idx];
-        try {
-          const categoria = await getCustomerCategoryFromSap(code, { forceRefresh: true });
-          if (categoria && categoria !== "Sin categoría") updated++;
-        } catch {
-          failed++;
-        }
-      }
-    }
-
-    await Promise.all(Array.from({ length: concurrency }, worker));
-
-    return safeJson(res, 200, {
-      ok: true,
-      from,
-      to,
-      limit,
-      scanned: codes.length,
-      updated,
-      failed,
-      message: "Backfill de categorías de clientes completado",
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
-  }
-});
 
 app.post("/api/admin/invoices/sync", verifyAdmin, async (req, res) => {
   try {
@@ -14575,8 +14453,8 @@ async function estratLoadItemDocsForAi({ itemCode, from, to, area = "__ALL__", g
 
   if (area !== "__ALL__") rows = rows.filter((x) => String(x.area || "") === area);
   if (grupo !== "__ALL__") {
-    const gSelN = normGroupName(grupo);
-    rows = rows.filter((x) => normGroupName(x.grupo) === gSelN);
+    const gSelN = globalThis.normGroupName(grupo);
+    rows = rows.filter((x) => globalThis.normGroupName(x.grupo) === gSelN);
   }
   return rows;
 }
