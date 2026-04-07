@@ -2589,6 +2589,7 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
 
     const fromQ = String(req.query?.from || "").slice(0, 10);
     const toQ = String(req.query?.to || "").slice(0, 10);
+    const user = String(req.query?.user || "").trim().toLowerCase();
     const onlyCreated = String(req.query?.onlyCreated || "0") === "1";
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
@@ -2598,6 +2599,7 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
     const createdJoin = onlyCreated
       ? `AND LOWER(COALESCE(q.usuario,'')) IN (SELECT LOWER(username) FROM app_users WHERE is_active=TRUE)`
       : ``;
+    const userJoin = user ? `AND LOWER(COALESCE(q.usuario,'')) LIKE '%${String(user).replace(/'/g, "''")}%'` : ``;
     const notCancelledJoin = `AND NOT (LOWER(COALESCE(q.cancel_status,'')) LIKE '%csyes%' OR LOWER(COALESCE(q.cancel_status,'')) LIKE '%cancel%' OR LOWER(COALESCE(q.status,'')) LIKE '%cancel%')`;
 
     const totalsR = await dbQuery(
@@ -2608,6 +2610,7 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
        ${createdJoin}
+       ${userJoin}
        ${notCancelledJoin}`,
       [from, to]
     );
@@ -2623,6 +2626,7 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
        ${createdJoin}
+       ${userJoin}
        ${notCancelledJoin}
        GROUP BY 1
        ORDER BY cotizado DESC
@@ -2639,6 +2643,7 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
        ${createdJoin}
+       ${userJoin}
        ${notCancelledJoin}
        GROUP BY 1
        ORDER BY cotizado DESC
@@ -2654,6 +2659,7 @@ app.get("/api/admin/quotes/dashboard-db", verifyAdmin, async (req, res) => {
        FROM quotes_cache q
        WHERE q.doc_date BETWEEN $1 AND $2
        ${createdJoin}
+       ${userJoin}
        ${notCancelledJoin}
        GROUP BY 1
        ORDER BY cotizado DESC
@@ -4649,6 +4655,87 @@ async function getState(k) {
   return r.rows?.[0]?.v || "";
 }
 
+const SELLER_CACHE = new Map();
+const SELLER_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+function sellerLabelFromCode(code) {
+  const n = Number(code);
+  return Number.isFinite(n) && n > -1 ? `Vendedor ${n}` : "Sin vendedor";
+}
+
+function getFreshSellerCache(code) {
+  const key = String(code ?? "").trim();
+  if (!key) return "";
+  const hit = SELLER_CACHE.get(key);
+  if (!hit) return "";
+  if (Date.now() - Number(hit.ts || 0) > SELLER_CACHE_TTL_MS) {
+    SELLER_CACHE.delete(key);
+    return "";
+  }
+  return String(hit.name || "").trim();
+}
+
+function setFreshSellerCache(code, name) {
+  const key = String(code ?? "").trim();
+  const clean = String(name || "").trim();
+  if (!key || !clean) return;
+  SELLER_CACHE.set(key, { name: clean, ts: Date.now() });
+}
+
+async function getSalesPersonNameFromSap(code) {
+  const codeNum = Number(code);
+  if (!Number.isFinite(codeNum) || codeNum < 0) return "";
+  const cached = getFreshSellerCache(codeNum);
+  if (cached) return cached;
+  if (missingSapEnv()) return sellerLabelFromCode(codeNum);
+
+  const tries = [
+    `/SalesPersons(${codeNum})?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name`,
+    `/SalesPersons(${codeNum})`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SalesEmployeeCode eq ${codeNum}`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SlpCode eq ${codeNum}`,
+    `/SalesPersons?$filter=SalesEmployeeCode eq ${codeNum}`,
+    `/SalesPersons?$filter=SlpCode eq ${codeNum}`
+  ];
+
+  for (const path of tries) {
+    try {
+      const resp = await slFetch(path, { timeoutMs: 30000 });
+      const row = Array.isArray(resp?.value) ? (resp.value[0] || null) : resp;
+      const name = String(
+        row?.SalesEmployeeName ||
+        row?.SlpName ||
+        row?.SalesPersonName ||
+        row?.Name ||
+        ""
+      ).trim();
+      if (name) {
+        setFreshSellerCache(codeNum, name);
+        return name;
+      }
+    } catch {}
+  }
+
+  const fallback = sellerLabelFromCode(codeNum);
+  setFreshSellerCache(codeNum, fallback);
+  return fallback;
+}
+
+function normalizeSellerLabel(v) {
+  return String(v || "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ");
+}
+
+function sellerDisplayName(row = {}) {
+  const name = String(row?.sellerName || "").trim();
+  if (name) return name;
+  const code = String(row?.sellerCode ?? "").trim();
+  return code ? sellerLabelFromCode(code) : "Sin vendedor";
+}
+
+function availableSellersFromRows(rows = []) {
+  return Array.from(new Set((Array.isArray(rows) ? rows : []).map((r) => sellerDisplayName(r)).filter(Boolean))).sort((a, b) => a.localeCompare(b));
+}
+
 /* =========================================================
    ✅ SAP Service Layer (cookie + timeout)
 ========================================================= */
@@ -6032,6 +6119,8 @@ async function ensureDb() {
       warehouse_code TEXT    NOT NULL,
       item_code      TEXT    NOT NULL DEFAULT '',
       item_desc      TEXT    NOT NULL DEFAULT '',
+      seller_code    INTEGER,
+      seller_name    TEXT    NOT NULL DEFAULT '',
       quantity       NUMERIC(18,4) NOT NULL DEFAULT 0,
       line_total     NUMERIC(18,2) NOT NULL DEFAULT 0,
       gross_profit   NUMERIC(18,2) NOT NULL DEFAULT 0,
@@ -6043,6 +6132,8 @@ async function ensureDb() {
   await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS doc_type TEXT NOT NULL DEFAULT 'INV';`);
   await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS item_code TEXT NOT NULL DEFAULT '';`);
   await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS item_desc TEXT NOT NULL DEFAULT '';`);
+  await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS seller_code INTEGER;`);
+  await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS seller_name TEXT NOT NULL DEFAULT '';`);
   await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS quantity NUMERIC(18,4) NOT NULL DEFAULT 0;`);
   await dbQuery(`ALTER TABLE fact_invoice_lines ADD COLUMN IF NOT EXISTS gross_profit NUMERIC(18,2) NOT NULL DEFAULT 0;`);
 
@@ -6051,6 +6142,8 @@ async function ensureDb() {
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_card ON fact_invoice_lines(card_code);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_item ON fact_invoice_lines(item_code);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_type ON fact_invoice_lines(doc_type);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_seller_name ON fact_invoice_lines(seller_name);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_seller_code ON fact_invoice_lines(seller_code);`);
 
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS sync_state (
@@ -6073,6 +6166,87 @@ async function getState(k) {
   if (!hasDb()) return "";
   const r = await dbQuery(`SELECT v FROM sync_state WHERE k=$1 LIMIT 1`, [k]);
   return r.rows?.[0]?.v || "";
+}
+
+const SELLER_CACHE = new Map();
+const SELLER_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+function sellerLabelFromCode(code) {
+  const n = Number(code);
+  return Number.isFinite(n) && n > -1 ? `Vendedor ${n}` : "Sin vendedor";
+}
+
+function getFreshSellerCache(code) {
+  const key = String(code ?? "").trim();
+  if (!key) return "";
+  const hit = SELLER_CACHE.get(key);
+  if (!hit) return "";
+  if (Date.now() - Number(hit.ts || 0) > SELLER_CACHE_TTL_MS) {
+    SELLER_CACHE.delete(key);
+    return "";
+  }
+  return String(hit.name || "").trim();
+}
+
+function setFreshSellerCache(code, name) {
+  const key = String(code ?? "").trim();
+  const clean = String(name || "").trim();
+  if (!key || !clean) return;
+  SELLER_CACHE.set(key, { name: clean, ts: Date.now() });
+}
+
+async function getSalesPersonNameFromSap(code) {
+  const codeNum = Number(code);
+  if (!Number.isFinite(codeNum) || codeNum < 0) return "";
+  const cached = getFreshSellerCache(codeNum);
+  if (cached) return cached;
+  if (missingSapEnv()) return sellerLabelFromCode(codeNum);
+
+  const tries = [
+    `/SalesPersons(${codeNum})?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name`,
+    `/SalesPersons(${codeNum})`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SalesEmployeeCode eq ${codeNum}`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SlpCode eq ${codeNum}`,
+    `/SalesPersons?$filter=SalesEmployeeCode eq ${codeNum}`,
+    `/SalesPersons?$filter=SlpCode eq ${codeNum}`
+  ];
+
+  for (const path of tries) {
+    try {
+      const resp = await slFetch(path, { timeoutMs: 30000 });
+      const row = Array.isArray(resp?.value) ? (resp.value[0] || null) : resp;
+      const name = String(
+        row?.SalesEmployeeName ||
+        row?.SlpName ||
+        row?.SalesPersonName ||
+        row?.Name ||
+        ""
+      ).trim();
+      if (name) {
+        setFreshSellerCache(codeNum, name);
+        return name;
+      }
+    } catch {}
+  }
+
+  const fallback = sellerLabelFromCode(codeNum);
+  setFreshSellerCache(codeNum, fallback);
+  return fallback;
+}
+
+function normalizeSellerLabel(v) {
+  return String(v || "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ");
+}
+
+function sellerDisplayName(row = {}) {
+  const name = String(row?.sellerName || "").trim();
+  if (name) return name;
+  const code = String(row?.sellerCode ?? "").trim();
+  return code ? sellerLabelFromCode(code) : "Sin vendedor";
+}
+
+function availableSellersFromRows(rows = []) {
+  return Array.from(new Set((Array.isArray(rows) ? rows : []).map((r) => sellerDisplayName(r)).filter(Boolean))).sort((a, b) => a.localeCompare(b));
 }
 
 /* =========================================================
@@ -6230,6 +6404,10 @@ async function upsertLinesToDb(docType, sign, header, docFull) {
   const docDate = String(header.DocDate || "").slice(0, 10);
   const cardCode = String(header.CardCode || "");
   const cardName = String(header.CardName || "");
+  const rawSellerCode = docFull?.SalesPersonCode ?? docFull?.SalesEmployeeCode ?? header?.SalesPersonCode ?? header?.SalesEmployeeCode ?? null;
+  const sellerCodeNum = Number(rawSellerCode);
+  const sellerCode = Number.isFinite(sellerCodeNum) && sellerCodeNum >= 0 ? sellerCodeNum : null;
+  const sellerName = sellerCode !== null ? await getSalesPersonNameFromSap(sellerCode) : "";
 
   const values = [];
   const params = [];
@@ -6257,12 +6435,14 @@ async function upsertLinesToDb(docType, sign, header, docFull) {
       wh,
       itemCode,
       itemDesc,
+      sellerCode,
+      sellerName,
       qty,
       lt,
       gp
     );
     values.push(
-      `($${p++},$${p++},$${p++},$${p++},$${p++}::date,$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`
+      `($${p++},$${p++},$${p++},$${p++},$${p++}::date,$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++})`
     );
   }
 
@@ -6271,7 +6451,7 @@ async function upsertLinesToDb(docType, sign, header, docFull) {
   await dbQuery(
     `
     INSERT INTO fact_invoice_lines
-      (doc_entry,line_num,doc_type,doc_num,doc_date,card_code,card_name,warehouse_code,item_code,item_desc,quantity,line_total,gross_profit)
+      (doc_entry,line_num,doc_type,doc_num,doc_date,card_code,card_name,warehouse_code,item_code,item_desc,seller_code,seller_name,quantity,line_total,gross_profit)
     VALUES ${values.join(",")}
     ON CONFLICT (doc_entry,line_num)
     DO UPDATE SET
@@ -6283,6 +6463,8 @@ async function upsertLinesToDb(docType, sign, header, docFull) {
       warehouse_code=EXCLUDED.warehouse_code,
       item_code=EXCLUDED.item_code,
       item_desc=EXCLUDED.item_desc,
+      seller_code=EXCLUDED.seller_code,
+      seller_name=EXCLUDED.seller_name,
       quantity=EXCLUDED.quantity,
       line_total=EXCLUDED.line_total,
       gross_profit=EXCLUDED.gross_profit,
@@ -6342,7 +6524,7 @@ async function syncRangeToDb({ from, to, maxDocs = 6000 }) {
 /* =========================================================
    ✅ Base rows + filters
 ========================================================= */
-async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "", allowSapCategoryFallback = true }) {
+async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", seller = "", q = "", allowSapCategoryFallback = true }) {
   const params = [from, to];
   const where = [`l.doc_date >= $1::date`, `l.doc_date <= $2::date`];
 
@@ -6353,6 +6535,12 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "
   if (warehouse) {
     params.push(warehouse);
     where.push(`l.warehouse_code = $${params.length}`);
+  }
+  const sellerSel = String(seller || "").trim();
+  if (sellerSel && sellerSel !== "__ALL__") {
+    params.push(`%${sellerSel}%`);
+    const idx = params.length;
+    where.push(`(COALESCE(l.seller_name,'') ILIKE $${idx} OR COALESCE(l.seller_code::text,'') ILIKE $${idx})`);
   }
   if (q) {
     params.push(`%${String(q).trim()}%`);
@@ -6398,6 +6586,8 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "
       warehouse: String(x.warehouse_code || ""),
       itemCode: String(x.item_code || ""),
       itemDesc: String(x.item_desc || ""),
+      sellerCode: Number.isFinite(Number(x.seller_code)) ? Number(x.seller_code) : null,
+      sellerName: String(x.seller_name || "").trim(),
       quantity: estratAiNum(x.quantity, 4),
       dollars: money2(x.line_total),
       grossProfit: money2(x.gross_profit),
@@ -6416,10 +6606,11 @@ function isoDateOnly(v) {
   return String(v).slice(0, 10);
 }
 
-function applyAreaGroupFilters(rows, { area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__" } = {}) {
+function applyAreaGroupFilters(rows, { area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__" } = {}) {
   const areaSel = String(area || "__ALL__").trim().toUpperCase();
   const grupoSel = String(grupo || "__ALL__").trim();
   const categoriaSel = String(categoria || "__ALL__").trim();
+  const sellerSel = String(seller || "__ALL__").trim();
   let out = Array.isArray(rows) ? rows.slice() : [];
 
   if (areaSel !== "__ALL__") {
@@ -6432,6 +6623,14 @@ function applyAreaGroupFilters(rows, { area = "__ALL__", grupo = "__ALL__", cate
   if (categoriaSel !== "__ALL__") {
     const cSel = normalizeCustomerCategoryName(categoriaSel);
     out = out.filter((r) => normalizeCustomerCategoryName(r.categoria) === cSel);
+  }
+  if (sellerSel !== "__ALL__") {
+    const sSel = normalizeSellerLabel(sellerSel);
+    out = out.filter((r) => {
+      const label = normalizeSellerLabel(sellerDisplayName(r));
+      const code = normalizeSellerLabel(String(r.sellerCode ?? ""));
+      return label === sSel || code === sSel;
+    });
   }
   return out;
 }
@@ -6742,10 +6941,11 @@ function availableCategoriesFromRows(rows = []) {
 /* =========================================================
    ✅ Dashboard from DB (neto)
 ========================================================= */
-async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", q = "", allowSapCategoryFallback = true }) {
-  const baseRows = await fetchInvoiceRows({ from, to, q, allowSapCategoryFallback });
+async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__", q = "", allowSapCategoryFallback = true }) {
+  const baseRows = await fetchInvoiceRows({ from, to, seller, q, allowSapCategoryFallback });
   const rowsForCategories = applyAreaGroupFilters(baseRows, { area, grupo, categoria: "__ALL__" });
-  const rows = applyAreaGroupFilters(rowsForCategories, { categoria });
+  const rows = applyAreaGroupFilters(rowsForCategories, { categoria, seller });
+  const rowsForSellers = applyAreaGroupFilters(baseRows, { area, grupo, categoria });
 
   const docInvSet = new Set();
   const docCrnSet = new Set();
@@ -6860,9 +7060,11 @@ async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo 
     area,
     grupo,
     categoria,
+    seller,
     availableAreas: ["__ALL__", "CONS", "RCI"],
     availableGroups: availableGroupsForArea(area),
     availableCategories: availableCategoriesFromRows(rowsForCategories),
+    availableSellers: availableSellersFromRows(rowsForSellers),
     totals: {
       invoices: docInvSet.size,
       creditNotes: docCrnSet.size,
@@ -6880,9 +7082,9 @@ async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo 
 /* =========================================================
    ✅ Details + Top products
 ========================================================= */
-async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", allowSapCategoryFallback = true }) {
-  let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse, allowSapCategoryFallback });
-  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
+async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__", allowSapCategoryFallback = true }) {
+  let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse, seller, allowSapCategoryFallback });
+  rows = applyAreaGroupFilters(rows, { area, grupo, categoria, seller });
 
   const map = new Map();
   for (const r of rows) {
@@ -6950,9 +7152,9 @@ async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", 
   return { ok: true, from, to, area, grupo, categoria, cardCode, warehouse, totals, invoices };
 }
 
-async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 10, allowSapCategoryFallback = true }) {
-  let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse, allowSapCategoryFallback });
-  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
+async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__", limit = 10, allowSapCategoryFallback = true }) {
+  let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse, seller, allowSapCategoryFallback });
+  rows = applyAreaGroupFilters(rows, { area, grupo, categoria, seller });
 
   const map = new Map();
   for (const r of rows) {
@@ -7007,10 +7209,10 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
 
 
 
-async function articlesFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 500, allowSapCategoryFallback = true }) {
-  let rows = await fetchInvoiceRows({ from, to, allowSapCategoryFallback });
+async function articlesFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__", limit = 500, allowSapCategoryFallback = true }) {
+  let rows = await fetchInvoiceRows({ from, to, seller, allowSapCategoryFallback });
   const rowsForCategories = applyAreaGroupFilters(rows, { area, grupo, categoria: "__ALL__" });
-  rows = applyAreaGroupFilters(rowsForCategories, { categoria });
+  rows = applyAreaGroupFilters(rowsForCategories, { categoria, seller });
 
   const map = new Map();
   for (const r of rows) {
@@ -7063,10 +7265,10 @@ async function articlesFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", c
   };
 }
 
-async function articleDetailFromDb({ from, to, itemCode = "", itemDesc = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", allowSapCategoryFallback = true }) {
-  let rows = await fetchInvoiceRows({ from, to, allowSapCategoryFallback });
+async function articleDetailFromDb({ from, to, itemCode = "", itemDesc = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__", allowSapCategoryFallback = true }) {
+  let rows = await fetchInvoiceRows({ from, to, seller, allowSapCategoryFallback });
   const rowsForCategories = applyAreaGroupFilters(rows, { area, grupo, categoria: "__ALL__" });
-  rows = applyAreaGroupFilters(rowsForCategories, { categoria });
+  rows = applyAreaGroupFilters(rowsForCategories, { categoria, seller });
 
   const codeSel = String(itemCode || "").trim();
   const descSel = String(itemDesc || "").trim().toLowerCase();
@@ -8172,10 +8374,11 @@ app.get("/api/admin/invoices/dashboard", verifyAdmin, async (req, res) => {
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
+    const seller = String(req.query?.seller || "__ALL__");
     const q = String(req.query?.q || "");
     const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q, allowSapCategoryFallback: !fast });
+    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, seller, q, allowSapCategoryFallback: !fast });
     data.lastSyncAt = await getState("last_sync_at");
     return safeJson(res, 200, data);
   } catch (e) {
@@ -8195,13 +8398,14 @@ app.get("/api/admin/invoices/details", verifyAdmin, async (req, res) => {
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
+    const seller = String(req.query?.seller || "__ALL__");
     const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    if (!cardCode || !warehouse) {
-      return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
+    if (!cardCode) {
+      return safeJson(res, 400, { ok: false, message: "cardCode requerido" });
     }
 
-    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria, allowSapCategoryFallback: !fast });
+    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria, seller, allowSapCategoryFallback: !fast });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -8220,10 +8424,11 @@ app.get("/api/admin/invoices/top-products", verifyAdmin, async (req, res) => {
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
+    const seller = String(req.query?.seller || "__ALL__");
     const limit = Math.max(1, Math.min(200, Number(req.query?.limit || 10)));
     const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    const data = await topProductsFromDb({ from, to, warehouse, cardCode, area, grupo, categoria, limit, allowSapCategoryFallback: !fast });
+    const data = await topProductsFromDb({ from, to, warehouse, cardCode, area, grupo, categoria, seller, limit, allowSapCategoryFallback: !fast });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -8240,10 +8445,11 @@ app.get("/api/admin/invoices/articles", verifyAdmin, async (req, res) => {
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
+    const seller = String(req.query?.seller || "__ALL__");
     const limit = Math.max(1, Math.min(2000, Number(req.query?.limit || 500)));
     const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    const data = await articlesFromDb({ from, to, area, grupo, categoria, limit, allowSapCategoryFallback: !fast });
+    const data = await articlesFromDb({ from, to, area, grupo, categoria, seller, limit, allowSapCategoryFallback: !fast });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -8260,6 +8466,7 @@ app.get("/api/admin/invoices/article-detail", verifyAdmin, async (req, res) => {
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
+    const seller = String(req.query?.seller || "__ALL__");
     const itemCode = String(req.query?.itemCode || "").trim();
     const itemDesc = String(req.query?.itemDesc || "").trim();
     const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
@@ -8268,7 +8475,7 @@ app.get("/api/admin/invoices/article-detail", verifyAdmin, async (req, res) => {
       return safeJson(res, 400, { ok: false, message: "itemCode o itemDesc requerido" });
     }
 
-    const data = await articleDetailFromDb({ from, to, itemCode, itemDesc, area, grupo, categoria, allowSapCategoryFallback: !fast });
+    const data = await articleDetailFromDb({ from, to, itemCode, itemDesc, area, grupo, categoria, seller, allowSapCategoryFallback: !fast });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -8285,10 +8492,11 @@ app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
+    const seller = String(req.query?.seller || "__ALL__");
     const q = String(req.query?.q || "");
     const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q, allowSapCategoryFallback: !fast });
+    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, seller, q, allowSapCategoryFallback: !fast });
 
     const wb = XLSX.utils.book_new();
     const rows = (data.table || []).map((r) => ({
@@ -8326,13 +8534,14 @@ app.get("/api/admin/invoices/details/export", verifyAdmin, async (req, res) => {
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
+    const seller = String(req.query?.seller || "__ALL__");
     const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    if (!cardCode || !warehouse) {
-      return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
+    if (!cardCode) {
+      return safeJson(res, 400, { ok: false, message: "cardCode requerido" });
     }
 
-    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria, allowSapCategoryFallback: !fast });
+    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria, seller, allowSapCategoryFallback: !fast });
     const wb = XLSX.utils.book_new();
 
     const rows = [];
