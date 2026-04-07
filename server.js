@@ -6414,7 +6414,8 @@ async function upsertLinesToDb(docType, sign, header, docFull) {
     null;
   const sellerCodeNum = Number(rawSellerCode);
   const sellerCode = Number.isFinite(sellerCodeNum) && sellerCodeNum >= 0 ? sellerCodeNum : null;
-  const sellerName = sellerCode !== null ? await getSalesPersonNameFromSap(sellerCode) : "";
+  const sellerNameRaw = sellerCode !== null ? await getSalesPersonNameFromSap(sellerCode).catch(() => "") : "";
+  const sellerName = sellerNameRaw || (sellerCode !== null ? sellerLabelFromCode(sellerCode) : "");
 
   const values = [];
   const params = [];
@@ -6567,6 +6568,8 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", selle
       l.warehouse_code,
       l.item_code,
       l.item_desc,
+      l.seller_code,
+      l.seller_name,
       l.quantity,
       l.line_total,
       l.gross_profit,
@@ -8505,7 +8508,24 @@ app.get("/api/admin/invoices/sellers", verifyAdmin, async (req, res) => {
 
     const rows = await fetchInvoiceRows({ from, to, allowSapCategoryFallback: !fast });
     const filtered = applyAreaGroupFilters(rows, { area, grupo, categoria, seller: "__ALL__" });
-    const sellers = availableSellersFromRows(filtered);
+    let sellers = availableSellersFromRows(filtered);
+
+    if (!sellers.length || (sellers.length === 1 && normalizeSellerLabel(sellers[0]) === "sin vendedor")) {
+      const params = [from, to];
+      const where = [`doc_date >= $1::date`, `doc_date <= $2::date`, `COALESCE(seller_code::text,'') <> '' OR COALESCE(seller_name,'') <> ''`];
+      const q = await dbQuery(
+        `SELECT DISTINCT seller_code, seller_name
+           FROM fact_invoice_lines
+          WHERE ${where.join(" AND ")}
+          ORDER BY seller_name ASC NULLS LAST, seller_code ASC NULLS LAST`,
+        params
+      );
+      const fallbackRows = (q.rows || []).map((r) => ({
+        sellerCode: Number.isFinite(Number(r.seller_code)) ? Number(r.seller_code) : null,
+        sellerName: String(r.seller_name || "").trim(),
+      }));
+      sellers = availableSellersFromRows(fallbackRows);
+    }
 
     return safeJson(res, 200, { ok: true, from, to, area, grupo, categoria, sellers });
   } catch (e) {
