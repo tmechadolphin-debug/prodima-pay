@@ -293,34 +293,6 @@ function norm(s) {
     .replace(/\s+/g, " ");
 }
 
-
-
-
-function ensureNormGroupNameHelper() {
-  if (typeof globalThis.normGroupName !== "function") {
-    globalThis.normGroupName = function normGroupNameSafe(s) {
-      return String(s || "")
-        .trim()
-        .normalize("NFD")
-        .replace(/[\u0300-\u036f]/g, "")
-        .replace(/\s+/g, " ")
-        .toUpperCase();
-    };
-  }
-  return globalThis.normGroupName;
-}
-const normGroupName = ensureNormGroupNameHelper();
-
-function normGroupName(s) {
-  return String(s || "")
-    .trim()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ")
-    .toUpperCase();
-}
-globalThis.normGroupName = normGroupName;
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -4370,7 +4342,7 @@ globalThis.GROUPS_RCI = new Set([
 /* =========================================================
    ✅ NORMALIZACIÓN + CANONICALIZACIÓN (+ HEURÍSTICA)
 ========================================================= */
-function normGroupName(s) {
+function adminNormGroupName(s) {
   return String(s || "")
     .trim()
     .normalize("NFD")
@@ -4379,15 +4351,15 @@ function normGroupName(s) {
     .toUpperCase();
 }
 
-globalThis.GROUPS_CONS_N = new Set(Array.from(globalThis.GROUPS_CONS).map(normGroupName));
-globalThis.GROUPS_RCI_N = new Set(Array.from(globalThis.GROUPS_RCI).map(normGroupName));
+globalThis.GROUPS_CONS_N = new Set(Array.from(globalThis.GROUPS_CONS).map(adminNormGroupName));
+globalThis.GROUPS_RCI_N = new Set(Array.from(globalThis.GROUPS_RCI).map(adminNormGroupName));
 
 const CANON_GROUP = new Map(
-  [...Array.from(globalThis.GROUPS_CONS), ...Array.from(globalThis.GROUPS_RCI)].map((g) => [globalThis.normGroupName(g), g])
+  [...Array.from(globalThis.GROUPS_CONS), ...Array.from(globalThis.GROUPS_RCI)].map((g) => [adminNormGroupName(g), g])
 );
 
 function canonicalGroupName(groupName) {
-  const n = globalThis.normGroupName(groupName);
+  const n = adminNormGroupName(groupName);
   return CANON_GROUP.get(n) || String(groupName || "").trim();
 }
 
@@ -4396,7 +4368,7 @@ function canonicalGroupName(groupName) {
  * (resuelve la mayoría de "Sin grupo" por abreviaturas/puntos/mayúsculas)
  */
 function guessCanonicalGroupName(groupNameRaw) {
-  const n = globalThis.normGroupName(groupNameRaw);
+  const n = adminNormGroupName(groupNameRaw);
   if (!n) return "";
 
   // ---- RCI ----
@@ -4434,7 +4406,7 @@ globalThis.normalizeGrupoFinal = function normalizeGrupoFinal(grupoRaw) {
   if (!raw) return "Sin grupo";
 
   const canon = canonicalGroupName(raw);
-  const canonN = globalThis.normGroupName(canon);
+  const canonN = adminNormGroupName(canon);
 
   // si ya está en tus listas, perfecto
   if (globalThis.GROUPS_CONS_N.has(canonN) || globalThis.GROUPS_RCI_N.has(canonN)) return canon;
@@ -4447,7 +4419,7 @@ globalThis.normalizeGrupoFinal = function normalizeGrupoFinal(grupoRaw) {
 }
 
 globalThis.inferAreaFromGroup = function inferAreaFromGroup(groupName) {
-  const g = globalThis.normGroupName(groupName);
+  const g = adminNormGroupName(groupName);
   if (!g) return "";
   if (globalThis.GROUPS_CONS_N.has(g)) return "CONS";
   if (globalThis.GROUPS_RCI_N.has(g)) return "RCI";
@@ -5215,8 +5187,8 @@ async function dashboardFromDbEstratificacion({ from, to, area, grupo, q }) {
     universe = universe.filter((x) => String(x.area || "") === areaSel);
   }
   if (grupoSel !== "__ALL__") {
-    const gSelN = globalThis.normGroupName(grupoSel);
-    universe = universe.filter((x) => globalThis.normGroupName(x.grupo) === gSelN);
+    const gSelN = adminNormGroupName(grupoSel);
+    universe = universe.filter((x) => adminNormGroupName(x.grupo) === gSelN);
   }
 
   const abcRev = abcByMetric(universe, "revenue");
@@ -5247,8 +5219,8 @@ async function dashboardFromDbEstratificacion({ from, to, area, grupo, q }) {
   // filtros de vista (incluye q)
   if (areaSel !== "__ALL__") outItems = outItems.filter((x) => String(x.area || "") === areaSel);
   if (grupoSel !== "__ALL__") {
-    const gSelN = globalThis.normGroupName(grupoSel);
-    outItems = outItems.filter((x) => globalThis.normGroupName(x.grupo) === gSelN);
+    const gSelN = adminNormGroupName(grupoSel);
+    outItems = outItems.filter((x) => adminNormGroupName(x.grupo) === gSelN);
   }
   if (qq) {
     outItems = outItems.filter(
@@ -5388,8 +5360,8 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
 
     if (areaSel !== "__ALL__") rows = rows.filter((x) => String(x.area || "") === areaSel);
     if (grupoSel !== "__ALL__") {
-      const gSelN = globalThis.normGroupName(grupoSel);
-      rows = rows.filter((x) => globalThis.normGroupName(x.grupo) === gSelN);
+      const gSelN = adminNormGroupName(grupoSel);
+      rows = rows.filter((x) => adminNormGroupName(x.grupo) === gSelN);
     }
 
     return safeJson(res, 200, { ok: true, itemCode, from, to, rows });
@@ -6318,13 +6290,10 @@ async function syncRangeToDb({ from, to, maxDocs = 6000 }) {
   const crnHeaders = await scanDocHeaders("CreditNotes", { f: from, t: to, maxDocs });
 
   let totalLines = 0;
-  const touchedCardCodes = new Set();
 
   for (const h of invHeaders) {
     try {
       const full = await getSapDocument("Invoices", h.DocEntry);
-      const cardCode = String(full?.CardCode || h?.CardCode || "").trim();
-      if (cardCode) touchedCardCodes.add(cardCode);
       totalLines += await upsertLinesToDb("INV", +1, h, full);
     } catch (e) {
       console.error("Invoice sync error", h?.DocEntry, e?.message || String(e));
@@ -6335,8 +6304,6 @@ async function syncRangeToDb({ from, to, maxDocs = 6000 }) {
   for (const h of crnHeaders) {
     try {
       const full = await getSapDocument("CreditNotes", h.DocEntry);
-      const cardCode = String(full?.CardCode || h?.CardCode || "").trim();
-      if (cardCode) touchedCardCodes.add(cardCode);
       totalLines += await upsertLinesToDb("CRN", -1, h, full);
     } catch (e) {
       console.error("Credit note sync error", h?.DocEntry, e?.message || String(e));
@@ -6344,19 +6311,11 @@ async function syncRangeToDb({ from, to, maxDocs = 6000 }) {
     await sleep(20);
   }
 
-  const categorySync = await syncCustomerCategoriesForCardCodes(Array.from(touchedCardCodes));
-
   await setState("last_sync_from", from);
   await setState("last_sync_to", to);
   await setState("last_sync_at", new Date().toISOString());
 
-  return {
-    invoices: invHeaders.length,
-    creditNotes: crnHeaders.length,
-    lines: totalLines,
-    categoryCards: touchedCardCodes.size,
-    categorySynced: Number(categorySync?.synced || 0),
-  };
+  return { invoices: invHeaders.length, creditNotes: crnHeaders.length, lines: totalLines };
 }
 
 /* =========================================================
@@ -6464,37 +6423,9 @@ const CUSTOMER_CATEGORY_CACHE = new Map();
 const CUSTOMER_CATEGORY_GROUP_CACHE = new Map();
 const CUSTOMER_CATEGORY_TTL_MS = 6 * 60 * 60 * 1000;
 
-function isKnownInvoiceProductGroupName(v) {
-  const n = globalThis.normGroupName(v);
-  if (!n) return false;
-  return globalThis.GROUPS_CONS_N.has(n) || globalThis.GROUPS_RCI_N.has(n);
-}
-
-function isSuspiciousCustomerCategoryValue(v, { source = "", groupCode = null } = {}) {
+function normalizeCustomerCategoryName(v) {
   const s = String(v || "").trim();
-  if (!s) return true;
-
-  const n = globalThis.normGroupName(s);
-  if (!n || n === "SIN CATEGORIA" || n === "SIN CATEGORÍA" || n === "SIN GRUPO") return true;
-
-  const src = String(source || "").trim().toLowerCase();
-  const hasGroupCode = Number.isFinite(Number(groupCode));
-
-  // Si vino de SAP y trae groupCode, lo respetamos.
-  if ((src === "sap" || src === "sap_cache") && hasGroupCode) return false;
-
-  // Si coincide con los grupos de artículos, casi seguro es un valor mal cacheado
-  // en categoría de cliente. En ese caso se fuerza refresh desde SAP y luego queda en DB.
-  if (isKnownInvoiceProductGroupName(s)) return true;
-
-  return false;
-}
-
-function normalizeCustomerCategoryName(v, opts = {}) {
-  const s = String(v || "").trim();
-  if (!s) return "Sin categoría";
-  if (!opts?.allowSuspicious && isSuspiciousCustomerCategoryValue(s, opts)) return "Sin categoría";
-  return s;
+  return s || "Sin categoría";
 }
 
 function getFreshCategoryCacheValue(map, key) {
@@ -6516,24 +6447,13 @@ async function getCustomerCategoryFromDb(cardCode) {
   if (!code || !hasDb()) return "";
   try {
     const r = await dbQuery(
-      `SELECT categoria, group_code, source
+      `SELECT categoria
          FROM customer_category_cache
         WHERE card_code = $1
         LIMIT 1`,
       [code]
     );
-    const row = r.rows?.[0] || null;
-    if (!row) return "";
-
-    const categoria = String(row?.categoria || "").trim();
-    const groupCode = row?.group_code ?? null;
-    const source = String(row?.source || "").trim();
-
-    if (isSuspiciousCustomerCategoryValue(categoria, { source, groupCode })) {
-      return "";
-    }
-
-    return normalizeCustomerCategoryName(categoria, { allowSuspicious: true, source, groupCode });
+    return normalizeCustomerCategoryName(r.rows?.[0]?.categoria || "");
   } catch {
     return "";
   }
@@ -6555,72 +6475,6 @@ async function setCustomerCategoryInDb(cardCode, categoria, groupCode = null, so
       [code, cat, Number.isFinite(Number(groupCode)) ? Number(groupCode) : null, String(source || "sap")]
     );
   } catch {}
-}
-
-async function syncCustomerCategoriesForCardCodes(cardCodes = [], { forceRefresh = false } = {}) {
-  const codes = Array.from(new Set((Array.isArray(cardCodes) ? cardCodes : [])
-    .map((x) => String(x || "").trim())
-    .filter(Boolean)));
-
-  if (!codes.length || !hasDb() || missingSapEnv()) {
-    return { requested: codes.length, synced: 0, skipped: codes.length };
-  }
-
-  let existingMap = new Map();
-  try {
-    const r = await dbQuery(
-      `SELECT card_code, categoria, group_code, source
-         FROM customer_category_cache
-        WHERE card_code = ANY($1::text[])`,
-      [codes]
-    );
-    existingMap = new Map((r.rows || []).map((row) => [String(row.card_code || "").trim(), row]));
-  } catch {}
-
-  const pending = [];
-  for (const code of codes) {
-    if (forceRefresh) {
-      pending.push(code);
-      continue;
-    }
-
-    const row = existingMap.get(code);
-    if (!row) {
-      pending.push(code);
-      continue;
-    }
-
-    const categoria = String(row?.categoria || "").trim();
-    const groupCode = row?.group_code ?? null;
-    const source = String(row?.source || "").trim();
-    if (isSuspiciousCustomerCategoryValue(categoria, { source, groupCode })) {
-      pending.push(code);
-      continue;
-    }
-  }
-
-  if (!pending.length) {
-    return { requested: codes.length, synced: 0, skipped: codes.length };
-  }
-
-  let synced = 0;
-  let cursor = 0;
-  const concurrency = Math.max(1, Math.min(6, pending.length));
-
-  async function worker() {
-    while (cursor < pending.length) {
-      const idx = cursor++;
-      const code = pending[idx];
-      try {
-        const cat = await getCustomerCategoryFromSap(code);
-        if (cat && cat !== "Sin categoría") synced++;
-      } catch {}
-      await sleep(10);
-    }
-  }
-
-  await Promise.all(Array.from({ length: concurrency }, worker));
-  return { requested: codes.length, synced, skipped: Math.max(0, codes.length - synced) };
 }
 
 async function getCustomerCategoryFromSap(cardCode) {
@@ -8514,35 +8368,6 @@ app.post("/api/admin/invoices/sync/recent", verifyAdmin, async (req, res) => {
 
     const out = await syncRangeToDb({ from, to: today, maxDocs });
     return safeJson(res, 200, { ok: true, ...out, from, to: today, days, maxDocs });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message });
-  }
-});
-
-app.post("/api/admin/invoices/categories/backfill", verifyAdmin, async (req, res) => {
-  try {
-    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
-    if (missingSapEnv()) return safeJson(res, 500, { ok: false, message: "SAP env incompleto" });
-
-    const fromQ = String(req.query?.from || req.body?.from || "").slice(0, 10);
-    const toQ = String(req.query?.to || req.body?.to || "").slice(0, 10);
-    const forceRefresh = ["1", "true", "yes", "si"].includes(String(req.query?.force || req.body?.force || "0").toLowerCase());
-
-    const today = getDateISOInOffset(TZ_OFFSET_MIN);
-    const from = isISO(fromQ) ? fromQ : addDaysISO(today, -60);
-    const to = isISO(toQ) ? toQ : today;
-
-    const r = await dbQuery(
-      `SELECT DISTINCT card_code
-         FROM fact_invoice_lines
-        WHERE doc_date BETWEEN $1::date AND $2::date
-          AND COALESCE(card_code,'') <> ''`,
-      [from, to]
-    );
-    const cardCodes = (r.rows || []).map((row) => String(row.card_code || "").trim()).filter(Boolean);
-    const out = await syncCustomerCategoriesForCardCodes(cardCodes, { forceRefresh });
-
-    return safeJson(res, 200, { ok: true, from, to, cards: cardCodes.length, ...out });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
@@ -14628,8 +14453,8 @@ async function estratLoadItemDocsForAi({ itemCode, from, to, area = "__ALL__", g
 
   if (area !== "__ALL__") rows = rows.filter((x) => String(x.area || "") === area);
   if (grupo !== "__ALL__") {
-    const gSelN = globalThis.normGroupName(grupo);
-    rows = rows.filter((x) => globalThis.normGroupName(x.grupo) === gSelN);
+    const gSelN = adminNormGroupName(grupo);
+    rows = rows.filter((x) => adminNormGroupName(x.grupo) === gSelN);
   }
   return rows;
 }
