@@ -4597,6 +4597,22 @@ async function ensureDb() {
   await dbQuery(`ALTER TABLE item_group_cache ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();`);
 
   await dbQuery(`
+    CREATE TABLE IF NOT EXISTS customer_category_cache (
+      card_code TEXT PRIMARY KEY,
+      categoria TEXT NOT NULL DEFAULT 'Sin categoría',
+      group_code INT,
+      source TEXT NOT NULL DEFAULT 'db',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await dbQuery(`ALTER TABLE customer_category_cache ADD COLUMN IF NOT EXISTS categoria TEXT NOT NULL DEFAULT 'Sin categoría';`);
+  await dbQuery(`ALTER TABLE customer_category_cache ADD COLUMN IF NOT EXISTS group_code INT;`);
+  await dbQuery(`ALTER TABLE customer_category_cache ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'db';`);
+  await dbQuery(`ALTER TABLE customer_category_cache ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_customer_category_updated_at ON customer_category_cache(updated_at DESC);`);
+
+  await dbQuery(`
     CREATE TABLE IF NOT EXISTS sync_state (
       k TEXT PRIMARY KEY,
       v TEXT NOT NULL,
@@ -6305,7 +6321,7 @@ async function syncRangeToDb({ from, to, maxDocs = 6000 }) {
 /* =========================================================
    ✅ Base rows + filters
 ========================================================= */
-async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "" }) {
+async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "", allowSapCategoryFallback = true }) {
   const params = [from, to];
   const where = [`l.doc_date >= $1::date`, `l.doc_date <= $2::date`];
 
@@ -6368,7 +6384,7 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", q = "
       area,
     };
   });
-  return hydrateCustomerCategories(mapped);
+  return hydrateCustomerCategories(mapped, { allowSapFallback: allowSapCategoryFallback });
 }
 
 
@@ -6426,12 +6442,54 @@ function setFreshCategoryCacheValue(map, key, value) {
   map.set(key, { value: normalizeCustomerCategoryName(value), ts: Date.now() });
 }
 
+async function getCustomerCategoryFromDb(cardCode) {
+  const code = String(cardCode || "").trim();
+  if (!code || !hasDb()) return "";
+  try {
+    const r = await dbQuery(
+      `SELECT categoria
+         FROM customer_category_cache
+        WHERE card_code = $1
+        LIMIT 1`,
+      [code]
+    );
+    return normalizeCustomerCategoryName(r.rows?.[0]?.categoria || "");
+  } catch {
+    return "";
+  }
+}
+
+async function setCustomerCategoryInDb(cardCode, categoria, groupCode = null, source = "sap") {
+  const code = String(cardCode || "").trim();
+  if (!code || !hasDb()) return;
+  const cat = normalizeCustomerCategoryName(categoria);
+  try {
+    await dbQuery(
+      `INSERT INTO customer_category_cache(card_code, categoria, group_code, source, updated_at)
+       VALUES($1,$2,$3,$4,NOW())
+       ON CONFLICT(card_code) DO UPDATE SET
+         categoria = EXCLUDED.categoria,
+         group_code = COALESCE(EXCLUDED.group_code, customer_category_cache.group_code),
+         source = EXCLUDED.source,
+         updated_at = NOW()`,
+      [code, cat, Number.isFinite(Number(groupCode)) ? Number(groupCode) : null, String(source || "sap")]
+    );
+  } catch {}
+}
+
 async function getCustomerCategoryFromSap(cardCode) {
   const code = String(cardCode || "").trim();
   if (!code) return "Sin categoría";
 
   const cached = getFreshCategoryCacheValue(CUSTOMER_CATEGORY_CACHE, code);
   if (cached) return cached;
+
+  const dbCached = await getCustomerCategoryFromDb(code);
+  if (dbCached) {
+    setFreshCategoryCacheValue(CUSTOMER_CATEGORY_CACHE, code, dbCached);
+    return dbCached;
+  }
+
   if (missingSapEnv()) {
     setFreshCategoryCacheValue(CUSTOMER_CATEGORY_CACHE, code, "Sin categoría");
     return "Sin categoría";
@@ -6496,10 +6554,11 @@ async function getCustomerCategoryFromSap(cardCode) {
   }
 
   setFreshCategoryCacheValue(CUSTOMER_CATEGORY_CACHE, code, category);
+  await setCustomerCategoryInDb(code, category, groupCode, "sap");
   return category;
 }
 
-async function hydrateCustomerCategories(rows = []) {
+async function hydrateCustomerCategories(rows = [], { allowSapFallback = true } = {}) {
   const base = Array.isArray(rows) ? rows : [];
   if (!base.length) return base;
 
@@ -6507,22 +6566,43 @@ async function hydrateCustomerCategories(rows = []) {
   if (!codes.length) return base.map((r) => ({ ...r, categoria: normalizeCustomerCategoryName(r?.categoria) }));
 
   const categoryByCode = new Map();
-  let cursor = 0;
-  const concurrency = Math.max(1, Math.min(8, codes.length));
+  const missing = [];
 
-  async function worker() {
-    while (cursor < codes.length) {
-      const idx = cursor++;
-      const code = codes[idx];
-      try {
-        categoryByCode.set(code, await getCustomerCategoryFromSap(code));
-      } catch {
-        categoryByCode.set(code, "Sin categoría");
-      }
+  for (const code of codes) {
+    const mem = getFreshCategoryCacheValue(CUSTOMER_CATEGORY_CACHE, code);
+    if (mem) {
+      categoryByCode.set(code, mem);
+      continue;
     }
+    const dbVal = await getCustomerCategoryFromDb(code);
+    if (dbVal) {
+      categoryByCode.set(code, dbVal);
+      setFreshCategoryCacheValue(CUSTOMER_CATEGORY_CACHE, code, dbVal);
+      continue;
+    }
+    missing.push(code);
   }
 
-  await Promise.all(Array.from({ length: concurrency }, worker));
+  if (allowSapFallback && missing.length && !missingSapEnv()) {
+    let cursor = 0;
+    const concurrency = Math.max(1, Math.min(6, missing.length));
+
+    async function worker() {
+      while (cursor < missing.length) {
+        const idx = cursor++;
+        const code = missing[idx];
+        try {
+          categoryByCode.set(code, await getCustomerCategoryFromSap(code));
+        } catch {
+          categoryByCode.set(code, "Sin categoría");
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: concurrency }, worker));
+  } else {
+    for (const code of missing) categoryByCode.set(code, "Sin categoría");
+  }
 
   return base.map((r) => ({
     ...r,
@@ -6543,8 +6623,8 @@ function availableCategoriesFromRows(rows = []) {
 /* =========================================================
    ✅ Dashboard from DB (neto)
 ========================================================= */
-async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", q = "" }) {
-  const baseRows = await fetchInvoiceRows({ from, to, q });
+async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", q = "", allowSapCategoryFallback = true }) {
+  const baseRows = await fetchInvoiceRows({ from, to, q, allowSapCategoryFallback });
   const rowsForCategories = applyAreaGroupFilters(baseRows, { area, grupo, categoria: "__ALL__" });
   const rows = applyAreaGroupFilters(rowsForCategories, { categoria });
 
@@ -6681,8 +6761,8 @@ async function dashboardFromDbAdminClientes({ from, to, area = "__ALL__", grupo 
 /* =========================================================
    ✅ Details + Top products
 ========================================================= */
-async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__" }) {
-  let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse });
+async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", allowSapCategoryFallback = true }) {
+  let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse, allowSapCategoryFallback });
   rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
 
   const map = new Map();
@@ -6751,8 +6831,8 @@ async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", 
   return { ok: true, from, to, area, grupo, categoria, cardCode, warehouse, totals, invoices };
 }
 
-async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 10 }) {
-  let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse });
+async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 10, allowSapCategoryFallback = true }) {
+  let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse, allowSapCategoryFallback });
   rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
 
   const map = new Map();
@@ -6806,69 +6886,50 @@ async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area
 }
 
 
-async function articlesFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 500 }) {
-  let rows = await fetchInvoiceRows({ from, to });
-  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
+
+
+async function articlesFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", limit = 500, allowSapCategoryFallback = true }) {
+  let rows = await fetchInvoiceRows({ from, to, allowSapCategoryFallback });
+  const rowsForCategories = applyAreaGroupFilters(rows, { area, grupo, categoria: "__ALL__" });
+  rows = applyAreaGroupFilters(rowsForCategories, { categoria });
 
   const map = new Map();
   for (const r of rows) {
-    const itemCode = String(r.itemCode || "").trim();
-    const itemDesc = String(r.itemDesc || "").trim();
-    const key = itemCode || itemDesc;
-    if (!key) continue;
-
+    if (!r.itemCode && !r.itemDesc) continue;
+    const key = String(r.itemCode || "").trim() || `DESC::${String(r.itemDesc || "").trim()}`;
     const cur = map.get(key) || {
-      itemCode,
-      itemDesc,
+      itemCode: r.itemCode,
+      itemDesc: r.itemDesc,
       qty: 0,
       dollars: 0,
       grossProfit: 0,
       invSet: new Set(),
       customerSet: new Set(),
-      area: r.area,
-      grupo: r.grupo,
-      categoria: r.categoria || "Sin categoría",
     };
-
     cur.qty += Number(r.quantity || 0);
     cur.dollars += Number(r.dollars || 0);
     cur.grossProfit += Number(r.grossProfit || 0);
     if (r.docType === "INV") cur.invSet.add(`${r.docType}:${r.docEntry}`);
-    if (r.cardCode) cur.customerSet.add(String(r.cardCode));
+    if (String(r.cardCode || "").trim()) cur.customerSet.add(String(r.cardCode || "").trim());
     map.set(key, cur);
   }
 
-  const categoriaLabel = categoria === "__ALL__"
-    ? "Todas las categorías"
-    : normalizeCustomerCategoryName(categoria);
-
-  const allItems = Array.from(map.values())
+  const items = Array.from(map.values())
     .map((x) => {
-      const dol = money2(x.dollars);
+      const dollars = money2(x.dollars);
       const gp = money2(x.grossProfit);
       return {
         itemCode: x.itemCode,
         itemDesc: x.itemDesc,
         qty: num(x.qty, 4),
-        dollars: dol,
+        dollars,
         grossProfit: gp,
-        grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
+        grossPct: dollars !== 0 ? num((gp / dollars) * 100, 2) : 0,
         invoices: x.invSet.size,
         customers: x.customerSet.size,
-        area: x.area,
-        grupo: x.grupo,
-        categoria: x.categoria,
       };
     })
-    .sort((a, b) => {
-      const byDol = Number(b.dollars || 0) - Number(a.dollars || 0);
-      if (byDol) return byDol;
-      const byQty = Number(b.qty || 0) - Number(a.qty || 0);
-      if (byQty) return byQty;
-      return String(a.itemCode || a.itemDesc || "").localeCompare(String(b.itemCode || b.itemDesc || ""));
-    });
-
-  const safeLimit = Math.max(1, Math.min(10000, Number(limit || 500)));
+    .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0));
 
   return {
     ok: true,
@@ -6877,37 +6938,32 @@ async function articlesFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", c
     area,
     grupo,
     categoria,
-    categoriaLabel,
-    totalItems: allItems.length,
-    shownItems: Math.min(allItems.length, safeLimit),
-    items: allItems.slice(0, safeLimit),
+    categoriaLabel: categoria === "__ALL__" ? "Todas las categorías" : categoria,
+    totalItems: items.length,
+    items: items.slice(0, Math.max(1, Math.min(2000, Number(limit || 500)))),
   };
 }
 
-function articleRowMatches(r, { itemCode = "", itemDesc = "" } = {}) {
-  const codeSel = String(itemCode || "").trim().toLowerCase();
+async function articleDetailFromDb({ from, to, itemCode = "", itemDesc = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", allowSapCategoryFallback = true }) {
+  let rows = await fetchInvoiceRows({ from, to, allowSapCategoryFallback });
+  const rowsForCategories = applyAreaGroupFilters(rows, { area, grupo, categoria: "__ALL__" });
+  rows = applyAreaGroupFilters(rowsForCategories, { categoria });
+
+  const codeSel = String(itemCode || "").trim();
   const descSel = String(itemDesc || "").trim().toLowerCase();
+  rows = rows.filter((r) => {
+    const codeOk = codeSel ? String(r.itemCode || "").trim() === codeSel : false;
+    const descOk = !codeSel && descSel ? String(r.itemDesc || "").trim().toLowerCase() === descSel : false;
+    return codeOk || descOk;
+  });
 
-  const codeRow = String(r?.itemCode || "").trim().toLowerCase();
-  const descRow = String(r?.itemDesc || "").trim().toLowerCase();
-
-  if (codeSel && codeRow === codeSel) return true;
-  if (!codeSel && descSel && descRow === descSel) return true;
-  if (codeSel && !codeRow && descSel && descRow === descSel) return true;
-  return false;
-}
-
-async function articleDetailFromDb({ from, to, itemCode = "", itemDesc = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__" }) {
-  const safeItemCode = String(itemCode || "").trim();
-  const safeItemDesc = String(itemDesc || "").trim();
-
-  if (!safeItemCode && !safeItemDesc) {
+  if (!rows.length) {
     return {
       ok: true,
       from,
       to,
-      itemCode: "",
-      itemDesc: "",
+      itemCode: codeSel,
+      itemDesc: itemDesc || "",
       totals: { qty: 0, dollars: 0, grossProfit: 0, grossPct: 0, invoices: 0, customers: 0 },
       byMonth: [],
       customers: [],
@@ -6916,34 +6972,23 @@ async function articleDetailFromDb({ from, to, itemCode = "", itemDesc = "", are
     };
   }
 
-  let rows = await fetchInvoiceRows({ from, to });
-  rows = applyAreaGroupFilters(rows, { area, grupo, categoria });
-  rows = rows.filter((r) => articleRowMatches(r, { itemCode: safeItemCode, itemDesc: safeItemDesc }));
+  const itemCodeOut = String(rows[0]?.itemCode || codeSel || "");
+  const itemDescOut = String(rows[0]?.itemDesc || itemDesc || "");
 
-  const monthMap = new Map();
-  const customerMap = new Map();
-  const whMap = new Map();
-  const invMap = new Map();
-  const invoiceSet = new Set();
+  const totals = { qty: 0, dollars: 0, grossProfit: 0 };
+  const invSet = new Set();
   const customerSet = new Set();
-
-  let resolvedCode = safeItemCode;
-  let resolvedDesc = safeItemDesc;
-  let totalQty = 0;
-  let totalDol = 0;
-  let totalGP = 0;
+  const monthMap = new Map();
+  const custMap = new Map();
+  const whMap = new Map();
+  const docMap = new Map();
 
   for (const r of rows) {
-    resolvedCode = resolvedCode || String(r.itemCode || "").trim();
-    resolvedDesc = resolvedDesc || String(r.itemDesc || "").trim();
-
-    const docKey = `${r.docType}:${r.docEntry}`;
-    invoiceSet.add(docKey);
-    if (r.cardCode) customerSet.add(String(r.cardCode).trim());
-
-    totalQty += Number(r.quantity || 0);
-    totalDol += Number(r.dollars || 0);
-    totalGP += Number(r.grossProfit || 0);
+    totals.qty += Number(r.quantity || 0);
+    totals.dollars += Number(r.dollars || 0);
+    totals.grossProfit += Number(r.grossProfit || 0);
+    if (r.docType === "INV") invSet.add(`${r.docType}:${r.docEntry}`);
+    if (String(r.cardCode || "").trim()) customerSet.add(String(r.cardCode || "").trim());
 
     const month = String(r.docDate || "").slice(0, 7);
     if (month) {
@@ -6951,65 +6996,58 @@ async function articleDetailFromDb({ from, to, itemCode = "", itemDesc = "", are
       cur.qty += Number(r.quantity || 0);
       cur.dollars += Number(r.dollars || 0);
       cur.grossProfit += Number(r.grossProfit || 0);
-      cur.invSet.add(docKey);
+      if (r.docType === "INV") cur.invSet.add(`${r.docType}:${r.docEntry}`);
       monthMap.set(month, cur);
     }
 
     const custKey = `${r.cardCode}||${r.cardName}`;
-    {
-      const cur = customerMap.get(custKey) || {
-        cardCode: r.cardCode,
-        cardName: r.cardName,
-        customer: `${r.cardCode} · ${r.cardName}`,
-        qty: 0,
-        dollars: 0,
-        grossProfit: 0,
-        invoicesSet: new Set(),
-        warehousesSet: new Set(),
-      };
-      cur.qty += Number(r.quantity || 0);
-      cur.dollars += Number(r.dollars || 0);
-      cur.grossProfit += Number(r.grossProfit || 0);
-      cur.invoicesSet.add(docKey);
-      if (r.warehouse) cur.warehousesSet.add(String(r.warehouse));
-      customerMap.set(custKey, cur);
-    }
+    const custCur = custMap.get(custKey) || {
+      cardCode: r.cardCode,
+      customer: `${r.cardCode} · ${r.cardName}`,
+      qty: 0,
+      dollars: 0,
+      grossProfit: 0,
+      invSet: new Set(),
+    };
+    custCur.qty += Number(r.quantity || 0);
+    custCur.dollars += Number(r.dollars || 0);
+    custCur.grossProfit += Number(r.grossProfit || 0);
+    if (r.docType === "INV") custCur.invSet.add(`${r.docType}:${r.docEntry}`);
+    custMap.set(custKey, custCur);
 
-    {
-      const wh = String(r.warehouse || "");
-      const cur = whMap.get(wh) || { warehouse: wh, qty: 0, dollars: 0, grossProfit: 0, invoicesSet: new Set(), customersSet: new Set() };
-      cur.qty += Number(r.quantity || 0);
-      cur.dollars += Number(r.dollars || 0);
-      cur.grossProfit += Number(r.grossProfit || 0);
-      cur.invoicesSet.add(docKey);
-      if (r.cardCode) cur.customersSet.add(String(r.cardCode));
-      whMap.set(wh, cur);
-    }
+    const whCur = whMap.get(r.warehouse) || {
+      warehouse: r.warehouse,
+      qty: 0,
+      dollars: 0,
+      grossProfit: 0,
+      customerSet: new Set(),
+    };
+    whCur.qty += Number(r.quantity || 0);
+    whCur.dollars += Number(r.dollars || 0);
+    whCur.grossProfit += Number(r.grossProfit || 0);
+    if (String(r.cardCode || "").trim()) whCur.customerSet.add(String(r.cardCode || "").trim());
+    whMap.set(r.warehouse, whCur);
 
-    {
-      const cur = invMap.get(docKey) || {
-        docType: r.docType,
-        docTypeLabel: r.docType === "CRN" ? "Nota de crédito" : "Factura",
-        docEntry: r.docEntry,
-        docNum: r.docNum,
-        docDate: r.docDate,
-        cardCode: r.cardCode,
-        cardName: r.cardName,
-        customer: `${r.cardCode} · ${r.cardName}`,
-        warehouse: r.warehouse,
-        qty: 0,
-        dollars: 0,
-        grossProfit: 0,
-      };
-      cur.qty += Number(r.quantity || 0);
-      cur.dollars += Number(r.dollars || 0);
-      cur.grossProfit += Number(r.grossProfit || 0);
-      invMap.set(docKey, cur);
-    }
+    const docKey = `${r.docType}:${r.docEntry}`;
+    const docCur = docMap.get(docKey) || {
+      docType: r.docType,
+      docTypeLabel: r.docType === "CRN" ? "Nota de crédito" : "Factura",
+      docNum: r.docNum,
+      docDate: r.docDate,
+      customer: `${r.cardCode} · ${r.cardName}`,
+      warehouse: r.warehouse,
+      qty: 0,
+      dollars: 0,
+      grossProfit: 0,
+    };
+    docCur.qty += Number(r.quantity || 0);
+    docCur.dollars += Number(r.dollars || 0);
+    docCur.grossProfit += Number(r.grossProfit || 0);
+    docMap.set(docKey, docCur);
   }
 
-  const totalsDol = money2(totalDol);
-  const totalsGp = money2(totalGP);
+  const dollars = money2(totals.dollars);
+  const gp = money2(totals.grossProfit);
 
   return {
     ok: true,
@@ -7018,94 +7056,81 @@ async function articleDetailFromDb({ from, to, itemCode = "", itemDesc = "", are
     area,
     grupo,
     categoria,
-    itemCode: resolvedCode,
-    itemDesc: resolvedDesc,
+    itemCode: itemCodeOut,
+    itemDesc: itemDescOut,
     totals: {
-      qty: num(totalQty, 4),
-      dollars: totalsDol,
-      grossProfit: totalsGp,
-      grossPct: totalsDol !== 0 ? num((totalsGp / totalsDol) * 100, 2) : 0,
-      invoices: invoiceSet.size,
+      qty: num(totals.qty, 4),
+      dollars,
+      grossProfit: gp,
+      grossPct: dollars !== 0 ? num((gp / dollars) * 100, 2) : 0,
+      invoices: invSet.size,
       customers: customerSet.size,
     },
     byMonth: Array.from(monthMap.values())
       .map((x) => {
-        const dol = money2(x.dollars);
-        const gp = money2(x.grossProfit);
+        const d = money2(x.dollars);
+        const g = money2(x.grossProfit);
         return {
           month: x.month,
           qty: num(x.qty, 4),
-          dollars: dol,
-          grossProfit: gp,
-          grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
+          dollars: d,
+          grossProfit: g,
+          grossPct: d !== 0 ? num((g / d) * 100, 2) : 0,
           invoices: x.invSet.size,
         };
       })
       .sort((a, b) => String(a.month).localeCompare(String(b.month))),
-    customers: Array.from(customerMap.values())
+    customers: Array.from(custMap.values())
       .map((x) => {
-        const dol = money2(x.dollars);
-        const gp = money2(x.grossProfit);
+        const d = money2(x.dollars);
+        const g = money2(x.grossProfit);
         return {
           cardCode: x.cardCode,
-          cardName: x.cardName,
           customer: x.customer,
           qty: num(x.qty, 4),
-          dollars: dol,
-          grossProfit: gp,
-          grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
-          invoices: x.invoicesSet.size,
-          warehouses: Array.from(x.warehousesSet.values()).sort((a, b) => String(a).localeCompare(String(b))),
+          dollars: d,
+          grossProfit: g,
+          grossPct: d !== 0 ? num((g / d) * 100, 2) : 0,
+          invoices: x.invSet.size,
         };
       })
       .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0))
-      .slice(0, 100),
+      .slice(0, 200),
     warehouses: Array.from(whMap.values())
       .map((x) => {
-        const dol = money2(x.dollars);
-        const gp = money2(x.grossProfit);
+        const d = money2(x.dollars);
+        const g = money2(x.grossProfit);
         return {
           warehouse: x.warehouse,
           qty: num(x.qty, 4),
-          dollars: dol,
-          grossProfit: gp,
-          grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
-          invoices: x.invoicesSet.size,
-          customers: x.customersSet.size,
+          dollars: d,
+          grossProfit: g,
+          grossPct: d !== 0 ? num((g / d) * 100, 2) : 0,
+          customers: x.customerSet.size,
         };
       })
-      .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0))
-      .slice(0, 30),
-    invoices: Array.from(invMap.values())
+      .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0)),
+    invoices: Array.from(docMap.values())
       .map((x) => {
-        const dol = money2(x.dollars);
-        const gp = money2(x.grossProfit);
+        const d = money2(x.dollars);
+        const g = money2(x.grossProfit);
         return {
           docType: x.docType,
           docTypeLabel: x.docTypeLabel,
-          docEntry: x.docEntry,
           docNum: x.docNum,
           docDate: x.docDate,
-          cardCode: x.cardCode,
-          cardName: x.cardName,
           customer: x.customer,
           warehouse: x.warehouse,
           qty: num(x.qty, 4),
-          dollars: dol,
-          grossProfit: gp,
-          grossPct: dol !== 0 ? num((gp / dol) * 100, 2) : 0,
+          dollars: d,
+          grossProfit: g,
+          grossPct: d !== 0 ? num((g / d) * 100, 2) : 0,
         };
       })
-      .sort((a, b) => {
-        if (String(b.docDate) !== String(a.docDate)) return String(b.docDate).localeCompare(String(a.docDate));
-        if (Number(b.docNum || 0) !== Number(a.docNum || 0)) return Number(b.docNum || 0) - Number(a.docNum || 0);
-        return String(a.docType || "").localeCompare(String(b.docType || ""));
-      })
-      .slice(0, 300),
+      .sort((a, b) => String(b.docDate || "").localeCompare(String(a.docDate || "")) || Number(b.docNum || 0) - Number(a.docNum || 0))
+      .slice(0, 500),
   };
 }
-
-
 
 /* =========================================================
    ✅ IA (admin-clientes) — contexto rico para análisis mensual
@@ -8029,8 +8054,9 @@ app.get("/api/admin/invoices/dashboard", verifyAdmin, async (req, res) => {
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
     const q = String(req.query?.q || "");
+    const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q });
+    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q, allowSapCategoryFallback: !fast });
     data.lastSyncAt = await getState("last_sync_at");
     return safeJson(res, 200, data);
   } catch (e) {
@@ -8050,12 +8076,13 @@ app.get("/api/admin/invoices/details", verifyAdmin, async (req, res) => {
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
+    const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
     if (!cardCode || !warehouse) {
       return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
     }
 
-    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria });
+    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria, allowSapCategoryFallback: !fast });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -8075,8 +8102,9 @@ app.get("/api/admin/invoices/top-products", verifyAdmin, async (req, res) => {
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
     const limit = Math.max(1, Math.min(200, Number(req.query?.limit || 10)));
+    const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    const data = await topProductsFromDb({ from, to, warehouse, cardCode, area, grupo, categoria, limit });
+    const data = await topProductsFromDb({ from, to, warehouse, cardCode, area, grupo, categoria, limit, allowSapCategoryFallback: !fast });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
@@ -8094,14 +8122,14 @@ app.get("/api/admin/invoices/articles", verifyAdmin, async (req, res) => {
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
     const limit = Math.max(1, Math.min(2000, Number(req.query?.limit || 500)));
+    const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    const data = await articlesFromDb({ from, to, area, grupo, categoria, limit });
+    const data = await articlesFromDb({ from, to, area, grupo, categoria, limit, allowSapCategoryFallback: !fast });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
-
 
 app.get("/api/admin/invoices/article-detail", verifyAdmin, async (req, res) => {
   try {
@@ -8110,24 +8138,23 @@ app.get("/api/admin/invoices/article-detail", verifyAdmin, async (req, res) => {
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
     const to = isISO(req.query?.to) ? String(req.query.to) : today;
-    const itemCode = String(req.query?.itemCode || "").trim();
-    const itemDesc = String(req.query?.itemDesc || "").trim();
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
+    const itemCode = String(req.query?.itemCode || "").trim();
+    const itemDesc = String(req.query?.itemDesc || "").trim();
+    const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
     if (!itemCode && !itemDesc) {
       return safeJson(res, 400, { ok: false, message: "itemCode o itemDesc requerido" });
     }
 
-    const data = await articleDetailFromDb({ from, to, itemCode, itemDesc, area, grupo, categoria });
+    const data = await articleDetailFromDb({ from, to, itemCode, itemDesc, area, grupo, categoria, allowSapCategoryFallback: !fast });
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
-
-
 
 app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
   try {
@@ -8140,8 +8167,9 @@ app.get("/api/admin/invoices/export", verifyAdmin, async (req, res) => {
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
     const q = String(req.query?.q || "");
+    const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
-    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q });
+    const data = await dashboardFromDbAdminClientes({ from, to, area, grupo, categoria, q, allowSapCategoryFallback: !fast });
 
     const wb = XLSX.utils.book_new();
     const rows = (data.table || []).map((r) => ({
@@ -8179,12 +8207,13 @@ app.get("/api/admin/invoices/details/export", verifyAdmin, async (req, res) => {
     const area = String(req.query?.area || "__ALL__");
     const grupo = String(req.query?.grupo || "__ALL__");
     const categoria = String(req.query?.categoria || "__ALL__");
+    const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
 
     if (!cardCode || !warehouse) {
       return safeJson(res, 400, { ok: false, message: "cardCode y warehouse requeridos" });
     }
 
-    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria });
+    const data = await detailsFromDb({ from, to, cardCode, warehouse, area, grupo, categoria, allowSapCategoryFallback: !fast });
     const wb = XLSX.utils.book_new();
 
     const rows = [];
