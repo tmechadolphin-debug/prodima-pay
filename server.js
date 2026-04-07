@@ -6414,8 +6414,7 @@ async function upsertLinesToDb(docType, sign, header, docFull) {
     null;
   const sellerCodeNum = Number(rawSellerCode);
   const sellerCode = Number.isFinite(sellerCodeNum) && sellerCodeNum >= 0 ? sellerCodeNum : null;
-  const sellerNameRaw = sellerCode !== null ? await getSalesPersonNameFromSap(sellerCode).catch(() => "") : "";
-  const sellerName = sellerNameRaw || (sellerCode !== null ? sellerLabelFromCode(sellerCode) : "");
+  const sellerName = sellerCode !== null ? await getSalesPersonNameFromSap(sellerCode) : "";
 
   const values = [];
   const params = [];
@@ -6568,8 +6567,6 @@ async function fetchInvoiceRows({ from, to, cardCode = "", warehouse = "", selle
       l.warehouse_code,
       l.item_code,
       l.item_desc,
-      l.seller_code,
-      l.seller_name,
       l.quantity,
       l.line_total,
       l.gross_profit,
@@ -8508,24 +8505,7 @@ app.get("/api/admin/invoices/sellers", verifyAdmin, async (req, res) => {
 
     const rows = await fetchInvoiceRows({ from, to, allowSapCategoryFallback: !fast });
     const filtered = applyAreaGroupFilters(rows, { area, grupo, categoria, seller: "__ALL__" });
-    let sellers = availableSellersFromRows(filtered);
-
-    if (!sellers.length || (sellers.length === 1 && normalizeSellerLabel(sellers[0]) === "sin vendedor")) {
-      const params = [from, to];
-      const where = [`doc_date >= $1::date`, `doc_date <= $2::date`, `COALESCE(seller_code::text,'') <> '' OR COALESCE(seller_name,'') <> ''`];
-      const q = await dbQuery(
-        `SELECT DISTINCT seller_code, seller_name
-           FROM fact_invoice_lines
-          WHERE ${where.join(" AND ")}
-          ORDER BY seller_name ASC NULLS LAST, seller_code ASC NULLS LAST`,
-        params
-      );
-      const fallbackRows = (q.rows || []).map((r) => ({
-        sellerCode: Number.isFinite(Number(r.seller_code)) ? Number(r.seller_code) : null,
-        sellerName: String(r.seller_name || "").trim(),
-      }));
-      sellers = availableSellersFromRows(fallbackRows);
-    }
+    const sellers = availableSellersFromRows(filtered);
 
     return safeJson(res, 200, { ok: true, from, to, area, grupo, categoria, sellers });
   } catch (e) {
@@ -8622,7 +8602,7 @@ async function getLinkedDeliveriesForOrder(orderHead, orderFull, deliveryCache) 
   if (!candidates) {
     candidates = await scanEntityHeaders(
       "DeliveryNotes",
-      "DocEntry,DocNum,DocDate,CardCode,CardName,CancelStatus,Canceled",
+      "DocEntry,DocNum,DocDate,CardCode,CardName,CancelStatus",
       orderDate,
       getDateISOInOffset(TZ_OFFSET_MIN),
       `CardCode eq ${quoteODataString(cardCode)}`,
@@ -8659,7 +8639,7 @@ async function getLinkedInvoicesForOrder(orderHead, orderFull, linkedDeliveries,
   if (!candidates) {
     candidates = await scanEntityHeaders(
       "Invoices",
-      "DocEntry,DocNum,DocDate,CardCode,CardName,CancelStatus,Canceled,SlpCode,SalesPersonCode,SalesEmployeeCode,DocTotal",
+      "DocEntry,DocNum,DocDate,CardCode,CardName,CancelStatus,SlpCode,SalesPersonCode,SalesEmployeeCode,DocTotal",
       orderDate,
       getDateISOInOffset(TZ_OFFSET_MIN),
       `CardCode eq ${quoteODataString(cardCode)}`,
@@ -8696,7 +8676,7 @@ async function fillRateFromSap({ from, to, seller = "__ALL__", maxDocs = 300 } =
 
   const headers = await scanEntityHeaders(
     "Orders",
-    "DocEntry,DocNum,DocDate,DocDueDate,DocTotal,CardCode,CardName,CancelStatus,Canceled,DocumentStatus,SlpCode,SalesPersonCode,SalesEmployeeCode",
+    "DocEntry,DocNum,DocDate,DocDueDate,DocTotal,CardCode,CardName,CancelStatus,DocumentStatus,SlpCode,SalesPersonCode,SalesEmployeeCode",
     from,
     to,
     "",
