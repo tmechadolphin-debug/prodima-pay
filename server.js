@@ -6404,7 +6404,14 @@ async function upsertLinesToDb(docType, sign, header, docFull) {
   const docDate = String(header.DocDate || "").slice(0, 10);
   const cardCode = String(header.CardCode || "");
   const cardName = String(header.CardName || "");
-  const rawSellerCode = docFull?.SalesPersonCode ?? docFull?.SalesEmployeeCode ?? header?.SalesPersonCode ?? header?.SalesEmployeeCode ?? null;
+  const rawSellerCode =
+    docFull?.SlpCode ??
+    docFull?.SalesPersonCode ??
+    docFull?.SalesEmployeeCode ??
+    header?.SlpCode ??
+    header?.SalesPersonCode ??
+    header?.SalesEmployeeCode ??
+    null;
   const sellerCodeNum = Number(rawSellerCode);
   const sellerCode = Number.isFinite(sellerCodeNum) && sellerCodeNum >= 0 ? sellerCodeNum : null;
   const sellerName = sellerCode !== null ? await getSalesPersonNameFromSap(sellerCode) : "";
@@ -8479,6 +8486,294 @@ app.get("/api/admin/invoices/article-detail", verifyAdmin, async (req, res) => {
     return safeJson(res, 200, data);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+
+
+app.get("/api/admin/invoices/sellers", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -90);
+    const to = isISO(req.query?.to) ? String(req.query.to) : today;
+    const area = String(req.query?.area || "__ALL__");
+    const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
+    const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
+
+    const rows = await fetchInvoiceRows({ from, to, allowSapCategoryFallback: !fast });
+    const filtered = applyAreaGroupFilters(rows, { area, grupo, categoria, seller: "__ALL__" });
+    const sellers = availableSellersFromRows(filtered);
+
+    return safeJson(res, 200, { ok: true, from, to, area, grupo, categoria, sellers });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+
+
+const FILL_RATE_CACHE = new Map();
+const FILL_RATE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+function fillRateCacheKey({ from, to, seller = "__ALL__" }) {
+  return `${String(from || "")}::${String(to || "")}::${String(seller || "__ALL__")}`;
+}
+function getFillRateCache(key) {
+  const hit = FILL_RATE_CACHE.get(key);
+  if (!hit) return null;
+  if (Date.now() - Number(hit.ts || 0) > FILL_RATE_CACHE_TTL_MS) {
+    FILL_RATE_CACHE.delete(key);
+    return null;
+  }
+  return hit.value;
+}
+function setFillRateCache(key, value) {
+  FILL_RATE_CACHE.set(key, { ts: Date.now(), value });
+}
+function isCancelledDocLike(doc = {}) {
+  const status = String(doc?.CancelStatus || doc?.Canceled || doc?.Cancelled || doc?.DocumentStatus || "").toLowerCase();
+  return status.includes("cancel") || status.includes("csyes") || status === "y" || status === "yes";
+}
+function extractDocTotal(doc = {}) {
+  const n = Number(doc?.DocTotal ?? doc?.docTotal ?? 0);
+  return Number.isFinite(n) ? Math.abs(n) : 0;
+}
+function extractDocDate(doc = {}) {
+  return isoDateOnly(doc?.DocDate || doc?.docDate || "");
+}
+async function fetchDocWithLines(entity, docEntry) {
+  const de = Number(docEntry || 0);
+  if (!Number.isFinite(de) || de <= 0) return null;
+  try {
+    return await slFetch(`/${entity}(${de})`, { timeoutMs: 90000 });
+  } catch (e) {
+    return null;
+  }
+}
+async function scanEntityHeaders(entity, selectFields, fromDate, toDate, extraFilter = "", topLimit = 400) {
+  const batchTop = 200;
+  const toPlus1 = addDaysISO(toDate, 1);
+  const out = [];
+  let skip = 0;
+  const baseFilter = `DocDate ge '${fromDate}' and DocDate lt '${toPlus1}'`;
+  const filter = extraFilter ? `${baseFilter} and (${extraFilter})` : baseFilter;
+
+  for (let page = 0; page < 20; page++) {
+    const raw = await slFetch(
+      `/${entity}?$select=${selectFields}` +
+      `&$filter=${encodeURIComponent(filter)}` +
+      `&$orderby=DocDate desc,DocEntry desc&$top=${batchTop}&$skip=${skip}`,
+      { timeoutMs: 90000 }
+    );
+    const rows = Array.isArray(raw?.value) ? raw.value : [];
+    if (!rows.length) break;
+    out.push(...rows);
+    skip += rows.length;
+    if (out.length >= topLimit) break;
+  }
+  return out.slice(0, topLimit);
+}
+async function getOrderSellerLabel(orderHead = {}, orderFull = null) {
+  const rawSellerCode =
+    orderFull?.SlpCode ??
+    orderFull?.SalesPersonCode ??
+    orderFull?.SalesEmployeeCode ??
+    orderHead?.SlpCode ??
+    orderHead?.SalesPersonCode ??
+    orderHead?.SalesEmployeeCode ??
+    null;
+  const sellerCodeNum = Number(rawSellerCode);
+  if (Number.isFinite(sellerCodeNum) && sellerCodeNum >= 0) {
+    return await getSalesPersonNameFromSap(sellerCodeNum);
+  }
+  return "";
+}
+async function getLinkedDeliveriesForOrder(orderHead, orderFull, deliveryCache) {
+  const orderDocEntry = Number(orderHead?.DocEntry || orderFull?.DocEntry || 0);
+  const cardCode = String(orderHead?.CardCode || orderFull?.CardCode || "").trim();
+  const orderDate = extractDocDate(orderHead) || extractDocDate(orderFull) || getDateISOInOffset(TZ_OFFSET_MIN);
+  if (!orderDocEntry || !cardCode) return [];
+
+  const cacheKey = `${cardCode}::${orderDate}`;
+  let candidates = deliveryCache.get(cacheKey);
+  if (!candidates) {
+    candidates = await scanEntityHeaders(
+      "DeliveryNotes",
+      "DocEntry,DocNum,DocDate,CardCode,CardName,CancelStatus,Canceled",
+      orderDate,
+      getDateISOInOffset(TZ_OFFSET_MIN),
+      `CardCode eq ${quoteODataString(cardCode)}`,
+      400
+    ).catch(() => []);
+    deliveryCache.set(cacheKey, candidates);
+  }
+
+  const out = [];
+  const seen = new Set();
+  for (const d of candidates) {
+    const de = Number(d?.DocEntry || 0);
+    if (!de || seen.has(de) || isCancelledDocLike(d)) continue;
+    const full = await fetchDocWithLines("DeliveryNotes", de);
+    if (!full || isCancelledDocLike(full)) continue;
+    const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+    const linked = lines.some((ln) => Number(ln?.BaseType) === 17 && Number(ln?.BaseEntry) === orderDocEntry);
+    if (linked) {
+      seen.add(de);
+      out.push(full);
+    }
+  }
+  return out;
+}
+async function getLinkedInvoicesForOrder(orderHead, orderFull, linkedDeliveries, invoiceCache) {
+  const orderDocEntry = Number(orderHead?.DocEntry || orderFull?.DocEntry || 0);
+  const cardCode = String(orderHead?.CardCode || orderFull?.CardCode || "").trim();
+  const orderDate = extractDocDate(orderHead) || extractDocDate(orderFull) || getDateISOInOffset(TZ_OFFSET_MIN);
+  if (!orderDocEntry || !cardCode) return [];
+  const deliverySet = new Set((linkedDeliveries || []).map((d) => Number(d?.DocEntry || 0)).filter(Boolean));
+
+  const cacheKey = `${cardCode}::${orderDate}`;
+  let candidates = invoiceCache.get(cacheKey);
+  if (!candidates) {
+    candidates = await scanEntityHeaders(
+      "Invoices",
+      "DocEntry,DocNum,DocDate,CardCode,CardName,CancelStatus,Canceled,SlpCode,SalesPersonCode,SalesEmployeeCode,DocTotal",
+      orderDate,
+      getDateISOInOffset(TZ_OFFSET_MIN),
+      `CardCode eq ${quoteODataString(cardCode)}`,
+      600
+    ).catch(() => []);
+    invoiceCache.set(cacheKey, candidates);
+  }
+
+  const out = [];
+  const seen = new Set();
+  for (const inv of candidates) {
+    const de = Number(inv?.DocEntry || 0);
+    if (!de || seen.has(de) || isCancelledDocLike(inv)) continue;
+    const full = await fetchDocWithLines("Invoices", de);
+    if (!full || isCancelledDocLike(full)) continue;
+    const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+    const linked = lines.some((ln) => {
+      const baseType = Number(ln?.BaseType);
+      const baseEntry = Number(ln?.BaseEntry);
+      return (baseType === 17 && baseEntry === orderDocEntry) || (baseType === 15 && deliverySet.has(baseEntry));
+    });
+    if (linked) {
+      seen.add(de);
+      out.push(full);
+    }
+  }
+  return out;
+}
+async function fillRateFromSap({ from, to, seller = "__ALL__", maxDocs = 300 } = {}) {
+  if (missingSapEnv()) throw new Error("SAP env incompleto");
+  const cacheKey = fillRateCacheKey({ from, to, seller });
+  const cached = getFillRateCache(cacheKey);
+  if (cached) return cached;
+
+  const headers = await scanEntityHeaders(
+    "Orders",
+    "DocEntry,DocNum,DocDate,DocDueDate,DocTotal,CardCode,CardName,CancelStatus,Canceled,DocumentStatus,SlpCode,SalesPersonCode,SalesEmployeeCode",
+    from,
+    to,
+    "",
+    maxDocs
+  );
+
+  const deliveryCache = new Map();
+  const invoiceCache = new Map();
+  const rows = [];
+  let totalPedido = 0;
+  let totalFacturado = 0;
+
+  for (const head of headers) {
+    if (isCancelledDocLike(head)) continue;
+    const full = await fetchDocWithLines("Orders", Number(head?.DocEntry || 0));
+    if (!full || isCancelledDocLike(full)) continue;
+
+    const sellerName = await getOrderSellerLabel(head, full).catch(() => "");
+    const sellerCodeRaw = full?.SlpCode ?? full?.SalesPersonCode ?? full?.SalesEmployeeCode ?? head?.SlpCode ?? head?.SalesPersonCode ?? head?.SalesEmployeeCode ?? null;
+    const sellerCode = Number.isFinite(Number(sellerCodeRaw)) ? Number(sellerCodeRaw) : null;
+    if (seller && seller !== "__ALL__") {
+      const sSel = normalizeSellerLabel(seller);
+      const label = normalizeSellerLabel(sellerName || sellerLabelFromCode(sellerCode));
+      const code = normalizeSellerLabel(String(sellerCode ?? ""));
+      if (label !== sSel && code !== sSel) continue;
+    }
+
+    const deliveries = await getLinkedDeliveriesForOrder(head, full, deliveryCache);
+    const invoices = await getLinkedInvoicesForOrder(head, full, deliveries, invoiceCache);
+
+    const montoPedido = extractDocTotal(full) || extractDocTotal(head);
+    const invoiceSeen = new Set();
+    let montoFacturado = 0;
+    for (const inv of invoices) {
+      const ide = Number(inv?.DocEntry || 0);
+      if (!ide || invoiceSeen.has(ide) || isCancelledDocLike(inv)) continue;
+      invoiceSeen.add(ide);
+      montoFacturado += extractDocTotal(inv);
+    }
+
+    const diferencia = money2(montoPedido - montoFacturado);
+    totalPedido += montoPedido;
+    totalFacturado += montoFacturado;
+
+    rows.push({
+      orderDocNum: Number(full?.DocNum || head?.DocNum || 0),
+      orderDocEntry: Number(full?.DocEntry || head?.DocEntry || 0),
+      cardCode: String(full?.CardCode || head?.CardCode || ""),
+      cardName: String(full?.CardName || head?.CardName || ""),
+      warehouse: String((Array.isArray(full?.DocumentLines) ? full.DocumentLines.find((ln) => String(ln?.WarehouseCode || "").trim())?.WarehouseCode : "") || ""),
+      sellerCode,
+      sellerName: sellerName || (sellerCode !== null ? sellerLabelFromCode(sellerCode) : ""),
+      orderDate: extractDocDate(full) || extractDocDate(head),
+      orderDueDate: isoDateOnly(full?.DocDueDate || head?.DocDueDate || ""),
+      status: String(full?.DocumentStatus || head?.DocumentStatus || ""),
+      totalPedido: money2(montoPedido),
+      totalFacturado: money2(montoFacturado),
+      diferencia,
+      fillRatePct: montoPedido > 0 ? num((montoFacturado / montoPedido) * 100, 2) : 0,
+      invoiceCount: invoiceSeen.size,
+      invoiceDocNums: invoices.map((inv) => Number(inv?.DocNum || 0)).filter(Boolean),
+    });
+  }
+
+  rows.sort((a, b) => Number(b.diferencia || 0) - Number(a.diferencia || 0));
+
+  const result = {
+    ok: true,
+    source: "sap",
+    from,
+    to,
+    seller,
+    totals: {
+      orders: rows.length,
+      pedido: money2(totalPedido),
+      facturado: money2(totalFacturado),
+      diferencia: money2(totalPedido - totalFacturado),
+      fillRatePct: totalPedido > 0 ? num((totalFacturado / totalPedido) * 100, 2) : 0,
+    },
+    rows: rows.slice(0, 500),
+  };
+  setFillRateCache(cacheKey, result);
+  return result;
+}
+
+app.get("/api/admin/invoices/fill-rate", verifyAdmin, async (req, res) => {
+  try {
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
+    const to = isISO(req.query?.to) ? String(req.query.to) : today;
+    const seller = String(req.query?.seller || "__ALL__").trim() || "__ALL__";
+    const maxDocs = Math.max(50, Math.min(1000, Number(req.query?.maxDocs || 300)));
+
+    const data = await fillRateFromSap({ from, to, seller, maxDocs });
+    return safeJson(res, 200, data);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
 });
 
