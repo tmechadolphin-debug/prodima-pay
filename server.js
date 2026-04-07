@@ -294,6 +294,23 @@ function norm(s) {
 }
 
 
+
+
+function ensureNormGroupNameHelper() {
+  if (typeof globalThis.normGroupName !== "function") {
+    globalThis.normGroupName = function normGroupNameSafe(s) {
+      return String(s || "")
+        .trim()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/\s+/g, " ")
+        .toUpperCase();
+    };
+  }
+  return globalThis.normGroupName;
+}
+const normGroupName = ensureNormGroupNameHelper();
+
 function normGroupName(s) {
   return String(s || "")
     .trim()
@@ -4366,11 +4383,11 @@ globalThis.GROUPS_CONS_N = new Set(Array.from(globalThis.GROUPS_CONS).map(normGr
 globalThis.GROUPS_RCI_N = new Set(Array.from(globalThis.GROUPS_RCI).map(normGroupName));
 
 const CANON_GROUP = new Map(
-  [...Array.from(globalThis.GROUPS_CONS), ...Array.from(globalThis.GROUPS_RCI)].map((g) => [normGroupName(g), g])
+  [...Array.from(globalThis.GROUPS_CONS), ...Array.from(globalThis.GROUPS_RCI)].map((g) => [globalThis.normGroupName(g), g])
 );
 
 function canonicalGroupName(groupName) {
-  const n = normGroupName(groupName);
+  const n = globalThis.normGroupName(groupName);
   return CANON_GROUP.get(n) || String(groupName || "").trim();
 }
 
@@ -4379,7 +4396,7 @@ function canonicalGroupName(groupName) {
  * (resuelve la mayoría de "Sin grupo" por abreviaturas/puntos/mayúsculas)
  */
 function guessCanonicalGroupName(groupNameRaw) {
-  const n = normGroupName(groupNameRaw);
+  const n = globalThis.normGroupName(groupNameRaw);
   if (!n) return "";
 
   // ---- RCI ----
@@ -4417,7 +4434,7 @@ globalThis.normalizeGrupoFinal = function normalizeGrupoFinal(grupoRaw) {
   if (!raw) return "Sin grupo";
 
   const canon = canonicalGroupName(raw);
-  const canonN = normGroupName(canon);
+  const canonN = globalThis.normGroupName(canon);
 
   // si ya está en tus listas, perfecto
   if (globalThis.GROUPS_CONS_N.has(canonN) || globalThis.GROUPS_RCI_N.has(canonN)) return canon;
@@ -4430,7 +4447,7 @@ globalThis.normalizeGrupoFinal = function normalizeGrupoFinal(grupoRaw) {
 }
 
 globalThis.inferAreaFromGroup = function inferAreaFromGroup(groupName) {
-  const g = normGroupName(groupName);
+  const g = globalThis.normGroupName(groupName);
   if (!g) return "";
   if (globalThis.GROUPS_CONS_N.has(g)) return "CONS";
   if (globalThis.GROUPS_RCI_N.has(g)) return "RCI";
@@ -5198,8 +5215,8 @@ async function dashboardFromDbEstratificacion({ from, to, area, grupo, q }) {
     universe = universe.filter((x) => String(x.area || "") === areaSel);
   }
   if (grupoSel !== "__ALL__") {
-    const gSelN = normGroupName(grupoSel);
-    universe = universe.filter((x) => normGroupName(x.grupo) === gSelN);
+    const gSelN = globalThis.normGroupName(grupoSel);
+    universe = universe.filter((x) => globalThis.normGroupName(x.grupo) === gSelN);
   }
 
   const abcRev = abcByMetric(universe, "revenue");
@@ -5230,8 +5247,8 @@ async function dashboardFromDbEstratificacion({ from, to, area, grupo, q }) {
   // filtros de vista (incluye q)
   if (areaSel !== "__ALL__") outItems = outItems.filter((x) => String(x.area || "") === areaSel);
   if (grupoSel !== "__ALL__") {
-    const gSelN = normGroupName(grupoSel);
-    outItems = outItems.filter((x) => normGroupName(x.grupo) === gSelN);
+    const gSelN = globalThis.normGroupName(grupoSel);
+    outItems = outItems.filter((x) => globalThis.normGroupName(x.grupo) === gSelN);
   }
   if (qq) {
     outItems = outItems.filter(
@@ -5371,8 +5388,8 @@ app.get("/api/admin/estratificacion/item-docs", verifyAdmin, async (req, res) =>
 
     if (areaSel !== "__ALL__") rows = rows.filter((x) => String(x.area || "") === areaSel);
     if (grupoSel !== "__ALL__") {
-      const gSelN = normGroupName(grupoSel);
-      rows = rows.filter((x) => normGroupName(x.grupo) === gSelN);
+      const gSelN = globalThis.normGroupName(grupoSel);
+      rows = rows.filter((x) => globalThis.normGroupName(x.grupo) === gSelN);
     }
 
     return safeJson(res, 200, { ok: true, itemCode, from, to, rows });
@@ -6448,7 +6465,7 @@ const CUSTOMER_CATEGORY_GROUP_CACHE = new Map();
 const CUSTOMER_CATEGORY_TTL_MS = 6 * 60 * 60 * 1000;
 
 function isKnownInvoiceProductGroupName(v) {
-  const n = normGroupName(v);
+  const n = globalThis.normGroupName(v);
   if (!n) return false;
   return globalThis.GROUPS_CONS_N.has(n) || globalThis.GROUPS_RCI_N.has(n);
 }
@@ -6457,7 +6474,7 @@ function isSuspiciousCustomerCategoryValue(v, { source = "", groupCode = null } 
   const s = String(v || "").trim();
   if (!s) return true;
 
-  const n = normGroupName(s);
+  const n = globalThis.normGroupName(s);
   if (!n || n === "SIN CATEGORIA" || n === "SIN CATEGORÍA" || n === "SIN GRUPO") return true;
 
   const src = String(source || "").trim().toLowerCase();
@@ -14611,8 +14628,8 @@ async function estratLoadItemDocsForAi({ itemCode, from, to, area = "__ALL__", g
 
   if (area !== "__ALL__") rows = rows.filter((x) => String(x.area || "") === area);
   if (grupo !== "__ALL__") {
-    const gSelN = normGroupName(grupo);
-    rows = rows.filter((x) => normGroupName(x.grupo) === gSelN);
+    const gSelN = globalThis.normGroupName(grupo);
+    rows = rows.filter((x) => globalThis.normGroupName(x.grupo) === gSelN);
   }
   return rows;
 }
