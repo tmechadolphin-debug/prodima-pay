@@ -8622,7 +8622,7 @@ async function getLinkedDeliveriesForOrder(orderHead, orderFull, deliveryCache) 
   if (!candidates) {
     candidates = await scanEntityHeaders(
       "DeliveryNotes",
-      "DocEntry,DocNum,DocDate,CardCode,CardName,CancelStatus,Canceled",
+      "DocEntry,DocNum,DocDate,CardCode,CardName,CancelStatus",
       orderDate,
       getDateISOInOffset(TZ_OFFSET_MIN),
       `CardCode eq ${quoteODataString(cardCode)}`,
@@ -8659,7 +8659,7 @@ async function getLinkedInvoicesForOrder(orderHead, orderFull, linkedDeliveries,
   if (!candidates) {
     candidates = await scanEntityHeaders(
       "Invoices",
-      "DocEntry,DocNum,DocDate,CardCode,CardName,CancelStatus,Canceled,SlpCode,SalesPersonCode,SalesEmployeeCode,DocTotal",
+      "DocEntry,DocNum,DocDate,CardCode,CardName,CancelStatus,SlpCode,SalesPersonCode,SalesEmployeeCode,DocTotal",
       orderDate,
       getDateISOInOffset(TZ_OFFSET_MIN),
       `CardCode eq ${quoteODataString(cardCode)}`,
@@ -8696,7 +8696,7 @@ async function fillRateFromSap({ from, to, seller = "__ALL__", maxDocs = 300 } =
 
   const headers = await scanEntityHeaders(
     "Orders",
-    "DocEntry,DocNum,DocDate,DocDueDate,DocTotal,CardCode,CardName,CancelStatus,Canceled,DocumentStatus,SlpCode,SalesPersonCode,SalesEmployeeCode",
+    "DocEntry,DocNum,DocDate,DocDueDate,DocTotal,CardCode,CardName,CancelStatus,DocumentStatus,SlpCode,SalesPersonCode,SalesEmployeeCode",
     from,
     to,
     "",
