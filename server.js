@@ -6233,6 +6233,9 @@ async function ensureDb() {
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fill_rate_lines_area ON fact_fill_rate_lines(area);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fill_rate_lines_grupo ON fact_fill_rate_lines(grupo);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fill_rate_lines_categoria ON fact_fill_rate_lines(categoria);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fill_rate_lines_item_code ON fact_fill_rate_lines(item_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fill_rate_lines_item_desc ON fact_fill_rate_lines(item_desc);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fill_rate_lines_status ON fact_fill_rate_lines(status);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fill_rate_seller_name ON fact_fill_rate_orders(seller_name);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_type ON fact_invoice_lines(doc_type);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_fact_seller_name ON fact_invoice_lines(seller_name);`);
@@ -7387,6 +7390,26 @@ async function articleDetailFromDb({ from, to, itemCode = "", itemDesc = "", are
     const descOk = !codeSel && descSel ? String(r.itemDesc || "").trim().toLowerCase() === descSel : false;
     return codeOk || descOk;
   });
+  const fillRate = await articleFillRateFromDb({
+    from,
+    to,
+    itemCode: codeSel,
+    itemDesc: itemDesc || "",
+    area,
+    grupo,
+    categoria,
+    seller,
+  }).catch(() => ({
+    ok: true,
+    source: "fact_fill_rate_lines",
+    from,
+    to,
+    itemCode: codeSel,
+    itemDesc: itemDesc || "",
+    totals: { orders: 0, excludedOpen: 0, pedido: 0, facturado: 0, diferencia: 0, fillRatePct: 0 },
+    rows: [],
+  }));
+
 
   if (!rows.length) {
     return {
@@ -7396,6 +7419,7 @@ async function articleDetailFromDb({ from, to, itemCode = "", itemDesc = "", are
       itemCode: codeSel,
       itemDesc: itemDesc || "",
       totals: { qty: 0, dollars: 0, grossProfit: 0, grossPct: 0, invoices: 0, customers: 0 },
+      fillRate,
       byMonth: [],
       customers: [],
       warehouses: [],
@@ -7497,6 +7521,7 @@ async function articleDetailFromDb({ from, to, itemCode = "", itemDesc = "", are
       invoices: invSet.size,
       customers: customerSet.size,
     },
+    fillRate,
     byMonth: Array.from(monthMap.values())
       .map((x) => {
         const d = money2(x.dollars);
@@ -8987,6 +9012,7 @@ async function syncFillRateRangeToDb({ from, to, seller = "__ALL__", maxDocs = 3
   let saved = 0;
   let totalPedido = 0;
   let totalFacturado = 0;
+  let excludedOpen = 0;
 
   for (const head of headers) {
     if (isCancelledDocLike(head)) continue;
@@ -9035,7 +9061,6 @@ async function syncFillRateRangeToDb({ from, to, seller = "__ALL__", maxDocs = 3
       invoiceDocNums: invoices.map((inv) => Number(inv?.DocNum || 0)).filter(Boolean),
     };
 
-    await upsertFillRateOrderRow(row);
 
     const orderLines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
     const itemGroupMap = await getItemGroupInfoMap(orderLines.map((ln) => String(ln?.ItemCode || "").trim()));
@@ -9079,8 +9104,13 @@ async function syncFillRateRangeToDb({ from, to, seller = "__ALL__", maxDocs = 3
 
     processed += 1;
     saved += 1;
-    totalPedido += Number(row.totalPedido || 0);
-    totalFacturado += Number(row.totalFacturado || 0);
+    const isOpenStatus = String(row.status || "").trim().toLowerCase() === "bost_open";
+    if (isOpenStatus) {
+      excludedOpen += 1;
+    } else {
+      totalPedido += Number(row.totalPedido || 0);
+      totalFacturado += Number(row.totalFacturado || 0);
+    }
 
     if (processed % 25 === 0) await sleep(15);
   }
@@ -9098,7 +9128,8 @@ async function syncFillRateRangeToDb({ from, to, seller = "__ALL__", maxDocs = 3
     processed,
     saved,
     totals: {
-      orders: saved,
+      orders: Math.max(0, saved - excludedOpen),
+      excludedOpen,
       pedido: money2(totalPedido),
       facturado: money2(totalFacturado),
       diferencia: money2(totalPedido - totalFacturado),
@@ -9106,6 +9137,145 @@ async function syncFillRateRangeToDb({ from, to, seller = "__ALL__", maxDocs = 3
     }
   };
 }
+
+async function articleFillRateFromDb({ from, to, itemCode = "", itemDesc = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__" } = {}) {
+  if (!hasDb()) throw new Error("DB no configurada (DATABASE_URL)");
+
+  const areaSel = String(area || "__ALL__").trim().toUpperCase();
+  const grupoSel = String(grupo || "__ALL__").trim();
+  const categoriaSel = String(categoria || "__ALL__").trim();
+  const sellerSel = String(seller || "__ALL__").trim();
+  const codeSel = String(itemCode || "").trim();
+  const descSel = String(itemDesc || "").trim();
+  const openExpr = `LOWER(BTRIM(COALESCE(status,''))) = 'bost_open'`;
+
+  const params = [from, to];
+  const where = [`order_date >= $1::date`, `order_date <= $2::date`];
+
+  if (sellerSel && sellerSel !== "__ALL__") {
+    params.push(`%${sellerSel}%`);
+    const idx = params.length;
+    where.push(`(COALESCE(seller_name,'') ILIKE $${idx} OR COALESCE(seller_code::text,'') ILIKE $${idx})`);
+  }
+  if (areaSel !== "__ALL__") {
+    params.push(areaSel);
+    where.push(`COALESCE(area,'') = $${params.length}`);
+  }
+  if (grupoSel !== "__ALL__") {
+    params.push(canonicalInvoiceGroup(grupoSel));
+    where.push(`COALESCE(grupo,'Sin grupo') = $${params.length}`);
+  }
+  if (categoriaSel !== "__ALL__") {
+    params.push(normalizeCustomerCategoryName(categoriaSel));
+    where.push(`COALESCE(categoria,'Sin categoría') = $${params.length}`);
+  }
+  if (codeSel) {
+    params.push(codeSel);
+    where.push(`COALESCE(item_code,'') = $${params.length}`);
+  } else if (descSel) {
+    params.push(descSel);
+    where.push(`LOWER(BTRIM(COALESCE(item_desc,''))) = LOWER(BTRIM($${params.length}))`);
+  } else {
+    return {
+      ok: true,
+      source: "fact_fill_rate_lines",
+      from,
+      to,
+      itemCode: codeSel,
+      itemDesc: descSel,
+      totals: { orders: 0, excludedOpen: 0, pedido: 0, facturado: 0, diferencia: 0, fillRatePct: 0 },
+      rows: [],
+    };
+  }
+
+  const totalsQ = await dbQuery(
+    `
+    SELECT
+      COUNT(DISTINCT CASE WHEN NOT (${openExpr}) THEN order_doc_entry END)::int AS orders,
+      COUNT(DISTINCT CASE WHEN ${openExpr} THEN order_doc_entry END)::int AS excluded_open_orders,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN order_line_total ELSE 0 END),0)::float AS pedido,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN invoiced_line_total ELSE 0 END),0)::float AS facturado,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN difference ELSE 0 END),0)::float AS diferencia
+    FROM fact_fill_rate_lines
+    WHERE ${where.join(" AND ")}
+    `,
+    params
+  );
+  const t = totalsQ.rows?.[0] || {};
+  const pedido = money2(t.pedido || 0);
+  const facturado = money2(t.facturado || 0);
+
+  const rowsQ = await dbQuery(
+    `
+    SELECT
+      order_doc_entry,
+      MAX(order_doc_num) AS order_doc_num,
+      MAX(order_date)::text AS order_date,
+      MAX(order_due_date)::text AS order_due_date,
+      MAX(card_code) AS card_code,
+      MAX(card_name) AS card_name,
+      MAX(warehouse_code) AS warehouse_code,
+      MAX(seller_code) AS seller_code,
+      MAX(seller_name) AS seller_name,
+      MAX(status) AS status,
+      COALESCE(SUM(order_line_total),0)::float AS raw_order_total,
+      COALESCE(SUM(invoiced_line_total),0)::float AS raw_invoiced_total,
+      COALESCE(SUM(difference),0)::float AS raw_difference,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN order_line_total ELSE 0 END),0)::float AS order_total,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN invoiced_line_total ELSE 0 END),0)::float AS invoiced_total,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN difference ELSE 0 END),0)::float AS difference,
+      COALESCE(STRING_AGG(DISTINCT NULLIF(invoice_doc_nums,''), ','), '') AS invoice_doc_nums
+    FROM fact_fill_rate_lines
+    WHERE ${where.join(" AND ")}
+    GROUP BY order_doc_entry
+    ORDER BY raw_difference DESC, MAX(order_date) DESC, MAX(order_doc_num) DESC
+    LIMIT 300
+    `,
+    params
+  );
+
+  return {
+    ok: true,
+    source: "fact_fill_rate_lines",
+    from,
+    to,
+    itemCode: codeSel,
+    itemDesc: descSel,
+    totals: {
+      orders: Number(t.orders || 0),
+      excludedOpen: Number(t.excluded_open_orders || 0),
+      pedido,
+      facturado,
+      diferencia: money2(t.diferencia || 0),
+      fillRatePct: pedido > 0 ? num((facturado / pedido) * 100, 2) : 0,
+    },
+    rows: (rowsQ.rows || []).map((r) => {
+      const status = String(r.status || "");
+      const isExcluded = status.trim().toLowerCase() === "bost_open";
+      const ord = money2(isExcluded ? r.raw_order_total : r.order_total);
+      const inv = money2(isExcluded ? r.raw_invoiced_total : r.invoiced_total);
+      return {
+        orderDocEntry: Number(r.order_doc_entry || 0),
+        orderDocNum: Number(r.order_doc_num || 0),
+        orderDate: isoDateOnly(r.order_date),
+        orderDueDate: isoDateOnly(r.order_due_date),
+        cardCode: String(r.card_code || ""),
+        cardName: String(r.card_name || ""),
+        warehouse: String(r.warehouse_code || ""),
+        sellerCode: Number.isFinite(Number(r.seller_code)) ? Number(r.seller_code) : null,
+        sellerName: String(r.seller_name || "").trim(),
+        status,
+        isExcluded,
+        totalPedido: ord,
+        totalFacturado: inv,
+        diferencia: money2(isExcluded ? r.raw_difference : r.difference),
+        fillRatePct: !isExcluded && ord > 0 ? num((inv / ord) * 100, 2) : 0,
+        invoiceDocNums: String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean),
+      };
+    }),
+  };
+}
+
 async function fillRateFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__" } = {}) {
   if (!hasDb()) throw new Error("DB no configurada (DATABASE_URL)");
 
@@ -9113,98 +9283,7 @@ async function fillRateFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", c
   const grupoSel = String(grupo || "__ALL__").trim();
   const categoriaSel = String(categoria || "__ALL__").trim();
   const sellerSel = String(seller || "__ALL__").trim();
-
-  const useOrderTable = areaSel === "__ALL__" && grupoSel === "__ALL__" && categoriaSel === "__ALL__";
-
-  if (useOrderTable) {
-    const params = [from, to];
-    const where = [`order_date >= $1::date`, `order_date <= $2::date`];
-    if (sellerSel && sellerSel !== "__ALL__") {
-      params.push(`%${sellerSel}%`);
-      const idx = params.length;
-      where.push(`(COALESCE(seller_name,'') ILIKE $${idx} OR COALESCE(seller_code::text,'') ILIKE $${idx})`);
-    }
-
-    const totalsQ = await dbQuery(
-      `
-      SELECT
-        COUNT(*)::int AS orders,
-        COALESCE(SUM(order_total),0)::float AS pedido,
-        COALESCE(SUM(invoiced_total),0)::float AS facturado,
-        COALESCE(SUM(difference),0)::float AS diferencia
-      FROM fact_fill_rate_orders
-      WHERE ${where.join(" AND ")}
-      `,
-      params
-    );
-    const t = totalsQ.rows?.[0] || {};
-    const pedido = Number(t.pedido || 0);
-    const facturado = Number(t.facturado || 0);
-
-    const rowsQ = await dbQuery(
-      `
-      SELECT
-        order_doc_num,
-        order_doc_entry,
-        card_code,
-        card_name,
-        warehouse_code,
-        seller_code,
-        seller_name,
-        order_date::text AS order_date,
-        order_due_date::text AS order_due_date,
-        status,
-        order_total,
-        invoiced_total,
-        difference,
-        fill_rate_pct,
-        invoice_count,
-        invoice_doc_nums
-      FROM fact_fill_rate_orders
-      WHERE ${where.join(" AND ")}
-      ORDER BY difference DESC, order_date DESC, order_doc_num DESC
-      LIMIT 500
-      `,
-      params
-    );
-
-    return {
-      ok: true,
-      source: "db",
-      from,
-      to,
-      area,
-      grupo,
-      categoria,
-      seller,
-      lastSyncAt: await getState("last_fill_rate_sync_at"),
-      totals: {
-        orders: Number(t.orders || 0),
-        pedido: money2(pedido),
-        facturado: money2(facturado),
-        diferencia: money2(Number(t.diferencia || 0)),
-        fillRatePct: pedido > 0 ? num((facturado / pedido) * 100, 2) : 0,
-      },
-      rows: (rowsQ.rows || []).map((r) => ({
-        orderDocNum: Number(r.order_doc_num || 0),
-        orderDocEntry: Number(r.order_doc_entry || 0),
-        cardCode: String(r.card_code || ""),
-        cardName: String(r.card_name || ""),
-        warehouse: String(r.warehouse_code || ""),
-        sellerCode: Number.isFinite(Number(r.seller_code)) ? Number(r.seller_code) : null,
-        sellerName: String(r.seller_name || "").trim(),
-        orderDate: isoDateOnly(r.order_date),
-        orderDueDate: isoDateOnly(r.order_due_date),
-        status: String(r.status || ""),
-        totalPedido: money2(r.order_total),
-        totalFacturado: money2(r.invoiced_total),
-        diferencia: money2(r.difference),
-        fillRatePct: num(r.fill_rate_pct, 2),
-        invoiceCount: Number(r.invoice_count || 0),
-        invoiceDocNums: String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean),
-      })),
-    };
-  }
+  const openExpr = `LOWER(BTRIM(COALESCE(status,''))) = 'bost_open'`;
 
   const params = [from, to];
   const where = [`order_date >= $1::date`, `order_date <= $2::date`];
@@ -9230,24 +9309,25 @@ async function fillRateFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", c
   const totalsQ = await dbQuery(
     `
     SELECT
-      COUNT(DISTINCT order_doc_entry)::int AS orders,
-      COALESCE(SUM(order_line_total),0)::float AS pedido,
-      COALESCE(SUM(invoiced_line_total),0)::float AS facturado,
-      COALESCE(SUM(difference),0)::float AS diferencia
+      COUNT(DISTINCT CASE WHEN NOT (${openExpr}) THEN order_doc_entry END)::int AS orders,
+      COUNT(DISTINCT CASE WHEN ${openExpr} THEN order_doc_entry END)::int AS excluded_open_orders,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN order_line_total ELSE 0 END),0)::float AS pedido,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN invoiced_line_total ELSE 0 END),0)::float AS facturado,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN difference ELSE 0 END),0)::float AS diferencia
     FROM fact_fill_rate_lines
     WHERE ${where.join(" AND ")}
     `,
     params
   );
   const t = totalsQ.rows?.[0] || {};
-  const pedido = Number(t.pedido || 0);
-  const facturado = Number(t.facturado || 0);
+  const pedido = money2(t.pedido || 0);
+  const facturado = money2(t.facturado || 0);
 
   const rowsQ = await dbQuery(
     `
     SELECT
-      order_doc_num,
       order_doc_entry,
+      MAX(order_doc_num) AS order_doc_num,
       MAX(card_code) AS card_code,
       MAX(card_name) AS card_name,
       MAX(warehouse_code) AS warehouse_code,
@@ -9256,14 +9336,17 @@ async function fillRateFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", c
       MAX(order_date)::text AS order_date,
       MAX(order_due_date)::text AS order_due_date,
       MAX(status) AS status,
-      COALESCE(SUM(order_line_total),0)::float AS order_total,
-      COALESCE(SUM(invoiced_line_total),0)::float AS invoiced_total,
-      COALESCE(SUM(difference),0)::float AS difference,
+      COALESCE(SUM(order_line_total),0)::float AS raw_order_total,
+      COALESCE(SUM(invoiced_line_total),0)::float AS raw_invoiced_total,
+      COALESCE(SUM(difference),0)::float AS raw_difference,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN order_line_total ELSE 0 END),0)::float AS order_total,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN invoiced_line_total ELSE 0 END),0)::float AS invoiced_total,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN difference ELSE 0 END),0)::float AS difference,
       COALESCE(STRING_AGG(DISTINCT NULLIF(invoice_doc_nums,''), ','), '') AS invoice_doc_nums
     FROM fact_fill_rate_lines
     WHERE ${where.join(" AND ")}
-    GROUP BY order_doc_num, order_doc_entry
-    ORDER BY difference DESC, order_date DESC, order_doc_num DESC
+    GROUP BY order_doc_entry
+    ORDER BY raw_difference DESC, MAX(order_date) DESC, MAX(order_doc_num) DESC
     LIMIT 500
     `,
     params
@@ -9271,7 +9354,7 @@ async function fillRateFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", c
 
   return {
     ok: true,
-    source: "db",
+    source: "fact_fill_rate_lines",
     from,
     to,
     area,
@@ -9281,14 +9364,17 @@ async function fillRateFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", c
     lastSyncAt: await getState("last_fill_rate_sync_at"),
     totals: {
       orders: Number(t.orders || 0),
-      pedido: money2(pedido),
-      facturado: money2(facturado),
-      diferencia: money2(Number(t.diferencia || 0)),
+      excludedOpen: Number(t.excluded_open_orders || 0),
+      pedido,
+      facturado,
+      diferencia: money2(t.diferencia || 0),
       fillRatePct: pedido > 0 ? num((facturado / pedido) * 100, 2) : 0,
     },
     rows: (rowsQ.rows || []).map((r) => {
-      const ord = money2(r.order_total);
-      const inv = money2(r.invoiced_total);
+      const status = String(r.status || "");
+      const isExcluded = status.trim().toLowerCase() === "bost_open";
+      const ord = money2(isExcluded ? r.raw_order_total : r.order_total);
+      const inv = money2(isExcluded ? r.raw_invoiced_total : r.invoiced_total);
       return {
         orderDocNum: Number(r.order_doc_num || 0),
         orderDocEntry: Number(r.order_doc_entry || 0),
@@ -9299,11 +9385,12 @@ async function fillRateFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", c
         sellerName: String(r.seller_name || "").trim(),
         orderDate: isoDateOnly(r.order_date),
         orderDueDate: isoDateOnly(r.order_due_date),
-        status: String(r.status || ""),
+        status,
+        isExcluded,
         totalPedido: ord,
         totalFacturado: inv,
-        diferencia: money2(r.difference),
-        fillRatePct: ord > 0 ? num((inv / ord) * 100, 2) : 0,
+        diferencia: money2(isExcluded ? r.raw_difference : r.difference),
+        fillRatePct: !isExcluded && ord > 0 ? num((inv / ord) * 100, 2) : 0,
         invoiceCount: String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean).length,
         invoiceDocNums: String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean),
       };
@@ -9329,6 +9416,7 @@ app.get("/api/admin/invoices/fill-rate", verifyAdmin, async (req, res) => {
 
 
 
+
 app.get("/api/admin/invoices/fill-rate/order-detail", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
@@ -9337,53 +9425,58 @@ app.get("/api/admin/invoices/fill-rate/order-detail", verifyAdmin, async (req, r
       return safeJson(res, 400, { ok: false, message: "orderDocEntry inválido" });
     }
 
-    let head = null;
+    const openExpr = `LOWER(BTRIM(COALESCE(status,''))) = 'bost_open'`;
+
     const headQ = await dbQuery(
       `
       SELECT
-        order_doc_entry,
-        order_doc_num,
-        order_date::text AS order_date,
-        order_due_date::text AS order_due_date,
-        card_code,
-        card_name,
-        warehouse_code,
-        seller_code,
-        seller_name,
-        status,
-        order_total,
-        invoiced_total,
-        difference,
-        fill_rate_pct,
-        invoice_count,
-        invoice_doc_nums
-      FROM fact_fill_rate_orders
+        MAX(order_doc_num) AS order_doc_num,
+        MAX(order_date)::text AS order_date,
+        MAX(order_due_date)::text AS order_due_date,
+        MAX(card_code) AS card_code,
+        MAX(card_name) AS card_name,
+        MAX(warehouse_code) AS warehouse_code,
+        MAX(seller_code) AS seller_code,
+        MAX(seller_name) AS seller_name,
+        MAX(status) AS status,
+        COALESCE(SUM(order_line_total),0)::float AS raw_order_total,
+        COALESCE(SUM(invoiced_line_total),0)::float AS raw_invoiced_total,
+        COALESCE(SUM(difference),0)::float AS raw_difference,
+        COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN order_line_total ELSE 0 END),0)::float AS order_total,
+        COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN invoiced_line_total ELSE 0 END),0)::float AS invoiced_total,
+        COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN difference ELSE 0 END),0)::float AS difference,
+        COUNT(DISTINCT CASE WHEN ${openExpr} THEN order_doc_entry END)::int AS excluded_open_orders,
+        COALESCE(STRING_AGG(DISTINCT NULLIF(invoice_doc_nums,''), ','), '') AS invoice_doc_nums
+      FROM fact_fill_rate_lines
       WHERE order_doc_entry = $1
-      LIMIT 1
       `,
       [orderDocEntry]
     );
-    if (headQ.rows?.[0]) {
-      const r = headQ.rows[0];
-      head = {
-        orderDocEntry: Number(r.order_doc_entry || 0),
-        orderDocNum: Number(r.order_doc_num || 0),
-        orderDate: isoDateOnly(r.order_date),
-        orderDueDate: isoDateOnly(r.order_due_date),
-        cardCode: String(r.card_code || ""),
-        cardName: String(r.card_name || ""),
-        warehouse: String(r.warehouse_code || ""),
-        sellerCode: Number.isFinite(Number(r.seller_code)) ? Number(r.seller_code) : null,
-        sellerName: String(r.seller_name || "").trim(),
-        status: String(r.status || ""),
-        totalPedido: money2(r.order_total),
-        totalFacturado: money2(r.invoiced_total),
-        diferencia: money2(r.difference),
-        fillRatePct: num(r.fill_rate_pct, 2),
-        invoiceCount: Number(r.invoice_count || 0),
-        invoiceDocNums: String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean),
-      };
-    }
+    const r = headQ.rows?.[0] || {};
+    const status = String(r.status || "");
+    const isExcluded = status.trim().toLowerCase() === "bost_open";
+    const invoiceDocNums = String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean);
+
+    const head = Number(r.order_doc_num || 0) > 0 ? {
+      orderDocEntry,
+      orderDocNum: Number(r.order_doc_num || 0),
+      orderDate: isoDateOnly(r.order_date),
+      orderDueDate: isoDateOnly(r.order_due_date),
+      cardCode: String(r.card_code || ""),
+      cardName: String(r.card_name || ""),
+      warehouse: String(r.warehouse_code || ""),
+      sellerCode: Number.isFinite(Number(r.seller_code)) ? Number(r.seller_code) : null,
+      sellerName: String(r.seller_name || "").trim(),
+      status,
+      isExcluded,
+      excludedOpenOrders: Number(r.excluded_open_orders || 0),
+      totalPedido: money2(r.raw_order_total),
+      totalFacturado: money2(r.raw_invoiced_total),
+      diferencia: money2(r.raw_difference),
+      fillRatePct: !isExcluded && money2(r.order_total) > 0 ? num((money2(r.invoiced_total) / money2(r.order_total)) * 100, 2) : 0,
+      invoiceCount: invoiceDocNums.length,
+      invoiceDocNums,
+    } : null;
 
     const linesQ = await dbQuery(
       `
@@ -9394,6 +9487,7 @@ app.get("/api/admin/invoices/fill-rate/order-detail", verifyAdmin, async (req, r
         grupo,
         area,
         categoria,
+        status,
         order_line_total,
         invoiced_line_total,
         difference,
@@ -9406,71 +9500,27 @@ app.get("/api/admin/invoices/fill-rate/order-detail", verifyAdmin, async (req, r
       [orderDocEntry]
     );
 
-    const lines = (linesQ.rows || []).map((r) => ({
-      lineNum: Number(r.line_num || 0),
-      itemCode: String(r.item_code || ""),
-      itemDesc: String(r.item_desc || ""),
-      grupo: String(r.grupo || ""),
-      area: String(r.area || ""),
-      categoria: String(r.categoria || ""),
-      totalPedido: money2(r.order_line_total),
-      totalFacturado: money2(r.invoiced_line_total),
-      diferencia: money2(r.difference),
-      fillRatePct: num(r.fill_rate_pct, 2),
-      invoiceDocNums: String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean),
-      invoiceCount: String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean).length,
+    const lines = (linesQ.rows || []).map((row) => ({
+      lineNum: Number(row.line_num || 0),
+      itemCode: String(row.item_code || ""),
+      itemDesc: String(row.item_desc || ""),
+      grupo: String(row.grupo || ""),
+      area: String(row.area || ""),
+      categoria: String(row.categoria || ""),
+      status: String(row.status || ""),
+      totalPedido: money2(row.order_line_total),
+      totalFacturado: money2(row.invoiced_line_total),
+      diferencia: money2(row.difference),
+      fillRatePct: num(row.fill_rate_pct, 2),
+      invoiceDocNums: String(row.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean),
+      invoiceCount: String(row.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean).length,
     }));
-
-    if (!head && lines.length) {
-      const aggQ = await dbQuery(
-        `
-        SELECT
-          MAX(order_doc_num) AS order_doc_num,
-          MAX(order_date)::text AS order_date,
-          MAX(order_due_date)::text AS order_due_date,
-          MAX(card_code) AS card_code,
-          MAX(card_name) AS card_name,
-          MAX(warehouse_code) AS warehouse_code,
-          MAX(seller_code) AS seller_code,
-          MAX(seller_name) AS seller_name,
-          MAX(status) AS status,
-          COALESCE(SUM(order_line_total),0)::float AS order_total,
-          COALESCE(SUM(invoiced_line_total),0)::float AS invoiced_total,
-          COALESCE(SUM(difference),0)::float AS difference,
-          COALESCE(MAX(fill_rate_pct),0)::float AS fill_rate_pct,
-          COALESCE(STRING_AGG(DISTINCT NULLIF(invoice_doc_nums,''), ','), '') AS invoice_doc_nums
-        FROM fact_fill_rate_lines
-        WHERE order_doc_entry = $1
-        `,
-        [orderDocEntry]
-      );
-      const r = aggQ.rows?.[0] || {};
-      const invoiceDocNums = String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean);
-      head = {
-        orderDocEntry,
-        orderDocNum: Number(r.order_doc_num || 0),
-        orderDate: isoDateOnly(r.order_date),
-        orderDueDate: isoDateOnly(r.order_due_date),
-        cardCode: String(r.card_code || ""),
-        cardName: String(r.card_name || ""),
-        warehouse: String(r.warehouse_code || ""),
-        sellerCode: Number.isFinite(Number(r.seller_code)) ? Number(r.seller_code) : null,
-        sellerName: String(r.seller_name || "").trim(),
-        status: String(r.status || ""),
-        totalPedido: money2(r.order_total),
-        totalFacturado: money2(r.invoiced_total),
-        diferencia: money2(r.difference),
-        fillRatePct: num(r.fill_rate_pct, 2),
-        invoiceCount: invoiceDocNums.length,
-        invoiceDocNums,
-      };
-    }
 
     if (!head) return safeJson(res, 404, { ok: false, message: "No encontré detalle de ese pedido en Fill Rate" });
 
     return safeJson(res, 200, {
       ok: true,
-      source: "db",
+      source: "fact_fill_rate_lines",
       order: head,
       lines,
     });
