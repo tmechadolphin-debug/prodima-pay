@@ -9106,7 +9106,7 @@ async function syncFillRateRangeToDb({ from, to, seller = "__ALL__", maxDocs = 3
     }
   };
 }
-async function fillRateFromDbasync function fillRateFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__" } = {}) {
+async function fillRateFromDb({ from, to, area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__" } = {}) {
   if (!hasDb()) throw new Error("DB no configurada (DATABASE_URL)");
 
   const areaSel = String(area || "__ALL__").trim().toUpperCase();
@@ -9327,6 +9327,157 @@ app.get("/api/admin/invoices/fill-rate", verifyAdmin, async (req, res) => {
   }
 });
 
+
+
+app.get("/api/admin/invoices/fill-rate/order-detail", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+    const orderDocEntry = Number(req.query?.orderDocEntry || 0);
+    if (!Number.isFinite(orderDocEntry) || orderDocEntry <= 0) {
+      return safeJson(res, 400, { ok: false, message: "orderDocEntry inválido" });
+    }
+
+    let head = null;
+    const headQ = await dbQuery(
+      `
+      SELECT
+        order_doc_entry,
+        order_doc_num,
+        order_date::text AS order_date,
+        order_due_date::text AS order_due_date,
+        card_code,
+        card_name,
+        warehouse_code,
+        seller_code,
+        seller_name,
+        status,
+        order_total,
+        invoiced_total,
+        difference,
+        fill_rate_pct,
+        invoice_count,
+        invoice_doc_nums
+      FROM fact_fill_rate_orders
+      WHERE order_doc_entry = $1
+      LIMIT 1
+      `,
+      [orderDocEntry]
+    );
+    if (headQ.rows?.[0]) {
+      const r = headQ.rows[0];
+      head = {
+        orderDocEntry: Number(r.order_doc_entry || 0),
+        orderDocNum: Number(r.order_doc_num || 0),
+        orderDate: isoDateOnly(r.order_date),
+        orderDueDate: isoDateOnly(r.order_due_date),
+        cardCode: String(r.card_code || ""),
+        cardName: String(r.card_name || ""),
+        warehouse: String(r.warehouse_code || ""),
+        sellerCode: Number.isFinite(Number(r.seller_code)) ? Number(r.seller_code) : null,
+        sellerName: String(r.seller_name || "").trim(),
+        status: String(r.status || ""),
+        totalPedido: money2(r.order_total),
+        totalFacturado: money2(r.invoiced_total),
+        diferencia: money2(r.difference),
+        fillRatePct: num(r.fill_rate_pct, 2),
+        invoiceCount: Number(r.invoice_count || 0),
+        invoiceDocNums: String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean),
+      };
+    }
+
+    const linesQ = await dbQuery(
+      `
+      SELECT
+        line_num,
+        item_code,
+        item_desc,
+        grupo,
+        area,
+        categoria,
+        order_line_total,
+        invoiced_line_total,
+        difference,
+        fill_rate_pct,
+        invoice_doc_nums
+      FROM fact_fill_rate_lines
+      WHERE order_doc_entry = $1
+      ORDER BY line_num ASC, difference DESC
+      `,
+      [orderDocEntry]
+    );
+
+    const lines = (linesQ.rows || []).map((r) => ({
+      lineNum: Number(r.line_num || 0),
+      itemCode: String(r.item_code || ""),
+      itemDesc: String(r.item_desc || ""),
+      grupo: String(r.grupo || ""),
+      area: String(r.area || ""),
+      categoria: String(r.categoria || ""),
+      totalPedido: money2(r.order_line_total),
+      totalFacturado: money2(r.invoiced_line_total),
+      diferencia: money2(r.difference),
+      fillRatePct: num(r.fill_rate_pct, 2),
+      invoiceDocNums: String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean),
+      invoiceCount: String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean).length,
+    }));
+
+    if (!head && lines.length) {
+      const aggQ = await dbQuery(
+        `
+        SELECT
+          MAX(order_doc_num) AS order_doc_num,
+          MAX(order_date)::text AS order_date,
+          MAX(order_due_date)::text AS order_due_date,
+          MAX(card_code) AS card_code,
+          MAX(card_name) AS card_name,
+          MAX(warehouse_code) AS warehouse_code,
+          MAX(seller_code) AS seller_code,
+          MAX(seller_name) AS seller_name,
+          MAX(status) AS status,
+          COALESCE(SUM(order_line_total),0)::float AS order_total,
+          COALESCE(SUM(invoiced_line_total),0)::float AS invoiced_total,
+          COALESCE(SUM(difference),0)::float AS difference,
+          COALESCE(MAX(fill_rate_pct),0)::float AS fill_rate_pct,
+          COALESCE(STRING_AGG(DISTINCT NULLIF(invoice_doc_nums,''), ','), '') AS invoice_doc_nums
+        FROM fact_fill_rate_lines
+        WHERE order_doc_entry = $1
+        `,
+        [orderDocEntry]
+      );
+      const r = aggQ.rows?.[0] || {};
+      const invoiceDocNums = String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean);
+      head = {
+        orderDocEntry,
+        orderDocNum: Number(r.order_doc_num || 0),
+        orderDate: isoDateOnly(r.order_date),
+        orderDueDate: isoDateOnly(r.order_due_date),
+        cardCode: String(r.card_code || ""),
+        cardName: String(r.card_name || ""),
+        warehouse: String(r.warehouse_code || ""),
+        sellerCode: Number.isFinite(Number(r.seller_code)) ? Number(r.seller_code) : null,
+        sellerName: String(r.seller_name || "").trim(),
+        status: String(r.status || ""),
+        totalPedido: money2(r.order_total),
+        totalFacturado: money2(r.invoiced_total),
+        diferencia: money2(r.difference),
+        fillRatePct: num(r.fill_rate_pct, 2),
+        invoiceCount: invoiceDocNums.length,
+        invoiceDocNums,
+      };
+    }
+
+    if (!head) return safeJson(res, 404, { ok: false, message: "No encontré detalle de ese pedido en Fill Rate" });
+
+    return safeJson(res, 200, {
+      ok: true,
+      source: "db",
+      order: head,
+      lines,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
 app.post("/api/admin/invoices/fill-rate/sync", verifyAdmin, async (req, res) => {
   try {
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
