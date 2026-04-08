@@ -9441,6 +9441,29 @@ async function customerFillRateFromDb({ from, to, cardCode = "", cardName = "", 
     params
   );
 
+
+  const itemRowsQ = await dbQuery(
+    `
+    SELECT
+      COALESCE(NULLIF(item_code,''), 'SIN-COD') AS item_code,
+      MAX(item_desc) AS item_desc,
+      MAX(grupo) AS grupo,
+      MAX(area) AS area,
+      MAX(categoria) AS categoria,
+      COUNT(DISTINCT CASE WHEN NOT (${openExpr}) THEN order_doc_entry END)::int AS orders,
+      COUNT(DISTINCT CASE WHEN ${openExpr} THEN order_doc_entry END)::int AS excluded_open_orders,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN order_line_total ELSE 0 END),0)::float AS pedido,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN invoiced_line_total ELSE 0 END),0)::float AS facturado,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN difference ELSE 0 END),0)::float AS diferencia
+    FROM fact_fill_rate_lines
+    WHERE ${where.join(" AND ")}
+    GROUP BY COALESCE(NULLIF(item_code,''), 'SIN-COD')
+    ORDER BY pedido DESC, facturado DESC, MAX(item_desc) ASC
+    LIMIT 300
+    `,
+    params
+  );
+
   return {
     ok: true,
     source: "fact_fill_rate_lines",
@@ -9478,6 +9501,27 @@ async function customerFillRateFromDb({ from, to, cardCode = "", cardName = "", 
         diferencia: money2(isExcluded ? r.raw_difference : r.difference),
         fillRatePct: !isExcluded && ord > 0 ? num((inv / ord) * 100, 2) : 0,
         invoiceDocNums: String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean),
+      };
+    }),
+    itemRows: (itemRowsQ.rows || []).map((r) => {
+      const orders = Number(r.orders || 0);
+      const excludedOpen = Number(r.excluded_open_orders || 0);
+      const ord = money2(r.pedido || 0);
+      const inv = money2(r.facturado || 0);
+      const onlyOpen = orders <= 0 && excludedOpen > 0;
+      return {
+        itemCode: String(r.item_code || ""),
+        itemDesc: String(r.item_desc || ""),
+        grupo: String(r.grupo || ""),
+        area: String(r.area || ""),
+        categoria: String(r.categoria || ""),
+        orders,
+        excludedOpen,
+        onlyOpen,
+        totalPedido: ord,
+        totalFacturado: inv,
+        diferencia: money2(r.diferencia || 0),
+        fillRatePct: !onlyOpen && ord > 0 ? num((inv / ord) * 100, 2) : 0,
       };
     }),
   };
