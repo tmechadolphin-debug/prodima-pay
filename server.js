@@ -7265,6 +7265,185 @@ async function detailsFromDb({ from, to, cardCode, warehouse, area = "__ALL__", 
   return { ok: true, from, to, area, grupo, categoria, cardCode, warehouse, totals, invoices };
 }
 
+
+async function customerDetailFromDb({ from, to, cardCode = "", cardName = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__", allowSapCategoryFallback = true }) {
+  let rows = await fetchInvoiceRows({ from, to, seller, allowSapCategoryFallback });
+  const rowsForCategories = applyAreaGroupFilters(rows, { area, grupo, categoria: "__ALL__" });
+  rows = applyAreaGroupFilters(rowsForCategories, { categoria, seller });
+
+  const codeSel = String(cardCode || "").trim();
+  const nameSel = String(cardName || "").trim();
+  const nameSelNorm = nameSel.toLowerCase();
+
+  rows = rows.filter((r) => {
+    const codeOk = codeSel ? String(r.cardCode || "").trim() === codeSel : false;
+    const nameOk = !codeSel && nameSelNorm ? String(r.cardName || "").trim().toLowerCase() === nameSelNorm : false;
+    return codeOk || nameOk;
+  });
+
+  const fillRate = await customerFillRateFromDb({
+    from,
+    to,
+    cardCode: codeSel,
+    cardName: nameSel,
+    area,
+    grupo,
+    categoria,
+    seller,
+  }).catch(() => ({
+    ok: true,
+    source: "fact_fill_rate_lines",
+    from,
+    to,
+    cardCode: codeSel,
+    cardName: nameSel,
+    totals: { orders: 0, excludedOpen: 0, pedido: 0, facturado: 0, diferencia: 0, fillRatePct: 0 },
+    rows: [],
+  }));
+
+  if (!rows.length) {
+    return {
+      ok: true,
+      from,
+      to,
+      cardCode: codeSel,
+      cardName: nameSel,
+      totals: { qty: 0, dollars: 0, grossProfit: 0, grossPct: 0, invoices: 0, warehouses: 0, items: 0 },
+      fillRate,
+      byMonth: [],
+      warehouses: [],
+      items: [],
+    };
+  }
+
+  const cardCodeOut = String(rows[0]?.cardCode || codeSel || "");
+  const cardNameOut = String(rows[0]?.cardName || nameSel || "");
+
+  const totals = { qty: 0, dollars: 0, grossProfit: 0 };
+  const invSet = new Set();
+  const warehouseSet = new Set();
+  const itemSet = new Set();
+  const monthMap = new Map();
+  const whMap = new Map();
+  const itemMap = new Map();
+
+  for (const r of rows) {
+    totals.qty += Number(r.quantity || 0);
+    totals.dollars += Number(r.dollars || 0);
+    totals.grossProfit += Number(r.grossProfit || 0);
+    if (r.docType === "INV") invSet.add(`${r.docType}:${r.docEntry}`);
+    if (String(r.warehouse || "").trim()) warehouseSet.add(String(r.warehouse || "").trim());
+    if (String(r.itemCode || "").trim()) itemSet.add(String(r.itemCode || "").trim());
+
+    const month = String(r.docDate || "").slice(0, 7);
+    if (month) {
+      const cur = monthMap.get(month) || { month, qty: 0, dollars: 0, grossProfit: 0, invSet: new Set() };
+      cur.qty += Number(r.quantity || 0);
+      cur.dollars += Number(r.dollars || 0);
+      cur.grossProfit += Number(r.grossProfit || 0);
+      if (r.docType === "INV") cur.invSet.add(`${r.docType}:${r.docEntry}`);
+      monthMap.set(month, cur);
+    }
+
+    const whCur = whMap.get(r.warehouse) || {
+      warehouse: r.warehouse,
+      qty: 0,
+      dollars: 0,
+      grossProfit: 0,
+      invSet: new Set(),
+    };
+    whCur.qty += Number(r.quantity || 0);
+    whCur.dollars += Number(r.dollars || 0);
+    whCur.grossProfit += Number(r.grossProfit || 0);
+    if (r.docType === "INV") whCur.invSet.add(`${r.docType}:${r.docEntry}`);
+    whMap.set(r.warehouse, whCur);
+
+    const itemKey = String(r.itemCode || "").trim() || `DESC::${String(r.itemDesc || "").trim()}`;
+    const itemCur = itemMap.get(itemKey) || {
+      itemCode: r.itemCode,
+      itemDesc: r.itemDesc,
+      qty: 0,
+      dollars: 0,
+      grossProfit: 0,
+      invSet: new Set(),
+    };
+    itemCur.qty += Number(r.quantity || 0);
+    itemCur.dollars += Number(r.dollars || 0);
+    itemCur.grossProfit += Number(r.grossProfit || 0);
+    if (r.docType === "INV") itemCur.invSet.add(`${r.docType}:${r.docEntry}`);
+    itemMap.set(itemKey, itemCur);
+  }
+
+  const dollars = money2(totals.dollars);
+  const gp = money2(totals.grossProfit);
+
+  return {
+    ok: true,
+    from,
+    to,
+    area,
+    grupo,
+    categoria,
+    cardCode: cardCodeOut,
+    cardName: cardNameOut,
+    totals: {
+      qty: num(totals.qty, 4),
+      dollars,
+      grossProfit: gp,
+      grossPct: dollars !== 0 ? num((gp / dollars) * 100, 2) : 0,
+      invoices: invSet.size,
+      warehouses: warehouseSet.size,
+      items: itemSet.size,
+    },
+    fillRate,
+    byMonth: Array.from(monthMap.values())
+      .map((x) => {
+        const d = money2(x.dollars);
+        const g = money2(x.grossProfit);
+        return {
+          month: x.month,
+          qty: num(x.qty, 4),
+          dollars: d,
+          grossProfit: g,
+          grossPct: d !== 0 ? num((g / d) * 100, 2) : 0,
+          invoices: x.invSet.size,
+        };
+      })
+      .sort((a, b) => String(a.month).localeCompare(String(b.month))),
+    warehouses: Array.from(whMap.values())
+      .map((x) => {
+        const d = money2(x.dollars);
+        const g = money2(x.grossProfit);
+        return {
+          warehouse: x.warehouse,
+          qty: num(x.qty, 4),
+          dollars: d,
+          grossProfit: g,
+          grossPct: d !== 0 ? num((g / d) * 100, 2) : 0,
+          invoices: x.invSet.size,
+        };
+      })
+      .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0)),
+    items: Array.from(itemMap.values())
+      .map((x) => {
+        const d = money2(x.dollars);
+        const g = money2(x.grossProfit);
+        return {
+          itemCode: x.itemCode,
+          itemDesc: x.itemDesc,
+          qty: num(x.qty, 4),
+          dollars: d,
+          grossProfit: g,
+          grossPct: d !== 0 ? num((g / d) * 100, 2) : 0,
+          invoices: x.invSet.size,
+        };
+      })
+      .sort((a, b) => Number(b.dollars || 0) - Number(a.dollars || 0))
+      .slice(0, 200),
+  };
+}
+
+
 async function topProductsFromDb({ from, to, warehouse = "", cardCode = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__", limit = 10, allowSapCategoryFallback = true }) {
   let rows = await fetchInvoiceRows({ from, to, cardCode, warehouse, seller, allowSapCategoryFallback });
   rows = applyAreaGroupFilters(rows, { area, grupo, categoria, seller });
@@ -8591,6 +8770,33 @@ app.get("/api/admin/invoices/articles", verifyAdmin, async (req, res) => {
   }
 });
 
+
+app.get("/api/admin/invoices/customer-detail", verifyAdmin, async (req, res) => {
+  try {
+    if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
+
+    const today = getDateISOInOffset(TZ_OFFSET_MIN);
+    const from = isISO(req.query?.from) ? String(req.query.from) : addDaysISO(today, -30);
+    const to = isISO(req.query?.to) ? String(req.query.to) : today;
+    const area = String(req.query?.area || "__ALL__");
+    const grupo = String(req.query?.grupo || "__ALL__");
+    const categoria = String(req.query?.categoria || "__ALL__");
+    const seller = String(req.query?.seller || "__ALL__");
+    const cardCode = String(req.query?.cardCode || "").trim();
+    const cardName = String(req.query?.cardName || "").trim();
+    const fast = ["1", "true", "yes", "si"].includes(String(req.query?.fast || "").toLowerCase());
+
+    if (!cardCode && !cardName) {
+      return safeJson(res, 400, { ok: false, message: "cardCode o cardName requerido" });
+    }
+
+    const data = await customerDetailFromDb({ from, to, cardCode, cardName, area, grupo, categoria, seller, allowSapCategoryFallback: !fast });
+    return safeJson(res, 200, data);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 app.get("/api/admin/invoices/article-detail", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
@@ -9137,6 +9343,146 @@ async function syncFillRateRangeToDb({ from, to, seller = "__ALL__", maxDocs = 3
     }
   };
 }
+
+
+async function customerFillRateFromDb({ from, to, cardCode = "", cardName = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__" } = {}) {
+  if (!hasDb()) throw new Error("DB no configurada (DATABASE_URL)");
+
+  const areaSel = String(area || "__ALL__").trim().toUpperCase();
+  const grupoSel = String(grupo || "__ALL__").trim();
+  const categoriaSel = String(categoria || "__ALL__").trim();
+  const sellerSel = String(seller || "__ALL__").trim();
+  const codeSel = String(cardCode || "").trim();
+  const nameSel = String(cardName || "").trim();
+  const openExpr = `LOWER(BTRIM(COALESCE(status,''))) = 'bost_open'`;
+
+  const params = [from, to];
+  const where = [`order_date >= $1::date`, `order_date <= $2::date`];
+
+  if (sellerSel && sellerSel !== "__ALL__") {
+    params.push(`%${sellerSel}%`);
+    const idx = params.length;
+    where.push(`(COALESCE(seller_name,'') ILIKE $${idx} OR COALESCE(seller_code::text,'') ILIKE $${idx})`);
+  }
+  if (areaSel !== "__ALL__") {
+    params.push(areaSel);
+    where.push(`COALESCE(area,'') = $${params.length}`);
+  }
+  if (grupoSel !== "__ALL__") {
+    params.push(canonicalInvoiceGroup(grupoSel));
+    where.push(`COALESCE(grupo,'Sin grupo') = $${params.length}`);
+  }
+  if (categoriaSel !== "__ALL__") {
+    params.push(normalizeCustomerCategoryName(categoriaSel));
+    where.push(`COALESCE(categoria,'Sin categoría') = $${params.length}`);
+  }
+  if (codeSel) {
+    params.push(codeSel);
+    where.push(`COALESCE(card_code,'') = $${params.length}`);
+  } else if (nameSel) {
+    params.push(nameSel);
+    where.push(`LOWER(BTRIM(COALESCE(card_name,''))) = LOWER(BTRIM($${params.length}))`);
+  } else {
+    return {
+      ok: true,
+      source: "fact_fill_rate_lines",
+      from,
+      to,
+      cardCode: codeSel,
+      cardName: nameSel,
+      totals: { orders: 0, excludedOpen: 0, pedido: 0, facturado: 0, diferencia: 0, fillRatePct: 0 },
+      rows: [],
+    };
+  }
+
+  const totalsQ = await dbQuery(
+    `
+    SELECT
+      COUNT(DISTINCT CASE WHEN NOT (${openExpr}) THEN order_doc_entry END)::int AS orders,
+      COUNT(DISTINCT CASE WHEN ${openExpr} THEN order_doc_entry END)::int AS excluded_open_orders,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN order_line_total ELSE 0 END),0)::float AS pedido,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN invoiced_line_total ELSE 0 END),0)::float AS facturado,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN difference ELSE 0 END),0)::float AS diferencia
+    FROM fact_fill_rate_lines
+    WHERE ${where.join(" AND ")}
+    `,
+    params
+  );
+  const t = totalsQ.rows?.[0] || {};
+  const pedido = money2(t.pedido || 0);
+  const facturado = money2(t.facturado || 0);
+
+  const rowsQ = await dbQuery(
+    `
+    SELECT
+      order_doc_entry,
+      MAX(order_doc_num) AS order_doc_num,
+      MAX(order_date)::text AS order_date,
+      MAX(order_due_date)::text AS order_due_date,
+      MAX(card_code) AS card_code,
+      MAX(card_name) AS card_name,
+      MAX(warehouse_code) AS warehouse_code,
+      MAX(seller_code) AS seller_code,
+      MAX(seller_name) AS seller_name,
+      MAX(status) AS status,
+      COALESCE(SUM(order_line_total),0)::float AS raw_order_total,
+      COALESCE(SUM(invoiced_line_total),0)::float AS raw_invoiced_total,
+      COALESCE(SUM(difference),0)::float AS raw_difference,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN order_line_total ELSE 0 END),0)::float AS order_total,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN invoiced_line_total ELSE 0 END),0)::float AS invoiced_total,
+      COALESCE(SUM(CASE WHEN NOT (${openExpr}) THEN difference ELSE 0 END),0)::float AS difference,
+      COALESCE(STRING_AGG(DISTINCT NULLIF(invoice_doc_nums,''), ','), '') AS invoice_doc_nums
+    FROM fact_fill_rate_lines
+    WHERE ${where.join(" AND ")}
+    GROUP BY order_doc_entry
+    ORDER BY raw_difference DESC, MAX(order_date) DESC, MAX(order_doc_num) DESC
+    LIMIT 500
+    `,
+    params
+  );
+
+  return {
+    ok: true,
+    source: "fact_fill_rate_lines",
+    from,
+    to,
+    cardCode: codeSel,
+    cardName: nameSel,
+    totals: {
+      orders: Number(t.orders || 0),
+      excludedOpen: Number(t.excluded_open_orders || 0),
+      pedido,
+      facturado,
+      diferencia: money2(t.diferencia || 0),
+      fillRatePct: pedido > 0 ? num((facturado / pedido) * 100, 2) : 0,
+    },
+    rows: (rowsQ.rows || []).map((r) => {
+      const status = String(r.status || "");
+      const isExcluded = status.trim().toLowerCase() === "bost_open";
+      const ord = money2(isExcluded ? r.raw_order_total : r.order_total);
+      const inv = money2(isExcluded ? r.raw_invoiced_total : r.invoiced_total);
+      return {
+        orderDocEntry: Number(r.order_doc_entry || 0),
+        orderDocNum: Number(r.order_doc_num || 0),
+        orderDate: isoDateOnly(r.order_date),
+        orderDueDate: isoDateOnly(r.order_due_date),
+        cardCode: String(r.card_code || ""),
+        cardName: String(r.card_name || ""),
+        warehouse: String(r.warehouse_code || ""),
+        sellerCode: Number.isFinite(Number(r.seller_code)) ? Number(r.seller_code) : null,
+        sellerName: String(r.seller_name || "").trim(),
+        status,
+        isExcluded,
+        totalPedido: ord,
+        totalFacturado: inv,
+        diferencia: money2(isExcluded ? r.raw_difference : r.difference),
+        fillRatePct: !isExcluded && ord > 0 ? num((inv / ord) * 100, 2) : 0,
+        invoiceDocNums: String(r.invoice_doc_nums || "").split(",").map((x) => Number(x || 0)).filter(Boolean),
+      };
+    }),
+  };
+}
+
 
 async function articleFillRateFromDb({ from, to, itemCode = "", itemDesc = "", area = "__ALL__", grupo = "__ALL__", categoria = "__ALL__", seller = "__ALL__" } = {}) {
   if (!hasDb()) throw new Error("DB no configurada (DATABASE_URL)");
