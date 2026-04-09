@@ -278,6 +278,14 @@ async function ensureDb() {
    Helpers generales
 ========================================================= */
 const TZ_OFFSET_MIN = -300; // Panamá UTC-5
+const AUTO_SYNC_ENABLED = !["0", "false", "no", "off"].includes(String(process.env.AUTO_SYNC_ENABLED ?? "true").trim().toLowerCase());
+const AUTO_SYNC_TIMES = String(process.env.AUTO_SYNC_TIMES || "07:30,12:00,15:00,17:00")
+  .split(",")
+  .map((x) => String(x || "").trim())
+  .filter(Boolean);
+const AUTO_SYNC_DAYS = Math.max(1, Math.min(7, Number(process.env.AUTO_SYNC_DAYS || 1)));
+const AUTO_SYNC_MAXDOCS = Math.max(500, Math.min(50000, Number(process.env.AUTO_SYNC_MAXDOCS || 12000)));
+
 
 function safeJson(res, status, obj) {
   res.status(status).json(obj);
@@ -10139,6 +10147,124 @@ app.post("/api/admin/invoices/customer-categories/backfill", verifyAdmin, async 
   }
 });
 
+
+let INVOICE_SYNC_RUNNING = false;
+let INVOICE_SYNC_CONTEXT = null;
+
+function getPanamaNowParts() {
+  const d = new Date(nowInOffsetMs(TZ_OFFSET_MIN));
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mm = String(d.getUTCMinutes()).padStart(2, "0");
+  const ss = String(d.getUTCSeconds()).padStart(2, "0");
+  return {
+    date: `${y}-${m}-${day}`,
+    hourMinute: `${hh}:${mm}`,
+    second: `${ss}`,
+    dayOfWeek: d.getUTCDay(),
+    iso: `${y}-${m}-${day}T${hh}:${mm}:${ss}-05:00`,
+  };
+}
+
+async function runInvoiceSyncJob({ from, to, maxDocs = AUTO_SYNC_MAXDOCS, source = "manual", slotKey = "", allowWhenBusy = false } = {}) {
+  if (!isISO(from) || !isISO(to)) throw new Error("from y to deben ser YYYY-MM-DD");
+  if (!hasDb()) throw new Error("DB no configurada (DATABASE_URL)");
+  if (missingSapEnv()) throw new Error("SAP env incompleto");
+
+  if (INVOICE_SYNC_RUNNING) {
+    if (!allowWhenBusy) {
+      const busy = INVOICE_SYNC_CONTEXT?.source ? `Ya hay un sync en progreso (${INVOICE_SYNC_CONTEXT.source})` : "Ya hay un sync en progreso";
+      throw new Error(busy);
+    }
+    return { ok: false, skipped: true, busy: true, message: "Sync omitido porque ya hay otro en progreso" };
+  }
+
+  INVOICE_SYNC_RUNNING = true;
+  INVOICE_SYNC_CONTEXT = { source, from, to, startedAt: new Date().toISOString(), slotKey: slotKey || "" };
+
+  try {
+    await setState("invoice_sync_running", "1");
+    await setState("invoice_sync_running_source", source);
+    await setState("invoice_sync_running_from", from);
+    await setState("invoice_sync_running_to", to);
+    await setState("invoice_sync_running_started_at", INVOICE_SYNC_CONTEXT.startedAt);
+
+    const out = await syncRangeToDb({ from, to, maxDocs });
+    const finishedAt = new Date().toISOString();
+    await setState("invoice_sync_last_run_source", source);
+    await setState("invoice_sync_last_run_from", from);
+    await setState("invoice_sync_last_run_to", to);
+    await setState("invoice_sync_last_run_finished_at", finishedAt);
+    await setState("invoice_sync_last_run_status", "ok");
+    if (slotKey) await setState("invoice_auto_last_slot", slotKey);
+    return { ok: true, ...out, from, to, maxDocs, source, slotKey, finishedAt };
+  } catch (e) {
+    const message = e?.message || String(e);
+    await setState("invoice_sync_last_run_source", source);
+    await setState("invoice_sync_last_run_from", from);
+    await setState("invoice_sync_last_run_to", to);
+    await setState("invoice_sync_last_run_finished_at", new Date().toISOString());
+    await setState("invoice_sync_last_run_status", `error: ${message}`);
+    throw e;
+  } finally {
+    INVOICE_SYNC_RUNNING = false;
+    INVOICE_SYNC_CONTEXT = null;
+    await setState("invoice_sync_running", "0");
+    await setState("invoice_sync_running_source", "");
+    await setState("invoice_sync_running_from", "");
+    await setState("invoice_sync_running_to", "");
+  }
+}
+
+function startInvoiceAutoSyncScheduler() {
+  if (!AUTO_SYNC_ENABLED) {
+    console.log("Invoice auto sync scheduler: disabled");
+    return;
+  }
+
+  const validTimes = Array.from(new Set(AUTO_SYNC_TIMES.filter((t) => /^\d{2}:\d{2}$/.test(t))));
+  if (!validTimes.length) {
+    console.log("Invoice auto sync scheduler: no valid times configured");
+    return;
+  }
+
+  console.log(`Invoice auto sync scheduler: enabled (${validTimes.join(", ")}, days=${AUTO_SYNC_DAYS})`);
+
+  const tick = async () => {
+    try {
+      const now = getPanamaNowParts();
+      if (!validTimes.includes(now.hourMinute)) return;
+
+      const slotKey = `${now.date} ${now.hourMinute}`;
+      const lastSlot = await getState("invoice_auto_last_slot");
+      if (String(lastSlot || "") === slotKey) return;
+
+      const from = addDaysISO(now.date, -(AUTO_SYNC_DAYS - 1));
+      const out = await runInvoiceSyncJob({
+        from,
+        to: now.date,
+        maxDocs: AUTO_SYNC_MAXDOCS,
+        source: `auto:${now.hourMinute}`,
+        slotKey,
+        allowWhenBusy: true,
+      });
+
+      if (out?.busy) {
+        console.log(`Invoice auto sync skipped (busy) at ${slotKey}`);
+      } else {
+        console.log(`Invoice auto sync OK ${slotKey} -> ${from}..${now.date}`);
+      }
+    } catch (e) {
+      console.error("Invoice auto sync error:", e?.message || String(e));
+    }
+  };
+
+  tick().catch(() => {});
+  setInterval(() => { tick().catch(() => {}); }, 30000);
+}
+
 app.post("/api/admin/invoices/sync", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
@@ -10152,8 +10278,8 @@ app.post("/api/admin/invoices/sync", verifyAdmin, async (req, res) => {
       return safeJson(res, 400, { ok: false, message: "from y to deben ser YYYY-MM-DD" });
     }
 
-    const out = await syncRangeToDb({ from: fromQ, to: toQ, maxDocs });
-    return safeJson(res, 200, { ok: true, ...out, from: fromQ, to: toQ, maxDocs });
+    const out = await runInvoiceSyncJob({ from: fromQ, to: toQ, maxDocs, source: "manual-range" });
+    return safeJson(res, 200, out);
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
   }
@@ -10170,10 +10296,33 @@ app.post("/api/admin/invoices/sync/recent", verifyAdmin, async (req, res) => {
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const from = addDaysISO(today, -(days - 1));
 
-    const out = await syncRangeToDb({ from, to: today, maxDocs });
-    return safeJson(res, 200, { ok: true, ...out, from, to: today, days, maxDocs });
+    const out = await runInvoiceSyncJob({ from, to: today, maxDocs, source: `manual-recent:${days}d` });
+    return safeJson(res, 200, { ...out, days });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
+  }
+});
+
+app.get("/api/admin/invoices/sync/status", verifyAdmin, async (req, res) => {
+  try {
+    const status = {
+      ok: true,
+      autoSyncEnabled: AUTO_SYNC_ENABLED,
+      autoSyncTimes: AUTO_SYNC_TIMES,
+      autoSyncDays: AUTO_SYNC_DAYS,
+      autoSyncMaxDocs: AUTO_SYNC_MAXDOCS,
+      running: INVOICE_SYNC_RUNNING,
+      runningContext: INVOICE_SYNC_CONTEXT,
+      lastAutoSlot: await getState("invoice_auto_last_slot"),
+      lastRunSource: await getState("invoice_sync_last_run_source"),
+      lastRunFrom: await getState("invoice_sync_last_run_from"),
+      lastRunTo: await getState("invoice_sync_last_run_to"),
+      lastRunFinishedAt: await getState("invoice_sync_last_run_finished_at"),
+      lastRunStatus: await getState("invoice_sync_last_run_status"),
+    };
+    return safeJson(res, 200, status);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
 });
 
@@ -19686,6 +19835,8 @@ app.post('/api/admin/production-close/orders/:absoluteEntry/process', verifyAdmi
   } catch (e) {
     console.error("DB init error:", e.message || String(e));
   }
+
+  startInvoiceAutoSyncScheduler();
 
   app.listen(Number(PORT), () => {
     console.log(`PRODIMA API UNIFICADA listening on :${PORT}`);
