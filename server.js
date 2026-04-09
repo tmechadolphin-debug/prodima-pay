@@ -10265,6 +10265,8 @@ function startInvoiceAutoSyncScheduler() {
   setInterval(() => { tick().catch(() => {}); }, 30000);
 }
 
+globalThis.startInvoiceAutoSyncScheduler = startInvoiceAutoSyncScheduler;
+
 app.post("/api/admin/invoices/sync", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada (DATABASE_URL)" });
@@ -19836,7 +19838,17 @@ app.post('/api/admin/production-close/orders/:absoluteEntry/process', verifyAdmi
     console.error("DB init error:", e.message || String(e));
   }
 
-  startInvoiceAutoSyncScheduler();
+  try {
+    if (typeof startInvoiceAutoSyncScheduler === "function") {
+      startInvoiceAutoSyncScheduler();
+    } else if (typeof globalThis.startInvoiceAutoSyncScheduler === "function") {
+      globalThis.startInvoiceAutoSyncScheduler();
+    } else {
+      console.warn("Invoice auto sync scheduler not available; startup continues without auto sync");
+    }
+  } catch (e) {
+    console.error("Invoice auto sync bootstrap error:", e?.message || String(e));
+  }
 
   app.listen(Number(PORT), () => {
     console.log(`PRODIMA API UNIFICADA listening on :${PORT}`);
