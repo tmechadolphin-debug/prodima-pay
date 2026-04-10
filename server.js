@@ -622,85 +622,48 @@ function isSapAuthLikeError(err) {
   );
 }
 
-function isSapTransientHttpStatus(status) {
-  const n = Number(status || 0);
-  return n === 429 || n === 502 || n === 503 || n === 504;
-}
-
 async function slFetch(path, options = {}, allowAuthRetry = true) {
   if (missingSapEnv()) throw new Error("Missing SAP env");
 
-  const maxTransientRetries = Math.max(0, Number(options.maxTransientRetries ?? 4));
-  const timeoutMs = Math.max(10000, Number(options.timeoutMs || 90000));
+  if (!SL_COOKIE || Date.now() - SL_COOKIE_AT > 25 * 60 * 1000) {
+    await slLogin();
+  }
+
   const base = getSapServiceRoot();
   const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
   const method = String(options.method || "GET").toUpperCase();
 
-  for (let attempt = 0; attempt <= maxTransientRetries; attempt++) {
-    if (!SL_COOKIE || Date.now() - SL_COOKIE_AT > 25 * 60 * 1000) {
-      await slLogin(attempt > 0);
-    }
+  const r = await fetch(url, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: SL_COOKIE,
+      ...(options.headers || {}),
+    },
+    body: options.body,
+  });
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-      const r = await fetch(url, {
-        method,
-        signal: controller.signal,
-        headers: {
-          "Content-Type": "application/json",
-          Cookie: SL_COOKIE,
-          ...(options.headers || {}),
-        },
-        body: options.body,
-      });
-
-      const txt = await r.text();
-      let data = {};
-      try {
-        data = JSON.parse(txt);
-      } catch {
-        data = { raw: txt };
-      }
-
-      if (!r.ok) {
-        if (allowAuthRetry && (r.status === 401 || r.status === 403)) {
-          clearSlSession();
-          await slLogin(true);
-          return slFetch(path, { ...options, timeoutMs, maxTransientRetries }, false);
-        }
-
-        if (isSapTransientHttpStatus(r.status) && attempt < maxTransientRetries) {
-          const waitMs = 1200 * Math.pow(2, attempt);
-          console.warn(`SAP transient HTTP ${r.status} en ${method} ${path}; reintentando en ${waitMs}ms (intento ${attempt + 1}/${maxTransientRetries})`);
-          await sleep(waitMs);
-          continue;
-        }
-
-        throw new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
-      }
-
-      return data;
-    } catch (err) {
-      const isAbort = String(err?.name || "") === "AbortError";
-      if ((isAbort || isSapTransientHttpStatus(Number(err?.status || 0))) && attempt < maxTransientRetries) {
-        const waitMs = 1200 * Math.pow(2, attempt);
-        console.warn(`SAP ${isAbort ? "timeout" : "transient error"} en ${method} ${path}; reintentando en ${waitMs}ms (intento ${attempt + 1}/${maxTransientRetries})`);
-        clearSlSession();
-        await sleep(waitMs);
-        continue;
-      }
-      if (isAbort) {
-        throw new Error(`SAP timeout (${timeoutMs}ms) en ${method} ${path}`);
-      }
-      throw err;
-    } finally {
-      clearTimeout(timeout);
-    }
+  const txt = await r.text();
+  let data = {};
+  try {
+    data = JSON.parse(txt);
+  } catch {
+    data = { raw: txt };
   }
 
-  throw new Error(`SAP transient retry exhausted en ${method} ${path}`);
+  if (!r.ok) {
+    const err = new Error(`SAP error ${r.status}: ${data?.error?.message?.value || txt}`);
+
+    if (allowAuthRetry && (r.status === 401 || r.status === 403)) {
+      clearSlSession();
+      await slLogin(true);
+      return slFetch(path, options, false);
+    }
+
+    throw err;
+  }
+
+  return data;
 }
 
 async function slFetchFreshSession(path, options = {}) {
@@ -4886,7 +4849,7 @@ function pickGrossProfit(ln) {
 
 async function scanDocHeaders(entity, { from, to, maxDocs = 2500 }) {
   const toPlus1 = addDaysISO(to, 1);
-  const batchTop = Math.max(50, Math.min(100, Number(process.env.SAP_SYNC_BATCH_TOP || 100)));
+  const batchTop = 200;
   let skipSap = 0;
   const out = [];
 
