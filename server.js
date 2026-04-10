@@ -10168,6 +10168,71 @@ function getPanamaNowParts() {
   };
 }
 
+function diffDaysInclusiveISO(from, to) {
+  const a = new Date(String(from || "").slice(0, 10) + "T00:00:00");
+  const b = new Date(String(to || "").slice(0, 10) + "T00:00:00");
+  if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return 0;
+  return Math.max(1, Math.floor((b.getTime() - a.getTime()) / 86400000) + 1);
+}
+
+function buildInvoiceSyncChunks(from, to, chunkDays = 7) {
+  const size = Math.max(1, Number(chunkDays || 7));
+  const chunks = [];
+  let cur = String(from || "").slice(0, 10);
+  const end = String(to || "").slice(0, 10);
+  while (cur && cur <= end) {
+    let chunkTo = addDaysISO(cur, size - 1);
+    if (chunkTo > end) chunkTo = end;
+    chunks.push({ from: cur, to: chunkTo });
+    cur = addDaysISO(chunkTo, 1);
+  }
+  return chunks;
+}
+
+async function syncRangeToDbChunked({ from, to, maxDocs = 6000, chunkDays = 7 } = {}) {
+  const totalDays = diffDaysInclusiveISO(from, to);
+  if (totalDays <= chunkDays) {
+    const out = await syncRangeToDb({ from, to, maxDocs });
+    return { ...out, chunks: [{ from, to, ...out }] };
+  }
+
+  const chunks = buildInvoiceSyncChunks(from, to, chunkDays);
+  const perChunkMaxDocs = Math.max(500, Math.min(Number(maxDocs || 6000), 3000));
+  const totals = {
+    invoices: 0,
+    creditNotes: 0,
+    lines: 0,
+    categoryBackfill: { scanned: 0, updated: 0, failed: 0 },
+    fillRateBackfill: { ok: true, processed: 0, saved: 0, totals: { orders: 0, pedido: 0, facturado: 0, diferencia: 0, fillRatePct: 0 } },
+    chunks: [],
+  };
+
+  for (const chunk of chunks) {
+    const out = await syncRangeToDb({ from: chunk.from, to: chunk.to, maxDocs: perChunkMaxDocs });
+    totals.invoices += Number(out?.invoices || 0);
+    totals.creditNotes += Number(out?.creditNotes || 0);
+    totals.lines += Number(out?.lines || 0);
+
+    totals.categoryBackfill.scanned += Number(out?.categoryBackfill?.scanned || 0);
+    totals.categoryBackfill.updated += Number(out?.categoryBackfill?.updated || 0);
+    totals.categoryBackfill.failed += Number(out?.categoryBackfill?.failed || 0);
+
+    totals.fillRateBackfill.processed += Number(out?.fillRateBackfill?.processed || 0);
+    totals.fillRateBackfill.saved += Number(out?.fillRateBackfill?.saved || 0);
+    totals.fillRateBackfill.totals.orders += Number(out?.fillRateBackfill?.totals?.orders || 0);
+    totals.fillRateBackfill.totals.pedido += Number(out?.fillRateBackfill?.totals?.pedido || 0);
+    totals.fillRateBackfill.totals.facturado += Number(out?.fillRateBackfill?.totals?.facturado || 0);
+    totals.fillRateBackfill.totals.diferencia += Number(out?.fillRateBackfill?.totals?.diferencia || 0);
+    totals.chunks.push({ from: chunk.from, to: chunk.to, invoices: out?.invoices || 0, creditNotes: out?.creditNotes || 0, lines: out?.lines || 0 });
+  }
+
+  totals.fillRateBackfill.totals.fillRatePct = totals.fillRateBackfill.totals.pedido > 0
+    ? Number(((totals.fillRateBackfill.totals.facturado / totals.fillRateBackfill.totals.pedido) * 100).toFixed(2))
+    : 0;
+
+  return totals;
+}
+
 async function runInvoiceSyncJob({ from, to, maxDocs = AUTO_SYNC_MAXDOCS, source = "manual", slotKey = "", allowWhenBusy = false } = {}) {
   if (!isISO(from) || !isISO(to)) throw new Error("from y to deben ser YYYY-MM-DD");
   if (!hasDb()) throw new Error("DB no configurada (DATABASE_URL)");
@@ -10191,7 +10256,10 @@ async function runInvoiceSyncJob({ from, to, maxDocs = AUTO_SYNC_MAXDOCS, source
     await setState("invoice_sync_running_to", to);
     await setState("invoice_sync_running_started_at", INVOICE_SYNC_CONTEXT.startedAt);
 
-    const out = await syncRangeToDb({ from, to, maxDocs });
+    const totalDays = diffDaysInclusiveISO(from, to);
+    const out = totalDays > 7
+      ? await syncRangeToDbChunked({ from, to, maxDocs, chunkDays: 7 })
+      : await syncRangeToDb({ from, to, maxDocs });
     const finishedAt = new Date().toISOString();
     await setState("invoice_sync_last_run_source", source);
     await setState("invoice_sync_last_run_from", from);
@@ -10274,7 +10342,7 @@ app.post("/api/admin/invoices/sync", verifyAdmin, async (req, res) => {
 
     const fromQ = String(req.query?.from || req.body?.from || "");
     const toQ = String(req.query?.to || req.body?.to || "");
-    const maxDocs = Math.max(500, Math.min(50000, Number(req.query?.maxDocs || req.body?.maxDocs || 12000)));
+    const maxDocs = Math.max(500, Math.min(12000, Number(req.query?.maxDocs || req.body?.maxDocs || 6000)));
 
     if (!isISO(fromQ) || !isISO(toQ)) {
       return safeJson(res, 400, { ok: false, message: "from y to deben ser YYYY-MM-DD" });
