@@ -6588,16 +6588,14 @@ async function upsertLinesToDb(docType, sign, header, docFull) {
   return values.length;
 }
 
-async function syncRangeToDb({ from, to, maxDocs = 6000, categoryBackfill = true, fillRateBackfill = true, categoryLimit = 3000 } = {}) {
+async function syncRangeToDb({ from, to, maxDocs = 6000 }) {
   if (!hasDb()) throw new Error("DB no configurada (DATABASE_URL)");
-
-  const docsCap = Math.max(100, Math.min(3000, Number(maxDocs || 6000)));
 
   // limpia el rango para evitar residuos de syncs anteriores
   await dbQuery(`DELETE FROM fact_invoice_lines WHERE doc_date >= $1::date AND doc_date <= $2::date`, [from, to]);
 
-  const invHeaders = await scanDocHeaders("Invoices", { f: from, t: to, maxDocs: docsCap });
-  const crnHeaders = await scanDocHeaders("CreditNotes", { f: from, t: to, maxDocs: docsCap });
+  const invHeaders = await scanDocHeaders("Invoices", { f: from, t: to, maxDocs });
+  const crnHeaders = await scanDocHeaders("CreditNotes", { f: from, t: to, maxDocs });
 
   let totalLines = 0;
 
@@ -6625,27 +6623,21 @@ async function syncRangeToDb({ from, to, maxDocs = 6000, categoryBackfill = true
   await setState("last_sync_to", to);
   await setState("last_sync_at", new Date().toISOString());
 
-  let categoryBackfillOut = { skipped: true, scanned: 0, updated: 0, failed: 0 };
-  if (categoryBackfill) {
-    try {
-      categoryBackfillOut = await backfillCustomerCategoriesForRange({ from, to, limit: Math.max(50, Math.min(3000, Number(categoryLimit || 3000))), forceRefresh: true });
-    } catch (e) {
-      console.error("Customer category backfill error", e?.message || String(e));
-      categoryBackfillOut = { ok: false, skipped: false, scanned: 0, updated: 0, failed: 0, message: e?.message || String(e) };
-    }
+  let categoryBackfill = { scanned: 0, updated: 0, failed: 0 };
+  try {
+    categoryBackfill = await backfillCustomerCategoriesForRange({ from, to, limit: 3000, forceRefresh: true });
+  } catch (e) {
+    console.error("Customer category backfill error", e?.message || String(e));
   }
 
-  let fillRateBackfillOut = { skipped: true, ok: false, processed: 0, saved: 0, totals: { orders: 0, pedido: 0, facturado: 0, diferencia: 0, fillRatePct: 0 } };
-  if (fillRateBackfill) {
-    try {
-      fillRateBackfillOut = await syncFillRateRangeToDb({ from, to, maxDocs: Math.max(100, Math.min(docsCap, 1000)) });
-    } catch (e) {
-      console.error("Fill rate backfill error", e?.message || String(e));
-      fillRateBackfillOut = { ok: false, skipped: false, processed: 0, saved: 0, message: e?.message || String(e), totals: { orders: 0, pedido: 0, facturado: 0, diferencia: 0, fillRatePct: 0 } };
-    }
+  let fillRateBackfill = { ok: false, processed: 0, saved: 0, totals: { orders: 0, pedido: 0, facturado: 0, diferencia: 0, fillRatePct: 0 } };
+  try {
+    fillRateBackfill = await syncFillRateRangeToDb({ from, to, maxDocs: Math.max(300, Math.min(maxDocs, 6000)) });
+  } catch (e) {
+    console.error("Fill rate backfill error", e?.message || String(e));
   }
 
-  return { invoices: invHeaders.length, creditNotes: crnHeaders.length, lines: totalLines, categoryBackfill: categoryBackfillOut, fillRateBackfill: fillRateBackfillOut };
+  return { invoices: invHeaders.length, creditNotes: crnHeaders.length, lines: totalLines, categoryBackfill, fillRateBackfill };
 }
 
 /* =========================================================
@@ -10176,7 +10168,7 @@ function getPanamaNowParts() {
   };
 }
 
-async function runInvoiceSyncJob({ from, to, maxDocs = AUTO_SYNC_MAXDOCS, source = "manual", slotKey = "", allowWhenBusy = false, categoryBackfill = true, fillRateBackfill = true } = {}) {
+async function runInvoiceSyncJob({ from, to, maxDocs = AUTO_SYNC_MAXDOCS, source = "manual", slotKey = "", allowWhenBusy = false } = {}) {
   if (!isISO(from) || !isISO(to)) throw new Error("from y to deben ser YYYY-MM-DD");
   if (!hasDb()) throw new Error("DB no configurada (DATABASE_URL)");
   if (missingSapEnv()) throw new Error("SAP env incompleto");
@@ -10199,7 +10191,7 @@ async function runInvoiceSyncJob({ from, to, maxDocs = AUTO_SYNC_MAXDOCS, source
     await setState("invoice_sync_running_to", to);
     await setState("invoice_sync_running_started_at", INVOICE_SYNC_CONTEXT.startedAt);
 
-    const out = await syncRangeToDb({ from, to, maxDocs, categoryBackfill, fillRateBackfill });
+    const out = await syncRangeToDb({ from, to, maxDocs });
     const finishedAt = new Date().toISOString();
     await setState("invoice_sync_last_run_source", source);
     await setState("invoice_sync_last_run_from", from);
@@ -10224,79 +10216,6 @@ async function runInvoiceSyncJob({ from, to, maxDocs = AUTO_SYNC_MAXDOCS, source
     await setState("invoice_sync_running_from", "");
     await setState("invoice_sync_running_to", "");
   }
-}
-
-function enumerateDateChunks(from, to, chunkDays = 1) {
-  const out = [];
-  const safeDays = Math.max(1, Math.min(7, Number(chunkDays || 1)));
-  let cursor = String(from || '').slice(0, 10);
-  const end = String(to || '').slice(0, 10);
-  while (cursor && cursor <= end) {
-    const chunkEndRaw = addDaysISO(cursor, safeDays - 1);
-    const chunkEnd = chunkEndRaw > end ? end : chunkEndRaw;
-    out.push({ from: cursor, to: chunkEnd });
-    cursor = addDaysISO(chunkEnd, 1);
-  }
-  return out;
-}
-
-async function runChunkedInvoiceSyncJob({ from, to, maxDocs = 800, source = "manual-range", categoryBackfill = false, fillRateBackfill = false, chunkDays = 1 } = {}) {
-  const chunks = enumerateDateChunks(from, to, chunkDays);
-  const totals = {
-    ok: true,
-    source,
-    from,
-    to,
-    maxDocs,
-    chunkDays,
-    chunks: chunks.length,
-    invoices: 0,
-    creditNotes: 0,
-    lines: 0,
-    categoryBackfill: { scanned: 0, updated: 0, failed: 0, skipped: !categoryBackfill },
-    fillRateBackfill: { processed: 0, saved: 0, skipped: !fillRateBackfill, ok: !!fillRateBackfill, totals: { orders: 0, pedido: 0, facturado: 0, diferencia: 0, fillRatePct: 0, excludedOpen: 0 } },
-    details: []
-  };
-
-  for (const chunk of chunks) {
-    const out = await runInvoiceSyncJob({
-      from: chunk.from,
-      to: chunk.to,
-      maxDocs: Math.max(100, Math.min(1000, Number(maxDocs || 800))),
-      source: `${source}:${chunk.from}`,
-      allowWhenBusy: false,
-      categoryBackfill,
-      fillRateBackfill,
-    });
-    totals.invoices += Number(out?.invoices || 0);
-    totals.creditNotes += Number(out?.creditNotes || 0);
-    totals.lines += Number(out?.lines || 0);
-    if (out?.categoryBackfill) {
-      totals.categoryBackfill.scanned += Number(out.categoryBackfill.scanned || 0);
-      totals.categoryBackfill.updated += Number(out.categoryBackfill.updated || 0);
-      totals.categoryBackfill.failed += Number(out.categoryBackfill.failed || 0);
-      totals.categoryBackfill.skipped = !!out.categoryBackfill.skipped;
-    }
-    if (out?.fillRateBackfill) {
-      totals.fillRateBackfill.processed += Number(out.fillRateBackfill.processed || 0);
-      totals.fillRateBackfill.saved += Number(out.fillRateBackfill.saved || 0);
-      totals.fillRateBackfill.skipped = !!out.fillRateBackfill.skipped;
-      totals.fillRateBackfill.ok = totals.fillRateBackfill.ok && !!out.fillRateBackfill.ok;
-      const t = out.fillRateBackfill.totals || {};
-      totals.fillRateBackfill.totals.orders += Number(t.orders || 0);
-      totals.fillRateBackfill.totals.excludedOpen += Number(t.excludedOpen || 0);
-      totals.fillRateBackfill.totals.pedido += Number(t.pedido || 0);
-      totals.fillRateBackfill.totals.facturado += Number(t.facturado || 0);
-      totals.fillRateBackfill.totals.diferencia += Number(t.diferencia || 0);
-    }
-    totals.details.push({ from: chunk.from, to: chunk.to, invoices: out?.invoices || 0, creditNotes: out?.creditNotes || 0, lines: out?.lines || 0, finishedAt: out?.finishedAt || new Date().toISOString() });
-  }
-
-  const pedido = Number(totals.fillRateBackfill.totals.pedido || 0);
-  const facturado = Number(totals.fillRateBackfill.totals.facturado || 0);
-  totals.fillRateBackfill.totals.fillRatePct = pedido > 0 ? Number(((facturado / pedido) * 100).toFixed(2)) : 0;
-  totals.finishedAt = new Date().toISOString();
-  return totals;
 }
 
 function startInvoiceAutoSyncScheduler() {
@@ -10355,27 +10274,16 @@ app.post("/api/admin/invoices/sync", verifyAdmin, async (req, res) => {
 
     const fromQ = String(req.query?.from || req.body?.from || "");
     const toQ = String(req.query?.to || req.body?.to || "");
-    const maxDocs = Math.max(100, Math.min(3000, Number(req.query?.maxDocs || req.body?.maxDocs || 800)));
-    const chunkDays = Math.max(1, Math.min(3, Number(req.query?.chunkDays || req.body?.chunkDays || 1)));
-    const categoryBackfill = String(req.query?.categoryBackfill || req.body?.categoryBackfill || "0") === "1";
-    const fillRateBackfill = String(req.query?.fillRateBackfill || req.body?.fillRateBackfill || "0") === "1";
+    const maxDocs = Math.max(500, Math.min(50000, Number(req.query?.maxDocs || req.body?.maxDocs || 12000)));
 
     if (!isISO(fromQ) || !isISO(toQ)) {
       return safeJson(res, 400, { ok: false, message: "from y to deben ser YYYY-MM-DD" });
     }
 
-    const out = await runChunkedInvoiceSyncJob({
-      from: fromQ,
-      to: toQ,
-      maxDocs,
-      source: "manual-range",
-      chunkDays,
-      categoryBackfill,
-      fillRateBackfill,
-    });
+    const out = await runInvoiceSyncJob({ from: fromQ, to: toQ, maxDocs, source: "manual-range" });
     return safeJson(res, 200, out);
   } catch (e) {
-    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+    return safeJson(res, 500, { ok: false, message: e.message });
   }
 });
 
@@ -10385,12 +10293,12 @@ app.post("/api/admin/invoices/sync/recent", verifyAdmin, async (req, res) => {
     if (missingSapEnv()) return safeJson(res, 500, { ok: false, message: "SAP env incompleto" });
 
     const days = Math.max(1, Math.min(90, Number(req.query?.days || req.body?.days || 10)));
-    const maxDocs = Math.max(100, Math.min(3000, Number(req.query?.maxDocs || req.body?.maxDocs || 800)));
+    const maxDocs = Math.max(500, Math.min(50000, Number(req.query?.maxDocs || req.body?.maxDocs || 12000)));
 
     const today = getDateISOInOffset(TZ_OFFSET_MIN);
     const from = addDaysISO(today, -(days - 1));
 
-    const out = await runChunkedInvoiceSyncJob({ from, to: today, maxDocs, source: `manual-recent:${days}d`, chunkDays: 1, categoryBackfill: false, fillRateBackfill: false });
+    const out = await runInvoiceSyncJob({ from, to: today, maxDocs, source: `manual-recent:${days}d` });
     return safeJson(res, 200, { ...out, days });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message });
