@@ -6039,7 +6039,7 @@ async function aoo20260414FetchHeaders({ maxDocs = 500 } = {}) {
   if (missingSapEnv()) throw new Error('SAP no configurado');
   const out = [];
   const seen = new Set();
-  const top = Math.max(50, Math.min(1000, Number(maxDocs || 500)));
+  const top = Math.max(50, Math.min(5000, Number(maxDocs || 5000)));
   const filters = [
     "Cancelled eq 'tNO' and DocumentStatus eq 'bost_Open'",
     "Cancelled eq 'tNO' and DocumentStatus eq 'bo_Open'",
@@ -6129,18 +6129,22 @@ function aoo20260414FirstWarehouse(lines = []) {
   return '';
 }
 
-async function aoo20260414BuildRows({ maxDocs = 500 } = {}) {
+async function aoo20260414BuildRows({ maxDocs = 5000 } = {}) {
   const headers = await aoo20260414FetchHeaders({ maxDocs });
   const rows = [];
+  const seen = new Set();
 
   for (const h of headers) {
     const de = Number(h?.DocEntry || 0);
-    if (!(de > 0)) continue;
+    if (!(de > 0) || seen.has(de)) continue;
 
     const full = await aoo20260414FetchOrderFull(de).catch(() => null);
     const src = full || h;
-    const status = aoo20260414Str(src?.DocumentStatus || src?.Status || h?.DocumentStatus || h?.Status);
-    if (!aoo20260414IsOpen(status)) continue;
+    const headerStatus = aoo20260414Str(src?.DocumentStatus || src?.Status || h?.DocumentStatus || h?.Status);
+    const lineRows = Array.isArray(src?.DocumentLines) ? src.DocumentLines : [];
+    const anyOpenLine = lineRows.some((ln) => prodDocStatusIsOpen(ln?.LineStatus || ln?.DocumentLineStatus || ln?.Status || '') || Number(ln?.OpenQty ?? ln?.RemainingOpenQuantity ?? 0) > 0.0001);
+    const isOpen = aoo20260414IsOpen(headerStatus) || anyOpenLine;
+    if (!isOpen) continue;
 
     const sellerCodeRaw = src?.SalesPersonCode ?? src?.SlpCode ?? h?.SalesPersonCode ?? h?.SlpCode ?? null;
     const sellerCode = sellerCodeRaw == null ? '' : String(sellerCodeRaw).trim();
@@ -6151,21 +6155,23 @@ async function aoo20260414BuildRows({ maxDocs = 500 } = {}) {
     sellerName = aoo20260414Str(sellerName || src?.SalesPersonName || src?.SlpName || '');
     if (sellerName && AOO20260414_EXCLUDED_SELLERS.has(normalizeSellerLabel(sellerName))) continue;
 
+    seen.add(de);
     rows.push({
       doc_entry: de,
       doc_num: Number(src?.DocNum || h?.DocNum || 0) || null,
       card_code: aoo20260414Str(src?.CardCode || h?.CardCode),
       card_name: aoo20260414Str(src?.CardName || h?.CardName),
-      warehouse_code: aoo20260414FirstWarehouse(src?.DocumentLines || []),
+      warehouse_code: aoo20260414FirstWarehouse(lineRows),
       comments: aoo20260414Str(src?.Comments || h?.Comments),
       doc_due_date: aoo20260414Date(src?.DocDueDate || h?.DocDueDate) || null,
       doc_date: aoo20260414Date(src?.DocDate || h?.DocDate) || null,
       seller_code: sellerCode,
       seller_name: sellerName,
-      document_status: status,
+      document_status: headerStatus || 'bost_Open',
     });
   }
 
+  rows.sort((a,b) => String(b.doc_date||'').localeCompare(String(a.doc_date||'')) || Number(b.doc_num||0)-Number(a.doc_num||0));
   return rows;
 }
 
@@ -6212,7 +6218,7 @@ async function aoo20260414Sync({ maxDocs = 500 } = {}) {
   return { rows, syncedAt };
 }
 
-async function aoo20260414ReadDb({ client = '', warehouse = '', seller = '' } = {}) {
+async function aoo20260414ReadDb({ client = '', warehouse = '', seller = '', limit = 5000 } = {}) {
   if (!hasDb()) throw new Error('DB no configurada');
   await aoo20260414EnsureDb();
 
@@ -6241,33 +6247,42 @@ async function aoo20260414ReadDb({ client = '', warehouse = '', seller = '' } = 
   }
 
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const countSql = `SELECT COUNT(*)::int AS total FROM admin_open_orders_cache ${whereSql}`;
+  const countRs = await dbQuery(countSql, params);
+  const total = Number(countRs.rows?.[0]?.total || 0);
+
+  const lim = Math.max(50, Math.min(10000, Number(limit || 5000)));
   const rs = await dbQuery(
     `SELECT doc_entry, doc_num, card_code, card_name, warehouse_code, comments, doc_due_date, doc_date, seller_code, seller_name, document_status, updated_at
      FROM admin_open_orders_cache
      ${whereSql}
-     ORDER BY doc_date DESC NULLS LAST, doc_num DESC NULLS LAST`,
-    params
+     ORDER BY doc_date DESC NULLS LAST, doc_num DESC NULLS LAST
+     LIMIT $${p}`,
+    [...params, lim]
   );
 
-  return rs.rows.map((r) => ({
-    docEntry: Number(r.doc_entry || 0),
-    docNum: r.doc_num == null ? null : Number(r.doc_num),
-    cardCode: aoo20260414Str(r.card_code),
-    cardName: aoo20260414Str(r.card_name),
-    warehouse: aoo20260414Str(r.warehouse_code),
-    comments: aoo20260414Str(r.comments),
-    docDueDate: aoo20260414Date(r.doc_due_date),
-    docDate: aoo20260414Date(r.doc_date),
-    sellerCode: aoo20260414Str(r.seller_code),
-    sellerName: aoo20260414Str(r.seller_name),
-    status: aoo20260414Str(r.document_status),
-    updatedAt: r.updated_at,
-  }));
+  return {
+    total,
+    rows: rs.rows.map((r) => ({
+      docEntry: Number(r.doc_entry || 0),
+      docNum: r.doc_num == null ? null : Number(r.doc_num),
+      cardCode: aoo20260414Str(r.card_code),
+      cardName: aoo20260414Str(r.card_name),
+      warehouse: aoo20260414Str(r.warehouse_code),
+      comments: aoo20260414Str(r.comments),
+      docDueDate: aoo20260414Date(r.doc_due_date),
+      docDate: aoo20260414Date(r.doc_date),
+      sellerCode: aoo20260414Str(r.seller_code),
+      sellerName: aoo20260414Str(r.seller_name),
+      status: aoo20260414Str(r.document_status),
+      updatedAt: r.updated_at,
+    }))
+  };
 }
 
 app.post('/api/admin/orders/sync', verifyAdmin, async (req, res) => {
   try {
-    const maxDocs = Math.max(50, Math.min(1000, Number(req.body?.maxDocs || req.query?.maxDocs || 500)));
+    const maxDocs = Math.max(50, Math.min(5000, Number(req.body?.maxDocs || req.query?.maxDocs || 5000)));
     const out = await aoo20260414Sync({ maxDocs });
     return safeJson(res, 200, { ok: true, syncedAt: out.syncedAt, count: out.rows.length });
   } catch (e) {
@@ -6277,13 +6292,14 @@ app.post('/api/admin/orders/sync', verifyAdmin, async (req, res) => {
 
 app.get('/api/admin/orders/db', verifyAdmin, async (req, res) => {
   try {
-    const orders = await aoo20260414ReadDb({
+    const out = await aoo20260414ReadDb({
       client: req.query?.client || '',
       warehouse: req.query?.warehouse || '',
       seller: req.query?.seller || '',
+      limit: req.query?.limit || 5000,
     });
     const lastSyncAt = await getState('admin_open_orders_last_sync_at').catch(() => '');
-    return safeJson(res, 200, { ok: true, orders, lastSyncAt });
+    return safeJson(res, 200, { ok: true, orders: out.rows, total: out.total, lastSyncAt });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -6291,19 +6307,20 @@ app.get('/api/admin/orders/db', verifyAdmin, async (req, res) => {
 
 app.get('/api/admin/orders/open', verifyAdmin, async (req, res) => {
   try {
-    const maxDocs = Math.max(50, Math.min(1000, Number(req.query?.maxDocs || 500)));
+    const maxDocs = Math.max(50, Math.min(5000, Number(req.query?.maxDocs || 5000)));
     const refresh = String(req.query?.refresh || '1') !== '0';
     let lastSyncAt = await getState('admin_open_orders_last_sync_at').catch(() => '');
     if (refresh) {
       const out = await aoo20260414Sync({ maxDocs });
       lastSyncAt = out.syncedAt;
     }
-    const orders = await aoo20260414ReadDb({
+    const out = await aoo20260414ReadDb({
       client: req.query?.client || '',
       warehouse: req.query?.warehouse || '',
       seller: req.query?.seller || '',
+      limit: req.query?.limit || 5000,
     });
-    return safeJson(res, 200, { ok: true, orders, lastSyncAt });
+    return safeJson(res, 200, { ok: true, orders: out.rows, total: out.total, lastSyncAt });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
