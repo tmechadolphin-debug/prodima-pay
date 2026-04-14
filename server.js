@@ -5962,6 +5962,54 @@ async function aoo20260414EnsureDb() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  const alters = [
+    `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS doc_num BIGINT`,
+    `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS card_code TEXT DEFAULT ''`,
+    `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS card_name TEXT DEFAULT ''`,
+    `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS warehouse_code TEXT DEFAULT ''`,
+    `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS comments TEXT DEFAULT ''`,
+    `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS doc_due_date DATE`,
+    `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS doc_date DATE`,
+    `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS seller_code TEXT DEFAULT ''`,
+    `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS seller_name TEXT DEFAULT ''`,
+    `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS document_status TEXT DEFAULT ''`,
+    `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()`
+  ];
+  for (const q of alters) {
+    try { await dbQuery(q); } catch {}
+  }
+
+  try {
+    await dbQuery(`
+      UPDATE admin_open_orders_cache
+      SET warehouse_code = COALESCE(NULLIF(warehouse_code,''), warehouse, '')
+      WHERE COALESCE(NULLIF(warehouse_code,''), '') = ''
+        AND EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'admin_open_orders_cache'
+            AND column_name = 'warehouse'
+        )
+    `);
+  } catch {}
+
+  try {
+    await dbQuery(`
+      UPDATE admin_open_orders_cache
+      SET document_status = COALESCE(NULLIF(document_status,''), status, '')
+      WHERE COALESCE(NULLIF(document_status,''), '') = ''
+        AND EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'admin_open_orders_cache'
+            AND column_name = 'status'
+        )
+    `);
+  } catch {}
+
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_cache_doc_date ON admin_open_orders_cache(doc_date);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_cache_card ON admin_open_orders_cache(card_code);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_cache_wh ON admin_open_orders_cache(warehouse_code);`);
