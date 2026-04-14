@@ -19943,13 +19943,13 @@ async function adminFetchOpenOrderHeadersFromSap({ top = 500 } = {}) {
 
   for (let skip = 0; skip < maxScan && out.length < wanted; skip += batchSize) {
     const filter = `Cancelled eq 'tNO'`;
-    const path = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,CancelStatus,Cancelled,SlpCode,SalesPersonCode,SalesEmployeeCode&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=${batchSize}&$skip=${skip}`;
+    const path = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,CancelStatus,Cancelled,SalesPersonCode,SalesEmployeeCode&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=${batchSize}&$skip=${skip}`;
     let rows = [];
     try {
       const res = await slFetch(path, { timeoutMs: 120000 });
       rows = typeof prodNormalizeSlCollection === 'function' ? prodNormalizeSlCollection(res) : (Array.isArray(res?.value) ? res.value : []);
     } catch {
-      const fallback = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,CancelStatus,Cancelled,SlpCode,SalesPersonCode,SalesEmployeeCode&$orderby=DocDate desc,DocEntry desc&$top=${batchSize}&$skip=${skip}`;
+      const fallback = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,CancelStatus,Cancelled,SalesPersonCode,SalesEmployeeCode&$orderby=DocDate desc,DocEntry desc&$top=${batchSize}&$skip=${skip}`;
       const res = await slFetch(fallback, { timeoutMs: 120000 });
       rows = typeof prodNormalizeSlCollection === 'function' ? prodNormalizeSlCollection(res) : (Array.isArray(res?.value) ? res.value : []);
     }
