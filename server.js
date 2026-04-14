@@ -4306,7 +4306,338 @@ app.get("/api/admin/messaging/dashboard", verifyAdmin, async (req, res) => {
   }
 });
 
-__extraBootTasks.push(async () => {
+__extraBootTasks.push
+
+/* =========================================================
+   Admin · Pedidos abiertos (SAP -> Supabase cache -> DB)
+========================================================= */
+function adminOrdersStr(v) {
+  return String(v || '').trim();
+}
+function adminOrdersNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+function adminOrdersIso(v) {
+  return String(v || '').slice(0, 10);
+}
+function adminOrdersNormalizeSellerLabel(v) {
+  return String(v || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ');
+}
+const ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS = new Set([
+  'luis aguilar',
+  'rci-01',
+  'rci-02',
+  'rci-03',
+  'oficina',
+  '-ningun empleado del departamento de ventas-',
+].map(adminOrdersNormalizeSellerLabel));
+const ADMIN_ORDERS_SELLER_CACHE = new Map();
+
+async function ensureAdminOpenOrdersTable() {
+  if (!hasDb()) return;
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS admin_open_orders_cache (
+      doc_entry BIGINT PRIMARY KEY,
+      doc_num BIGINT,
+      card_code TEXT DEFAULT '',
+      card_name TEXT DEFAULT '',
+      warehouse_code TEXT DEFAULT '',
+      comments TEXT DEFAULT '',
+      doc_due_date DATE,
+      doc_date DATE,
+      seller_code BIGINT,
+      seller_name TEXT DEFAULT '',
+      status TEXT DEFAULT '',
+      sync_source TEXT DEFAULT 'sap_orders_open',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_doc_date ON admin_open_orders_cache(doc_date);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_card_code ON admin_open_orders_cache(card_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_wh ON admin_open_orders_cache(warehouse_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_seller_name ON admin_open_orders_cache(seller_name);`);
+}
+__extraBootTasks.push(ensureAdminOpenOrdersTable);
+
+function adminOrdersNormalizeRows(raw) {
+  if (Array.isArray(raw?.value)) return raw.value;
+  if (Array.isArray(raw)) return raw;
+  return [];
+}
+
+async function adminOrdersResolveSellerName(code) {
+  const codeNum = Number(code);
+  if (!Number.isFinite(codeNum) || codeNum < 0) return '';
+  const key = String(codeNum);
+  const cached = ADMIN_ORDERS_SELLER_CACHE.get(key);
+  if (cached && (Date.now() - Number(cached.ts || 0) < 6 * 60 * 60 * 1000)) return String(cached.name || '');
+  if (missingSapEnv()) return '';
+  const tries = [
+    `/SalesPersons(${codeNum})?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name`,
+    `/SalesPersons(${codeNum})`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SalesEmployeeCode eq ${codeNum}`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SlpCode eq ${codeNum}`,
+  ];
+  for (const path of tries) {
+    try {
+      const resp = await slFetch(path, { timeoutMs: 30000 });
+      const row = Array.isArray(resp?.value) ? (resp.value[0] || null) : resp;
+      const name = String(
+        row?.SalesEmployeeName || row?.SlpName || row?.SalesPersonName || row?.Name || ''
+      ).trim();
+      if (name) {
+        ADMIN_ORDERS_SELLER_CACHE.set(key, { name, ts: Date.now() });
+        return name;
+      }
+    } catch {}
+  }
+  return '';
+}
+
+async function adminOrdersFetchDocumentLines(docEntry) {
+  const de = Number(docEntry || 0);
+  if (!(de > 0)) return [];
+  const paths = [
+    `/Orders(${de})/DocumentLines?$top=500`,
+    `/Orders(${de})/DocumentLines`,
+  ];
+  for (const path of paths) {
+    try {
+      const raw = await slFetch(path, { timeoutMs: 90000 });
+      const rows = Array.isArray(raw?.value)
+        ? raw.value
+        : Array.isArray(raw?.DocumentLines)
+          ? raw.DocumentLines
+          : Array.isArray(raw)
+            ? raw
+            : [];
+      if (rows.length) return rows;
+    } catch {}
+  }
+  return [];
+}
+
+async function adminOrdersFetchFullOrder(docEntry) {
+  const de = Number(docEntry || 0);
+  if (!(de > 0)) return null;
+  try {
+    const full = await getDoc('Orders', de);
+    if (full && Array.isArray(full.DocumentLines) && full.DocumentLines.length) return full;
+    const lines = await adminOrdersFetchDocumentLines(de);
+    if (full) return { ...full, DocumentLines: lines };
+  } catch {}
+  try {
+    const head = await slFetch(`/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled&$filter=${encodeURIComponent(`DocEntry eq ${de}`)}&$top=1`, { timeoutMs: 90000 });
+    const row = adminOrdersNormalizeRows(head)[0] || null;
+    if (!row) return null;
+    const lines = await adminOrdersFetchDocumentLines(de);
+    return { ...row, DocumentLines: lines };
+  } catch {
+    return null;
+  }
+}
+
+function adminOrdersExtractWarehouse(lines = []) {
+  const first = (Array.isArray(lines) ? lines : []).find((ln) => adminOrdersStr(ln?.WarehouseCode || ln?.WhsCode || ln?.warehouseCode || ln?.WhsCode));
+  return adminOrdersStr(first?.WarehouseCode || first?.WhsCode || first?.warehouseCode || '');
+}
+
+function adminOrdersIsOpenStatus(v) {
+  const s = adminOrdersStr(v).toLowerCase();
+  return s.includes('open') || s.includes('bost_open') || s in {'o':1, 'open':1};
+}
+
+async function adminOrdersFetchOpenHeaders({ top = 1200 } = {}) {
+  if (missingSapEnv()) throw new Error('SAP no configurado');
+  const out = [];
+  let skip = 0;
+  const safeTop = Math.max(50, Math.min(5000, Number(top || 1200)));
+  for (let page = 0; page < 30 && out.length < safeTop; page++) {
+    const filter = `Cancelled eq 'tNO' and DocumentStatus eq 'bost_Open'`;
+    const path = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=200&$skip=${skip}`;
+    const raw = await slFetch(path, { timeoutMs: 120000 });
+    const rows = adminOrdersNormalizeRows(raw);
+    if (!rows.length) break;
+    out.push(...rows);
+    skip += rows.length;
+    if (rows.length < 200) break;
+  }
+  return out.slice(0, safeTop);
+}
+
+async function adminOrdersBuildCacheRows({ top = 1200 } = {}) {
+  const headers = await adminOrdersFetchOpenHeaders({ top });
+  const rows = [];
+  for (const h of headers) {
+    const docEntry = Number(h?.DocEntry || 0);
+    if (!(docEntry > 0)) continue;
+    const full = await adminOrdersFetchFullOrder(docEntry);
+    const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+    const status = adminOrdersStr(full?.DocumentStatus || h?.DocumentStatus || '');
+    if (status && !adminOrdersIsOpenStatus(status)) continue;
+    const warehouse = adminOrdersExtractWarehouse(lines);
+    const sellerCodeRaw = full?.SalesPersonCode ?? h?.SalesPersonCode ?? null;
+    const sellerCode = Number.isFinite(Number(sellerCodeRaw)) ? Number(sellerCodeRaw) : null;
+    const sellerName = sellerCode !== null ? await adminOrdersResolveSellerName(sellerCode).catch(() => '') : '';
+    if (sellerName && ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS.has(adminOrdersNormalizeSellerLabel(sellerName))) continue;
+    rows.push({
+      docEntry,
+      docNum: Number(h?.DocNum || full?.DocNum || 0) || null,
+      cardCode: adminOrdersStr(h?.CardCode || full?.CardCode),
+      cardName: adminOrdersStr(h?.CardName || full?.CardName),
+      warehouseCode: warehouse,
+      comments: adminOrdersStr(full?.Comments || h?.Comments),
+      docDueDate: adminOrdersIso(h?.DocDueDate || full?.DocDueDate),
+      docDate: adminOrdersIso(h?.DocDate || full?.DocDate),
+      sellerCode,
+      sellerName,
+      status: status || 'bost_Open',
+    });
+    if (rows.length % 20 === 0) await sleep(10);
+  }
+  return rows;
+}
+
+async function adminOrdersReplaceCache(rows = []) {
+  if (!hasDb()) throw new Error('DB no configurada');
+  await ensureAdminOpenOrdersTable();
+  await dbQuery('BEGIN');
+  try {
+    await dbQuery(`DELETE FROM admin_open_orders_cache`);
+    if (rows.length) {
+      const values = [];
+      const params = [];
+      let p = 1;
+      for (const r of rows) {
+        values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++}::date,$${p++}::date,$${p++},$${p++},$${p++},'sap_orders_open',NOW())`);
+        params.push(
+          Number(r.docEntry || 0),
+          r.docNum != null ? Number(r.docNum) : null,
+          adminOrdersStr(r.cardCode),
+          adminOrdersStr(r.cardName),
+          adminOrdersStr(r.warehouseCode),
+          adminOrdersStr(r.comments),
+          adminOrdersIso(r.docDueDate) || null,
+          adminOrdersIso(r.docDate) || null,
+          Number.isFinite(Number(r.sellerCode)) ? Number(r.sellerCode) : null,
+          adminOrdersStr(r.sellerName),
+          adminOrdersStr(r.status || 'bost_Open'),
+        )
+      }
+      await dbQuery(
+        `INSERT INTO admin_open_orders_cache(
+          doc_entry, doc_num, card_code, card_name, warehouse_code, comments,
+          doc_due_date, doc_date, seller_code, seller_name, status, sync_source, updated_at
+        ) VALUES ${values.join(',')}`,
+        params
+      );
+    }
+    await setState('admin_open_orders_last_sync_at', new Date().toISOString());
+    await dbQuery('COMMIT');
+  } catch (e) {
+    await dbQuery('ROLLBACK').catch(() => {});
+    throw e;
+  }
+}
+
+async function adminOrdersReadDb({ client = '', warehouse = '', seller = '', top = 500 } = {}) {
+  if (!hasDb()) throw new Error('DB no configurada');
+  await ensureAdminOpenOrdersTable();
+  const where = [];
+  const params = [];
+  let p = 1;
+  if (adminOrdersStr(client)) {
+    where.push(`(LOWER(card_code) LIKE $${p} OR LOWER(card_name) LIKE $${p})`);
+    params.push(`%${adminOrdersStr(client).toLowerCase()}%`);
+    p += 1;
+  }
+  if (adminOrdersStr(warehouse)) {
+    where.push(`LOWER(warehouse_code) = $${p++}`);
+    params.push(adminOrdersStr(warehouse).toLowerCase());
+  }
+  if (adminOrdersStr(seller)) {
+    where.push(`(LOWER(COALESCE(seller_name,'')) LIKE $${p} OR CAST(COALESCE(seller_code,0) AS TEXT) = $${p+1})`);
+    params.push(`%${adminOrdersStr(seller).toLowerCase()}%`);
+    params.push(adminOrdersStr(seller));
+    p += 2;
+  }
+  params.push(Math.max(1, Math.min(5000, Number(top || 500))));
+  const sql = `
+    SELECT
+      doc_entry AS "docEntry",
+      doc_num AS "docNum",
+      card_code AS "cardCode",
+      card_name AS "cardName",
+      warehouse_code AS "warehouse",
+      comments,
+      doc_due_date AS "docDueDate",
+      doc_date AS "docDate",
+      seller_code AS "sellerCode",
+      seller_name AS "sellerName",
+      status,
+      updated_at AS "updatedAt"
+    FROM admin_open_orders_cache
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY doc_date DESC NULLS LAST, doc_num DESC NULLS LAST
+    LIMIT $${p}
+  `;
+  const r = await dbQuery(sql, params);
+  const lastSyncAt = await getState('admin_open_orders_last_sync_at');
+  return { rows: r.rows || [], lastSyncAt };
+}
+
+app.post('/api/admin/orders/sync', verifyAdmin, async (req, res) => {
+  try {
+    const top = Math.max(50, Math.min(5000, Number(req.body?.top || req.query?.top || 1200)));
+    const rows = await adminOrdersBuildCacheRows({ top });
+    await adminOrdersReplaceCache(rows);
+    return safeJson(res, 200, { ok: true, synced: rows.length, lastSyncAt: await getState('admin_open_orders_last_sync_at') });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/orders/db', verifyAdmin, async (req, res) => {
+  try {
+    const out = await adminOrdersReadDb({
+      client: req.query?.client || '',
+      warehouse: req.query?.warehouse || '',
+      seller: req.query?.seller || '',
+      top: req.query?.top || 500,
+    });
+    return safeJson(res, 200, { ok: true, orders: out.rows, count: out.rows.length, lastSyncAt: out.lastSyncAt || '' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/orders/open', verifyAdmin, async (req, res) => {
+  try {
+    const refresh = String(req.query?.refresh || '1') !== '0';
+    if (refresh) {
+      const top = Math.max(50, Math.min(5000, Number(req.query?.top || 1200)));
+      const rows = await adminOrdersBuildCacheRows({ top });
+      await adminOrdersReplaceCache(rows);
+    }
+    const out = await adminOrdersReadDb({
+      client: req.query?.client || '',
+      warehouse: req.query?.warehouse || '',
+      seller: req.query?.seller || '',
+      top: req.query?.top || 500,
+    });
+    return safeJson(res, 200, { ok: true, orders: out.rows, count: out.rows.length, lastSyncAt: out.lastSyncAt || '' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+(async () => {
   try {
     await ensureDb();
   } catch (e) {
@@ -5931,6 +6262,337 @@ __extraBootTasks.push(async () => {
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
+
+
+/* =========================================================
+   Admin · Pedidos abiertos (SAP -> Supabase cache -> DB)
+========================================================= */
+function adminOrdersStr(v) {
+  return String(v || '').trim();
+}
+function adminOrdersNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+function adminOrdersIso(v) {
+  return String(v || '').slice(0, 10);
+}
+function adminOrdersNormalizeSellerLabel(v) {
+  return String(v || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ');
+}
+const ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS = new Set([
+  'luis aguilar',
+  'rci-01',
+  'rci-02',
+  'rci-03',
+  'oficina',
+  '-ningun empleado del departamento de ventas-',
+].map(adminOrdersNormalizeSellerLabel));
+const ADMIN_ORDERS_SELLER_CACHE = new Map();
+
+async function ensureAdminOpenOrdersTable() {
+  if (!hasDb()) return;
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS admin_open_orders_cache (
+      doc_entry BIGINT PRIMARY KEY,
+      doc_num BIGINT,
+      card_code TEXT DEFAULT '',
+      card_name TEXT DEFAULT '',
+      warehouse_code TEXT DEFAULT '',
+      comments TEXT DEFAULT '',
+      doc_due_date DATE,
+      doc_date DATE,
+      seller_code BIGINT,
+      seller_name TEXT DEFAULT '',
+      status TEXT DEFAULT '',
+      sync_source TEXT DEFAULT 'sap_orders_open',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_doc_date ON admin_open_orders_cache(doc_date);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_card_code ON admin_open_orders_cache(card_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_wh ON admin_open_orders_cache(warehouse_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_seller_name ON admin_open_orders_cache(seller_name);`);
+}
+__extraBootTasks.push(ensureAdminOpenOrdersTable);
+
+function adminOrdersNormalizeRows(raw) {
+  if (Array.isArray(raw?.value)) return raw.value;
+  if (Array.isArray(raw)) return raw;
+  return [];
+}
+
+async function adminOrdersResolveSellerName(code) {
+  const codeNum = Number(code);
+  if (!Number.isFinite(codeNum) || codeNum < 0) return '';
+  const key = String(codeNum);
+  const cached = ADMIN_ORDERS_SELLER_CACHE.get(key);
+  if (cached && (Date.now() - Number(cached.ts || 0) < 6 * 60 * 60 * 1000)) return String(cached.name || '');
+  if (missingSapEnv()) return '';
+  const tries = [
+    `/SalesPersons(${codeNum})?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name`,
+    `/SalesPersons(${codeNum})`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SalesEmployeeCode eq ${codeNum}`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SlpCode eq ${codeNum}`,
+  ];
+  for (const path of tries) {
+    try {
+      const resp = await slFetch(path, { timeoutMs: 30000 });
+      const row = Array.isArray(resp?.value) ? (resp.value[0] || null) : resp;
+      const name = String(
+        row?.SalesEmployeeName || row?.SlpName || row?.SalesPersonName || row?.Name || ''
+      ).trim();
+      if (name) {
+        ADMIN_ORDERS_SELLER_CACHE.set(key, { name, ts: Date.now() });
+        return name;
+      }
+    } catch {}
+  }
+  return '';
+}
+
+async function adminOrdersFetchDocumentLines(docEntry) {
+  const de = Number(docEntry || 0);
+  if (!(de > 0)) return [];
+  const paths = [
+    `/Orders(${de})/DocumentLines?$top=500`,
+    `/Orders(${de})/DocumentLines`,
+  ];
+  for (const path of paths) {
+    try {
+      const raw = await slFetch(path, { timeoutMs: 90000 });
+      const rows = Array.isArray(raw?.value)
+        ? raw.value
+        : Array.isArray(raw?.DocumentLines)
+          ? raw.DocumentLines
+          : Array.isArray(raw)
+            ? raw
+            : [];
+      if (rows.length) return rows;
+    } catch {}
+  }
+  return [];
+}
+
+async function adminOrdersFetchFullOrder(docEntry) {
+  const de = Number(docEntry || 0);
+  if (!(de > 0)) return null;
+  try {
+    const full = await getDoc('Orders', de);
+    if (full && Array.isArray(full.DocumentLines) && full.DocumentLines.length) return full;
+    const lines = await adminOrdersFetchDocumentLines(de);
+    if (full) return { ...full, DocumentLines: lines };
+  } catch {}
+  try {
+    const head = await slFetch(`/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled&$filter=${encodeURIComponent(`DocEntry eq ${de}`)}&$top=1`, { timeoutMs: 90000 });
+    const row = adminOrdersNormalizeRows(head)[0] || null;
+    if (!row) return null;
+    const lines = await adminOrdersFetchDocumentLines(de);
+    return { ...row, DocumentLines: lines };
+  } catch {
+    return null;
+  }
+}
+
+function adminOrdersExtractWarehouse(lines = []) {
+  const first = (Array.isArray(lines) ? lines : []).find((ln) => adminOrdersStr(ln?.WarehouseCode || ln?.WhsCode || ln?.warehouseCode || ln?.WhsCode));
+  return adminOrdersStr(first?.WarehouseCode || first?.WhsCode || first?.warehouseCode || '');
+}
+
+function adminOrdersIsOpenStatus(v) {
+  const s = adminOrdersStr(v).toLowerCase();
+  return s.includes('open') || s.includes('bost_open') || s in {'o':1, 'open':1};
+}
+
+async function adminOrdersFetchOpenHeaders({ top = 1200 } = {}) {
+  if (missingSapEnv()) throw new Error('SAP no configurado');
+  const out = [];
+  let skip = 0;
+  const safeTop = Math.max(50, Math.min(5000, Number(top || 1200)));
+  for (let page = 0; page < 30 && out.length < safeTop; page++) {
+    const filter = `Cancelled eq 'tNO' and DocumentStatus eq 'bost_Open'`;
+    const path = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=200&$skip=${skip}`;
+    const raw = await slFetch(path, { timeoutMs: 120000 });
+    const rows = adminOrdersNormalizeRows(raw);
+    if (!rows.length) break;
+    out.push(...rows);
+    skip += rows.length;
+    if (rows.length < 200) break;
+  }
+  return out.slice(0, safeTop);
+}
+
+async function adminOrdersBuildCacheRows({ top = 1200 } = {}) {
+  const headers = await adminOrdersFetchOpenHeaders({ top });
+  const rows = [];
+  for (const h of headers) {
+    const docEntry = Number(h?.DocEntry || 0);
+    if (!(docEntry > 0)) continue;
+    const full = await adminOrdersFetchFullOrder(docEntry);
+    const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+    const status = adminOrdersStr(full?.DocumentStatus || h?.DocumentStatus || '');
+    if (status && !adminOrdersIsOpenStatus(status)) continue;
+    const warehouse = adminOrdersExtractWarehouse(lines);
+    const sellerCodeRaw = full?.SalesPersonCode ?? h?.SalesPersonCode ?? null;
+    const sellerCode = Number.isFinite(Number(sellerCodeRaw)) ? Number(sellerCodeRaw) : null;
+    const sellerName = sellerCode !== null ? await adminOrdersResolveSellerName(sellerCode).catch(() => '') : '';
+    if (sellerName && ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS.has(adminOrdersNormalizeSellerLabel(sellerName))) continue;
+    rows.push({
+      docEntry,
+      docNum: Number(h?.DocNum || full?.DocNum || 0) || null,
+      cardCode: adminOrdersStr(h?.CardCode || full?.CardCode),
+      cardName: adminOrdersStr(h?.CardName || full?.CardName),
+      warehouseCode: warehouse,
+      comments: adminOrdersStr(full?.Comments || h?.Comments),
+      docDueDate: adminOrdersIso(h?.DocDueDate || full?.DocDueDate),
+      docDate: adminOrdersIso(h?.DocDate || full?.DocDate),
+      sellerCode,
+      sellerName,
+      status: status || 'bost_Open',
+    });
+    if (rows.length % 20 === 0) await sleep(10);
+  }
+  return rows;
+}
+
+async function adminOrdersReplaceCache(rows = []) {
+  if (!hasDb()) throw new Error('DB no configurada');
+  await ensureAdminOpenOrdersTable();
+  await dbQuery('BEGIN');
+  try {
+    await dbQuery(`DELETE FROM admin_open_orders_cache`);
+    if (rows.length) {
+      const values = [];
+      const params = [];
+      let p = 1;
+      for (const r of rows) {
+        values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++}::date,$${p++}::date,$${p++},$${p++},$${p++},'sap_orders_open',NOW())`);
+        params.push(
+          Number(r.docEntry || 0),
+          r.docNum != null ? Number(r.docNum) : null,
+          adminOrdersStr(r.cardCode),
+          adminOrdersStr(r.cardName),
+          adminOrdersStr(r.warehouseCode),
+          adminOrdersStr(r.comments),
+          adminOrdersIso(r.docDueDate) || null,
+          adminOrdersIso(r.docDate) || null,
+          Number.isFinite(Number(r.sellerCode)) ? Number(r.sellerCode) : null,
+          adminOrdersStr(r.sellerName),
+          adminOrdersStr(r.status || 'bost_Open'),
+        )
+      }
+      await dbQuery(
+        `INSERT INTO admin_open_orders_cache(
+          doc_entry, doc_num, card_code, card_name, warehouse_code, comments,
+          doc_due_date, doc_date, seller_code, seller_name, status, sync_source, updated_at
+        ) VALUES ${values.join(',')}`,
+        params
+      );
+    }
+    await setState('admin_open_orders_last_sync_at', new Date().toISOString());
+    await dbQuery('COMMIT');
+  } catch (e) {
+    await dbQuery('ROLLBACK').catch(() => {});
+    throw e;
+  }
+}
+
+async function adminOrdersReadDb({ client = '', warehouse = '', seller = '', top = 500 } = {}) {
+  if (!hasDb()) throw new Error('DB no configurada');
+  await ensureAdminOpenOrdersTable();
+  const where = [];
+  const params = [];
+  let p = 1;
+  if (adminOrdersStr(client)) {
+    where.push(`(LOWER(card_code) LIKE $${p} OR LOWER(card_name) LIKE $${p})`);
+    params.push(`%${adminOrdersStr(client).toLowerCase()}%`);
+    p += 1;
+  }
+  if (adminOrdersStr(warehouse)) {
+    where.push(`LOWER(warehouse_code) = $${p++}`);
+    params.push(adminOrdersStr(warehouse).toLowerCase());
+  }
+  if (adminOrdersStr(seller)) {
+    where.push(`(LOWER(COALESCE(seller_name,'')) LIKE $${p} OR CAST(COALESCE(seller_code,0) AS TEXT) = $${p+1})`);
+    params.push(`%${adminOrdersStr(seller).toLowerCase()}%`);
+    params.push(adminOrdersStr(seller));
+    p += 2;
+  }
+  params.push(Math.max(1, Math.min(5000, Number(top || 500))));
+  const sql = `
+    SELECT
+      doc_entry AS "docEntry",
+      doc_num AS "docNum",
+      card_code AS "cardCode",
+      card_name AS "cardName",
+      warehouse_code AS "warehouse",
+      comments,
+      doc_due_date AS "docDueDate",
+      doc_date AS "docDate",
+      seller_code AS "sellerCode",
+      seller_name AS "sellerName",
+      status,
+      updated_at AS "updatedAt"
+    FROM admin_open_orders_cache
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY doc_date DESC NULLS LAST, doc_num DESC NULLS LAST
+    LIMIT $${p}
+  `;
+  const r = await dbQuery(sql, params);
+  const lastSyncAt = await getState('admin_open_orders_last_sync_at');
+  return { rows: r.rows || [], lastSyncAt };
+}
+
+app.post('/api/admin/orders/sync', verifyAdmin, async (req, res) => {
+  try {
+    const top = Math.max(50, Math.min(5000, Number(req.body?.top || req.query?.top || 1200)));
+    const rows = await adminOrdersBuildCacheRows({ top });
+    await adminOrdersReplaceCache(rows);
+    return safeJson(res, 200, { ok: true, synced: rows.length, lastSyncAt: await getState('admin_open_orders_last_sync_at') });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/orders/db', verifyAdmin, async (req, res) => {
+  try {
+    const out = await adminOrdersReadDb({
+      client: req.query?.client || '',
+      warehouse: req.query?.warehouse || '',
+      seller: req.query?.seller || '',
+      top: req.query?.top || 500,
+    });
+    return safeJson(res, 200, { ok: true, orders: out.rows, count: out.rows.length, lastSyncAt: out.lastSyncAt || '' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/orders/open', verifyAdmin, async (req, res) => {
+  try {
+    const refresh = String(req.query?.refresh || '1') !== '0';
+    if (refresh) {
+      const top = Math.max(50, Math.min(5000, Number(req.query?.top || 1200)));
+      const rows = await adminOrdersBuildCacheRows({ top });
+      await adminOrdersReplaceCache(rows);
+    }
+    const out = await adminOrdersReadDb({
+      client: req.query?.client || '',
+      warehouse: req.query?.warehouse || '',
+      seller: req.query?.seller || '',
+      top: req.query?.top || 500,
+    });
+    return safeJson(res, 200, { ok: true, orders: out.rows, count: out.rows.length, lastSyncAt: out.lastSyncAt || '' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 (async () => {
   try {
     await ensureDb();
@@ -5941,7 +6603,338 @@ process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
   console.log(`SKIP duplicate listen on :${PORT}`);
 })();
 
-__extraBootTasks.push(async () => {
+__extraBootTasks.push
+
+/* =========================================================
+   Admin · Pedidos abiertos (SAP -> Supabase cache -> DB)
+========================================================= */
+function adminOrdersStr(v) {
+  return String(v || '').trim();
+}
+function adminOrdersNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+function adminOrdersIso(v) {
+  return String(v || '').slice(0, 10);
+}
+function adminOrdersNormalizeSellerLabel(v) {
+  return String(v || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ');
+}
+const ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS = new Set([
+  'luis aguilar',
+  'rci-01',
+  'rci-02',
+  'rci-03',
+  'oficina',
+  '-ningun empleado del departamento de ventas-',
+].map(adminOrdersNormalizeSellerLabel));
+const ADMIN_ORDERS_SELLER_CACHE = new Map();
+
+async function ensureAdminOpenOrdersTable() {
+  if (!hasDb()) return;
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS admin_open_orders_cache (
+      doc_entry BIGINT PRIMARY KEY,
+      doc_num BIGINT,
+      card_code TEXT DEFAULT '',
+      card_name TEXT DEFAULT '',
+      warehouse_code TEXT DEFAULT '',
+      comments TEXT DEFAULT '',
+      doc_due_date DATE,
+      doc_date DATE,
+      seller_code BIGINT,
+      seller_name TEXT DEFAULT '',
+      status TEXT DEFAULT '',
+      sync_source TEXT DEFAULT 'sap_orders_open',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_doc_date ON admin_open_orders_cache(doc_date);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_card_code ON admin_open_orders_cache(card_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_wh ON admin_open_orders_cache(warehouse_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_seller_name ON admin_open_orders_cache(seller_name);`);
+}
+__extraBootTasks.push(ensureAdminOpenOrdersTable);
+
+function adminOrdersNormalizeRows(raw) {
+  if (Array.isArray(raw?.value)) return raw.value;
+  if (Array.isArray(raw)) return raw;
+  return [];
+}
+
+async function adminOrdersResolveSellerName(code) {
+  const codeNum = Number(code);
+  if (!Number.isFinite(codeNum) || codeNum < 0) return '';
+  const key = String(codeNum);
+  const cached = ADMIN_ORDERS_SELLER_CACHE.get(key);
+  if (cached && (Date.now() - Number(cached.ts || 0) < 6 * 60 * 60 * 1000)) return String(cached.name || '');
+  if (missingSapEnv()) return '';
+  const tries = [
+    `/SalesPersons(${codeNum})?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name`,
+    `/SalesPersons(${codeNum})`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SalesEmployeeCode eq ${codeNum}`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SlpCode eq ${codeNum}`,
+  ];
+  for (const path of tries) {
+    try {
+      const resp = await slFetch(path, { timeoutMs: 30000 });
+      const row = Array.isArray(resp?.value) ? (resp.value[0] || null) : resp;
+      const name = String(
+        row?.SalesEmployeeName || row?.SlpName || row?.SalesPersonName || row?.Name || ''
+      ).trim();
+      if (name) {
+        ADMIN_ORDERS_SELLER_CACHE.set(key, { name, ts: Date.now() });
+        return name;
+      }
+    } catch {}
+  }
+  return '';
+}
+
+async function adminOrdersFetchDocumentLines(docEntry) {
+  const de = Number(docEntry || 0);
+  if (!(de > 0)) return [];
+  const paths = [
+    `/Orders(${de})/DocumentLines?$top=500`,
+    `/Orders(${de})/DocumentLines`,
+  ];
+  for (const path of paths) {
+    try {
+      const raw = await slFetch(path, { timeoutMs: 90000 });
+      const rows = Array.isArray(raw?.value)
+        ? raw.value
+        : Array.isArray(raw?.DocumentLines)
+          ? raw.DocumentLines
+          : Array.isArray(raw)
+            ? raw
+            : [];
+      if (rows.length) return rows;
+    } catch {}
+  }
+  return [];
+}
+
+async function adminOrdersFetchFullOrder(docEntry) {
+  const de = Number(docEntry || 0);
+  if (!(de > 0)) return null;
+  try {
+    const full = await getDoc('Orders', de);
+    if (full && Array.isArray(full.DocumentLines) && full.DocumentLines.length) return full;
+    const lines = await adminOrdersFetchDocumentLines(de);
+    if (full) return { ...full, DocumentLines: lines };
+  } catch {}
+  try {
+    const head = await slFetch(`/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled&$filter=${encodeURIComponent(`DocEntry eq ${de}`)}&$top=1`, { timeoutMs: 90000 });
+    const row = adminOrdersNormalizeRows(head)[0] || null;
+    if (!row) return null;
+    const lines = await adminOrdersFetchDocumentLines(de);
+    return { ...row, DocumentLines: lines };
+  } catch {
+    return null;
+  }
+}
+
+function adminOrdersExtractWarehouse(lines = []) {
+  const first = (Array.isArray(lines) ? lines : []).find((ln) => adminOrdersStr(ln?.WarehouseCode || ln?.WhsCode || ln?.warehouseCode || ln?.WhsCode));
+  return adminOrdersStr(first?.WarehouseCode || first?.WhsCode || first?.warehouseCode || '');
+}
+
+function adminOrdersIsOpenStatus(v) {
+  const s = adminOrdersStr(v).toLowerCase();
+  return s.includes('open') || s.includes('bost_open') || s in {'o':1, 'open':1};
+}
+
+async function adminOrdersFetchOpenHeaders({ top = 1200 } = {}) {
+  if (missingSapEnv()) throw new Error('SAP no configurado');
+  const out = [];
+  let skip = 0;
+  const safeTop = Math.max(50, Math.min(5000, Number(top || 1200)));
+  for (let page = 0; page < 30 && out.length < safeTop; page++) {
+    const filter = `Cancelled eq 'tNO' and DocumentStatus eq 'bost_Open'`;
+    const path = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=200&$skip=${skip}`;
+    const raw = await slFetch(path, { timeoutMs: 120000 });
+    const rows = adminOrdersNormalizeRows(raw);
+    if (!rows.length) break;
+    out.push(...rows);
+    skip += rows.length;
+    if (rows.length < 200) break;
+  }
+  return out.slice(0, safeTop);
+}
+
+async function adminOrdersBuildCacheRows({ top = 1200 } = {}) {
+  const headers = await adminOrdersFetchOpenHeaders({ top });
+  const rows = [];
+  for (const h of headers) {
+    const docEntry = Number(h?.DocEntry || 0);
+    if (!(docEntry > 0)) continue;
+    const full = await adminOrdersFetchFullOrder(docEntry);
+    const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+    const status = adminOrdersStr(full?.DocumentStatus || h?.DocumentStatus || '');
+    if (status && !adminOrdersIsOpenStatus(status)) continue;
+    const warehouse = adminOrdersExtractWarehouse(lines);
+    const sellerCodeRaw = full?.SalesPersonCode ?? h?.SalesPersonCode ?? null;
+    const sellerCode = Number.isFinite(Number(sellerCodeRaw)) ? Number(sellerCodeRaw) : null;
+    const sellerName = sellerCode !== null ? await adminOrdersResolveSellerName(sellerCode).catch(() => '') : '';
+    if (sellerName && ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS.has(adminOrdersNormalizeSellerLabel(sellerName))) continue;
+    rows.push({
+      docEntry,
+      docNum: Number(h?.DocNum || full?.DocNum || 0) || null,
+      cardCode: adminOrdersStr(h?.CardCode || full?.CardCode),
+      cardName: adminOrdersStr(h?.CardName || full?.CardName),
+      warehouseCode: warehouse,
+      comments: adminOrdersStr(full?.Comments || h?.Comments),
+      docDueDate: adminOrdersIso(h?.DocDueDate || full?.DocDueDate),
+      docDate: adminOrdersIso(h?.DocDate || full?.DocDate),
+      sellerCode,
+      sellerName,
+      status: status || 'bost_Open',
+    });
+    if (rows.length % 20 === 0) await sleep(10);
+  }
+  return rows;
+}
+
+async function adminOrdersReplaceCache(rows = []) {
+  if (!hasDb()) throw new Error('DB no configurada');
+  await ensureAdminOpenOrdersTable();
+  await dbQuery('BEGIN');
+  try {
+    await dbQuery(`DELETE FROM admin_open_orders_cache`);
+    if (rows.length) {
+      const values = [];
+      const params = [];
+      let p = 1;
+      for (const r of rows) {
+        values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++}::date,$${p++}::date,$${p++},$${p++},$${p++},'sap_orders_open',NOW())`);
+        params.push(
+          Number(r.docEntry || 0),
+          r.docNum != null ? Number(r.docNum) : null,
+          adminOrdersStr(r.cardCode),
+          adminOrdersStr(r.cardName),
+          adminOrdersStr(r.warehouseCode),
+          adminOrdersStr(r.comments),
+          adminOrdersIso(r.docDueDate) || null,
+          adminOrdersIso(r.docDate) || null,
+          Number.isFinite(Number(r.sellerCode)) ? Number(r.sellerCode) : null,
+          adminOrdersStr(r.sellerName),
+          adminOrdersStr(r.status || 'bost_Open'),
+        )
+      }
+      await dbQuery(
+        `INSERT INTO admin_open_orders_cache(
+          doc_entry, doc_num, card_code, card_name, warehouse_code, comments,
+          doc_due_date, doc_date, seller_code, seller_name, status, sync_source, updated_at
+        ) VALUES ${values.join(',')}`,
+        params
+      );
+    }
+    await setState('admin_open_orders_last_sync_at', new Date().toISOString());
+    await dbQuery('COMMIT');
+  } catch (e) {
+    await dbQuery('ROLLBACK').catch(() => {});
+    throw e;
+  }
+}
+
+async function adminOrdersReadDb({ client = '', warehouse = '', seller = '', top = 500 } = {}) {
+  if (!hasDb()) throw new Error('DB no configurada');
+  await ensureAdminOpenOrdersTable();
+  const where = [];
+  const params = [];
+  let p = 1;
+  if (adminOrdersStr(client)) {
+    where.push(`(LOWER(card_code) LIKE $${p} OR LOWER(card_name) LIKE $${p})`);
+    params.push(`%${adminOrdersStr(client).toLowerCase()}%`);
+    p += 1;
+  }
+  if (adminOrdersStr(warehouse)) {
+    where.push(`LOWER(warehouse_code) = $${p++}`);
+    params.push(adminOrdersStr(warehouse).toLowerCase());
+  }
+  if (adminOrdersStr(seller)) {
+    where.push(`(LOWER(COALESCE(seller_name,'')) LIKE $${p} OR CAST(COALESCE(seller_code,0) AS TEXT) = $${p+1})`);
+    params.push(`%${adminOrdersStr(seller).toLowerCase()}%`);
+    params.push(adminOrdersStr(seller));
+    p += 2;
+  }
+  params.push(Math.max(1, Math.min(5000, Number(top || 500))));
+  const sql = `
+    SELECT
+      doc_entry AS "docEntry",
+      doc_num AS "docNum",
+      card_code AS "cardCode",
+      card_name AS "cardName",
+      warehouse_code AS "warehouse",
+      comments,
+      doc_due_date AS "docDueDate",
+      doc_date AS "docDate",
+      seller_code AS "sellerCode",
+      seller_name AS "sellerName",
+      status,
+      updated_at AS "updatedAt"
+    FROM admin_open_orders_cache
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY doc_date DESC NULLS LAST, doc_num DESC NULLS LAST
+    LIMIT $${p}
+  `;
+  const r = await dbQuery(sql, params);
+  const lastSyncAt = await getState('admin_open_orders_last_sync_at');
+  return { rows: r.rows || [], lastSyncAt };
+}
+
+app.post('/api/admin/orders/sync', verifyAdmin, async (req, res) => {
+  try {
+    const top = Math.max(50, Math.min(5000, Number(req.body?.top || req.query?.top || 1200)));
+    const rows = await adminOrdersBuildCacheRows({ top });
+    await adminOrdersReplaceCache(rows);
+    return safeJson(res, 200, { ok: true, synced: rows.length, lastSyncAt: await getState('admin_open_orders_last_sync_at') });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/orders/db', verifyAdmin, async (req, res) => {
+  try {
+    const out = await adminOrdersReadDb({
+      client: req.query?.client || '',
+      warehouse: req.query?.warehouse || '',
+      seller: req.query?.seller || '',
+      top: req.query?.top || 500,
+    });
+    return safeJson(res, 200, { ok: true, orders: out.rows, count: out.rows.length, lastSyncAt: out.lastSyncAt || '' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/orders/open', verifyAdmin, async (req, res) => {
+  try {
+    const refresh = String(req.query?.refresh || '1') !== '0';
+    if (refresh) {
+      const top = Math.max(50, Math.min(5000, Number(req.query?.top || 1200)));
+      const rows = await adminOrdersBuildCacheRows({ top });
+      await adminOrdersReplaceCache(rows);
+    }
+    const out = await adminOrdersReadDb({
+      client: req.query?.client || '',
+      warehouse: req.query?.warehouse || '',
+      seller: req.query?.seller || '',
+      top: req.query?.top || 500,
+    });
+    return safeJson(res, 200, { ok: true, orders: out.rows, count: out.rows.length, lastSyncAt: out.lastSyncAt || '' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+(async () => {
   try {
     await ensureDb();
   } catch (e) {
@@ -10334,6 +11327,337 @@ app.get("/api/admin/invoices/sync/status", verifyAdmin, async (req, res) => {
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
+
+
+/* =========================================================
+   Admin · Pedidos abiertos (SAP -> Supabase cache -> DB)
+========================================================= */
+function adminOrdersStr(v) {
+  return String(v || '').trim();
+}
+function adminOrdersNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+function adminOrdersIso(v) {
+  return String(v || '').slice(0, 10);
+}
+function adminOrdersNormalizeSellerLabel(v) {
+  return String(v || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ');
+}
+const ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS = new Set([
+  'luis aguilar',
+  'rci-01',
+  'rci-02',
+  'rci-03',
+  'oficina',
+  '-ningun empleado del departamento de ventas-',
+].map(adminOrdersNormalizeSellerLabel));
+const ADMIN_ORDERS_SELLER_CACHE = new Map();
+
+async function ensureAdminOpenOrdersTable() {
+  if (!hasDb()) return;
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS admin_open_orders_cache (
+      doc_entry BIGINT PRIMARY KEY,
+      doc_num BIGINT,
+      card_code TEXT DEFAULT '',
+      card_name TEXT DEFAULT '',
+      warehouse_code TEXT DEFAULT '',
+      comments TEXT DEFAULT '',
+      doc_due_date DATE,
+      doc_date DATE,
+      seller_code BIGINT,
+      seller_name TEXT DEFAULT '',
+      status TEXT DEFAULT '',
+      sync_source TEXT DEFAULT 'sap_orders_open',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_doc_date ON admin_open_orders_cache(doc_date);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_card_code ON admin_open_orders_cache(card_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_wh ON admin_open_orders_cache(warehouse_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_seller_name ON admin_open_orders_cache(seller_name);`);
+}
+__extraBootTasks.push(ensureAdminOpenOrdersTable);
+
+function adminOrdersNormalizeRows(raw) {
+  if (Array.isArray(raw?.value)) return raw.value;
+  if (Array.isArray(raw)) return raw;
+  return [];
+}
+
+async function adminOrdersResolveSellerName(code) {
+  const codeNum = Number(code);
+  if (!Number.isFinite(codeNum) || codeNum < 0) return '';
+  const key = String(codeNum);
+  const cached = ADMIN_ORDERS_SELLER_CACHE.get(key);
+  if (cached && (Date.now() - Number(cached.ts || 0) < 6 * 60 * 60 * 1000)) return String(cached.name || '');
+  if (missingSapEnv()) return '';
+  const tries = [
+    `/SalesPersons(${codeNum})?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name`,
+    `/SalesPersons(${codeNum})`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SalesEmployeeCode eq ${codeNum}`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SlpCode eq ${codeNum}`,
+  ];
+  for (const path of tries) {
+    try {
+      const resp = await slFetch(path, { timeoutMs: 30000 });
+      const row = Array.isArray(resp?.value) ? (resp.value[0] || null) : resp;
+      const name = String(
+        row?.SalesEmployeeName || row?.SlpName || row?.SalesPersonName || row?.Name || ''
+      ).trim();
+      if (name) {
+        ADMIN_ORDERS_SELLER_CACHE.set(key, { name, ts: Date.now() });
+        return name;
+      }
+    } catch {}
+  }
+  return '';
+}
+
+async function adminOrdersFetchDocumentLines(docEntry) {
+  const de = Number(docEntry || 0);
+  if (!(de > 0)) return [];
+  const paths = [
+    `/Orders(${de})/DocumentLines?$top=500`,
+    `/Orders(${de})/DocumentLines`,
+  ];
+  for (const path of paths) {
+    try {
+      const raw = await slFetch(path, { timeoutMs: 90000 });
+      const rows = Array.isArray(raw?.value)
+        ? raw.value
+        : Array.isArray(raw?.DocumentLines)
+          ? raw.DocumentLines
+          : Array.isArray(raw)
+            ? raw
+            : [];
+      if (rows.length) return rows;
+    } catch {}
+  }
+  return [];
+}
+
+async function adminOrdersFetchFullOrder(docEntry) {
+  const de = Number(docEntry || 0);
+  if (!(de > 0)) return null;
+  try {
+    const full = await getDoc('Orders', de);
+    if (full && Array.isArray(full.DocumentLines) && full.DocumentLines.length) return full;
+    const lines = await adminOrdersFetchDocumentLines(de);
+    if (full) return { ...full, DocumentLines: lines };
+  } catch {}
+  try {
+    const head = await slFetch(`/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled&$filter=${encodeURIComponent(`DocEntry eq ${de}`)}&$top=1`, { timeoutMs: 90000 });
+    const row = adminOrdersNormalizeRows(head)[0] || null;
+    if (!row) return null;
+    const lines = await adminOrdersFetchDocumentLines(de);
+    return { ...row, DocumentLines: lines };
+  } catch {
+    return null;
+  }
+}
+
+function adminOrdersExtractWarehouse(lines = []) {
+  const first = (Array.isArray(lines) ? lines : []).find((ln) => adminOrdersStr(ln?.WarehouseCode || ln?.WhsCode || ln?.warehouseCode || ln?.WhsCode));
+  return adminOrdersStr(first?.WarehouseCode || first?.WhsCode || first?.warehouseCode || '');
+}
+
+function adminOrdersIsOpenStatus(v) {
+  const s = adminOrdersStr(v).toLowerCase();
+  return s.includes('open') || s.includes('bost_open') || s in {'o':1, 'open':1};
+}
+
+async function adminOrdersFetchOpenHeaders({ top = 1200 } = {}) {
+  if (missingSapEnv()) throw new Error('SAP no configurado');
+  const out = [];
+  let skip = 0;
+  const safeTop = Math.max(50, Math.min(5000, Number(top || 1200)));
+  for (let page = 0; page < 30 && out.length < safeTop; page++) {
+    const filter = `Cancelled eq 'tNO' and DocumentStatus eq 'bost_Open'`;
+    const path = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=200&$skip=${skip}`;
+    const raw = await slFetch(path, { timeoutMs: 120000 });
+    const rows = adminOrdersNormalizeRows(raw);
+    if (!rows.length) break;
+    out.push(...rows);
+    skip += rows.length;
+    if (rows.length < 200) break;
+  }
+  return out.slice(0, safeTop);
+}
+
+async function adminOrdersBuildCacheRows({ top = 1200 } = {}) {
+  const headers = await adminOrdersFetchOpenHeaders({ top });
+  const rows = [];
+  for (const h of headers) {
+    const docEntry = Number(h?.DocEntry || 0);
+    if (!(docEntry > 0)) continue;
+    const full = await adminOrdersFetchFullOrder(docEntry);
+    const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+    const status = adminOrdersStr(full?.DocumentStatus || h?.DocumentStatus || '');
+    if (status && !adminOrdersIsOpenStatus(status)) continue;
+    const warehouse = adminOrdersExtractWarehouse(lines);
+    const sellerCodeRaw = full?.SalesPersonCode ?? h?.SalesPersonCode ?? null;
+    const sellerCode = Number.isFinite(Number(sellerCodeRaw)) ? Number(sellerCodeRaw) : null;
+    const sellerName = sellerCode !== null ? await adminOrdersResolveSellerName(sellerCode).catch(() => '') : '';
+    if (sellerName && ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS.has(adminOrdersNormalizeSellerLabel(sellerName))) continue;
+    rows.push({
+      docEntry,
+      docNum: Number(h?.DocNum || full?.DocNum || 0) || null,
+      cardCode: adminOrdersStr(h?.CardCode || full?.CardCode),
+      cardName: adminOrdersStr(h?.CardName || full?.CardName),
+      warehouseCode: warehouse,
+      comments: adminOrdersStr(full?.Comments || h?.Comments),
+      docDueDate: adminOrdersIso(h?.DocDueDate || full?.DocDueDate),
+      docDate: adminOrdersIso(h?.DocDate || full?.DocDate),
+      sellerCode,
+      sellerName,
+      status: status || 'bost_Open',
+    });
+    if (rows.length % 20 === 0) await sleep(10);
+  }
+  return rows;
+}
+
+async function adminOrdersReplaceCache(rows = []) {
+  if (!hasDb()) throw new Error('DB no configurada');
+  await ensureAdminOpenOrdersTable();
+  await dbQuery('BEGIN');
+  try {
+    await dbQuery(`DELETE FROM admin_open_orders_cache`);
+    if (rows.length) {
+      const values = [];
+      const params = [];
+      let p = 1;
+      for (const r of rows) {
+        values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++}::date,$${p++}::date,$${p++},$${p++},$${p++},'sap_orders_open',NOW())`);
+        params.push(
+          Number(r.docEntry || 0),
+          r.docNum != null ? Number(r.docNum) : null,
+          adminOrdersStr(r.cardCode),
+          adminOrdersStr(r.cardName),
+          adminOrdersStr(r.warehouseCode),
+          adminOrdersStr(r.comments),
+          adminOrdersIso(r.docDueDate) || null,
+          adminOrdersIso(r.docDate) || null,
+          Number.isFinite(Number(r.sellerCode)) ? Number(r.sellerCode) : null,
+          adminOrdersStr(r.sellerName),
+          adminOrdersStr(r.status || 'bost_Open'),
+        )
+      }
+      await dbQuery(
+        `INSERT INTO admin_open_orders_cache(
+          doc_entry, doc_num, card_code, card_name, warehouse_code, comments,
+          doc_due_date, doc_date, seller_code, seller_name, status, sync_source, updated_at
+        ) VALUES ${values.join(',')}`,
+        params
+      );
+    }
+    await setState('admin_open_orders_last_sync_at', new Date().toISOString());
+    await dbQuery('COMMIT');
+  } catch (e) {
+    await dbQuery('ROLLBACK').catch(() => {});
+    throw e;
+  }
+}
+
+async function adminOrdersReadDb({ client = '', warehouse = '', seller = '', top = 500 } = {}) {
+  if (!hasDb()) throw new Error('DB no configurada');
+  await ensureAdminOpenOrdersTable();
+  const where = [];
+  const params = [];
+  let p = 1;
+  if (adminOrdersStr(client)) {
+    where.push(`(LOWER(card_code) LIKE $${p} OR LOWER(card_name) LIKE $${p})`);
+    params.push(`%${adminOrdersStr(client).toLowerCase()}%`);
+    p += 1;
+  }
+  if (adminOrdersStr(warehouse)) {
+    where.push(`LOWER(warehouse_code) = $${p++}`);
+    params.push(adminOrdersStr(warehouse).toLowerCase());
+  }
+  if (adminOrdersStr(seller)) {
+    where.push(`(LOWER(COALESCE(seller_name,'')) LIKE $${p} OR CAST(COALESCE(seller_code,0) AS TEXT) = $${p+1})`);
+    params.push(`%${adminOrdersStr(seller).toLowerCase()}%`);
+    params.push(adminOrdersStr(seller));
+    p += 2;
+  }
+  params.push(Math.max(1, Math.min(5000, Number(top || 500))));
+  const sql = `
+    SELECT
+      doc_entry AS "docEntry",
+      doc_num AS "docNum",
+      card_code AS "cardCode",
+      card_name AS "cardName",
+      warehouse_code AS "warehouse",
+      comments,
+      doc_due_date AS "docDueDate",
+      doc_date AS "docDate",
+      seller_code AS "sellerCode",
+      seller_name AS "sellerName",
+      status,
+      updated_at AS "updatedAt"
+    FROM admin_open_orders_cache
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY doc_date DESC NULLS LAST, doc_num DESC NULLS LAST
+    LIMIT $${p}
+  `;
+  const r = await dbQuery(sql, params);
+  const lastSyncAt = await getState('admin_open_orders_last_sync_at');
+  return { rows: r.rows || [], lastSyncAt };
+}
+
+app.post('/api/admin/orders/sync', verifyAdmin, async (req, res) => {
+  try {
+    const top = Math.max(50, Math.min(5000, Number(req.body?.top || req.query?.top || 1200)));
+    const rows = await adminOrdersBuildCacheRows({ top });
+    await adminOrdersReplaceCache(rows);
+    return safeJson(res, 200, { ok: true, synced: rows.length, lastSyncAt: await getState('admin_open_orders_last_sync_at') });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/orders/db', verifyAdmin, async (req, res) => {
+  try {
+    const out = await adminOrdersReadDb({
+      client: req.query?.client || '',
+      warehouse: req.query?.warehouse || '',
+      seller: req.query?.seller || '',
+      top: req.query?.top || 500,
+    });
+    return safeJson(res, 200, { ok: true, orders: out.rows, count: out.rows.length, lastSyncAt: out.lastSyncAt || '' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/orders/open', verifyAdmin, async (req, res) => {
+  try {
+    const refresh = String(req.query?.refresh || '1') !== '0';
+    if (refresh) {
+      const top = Math.max(50, Math.min(5000, Number(req.query?.top || 1200)));
+      const rows = await adminOrdersBuildCacheRows({ top });
+      await adminOrdersReplaceCache(rows);
+    }
+    const out = await adminOrdersReadDb({
+      client: req.query?.client || '',
+      warehouse: req.query?.warehouse || '',
+      seller: req.query?.seller || '',
+      top: req.query?.top || 500,
+    });
+    return safeJson(res, 200, { ok: true, orders: out.rows, count: out.rows.length, lastSyncAt: out.lastSyncAt || '' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 (async () => {
   try {
     await ensureDb();
@@ -10344,7 +11668,338 @@ process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
   console.log(`SKIP duplicate listen on :${PORT}`);
 })();
 
-__extraBootTasks.push(async () => {
+__extraBootTasks.push
+
+/* =========================================================
+   Admin · Pedidos abiertos (SAP -> Supabase cache -> DB)
+========================================================= */
+function adminOrdersStr(v) {
+  return String(v || '').trim();
+}
+function adminOrdersNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+function adminOrdersIso(v) {
+  return String(v || '').slice(0, 10);
+}
+function adminOrdersNormalizeSellerLabel(v) {
+  return String(v || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ');
+}
+const ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS = new Set([
+  'luis aguilar',
+  'rci-01',
+  'rci-02',
+  'rci-03',
+  'oficina',
+  '-ningun empleado del departamento de ventas-',
+].map(adminOrdersNormalizeSellerLabel));
+const ADMIN_ORDERS_SELLER_CACHE = new Map();
+
+async function ensureAdminOpenOrdersTable() {
+  if (!hasDb()) return;
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS admin_open_orders_cache (
+      doc_entry BIGINT PRIMARY KEY,
+      doc_num BIGINT,
+      card_code TEXT DEFAULT '',
+      card_name TEXT DEFAULT '',
+      warehouse_code TEXT DEFAULT '',
+      comments TEXT DEFAULT '',
+      doc_due_date DATE,
+      doc_date DATE,
+      seller_code BIGINT,
+      seller_name TEXT DEFAULT '',
+      status TEXT DEFAULT '',
+      sync_source TEXT DEFAULT 'sap_orders_open',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_doc_date ON admin_open_orders_cache(doc_date);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_card_code ON admin_open_orders_cache(card_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_wh ON admin_open_orders_cache(warehouse_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_seller_name ON admin_open_orders_cache(seller_name);`);
+}
+__extraBootTasks.push(ensureAdminOpenOrdersTable);
+
+function adminOrdersNormalizeRows(raw) {
+  if (Array.isArray(raw?.value)) return raw.value;
+  if (Array.isArray(raw)) return raw;
+  return [];
+}
+
+async function adminOrdersResolveSellerName(code) {
+  const codeNum = Number(code);
+  if (!Number.isFinite(codeNum) || codeNum < 0) return '';
+  const key = String(codeNum);
+  const cached = ADMIN_ORDERS_SELLER_CACHE.get(key);
+  if (cached && (Date.now() - Number(cached.ts || 0) < 6 * 60 * 60 * 1000)) return String(cached.name || '');
+  if (missingSapEnv()) return '';
+  const tries = [
+    `/SalesPersons(${codeNum})?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name`,
+    `/SalesPersons(${codeNum})`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SalesEmployeeCode eq ${codeNum}`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SlpCode eq ${codeNum}`,
+  ];
+  for (const path of tries) {
+    try {
+      const resp = await slFetch(path, { timeoutMs: 30000 });
+      const row = Array.isArray(resp?.value) ? (resp.value[0] || null) : resp;
+      const name = String(
+        row?.SalesEmployeeName || row?.SlpName || row?.SalesPersonName || row?.Name || ''
+      ).trim();
+      if (name) {
+        ADMIN_ORDERS_SELLER_CACHE.set(key, { name, ts: Date.now() });
+        return name;
+      }
+    } catch {}
+  }
+  return '';
+}
+
+async function adminOrdersFetchDocumentLines(docEntry) {
+  const de = Number(docEntry || 0);
+  if (!(de > 0)) return [];
+  const paths = [
+    `/Orders(${de})/DocumentLines?$top=500`,
+    `/Orders(${de})/DocumentLines`,
+  ];
+  for (const path of paths) {
+    try {
+      const raw = await slFetch(path, { timeoutMs: 90000 });
+      const rows = Array.isArray(raw?.value)
+        ? raw.value
+        : Array.isArray(raw?.DocumentLines)
+          ? raw.DocumentLines
+          : Array.isArray(raw)
+            ? raw
+            : [];
+      if (rows.length) return rows;
+    } catch {}
+  }
+  return [];
+}
+
+async function adminOrdersFetchFullOrder(docEntry) {
+  const de = Number(docEntry || 0);
+  if (!(de > 0)) return null;
+  try {
+    const full = await getDoc('Orders', de);
+    if (full && Array.isArray(full.DocumentLines) && full.DocumentLines.length) return full;
+    const lines = await adminOrdersFetchDocumentLines(de);
+    if (full) return { ...full, DocumentLines: lines };
+  } catch {}
+  try {
+    const head = await slFetch(`/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled&$filter=${encodeURIComponent(`DocEntry eq ${de}`)}&$top=1`, { timeoutMs: 90000 });
+    const row = adminOrdersNormalizeRows(head)[0] || null;
+    if (!row) return null;
+    const lines = await adminOrdersFetchDocumentLines(de);
+    return { ...row, DocumentLines: lines };
+  } catch {
+    return null;
+  }
+}
+
+function adminOrdersExtractWarehouse(lines = []) {
+  const first = (Array.isArray(lines) ? lines : []).find((ln) => adminOrdersStr(ln?.WarehouseCode || ln?.WhsCode || ln?.warehouseCode || ln?.WhsCode));
+  return adminOrdersStr(first?.WarehouseCode || first?.WhsCode || first?.warehouseCode || '');
+}
+
+function adminOrdersIsOpenStatus(v) {
+  const s = adminOrdersStr(v).toLowerCase();
+  return s.includes('open') || s.includes('bost_open') || s in {'o':1, 'open':1};
+}
+
+async function adminOrdersFetchOpenHeaders({ top = 1200 } = {}) {
+  if (missingSapEnv()) throw new Error('SAP no configurado');
+  const out = [];
+  let skip = 0;
+  const safeTop = Math.max(50, Math.min(5000, Number(top || 1200)));
+  for (let page = 0; page < 30 && out.length < safeTop; page++) {
+    const filter = `Cancelled eq 'tNO' and DocumentStatus eq 'bost_Open'`;
+    const path = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=200&$skip=${skip}`;
+    const raw = await slFetch(path, { timeoutMs: 120000 });
+    const rows = adminOrdersNormalizeRows(raw);
+    if (!rows.length) break;
+    out.push(...rows);
+    skip += rows.length;
+    if (rows.length < 200) break;
+  }
+  return out.slice(0, safeTop);
+}
+
+async function adminOrdersBuildCacheRows({ top = 1200 } = {}) {
+  const headers = await adminOrdersFetchOpenHeaders({ top });
+  const rows = [];
+  for (const h of headers) {
+    const docEntry = Number(h?.DocEntry || 0);
+    if (!(docEntry > 0)) continue;
+    const full = await adminOrdersFetchFullOrder(docEntry);
+    const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+    const status = adminOrdersStr(full?.DocumentStatus || h?.DocumentStatus || '');
+    if (status && !adminOrdersIsOpenStatus(status)) continue;
+    const warehouse = adminOrdersExtractWarehouse(lines);
+    const sellerCodeRaw = full?.SalesPersonCode ?? h?.SalesPersonCode ?? null;
+    const sellerCode = Number.isFinite(Number(sellerCodeRaw)) ? Number(sellerCodeRaw) : null;
+    const sellerName = sellerCode !== null ? await adminOrdersResolveSellerName(sellerCode).catch(() => '') : '';
+    if (sellerName && ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS.has(adminOrdersNormalizeSellerLabel(sellerName))) continue;
+    rows.push({
+      docEntry,
+      docNum: Number(h?.DocNum || full?.DocNum || 0) || null,
+      cardCode: adminOrdersStr(h?.CardCode || full?.CardCode),
+      cardName: adminOrdersStr(h?.CardName || full?.CardName),
+      warehouseCode: warehouse,
+      comments: adminOrdersStr(full?.Comments || h?.Comments),
+      docDueDate: adminOrdersIso(h?.DocDueDate || full?.DocDueDate),
+      docDate: adminOrdersIso(h?.DocDate || full?.DocDate),
+      sellerCode,
+      sellerName,
+      status: status || 'bost_Open',
+    });
+    if (rows.length % 20 === 0) await sleep(10);
+  }
+  return rows;
+}
+
+async function adminOrdersReplaceCache(rows = []) {
+  if (!hasDb()) throw new Error('DB no configurada');
+  await ensureAdminOpenOrdersTable();
+  await dbQuery('BEGIN');
+  try {
+    await dbQuery(`DELETE FROM admin_open_orders_cache`);
+    if (rows.length) {
+      const values = [];
+      const params = [];
+      let p = 1;
+      for (const r of rows) {
+        values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++}::date,$${p++}::date,$${p++},$${p++},$${p++},'sap_orders_open',NOW())`);
+        params.push(
+          Number(r.docEntry || 0),
+          r.docNum != null ? Number(r.docNum) : null,
+          adminOrdersStr(r.cardCode),
+          adminOrdersStr(r.cardName),
+          adminOrdersStr(r.warehouseCode),
+          adminOrdersStr(r.comments),
+          adminOrdersIso(r.docDueDate) || null,
+          adminOrdersIso(r.docDate) || null,
+          Number.isFinite(Number(r.sellerCode)) ? Number(r.sellerCode) : null,
+          adminOrdersStr(r.sellerName),
+          adminOrdersStr(r.status || 'bost_Open'),
+        )
+      }
+      await dbQuery(
+        `INSERT INTO admin_open_orders_cache(
+          doc_entry, doc_num, card_code, card_name, warehouse_code, comments,
+          doc_due_date, doc_date, seller_code, seller_name, status, sync_source, updated_at
+        ) VALUES ${values.join(',')}`,
+        params
+      );
+    }
+    await setState('admin_open_orders_last_sync_at', new Date().toISOString());
+    await dbQuery('COMMIT');
+  } catch (e) {
+    await dbQuery('ROLLBACK').catch(() => {});
+    throw e;
+  }
+}
+
+async function adminOrdersReadDb({ client = '', warehouse = '', seller = '', top = 500 } = {}) {
+  if (!hasDb()) throw new Error('DB no configurada');
+  await ensureAdminOpenOrdersTable();
+  const where = [];
+  const params = [];
+  let p = 1;
+  if (adminOrdersStr(client)) {
+    where.push(`(LOWER(card_code) LIKE $${p} OR LOWER(card_name) LIKE $${p})`);
+    params.push(`%${adminOrdersStr(client).toLowerCase()}%`);
+    p += 1;
+  }
+  if (adminOrdersStr(warehouse)) {
+    where.push(`LOWER(warehouse_code) = $${p++}`);
+    params.push(adminOrdersStr(warehouse).toLowerCase());
+  }
+  if (adminOrdersStr(seller)) {
+    where.push(`(LOWER(COALESCE(seller_name,'')) LIKE $${p} OR CAST(COALESCE(seller_code,0) AS TEXT) = $${p+1})`);
+    params.push(`%${adminOrdersStr(seller).toLowerCase()}%`);
+    params.push(adminOrdersStr(seller));
+    p += 2;
+  }
+  params.push(Math.max(1, Math.min(5000, Number(top || 500))));
+  const sql = `
+    SELECT
+      doc_entry AS "docEntry",
+      doc_num AS "docNum",
+      card_code AS "cardCode",
+      card_name AS "cardName",
+      warehouse_code AS "warehouse",
+      comments,
+      doc_due_date AS "docDueDate",
+      doc_date AS "docDate",
+      seller_code AS "sellerCode",
+      seller_name AS "sellerName",
+      status,
+      updated_at AS "updatedAt"
+    FROM admin_open_orders_cache
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY doc_date DESC NULLS LAST, doc_num DESC NULLS LAST
+    LIMIT $${p}
+  `;
+  const r = await dbQuery(sql, params);
+  const lastSyncAt = await getState('admin_open_orders_last_sync_at');
+  return { rows: r.rows || [], lastSyncAt };
+}
+
+app.post('/api/admin/orders/sync', verifyAdmin, async (req, res) => {
+  try {
+    const top = Math.max(50, Math.min(5000, Number(req.body?.top || req.query?.top || 1200)));
+    const rows = await adminOrdersBuildCacheRows({ top });
+    await adminOrdersReplaceCache(rows);
+    return safeJson(res, 200, { ok: true, synced: rows.length, lastSyncAt: await getState('admin_open_orders_last_sync_at') });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/orders/db', verifyAdmin, async (req, res) => {
+  try {
+    const out = await adminOrdersReadDb({
+      client: req.query?.client || '',
+      warehouse: req.query?.warehouse || '',
+      seller: req.query?.seller || '',
+      top: req.query?.top || 500,
+    });
+    return safeJson(res, 200, { ok: true, orders: out.rows, count: out.rows.length, lastSyncAt: out.lastSyncAt || '' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/orders/open', verifyAdmin, async (req, res) => {
+  try {
+    const refresh = String(req.query?.refresh || '1') !== '0';
+    if (refresh) {
+      const top = Math.max(50, Math.min(5000, Number(req.query?.top || 1200)));
+      const rows = await adminOrdersBuildCacheRows({ top });
+      await adminOrdersReplaceCache(rows);
+    }
+    const out = await adminOrdersReadDb({
+      client: req.query?.client || '',
+      warehouse: req.query?.warehouse || '',
+      seller: req.query?.seller || '',
+      top: req.query?.top || 500,
+    });
+    return safeJson(res, 200, { ok: true, orders: out.rows, count: out.rows.length, lastSyncAt: out.lastSyncAt || '' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+(async () => {
   try {
     await ensureDb();
   } catch (e) {
@@ -19830,40 +21485,19 @@ app.post('/api/admin/production-close/orders/:absoluteEntry/process', verifyAdmi
 
 
 /* =========================================================
-   Admin pedidos abiertos DB + Sync SAP
+   Admin · Pedidos abiertos (SAP -> Supabase cache -> DB)
 ========================================================= */
-async function ensureAdminOpenOrdersDb() {
-  if (!hasDb()) return;
-  await dbQuery(`
-    CREATE TABLE IF NOT EXISTS admin_open_orders_cache (
-      doc_entry BIGINT PRIMARY KEY,
-      doc_num BIGINT,
-      doc_date DATE,
-      doc_due_date DATE,
-      card_code TEXT,
-      card_name TEXT,
-      warehouse TEXT,
-      seller_code TEXT,
-      seller_name TEXT,
-      status TEXT,
-      comments TEXT,
-      updated_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-  const idx = [
-    `CREATE INDEX IF NOT EXISTS idx_admin_open_orders_doc_date ON admin_open_orders_cache(doc_date)`,
-    `CREATE INDEX IF NOT EXISTS idx_admin_open_orders_doc_due_date ON admin_open_orders_cache(doc_due_date)`,
-    `CREATE INDEX IF NOT EXISTS idx_admin_open_orders_card_code ON admin_open_orders_cache(card_code)`,
-    `CREATE INDEX IF NOT EXISTS idx_admin_open_orders_warehouse ON admin_open_orders_cache(warehouse)`,
-    `CREATE INDEX IF NOT EXISTS idx_admin_open_orders_seller_name ON admin_open_orders_cache(seller_name)`
-  ];
-  for (const q of idx) {
-    try { await dbQuery(q); } catch {}
-  }
+function adminOrdersStr(v) {
+  return String(v || '').trim();
 }
-__extraBootTasks.push(ensureAdminOpenOrdersDb);
-
-function adminOpenOrdersNormalizeSellerLabel(v = '') {
+function adminOrdersNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+function adminOrdersIso(v) {
+  return String(v || '').slice(0, 10);
+}
+function adminOrdersNormalizeSellerLabel(v) {
   return String(v || '')
     .trim()
     .toLowerCase()
@@ -19871,163 +21505,216 @@ function adminOpenOrdersNormalizeSellerLabel(v = '') {
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/\s+/g, ' ');
 }
-
 const ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS = new Set([
-  'Luis Aguilar',
-  'RCI-01',
-  'RCI-02',
-  'RCI-03',
-  'Oficina',
-  '-Ningún empleado del departamento de ventas-'
-].map(adminOpenOrdersNormalizeSellerLabel));
+  'luis aguilar',
+  'rci-01',
+  'rci-02',
+  'rci-03',
+  'oficina',
+  '-ningun empleado del departamento de ventas-',
+].map(adminOrdersNormalizeSellerLabel));
+const ADMIN_ORDERS_SELLER_CACHE = new Map();
 
-function adminOpenOrdersIsCancelled(row = {}) {
-  const raw = String(row?.CancelStatus ?? row?.Cancelled ?? row?.Canceled ?? '').trim().toLowerCase();
-  return raw === 'csyes' || raw === 'cancelled' || raw === 'canceled' || raw === 'yes' || raw === 'true' || raw === 'ttrue';
+async function ensureAdminOpenOrdersTable() {
+  if (!hasDb()) return;
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS admin_open_orders_cache (
+      doc_entry BIGINT PRIMARY KEY,
+      doc_num BIGINT,
+      card_code TEXT DEFAULT '',
+      card_name TEXT DEFAULT '',
+      warehouse_code TEXT DEFAULT '',
+      comments TEXT DEFAULT '',
+      doc_due_date DATE,
+      doc_date DATE,
+      seller_code BIGINT,
+      seller_name TEXT DEFAULT '',
+      status TEXT DEFAULT '',
+      sync_source TEXT DEFAULT 'sap_orders_open',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_doc_date ON admin_open_orders_cache(doc_date);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_card_code ON admin_open_orders_cache(card_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_wh ON admin_open_orders_cache(warehouse_code);`);
+  await dbQuery(`CREATE INDEX IF NOT EXISTS idx_admin_open_orders_seller_name ON admin_open_orders_cache(seller_name);`);
+}
+__extraBootTasks.push(ensureAdminOpenOrdersTable);
+
+function adminOrdersNormalizeRows(raw) {
+  if (Array.isArray(raw?.value)) return raw.value;
+  if (Array.isArray(raw)) return raw;
+  return [];
 }
 
-function adminOpenOrdersFirstWarehouse(lines = []) {
-  const arr = Array.isArray(lines) ? lines : [];
-  for (const ln of arr) {
-    const wh = String(
-      ln?.WarehouseCode ??
-      ln?.WhsCode ??
-      ln?.Warehouse ??
-      ln?.FromWarehouseCode ??
-      ln?.Whs ??
-      ''
-    ).trim();
-    if (wh) return wh;
+async function adminOrdersResolveSellerName(code) {
+  const codeNum = Number(code);
+  if (!Number.isFinite(codeNum) || codeNum < 0) return '';
+  const key = String(codeNum);
+  const cached = ADMIN_ORDERS_SELLER_CACHE.get(key);
+  if (cached && (Date.now() - Number(cached.ts || 0) < 6 * 60 * 60 * 1000)) return String(cached.name || '');
+  if (missingSapEnv()) return '';
+  const tries = [
+    `/SalesPersons(${codeNum})?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name`,
+    `/SalesPersons(${codeNum})`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SalesEmployeeCode eq ${codeNum}`,
+    `/SalesPersons?$select=SalesEmployeeCode,SalesEmployeeName,SlpCode,SlpName,SalesPersonName,Name&$filter=SlpCode eq ${codeNum}`,
+  ];
+  for (const path of tries) {
+    try {
+      const resp = await slFetch(path, { timeoutMs: 30000 });
+      const row = Array.isArray(resp?.value) ? (resp.value[0] || null) : resp;
+      const name = String(
+        row?.SalesEmployeeName || row?.SlpName || row?.SalesPersonName || row?.Name || ''
+      ).trim();
+      if (name) {
+        ADMIN_ORDERS_SELLER_CACHE.set(key, { name, ts: Date.now() });
+        return name;
+      }
+    } catch {}
   }
   return '';
 }
 
-async function adminOpenOrdersFetchLines(docEntry) {
+async function adminOrdersFetchDocumentLines(docEntry) {
   const de = Number(docEntry || 0);
   if (!(de > 0)) return [];
-
-  try {
-    const full = await getDoc('Orders', de);
-    if (Array.isArray(full?.DocumentLines) && full.DocumentLines.length) return full.DocumentLines;
-  } catch {}
-
-  const linePaths = [
+  const paths = [
     `/Orders(${de})/DocumentLines?$top=500`,
     `/Orders(${de})/DocumentLines`,
-    `/Orders?$filter=${encodeURIComponent(`DocEntry eq ${de}`)}&$select=DocEntry&$top=1`
   ];
-
-  for (const p of linePaths) {
+  for (const path of paths) {
     try {
-      const raw = await slFetch(p, { timeoutMs: 120000 });
-      const rows = Array.isArray(raw?.DocumentLines)
-        ? raw.DocumentLines
-        : Array.isArray(raw?.value)
-          ? raw.value
+      const raw = await slFetch(path, { timeoutMs: 90000 });
+      const rows = Array.isArray(raw?.value)
+        ? raw.value
+        : Array.isArray(raw?.DocumentLines)
+          ? raw.DocumentLines
           : Array.isArray(raw)
             ? raw
-            : (typeof prodNormalizeSlCollection === 'function' ? prodNormalizeSlCollection(raw) : []);
-      if (Array.isArray(rows) && rows.length) return rows;
+            : [];
+      if (rows.length) return rows;
     } catch {}
   }
   return [];
 }
 
-async function adminFetchOpenOrderHeadersFromSap({ top = 500 } = {}) {
-  if (missingSapEnv()) throw new Error('Faltan variables SAP');
-  const wanted = Math.max(20, Math.min(2000, Number(top || 500)));
-  const batchSize = 200;
-  const maxScan = Math.max(wanted * 3, 600);
-  const out = [];
-  const seen = new Set();
-
-  for (let skip = 0; skip < maxScan && out.length < wanted; skip += batchSize) {
-    const filter = `Cancelled eq 'tNO'`;
-    const path = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,CancelStatus,Cancelled,SalesPersonCode&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=${batchSize}&$skip=${skip}`;
-    let rows = [];
-    try {
-      const res = await slFetch(path, { timeoutMs: 120000 });
-      rows = typeof prodNormalizeSlCollection === 'function' ? prodNormalizeSlCollection(res) : (Array.isArray(res?.value) ? res.value : []);
-    } catch {
-      const fallback = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,CancelStatus,Cancelled,SalesPersonCode&$orderby=DocDate desc,DocEntry desc&$top=${batchSize}&$skip=${skip}`;
-      const res = await slFetch(fallback, { timeoutMs: 120000 });
-      rows = typeof prodNormalizeSlCollection === 'function' ? prodNormalizeSlCollection(res) : (Array.isArray(res?.value) ? res.value : []);
-    }
-    if (!rows.length) break;
-    for (const row of rows) {
-      const key = String(row?.DocEntry ?? row?.DocNum ?? '').trim();
-      if (!key || seen.has(key)) continue;
-      seen.add(key);
-      if (adminOpenOrdersIsCancelled(row)) continue;
-      if (typeof prodDocStatusIsOpen === 'function' && !prodDocStatusIsOpen(row?.DocumentStatus || row?.Status || '')) continue;
-      out.push(row);
-      if (out.length >= wanted) break;
-    }
-    if (rows.length < batchSize) break;
+async function adminOrdersFetchFullOrder(docEntry) {
+  const de = Number(docEntry || 0);
+  if (!(de > 0)) return null;
+  try {
+    const full = await getDoc('Orders', de);
+    if (full && Array.isArray(full.DocumentLines) && full.DocumentLines.length) return full;
+    const lines = await adminOrdersFetchDocumentLines(de);
+    if (full) return { ...full, DocumentLines: lines };
+  } catch {}
+  try {
+    const head = await slFetch(`/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled&$filter=${encodeURIComponent(`DocEntry eq ${de}`)}&$top=1`, { timeoutMs: 90000 });
+    const row = adminOrdersNormalizeRows(head)[0] || null;
+    if (!row) return null;
+    const lines = await adminOrdersFetchDocumentLines(de);
+    return { ...row, DocumentLines: lines };
+  } catch {
+    return null;
   }
-  return out;
 }
 
-async function adminBuildOpenOrdersRows({ top = 500 } = {}) {
-  const headers = await adminFetchOpenOrderHeadersFromSap({ top });
+function adminOrdersExtractWarehouse(lines = []) {
+  const first = (Array.isArray(lines) ? lines : []).find((ln) => adminOrdersStr(ln?.WarehouseCode || ln?.WhsCode || ln?.warehouseCode || ln?.WhsCode));
+  return adminOrdersStr(first?.WarehouseCode || first?.WhsCode || first?.warehouseCode || '');
+}
+
+function adminOrdersIsOpenStatus(v) {
+  const s = adminOrdersStr(v).toLowerCase();
+  return s.includes('open') || s.includes('bost_open') || s in {'o':1, 'open':1};
+}
+
+async function adminOrdersFetchOpenHeaders({ top = 1200 } = {}) {
+  if (missingSapEnv()) throw new Error('SAP no configurado');
+  const out = [];
+  let skip = 0;
+  const safeTop = Math.max(50, Math.min(5000, Number(top || 1200)));
+  for (let page = 0; page < 30 && out.length < safeTop; page++) {
+    const filter = `Cancelled eq 'tNO' and DocumentStatus eq 'bost_Open'`;
+    const path = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=200&$skip=${skip}`;
+    const raw = await slFetch(path, { timeoutMs: 120000 });
+    const rows = adminOrdersNormalizeRows(raw);
+    if (!rows.length) break;
+    out.push(...rows);
+    skip += rows.length;
+    if (rows.length < 200) break;
+  }
+  return out.slice(0, safeTop);
+}
+
+async function adminOrdersBuildCacheRows({ top = 1200 } = {}) {
+  const headers = await adminOrdersFetchOpenHeaders({ top });
   const rows = [];
-
-  for (const head of headers) {
-    const docEntry = Number(head?.DocEntry || 0);
+  for (const h of headers) {
+    const docEntry = Number(h?.DocEntry || 0);
     if (!(docEntry > 0)) continue;
-
-    const lines = await adminOpenOrdersFetchLines(docEntry).catch(() => []);
-    const warehouse = adminOpenOrdersFirstWarehouse(lines);
-    const sellerCodeRaw = head?.SlpCode ?? head?.SalesPersonCode ?? head?.SalesEmployeeCode ?? null;
-    const sellerCode = (sellerCodeRaw === null || sellerCodeRaw === undefined || String(sellerCodeRaw).trim() === '') ? '' : String(sellerCodeRaw).trim();
-    const sellerNameRaw = sellerCode ? await getSalesPersonNameFromSap(sellerCode).catch(() => '') : '';
-    const sellerName = String(sellerNameRaw || '').trim();
-    if (ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS.has(adminOpenOrdersNormalizeSellerLabel(sellerName))) continue;
-
+    const full = await adminOrdersFetchFullOrder(docEntry);
+    const lines = Array.isArray(full?.DocumentLines) ? full.DocumentLines : [];
+    const status = adminOrdersStr(full?.DocumentStatus || h?.DocumentStatus || '');
+    if (status && !adminOrdersIsOpenStatus(status)) continue;
+    const warehouse = adminOrdersExtractWarehouse(lines);
+    const sellerCodeRaw = full?.SalesPersonCode ?? h?.SalesPersonCode ?? null;
+    const sellerCode = Number.isFinite(Number(sellerCodeRaw)) ? Number(sellerCodeRaw) : null;
+    const sellerName = sellerCode !== null ? await adminOrdersResolveSellerName(sellerCode).catch(() => '') : '';
+    if (sellerName && ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS.has(adminOrdersNormalizeSellerLabel(sellerName))) continue;
     rows.push({
       docEntry,
-      docNum: Number(head?.DocNum || 0) || null,
-      docDate: String(head?.DocDate || '').slice(0, 10) || null,
-      docDueDate: String(head?.DocDueDate || '').slice(0, 10) || null,
-      cardCode: String(head?.CardCode || '').trim(),
-      cardName: String(head?.CardName || '').trim(),
-      warehouse: warehouse || '',
+      docNum: Number(h?.DocNum || full?.DocNum || 0) || null,
+      cardCode: adminOrdersStr(h?.CardCode || full?.CardCode),
+      cardName: adminOrdersStr(h?.CardName || full?.CardName),
+      warehouseCode: warehouse,
+      comments: adminOrdersStr(full?.Comments || h?.Comments),
+      docDueDate: adminOrdersIso(h?.DocDueDate || full?.DocDueDate),
+      docDate: adminOrdersIso(h?.DocDate || full?.DocDate),
       sellerCode,
       sellerName,
-      status: String(head?.DocumentStatus || head?.Status || '').trim(),
-      comments: String(head?.Comments || '').trim(),
+      status: status || 'bost_Open',
     });
+    if (rows.length % 20 === 0) await sleep(10);
   }
-
-  return rows.sort((a, b) => String(b.docDate || '').localeCompare(String(a.docDate || '')) || ((b.docNum || 0) - (a.docNum || 0)));
+  return rows;
 }
 
-async function adminReplaceOpenOrdersCache(rows = []) {
+async function adminOrdersReplaceCache(rows = []) {
   if (!hasDb()) throw new Error('DB no configurada');
+  await ensureAdminOpenOrdersTable();
   await dbQuery('BEGIN');
   try {
-    await dbQuery('DELETE FROM admin_open_orders_cache');
-    for (const r of (Array.isArray(rows) ? rows : [])) {
-      await dbQuery(
-        `INSERT INTO admin_open_orders_cache(
-           doc_entry, doc_num, doc_date, doc_due_date, card_code, card_name,
-           warehouse, seller_code, seller_name, status, comments, updated_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())`,
-        [
+    await dbQuery(`DELETE FROM admin_open_orders_cache`);
+    if (rows.length) {
+      const values = [];
+      const params = [];
+      let p = 1;
+      for (const r of rows) {
+        values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++}::date,$${p++}::date,$${p++},$${p++},$${p++},'sap_orders_open',NOW())`);
+        params.push(
           Number(r.docEntry || 0),
           r.docNum != null ? Number(r.docNum) : null,
-          r.docDate || null,
-          r.docDueDate || null,
-          String(r.cardCode || ''),
-          String(r.cardName || ''),
-          String(r.warehouse || ''),
-          String(r.sellerCode || ''),
-          String(r.sellerName || ''),
-          String(r.status || ''),
-          String(r.comments || ''),
-        ]
+          adminOrdersStr(r.cardCode),
+          adminOrdersStr(r.cardName),
+          adminOrdersStr(r.warehouseCode),
+          adminOrdersStr(r.comments),
+          adminOrdersIso(r.docDueDate) || null,
+          adminOrdersIso(r.docDate) || null,
+          Number.isFinite(Number(r.sellerCode)) ? Number(r.sellerCode) : null,
+          adminOrdersStr(r.sellerName),
+          adminOrdersStr(r.status || 'bost_Open'),
+        )
+      }
+      await dbQuery(
+        `INSERT INTO admin_open_orders_cache(
+          doc_entry, doc_num, card_code, card_name, warehouse_code, comments,
+          doc_due_date, doc_date, seller_code, seller_name, status, sync_source, updated_at
+        ) VALUES ${values.join(',')}`,
+        params
       );
     }
+    await setState('admin_open_orders_last_sync_at', new Date().toISOString());
     await dbQuery('COMMIT');
   } catch (e) {
     await dbQuery('ROLLBACK').catch(() => {});
@@ -20035,70 +21722,58 @@ async function adminReplaceOpenOrdersCache(rows = []) {
   }
 }
 
-async function adminSyncOpenOrdersToDb({ top = 500 } = {}) {
-  const rows = await adminBuildOpenOrdersRows({ top });
-  await adminReplaceOpenOrdersCache(rows);
-  const at = new Date().toISOString();
-  await setState('admin_open_orders_last_sync_at', at);
-  await setState('admin_open_orders_last_sync_count', rows.length);
-  return { rowsSaved: rows.length, lastSyncAt: at };
-}
-
-async function adminReadOpenOrdersDb({ client = '', warehouse = '', seller = '', limit = 500 } = {}) {
+async function adminOrdersReadDb({ client = '', warehouse = '', seller = '', top = 500 } = {}) {
   if (!hasDb()) throw new Error('DB no configurada');
+  await ensureAdminOpenOrdersTable();
   const where = [];
   const params = [];
   let p = 1;
-  const clientQ = String(client || '').trim().toLowerCase();
-  const warehouseQ = String(warehouse || '').trim().toLowerCase();
-  const sellerQ = String(seller || '').trim().toLowerCase();
-
-  if (clientQ) {
-    where.push(`(LOWER(COALESCE(card_code,'')) LIKE $${p} OR LOWER(COALESCE(card_name,'')) LIKE $${p})`);
-    params.push(`%${clientQ}%`);
+  if (adminOrdersStr(client)) {
+    where.push(`(LOWER(card_code) LIKE $${p} OR LOWER(card_name) LIKE $${p})`);
+    params.push(`%${adminOrdersStr(client).toLowerCase()}%`);
     p += 1;
   }
-  if (warehouseQ) {
-    where.push(`LOWER(COALESCE(warehouse,'')) LIKE $${p}`);
-    params.push(`%${warehouseQ}%`);
-    p += 1;
+  if (adminOrdersStr(warehouse)) {
+    where.push(`LOWER(warehouse_code) = $${p++}`);
+    params.push(adminOrdersStr(warehouse).toLowerCase());
   }
-  if (sellerQ) {
-    where.push(`(LOWER(COALESCE(seller_code,'')) LIKE $${p} OR LOWER(COALESCE(seller_name,'')) LIKE $${p})`);
-    params.push(`%${sellerQ}%`);
-    p += 1;
+  if (adminOrdersStr(seller)) {
+    where.push(`(LOWER(COALESCE(seller_name,'')) LIKE $${p} OR CAST(COALESCE(seller_code,0) AS TEXT) = $${p+1})`);
+    params.push(`%${adminOrdersStr(seller).toLowerCase()}%`);
+    params.push(adminOrdersStr(seller));
+    p += 2;
   }
-
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const lim = Math.max(1, Math.min(2000, Number(limit || 500)));
+  params.push(Math.max(1, Math.min(5000, Number(top || 500))));
   const sql = `
-    SELECT doc_entry, doc_num, doc_date, doc_due_date, card_code, card_name, warehouse, seller_code, seller_name, status, comments, updated_at
+    SELECT
+      doc_entry AS "docEntry",
+      doc_num AS "docNum",
+      card_code AS "cardCode",
+      card_name AS "cardName",
+      warehouse_code AS "warehouse",
+      comments,
+      doc_due_date AS "docDueDate",
+      doc_date AS "docDate",
+      seller_code AS "sellerCode",
+      seller_name AS "sellerName",
+      status,
+      updated_at AS "updatedAt"
     FROM admin_open_orders_cache
-    ${whereSql}
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY doc_date DESC NULLS LAST, doc_num DESC NULLS LAST
-    LIMIT ${lim}`;
+    LIMIT $${p}
+  `;
   const r = await dbQuery(sql, params);
-  return r.rows.map((x) => ({
-    docEntry: Number(x.doc_entry || 0) || null,
-    docNum: Number(x.doc_num || 0) || null,
-    docDate: x.doc_date ? String(x.doc_date).slice(0, 10) : '',
-    docDueDate: x.doc_due_date ? String(x.doc_due_date).slice(0, 10) : '',
-    cardCode: String(x.card_code || ''),
-    cardName: String(x.card_name || ''),
-    warehouse: String(x.warehouse || ''),
-    sellerCode: String(x.seller_code || ''),
-    sellerName: String(x.seller_name || ''),
-    status: String(x.status || ''),
-    comments: String(x.comments || ''),
-    updatedAt: x.updated_at ? new Date(x.updated_at).toISOString() : '',
-  }));
+  const lastSyncAt = await getState('admin_open_orders_last_sync_at');
+  return { rows: r.rows || [], lastSyncAt };
 }
 
 app.post('/api/admin/orders/sync', verifyAdmin, async (req, res) => {
   try {
-    const top = Math.max(20, Math.min(2000, Number(req.body?.top || req.query?.top || 500)));
-    const out = await adminSyncOpenOrdersToDb({ top });
-    return safeJson(res, 200, { ok: true, ...out });
+    const top = Math.max(50, Math.min(5000, Number(req.body?.top || req.query?.top || 1200)));
+    const rows = await adminOrdersBuildCacheRows({ top });
+    await adminOrdersReplaceCache(rows);
+    return safeJson(res, 200, { ok: true, synced: rows.length, lastSyncAt: await getState('admin_open_orders_last_sync_at') });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -20106,14 +21781,13 @@ app.post('/api/admin/orders/sync', verifyAdmin, async (req, res) => {
 
 app.get('/api/admin/orders/db', verifyAdmin, async (req, res) => {
   try {
-    const rows = await adminReadOpenOrdersDb({
+    const out = await adminOrdersReadDb({
       client: req.query?.client || '',
       warehouse: req.query?.warehouse || '',
       seller: req.query?.seller || '',
-      limit: req.query?.limit || 500,
+      top: req.query?.top || 500,
     });
-    const lastSyncAt = await getState('admin_open_orders_last_sync_at');
-    return safeJson(res, 200, { ok: true, orders: rows, lastSyncAt });
+    return safeJson(res, 200, { ok: true, orders: out.rows, count: out.rows.length, lastSyncAt: out.lastSyncAt || '' });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
@@ -20121,15 +21795,19 @@ app.get('/api/admin/orders/db', verifyAdmin, async (req, res) => {
 
 app.get('/api/admin/orders/open', verifyAdmin, async (req, res) => {
   try {
-    const top = Math.max(20, Math.min(2000, Number(req.query?.top || 500)));
-    const sync = await adminSyncOpenOrdersToDb({ top });
-    const rows = await adminReadOpenOrdersDb({
+    const refresh = String(req.query?.refresh || '1') !== '0';
+    if (refresh) {
+      const top = Math.max(50, Math.min(5000, Number(req.query?.top || 1200)));
+      const rows = await adminOrdersBuildCacheRows({ top });
+      await adminOrdersReplaceCache(rows);
+    }
+    const out = await adminOrdersReadDb({
       client: req.query?.client || '',
       warehouse: req.query?.warehouse || '',
       seller: req.query?.seller || '',
-      limit: req.query?.limit || top,
+      top: req.query?.top || 500,
     });
-    return safeJson(res, 200, { ok: true, orders: rows, lastSyncAt: sync.lastSyncAt, rowsSaved: sync.rowsSaved, source: 'supabase_after_sync' });
+    return safeJson(res, 200, { ok: true, orders: out.rows, count: out.rows.length, lastSyncAt: out.lastSyncAt || '' });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
   }
