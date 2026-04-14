@@ -1736,158 +1736,108 @@ app.get("/api/admin/meta", verifyAdmin, async (req, res) => {
 });
 
 
+const adminOrdersNormalizeSellerLabel = (v) =>
+  String(v || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ");
+
 const ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS = new Set([
-  normalizeSellerLabel("Luis Aguilar"),
-  normalizeSellerLabel("RCI-01"),
-  normalizeSellerLabel("RCI-02"),
-  normalizeSellerLabel("RCI-03"),
-  normalizeSellerLabel("Oficina"),
-  normalizeSellerLabel("-Ningún empleado del departamento de ventas-"),
-  normalizeSellerLabel("-Ningun empleado del departamento de ventas-"),
-]);
+  "Luis Aguilar",
+  "RCI-01",
+  "RCI-02",
+  "RCI-03",
+  "Oficina",
+  "-Ningún empleado del departamento de ventas-",
+].map(adminOrdersNormalizeSellerLabel));
 
-function orderWarehouseFromDoc(doc = {}) {
-  const lines = Array.isArray(doc?.DocumentLines) ? doc.DocumentLines : [];
-  const first = lines.find((ln) => String(ln?.WarehouseCode || ln?.WhsCode || "").trim());
-  return String(first?.WarehouseCode || first?.WhsCode || doc?.WarehouseCode || doc?.WhsCode || "").trim();
-}
-
-function orderStatusIsOpen(doc = {}) {
-  const vals = [doc?.DocumentStatus, doc?.DocStatus, doc?.Status, doc?.status]
-    .map((x) => String(x || "").trim().toLowerCase())
-    .filter(Boolean);
-  return vals.some((v) => v === "bost_open" || v === "o" || v.includes("open"));
-}
-
-function textMatchLoose(value, query) {
-  const q = normalizeSellerLabel(query);
-  if (!q) return true;
-  const v = normalizeSellerLabel(value);
-  return !!v && v.includes(q);
-}
-
-async function fetchAdminOpenOrdersFromSap({ client = "", warehouse = "", seller = "", top = 500 } = {}) {
-  if (missingSapEnv()) throw new Error("SAP env incompleto");
-
-  const maxRows = Math.max(20, Math.min(1000, Number(top || 500)));
-  const rows = [];
-  let skip = 0;
-  const batchTop = 100;
-
-  const baseSelect = "DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,SlpCode,SalesPersonCode,SalesEmployeeCode,DocumentStatus,DocStatus";
-  const expand = "$expand=DocumentLines($select=WarehouseCode,WhsCode)";
-  const orderBy = "$orderby=DocDate desc,DocEntry desc";
-  const filterTries = [
-    "DocumentStatus eq 'bost_Open'",
-    "DocStatus eq 'bost_Open' or DocStatus eq 'O'",
-    "DocumentStatus eq 'bost_Open' or DocStatus eq 'bost_Open' or DocStatus eq 'O'",
-    ""
-  ];
-
-  let workingFilter = null;
-
-  async function fetchPage(filterExpr) {
-    const parts = [`/Orders?$select=${baseSelect}`, expand];
-    if (filterExpr) parts.push(`$filter=${encodeURIComponent(filterExpr)}`);
-    parts.push(orderBy, `$top=${batchTop}`, `$skip=${skip}`);
-    return slFetchFreshSession(parts.join('&'));
-  }
-
-  for (const tryFilter of filterTries) {
-    try {
-      await fetchPage(tryFilter);
-      workingFilter = tryFilter;
-      break;
-    } catch (e) {}
-  }
-
-  if (workingFilter === null) throw new Error("No se pudo consultar Orders en SAP Service Layer");
-
-  while (rows.length < maxRows) {
-    const raw = await fetchPage(workingFilter);
-    const page = Array.isArray(raw?.value) ? raw.value : [];
-    if (!page.length) break;
-    skip += page.length;
-
-    for (const head of page) {
-      if (!orderStatusIsOpen(head) && !workingFilter) continue;
-
-      let doc = head;
-      let wh = orderWarehouseFromDoc(doc);
-      if (!wh) {
-        try {
-          const full = await slFetchFreshSession(`/Orders(${Number(head?.DocEntry || 0)})?$select=${baseSelect}&$expand=DocumentLines($select=WarehouseCode,WhsCode)`);
-          if (full) {
-            doc = full;
-            wh = orderWarehouseFromDoc(full);
-          }
-        } catch {}
-      }
-
-      const sellerCodeRaw = doc?.SlpCode ?? doc?.SalesPersonCode ?? doc?.SalesEmployeeCode ?? head?.SlpCode ?? head?.SalesPersonCode ?? head?.SalesEmployeeCode ?? null;
-      const sellerCodeNum = Number(sellerCodeRaw);
-      const sellerCode = Number.isFinite(sellerCodeNum) && sellerCodeNum >= 0 ? sellerCodeNum : null;
-      const sellerName = sellerCode !== null ? await getSalesPersonNameFromSap(sellerCode).catch(() => "") : "";
-      const sellerLabel = String(sellerName || (sellerCode !== null ? sellerLabelFromCode(sellerCode) : "Sin vendedor")).trim();
-      if (ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS.has(normalizeSellerLabel(sellerLabel))) continue;
-
-      const cardCode = String(doc?.CardCode || head?.CardCode || "").trim();
-      const cardName = String(doc?.CardName || head?.CardName || "").trim();
-      const comments = String(doc?.Comments || head?.Comments || "").trim();
-      const docDate = String(doc?.DocDate || head?.DocDate || "").slice(0, 10);
-      const docDueDate = String(doc?.DocDueDate || head?.DocDueDate || "").slice(0, 10);
-
-      if (client) {
-        const q = normalizeSellerLabel(client);
-        const combo = normalizeSellerLabel(`${cardCode} ${cardName}`);
-        if (!combo.includes(q)) continue;
-      }
-      if (warehouse && !textMatchLoose(wh, warehouse)) continue;
-      if (seller) {
-        const q = normalizeSellerLabel(seller);
-        const byName = normalizeSellerLabel(sellerLabel);
-        const byCode = normalizeSellerLabel(String(sellerCode ?? ""));
-        if (!(byName.includes(q) || byCode.includes(q))) continue;
-      }
-
-      rows.push({
-        docEntry: Number(doc?.DocEntry || head?.DocEntry || 0),
-        docNum: Number(doc?.DocNum || head?.DocNum || 0),
-        cardCode,
-        cardName,
-        warehouse: wh || "",
-        comments,
-        docDueDate,
-        docDate,
-        sellerCode,
-        sellerName: sellerLabel,
-        status: String(doc?.DocumentStatus || doc?.DocStatus || head?.DocumentStatus || head?.DocStatus || ""),
-      });
-
-      if (rows.length >= maxRows) break;
-    }
-
-    if (page.length < batchTop) break;
-  }
-
-  return rows;
+function adminOpenOrdersFirstWarehouse(lines = []) {
+  const row = (Array.isArray(lines) ? lines : []).find((ln) => String(ln?.WarehouseCode || "").trim());
+  return String(row?.WarehouseCode || "").trim();
 }
 
 app.get("/api/admin/orders/open", verifyAdmin, async (req, res) => {
   try {
-    const client = String(req.query?.client || "").trim();
-    const warehouse = String(req.query?.warehouse || req.query?.wh || "").trim();
-    const seller = String(req.query?.seller || "").trim();
-    const top = Math.max(20, Math.min(1000, Number(req.query?.top || 500)));
+    if (missingSapEnv()) return safeJson(res, 500, { ok: false, message: "SAP env incompleto" });
 
-    const orders = await fetchAdminOpenOrdersFromSap({ client, warehouse, seller, top });
+    const client = String(req.query?.client || "").trim().toLowerCase();
+    const warehouse = String(req.query?.warehouse || "").trim().toUpperCase();
+    const seller = String(req.query?.seller || "").trim();
+    const top = Math.max(20, Math.min(500, Number(req.query?.top || 250)));
+
+    const raw = await slFetchFreshSession(
+      `/Orders?$select=DocEntry,DocNum,CardCode,CardName,Comments,DocDueDate,DocDate,DocumentStatus,DocStatus,SlpCode,SalesPersonCode,SalesEmployeeCode` +
+      `&$filter=DocumentStatus eq 'bost_Open'` +
+      `&$orderby=DocDate desc` +
+      `&$top=${Math.max(top * 3, 120)}` +
+      `&$expand=DocumentLines($select=WarehouseCode)`
+    );
+
+    const values = Array.isArray(raw?.value) ? raw.value : [];
+    const sellerNameCache = new Map();
+
+    async function resolveSellerName(row) {
+      const codeRaw = row?.SlpCode ?? row?.SalesPersonCode ?? row?.SalesEmployeeCode ?? null;
+      const codeNum = Number(codeRaw);
+      if (!Number.isFinite(codeNum)) return "";
+      if (sellerNameCache.has(codeNum)) return sellerNameCache.get(codeNum) || "";
+      let name = "";
+      try {
+        if (typeof getSalesPersonNameFromSap === "function") {
+          name = await getSalesPersonNameFromSap(codeNum);
+        }
+      } catch {}
+      name = String(name || "").trim();
+      sellerNameCache.set(codeNum, name);
+      return name;
+    }
+
+    const rows = [];
+    for (const row of values) {
+      const sellerCodeRaw = row?.SlpCode ?? row?.SalesPersonCode ?? row?.SalesEmployeeCode ?? null;
+      const sellerCode = Number.isFinite(Number(sellerCodeRaw)) ? Number(sellerCodeRaw) : null;
+      const sellerName = await resolveSellerName(row);
+      const sellerNorm = adminOrdersNormalizeSellerLabel(sellerName || String(sellerCode ?? ""));
+      if (sellerNorm && ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS.has(sellerNorm)) continue;
+
+      const out = {
+        docEntry: Number(row?.DocEntry || 0),
+        docNum: Number(row?.DocNum || 0),
+        cardCode: String(row?.CardCode || "").trim(),
+        cardName: String(row?.CardName || "").trim(),
+        warehouse: adminOpenOrdersFirstWarehouse(row?.DocumentLines || []),
+        comments: String(row?.Comments || "").trim(),
+        docDueDate: isoDateOnly(row?.DocDueDate || ""),
+        docDate: isoDateOnly(row?.DocDate || ""),
+        sellerCode,
+        sellerName,
+        status: String(row?.DocumentStatus || row?.DocStatus || "").trim() || "bost_Open",
+      };
+
+      if (client) {
+        const cardCode = String(out.cardCode || "").toLowerCase();
+        const cardName = String(out.cardName || "").toLowerCase();
+        if (!cardCode.includes(client) && !cardName.includes(client)) continue;
+      }
+      if (warehouse && String(out.warehouse || "").trim().toUpperCase() !== warehouse) continue;
+      if (seller) {
+        const sellerSel = adminOrdersNormalizeSellerLabel(seller);
+        const sellerLabel = adminOrdersNormalizeSellerLabel(out.sellerName || "");
+        const sellerCodeNorm = adminOrdersNormalizeSellerLabel(String(out.sellerCode ?? ""));
+        if (sellerLabel !== sellerSel && sellerCodeNorm !== sellerSel) continue;
+      }
+
+      rows.push(out);
+      if (rows.length >= top) break;
+    }
 
     return safeJson(res, 200, {
       ok: true,
+      count: rows.length,
+      rows,
       generatedAt: new Date().toISOString(),
-      filters: { client, warehouse, seller, top },
-      count: orders.length,
-      orders,
     });
   } catch (e) {
     return safeJson(res, 500, { ok: false, message: e.message || String(e) });
