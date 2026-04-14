@@ -1735,6 +1735,165 @@ app.get("/api/admin/meta", verifyAdmin, async (req, res) => {
   });
 });
 
+
+const ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS = new Set([
+  normalizeSellerLabel("Luis Aguilar"),
+  normalizeSellerLabel("RCI-01"),
+  normalizeSellerLabel("RCI-02"),
+  normalizeSellerLabel("RCI-03"),
+  normalizeSellerLabel("Oficina"),
+  normalizeSellerLabel("-Ningún empleado del departamento de ventas-"),
+  normalizeSellerLabel("-Ningun empleado del departamento de ventas-"),
+]);
+
+function orderWarehouseFromDoc(doc = {}) {
+  const lines = Array.isArray(doc?.DocumentLines) ? doc.DocumentLines : [];
+  const first = lines.find((ln) => String(ln?.WarehouseCode || ln?.WhsCode || "").trim());
+  return String(first?.WarehouseCode || first?.WhsCode || doc?.WarehouseCode || doc?.WhsCode || "").trim();
+}
+
+function orderStatusIsOpen(doc = {}) {
+  const vals = [doc?.DocumentStatus, doc?.DocStatus, doc?.Status, doc?.status]
+    .map((x) => String(x || "").trim().toLowerCase())
+    .filter(Boolean);
+  return vals.some((v) => v === "bost_open" || v === "o" || v.includes("open"));
+}
+
+function textMatchLoose(value, query) {
+  const q = normalizeSellerLabel(query);
+  if (!q) return true;
+  const v = normalizeSellerLabel(value);
+  return !!v && v.includes(q);
+}
+
+async function fetchAdminOpenOrdersFromSap({ client = "", warehouse = "", seller = "", top = 500 } = {}) {
+  if (missingSapEnv()) throw new Error("SAP env incompleto");
+
+  const maxRows = Math.max(20, Math.min(1000, Number(top || 500)));
+  const rows = [];
+  let skip = 0;
+  const batchTop = 100;
+
+  const baseSelect = "DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,SlpCode,SalesPersonCode,SalesEmployeeCode,DocumentStatus,DocStatus";
+  const expand = "$expand=DocumentLines($select=WarehouseCode,WhsCode)";
+  const orderBy = "$orderby=DocDate desc,DocEntry desc";
+  const filterTries = [
+    "DocumentStatus eq 'bost_Open'",
+    "DocStatus eq 'bost_Open' or DocStatus eq 'O'",
+    "DocumentStatus eq 'bost_Open' or DocStatus eq 'bost_Open' or DocStatus eq 'O'",
+    ""
+  ];
+
+  let workingFilter = null;
+
+  async function fetchPage(filterExpr) {
+    const parts = [`/Orders?$select=${baseSelect}`, expand];
+    if (filterExpr) parts.push(`$filter=${encodeURIComponent(filterExpr)}`);
+    parts.push(orderBy, `$top=${batchTop}`, `$skip=${skip}`);
+    return slFetchFreshSession(parts.join('&'));
+  }
+
+  for (const tryFilter of filterTries) {
+    try {
+      await fetchPage(tryFilter);
+      workingFilter = tryFilter;
+      break;
+    } catch (e) {}
+  }
+
+  if (workingFilter === null) throw new Error("No se pudo consultar Orders en SAP Service Layer");
+
+  while (rows.length < maxRows) {
+    const raw = await fetchPage(workingFilter);
+    const page = Array.isArray(raw?.value) ? raw.value : [];
+    if (!page.length) break;
+    skip += page.length;
+
+    for (const head of page) {
+      if (!orderStatusIsOpen(head) && !workingFilter) continue;
+
+      let doc = head;
+      let wh = orderWarehouseFromDoc(doc);
+      if (!wh) {
+        try {
+          const full = await slFetchFreshSession(`/Orders(${Number(head?.DocEntry || 0)})?$select=${baseSelect}&$expand=DocumentLines($select=WarehouseCode,WhsCode)`);
+          if (full) {
+            doc = full;
+            wh = orderWarehouseFromDoc(full);
+          }
+        } catch {}
+      }
+
+      const sellerCodeRaw = doc?.SlpCode ?? doc?.SalesPersonCode ?? doc?.SalesEmployeeCode ?? head?.SlpCode ?? head?.SalesPersonCode ?? head?.SalesEmployeeCode ?? null;
+      const sellerCodeNum = Number(sellerCodeRaw);
+      const sellerCode = Number.isFinite(sellerCodeNum) && sellerCodeNum >= 0 ? sellerCodeNum : null;
+      const sellerName = sellerCode !== null ? await getSalesPersonNameFromSap(sellerCode).catch(() => "") : "";
+      const sellerLabel = String(sellerName || (sellerCode !== null ? sellerLabelFromCode(sellerCode) : "Sin vendedor")).trim();
+      if (ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS.has(normalizeSellerLabel(sellerLabel))) continue;
+
+      const cardCode = String(doc?.CardCode || head?.CardCode || "").trim();
+      const cardName = String(doc?.CardName || head?.CardName || "").trim();
+      const comments = String(doc?.Comments || head?.Comments || "").trim();
+      const docDate = String(doc?.DocDate || head?.DocDate || "").slice(0, 10);
+      const docDueDate = String(doc?.DocDueDate || head?.DocDueDate || "").slice(0, 10);
+
+      if (client) {
+        const q = normalizeSellerLabel(client);
+        const combo = normalizeSellerLabel(`${cardCode} ${cardName}`);
+        if (!combo.includes(q)) continue;
+      }
+      if (warehouse && !textMatchLoose(wh, warehouse)) continue;
+      if (seller) {
+        const q = normalizeSellerLabel(seller);
+        const byName = normalizeSellerLabel(sellerLabel);
+        const byCode = normalizeSellerLabel(String(sellerCode ?? ""));
+        if (!(byName.includes(q) || byCode.includes(q))) continue;
+      }
+
+      rows.push({
+        docEntry: Number(doc?.DocEntry || head?.DocEntry || 0),
+        docNum: Number(doc?.DocNum || head?.DocNum || 0),
+        cardCode,
+        cardName,
+        warehouse: wh || "",
+        comments,
+        docDueDate,
+        docDate,
+        sellerCode,
+        sellerName: sellerLabel,
+        status: String(doc?.DocumentStatus || doc?.DocStatus || head?.DocumentStatus || head?.DocStatus || ""),
+      });
+
+      if (rows.length >= maxRows) break;
+    }
+
+    if (page.length < batchTop) break;
+  }
+
+  return rows;
+}
+
+app.get("/api/admin/orders/open", verifyAdmin, async (req, res) => {
+  try {
+    const client = String(req.query?.client || "").trim();
+    const warehouse = String(req.query?.warehouse || req.query?.wh || "").trim();
+    const seller = String(req.query?.seller || "").trim();
+    const top = Math.max(20, Math.min(1000, Number(req.query?.top || 500)));
+
+    const orders = await fetchAdminOpenOrdersFromSap({ client, warehouse, seller, top });
+
+    return safeJson(res, 200, {
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      filters: { client, warehouse, seller, top },
+      count: orders.length,
+      orders,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 app.get("/api/admin/users", verifyAdmin, async (req, res) => {
   try {
     if (!hasDb()) return safeJson(res, 500, { ok: false, message: "DB no configurada" });
