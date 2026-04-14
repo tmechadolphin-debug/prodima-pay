@@ -19827,6 +19827,314 @@ app.post('/api/admin/production-close/orders/:absoluteEntry/process', verifyAdmi
   }
 });
 
+
+
+/* =========================================================
+   Admin pedidos abiertos DB + Sync SAP
+========================================================= */
+async function ensureAdminOpenOrdersDb() {
+  if (!hasDb()) return;
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS admin_open_orders_cache (
+      doc_entry BIGINT PRIMARY KEY,
+      doc_num BIGINT,
+      doc_date DATE,
+      doc_due_date DATE,
+      card_code TEXT,
+      card_name TEXT,
+      warehouse TEXT,
+      seller_code TEXT,
+      seller_name TEXT,
+      status TEXT,
+      comments TEXT,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  const idx = [
+    `CREATE INDEX IF NOT EXISTS idx_admin_open_orders_doc_date ON admin_open_orders_cache(doc_date)`,
+    `CREATE INDEX IF NOT EXISTS idx_admin_open_orders_doc_due_date ON admin_open_orders_cache(doc_due_date)`,
+    `CREATE INDEX IF NOT EXISTS idx_admin_open_orders_card_code ON admin_open_orders_cache(card_code)`,
+    `CREATE INDEX IF NOT EXISTS idx_admin_open_orders_warehouse ON admin_open_orders_cache(warehouse)`,
+    `CREATE INDEX IF NOT EXISTS idx_admin_open_orders_seller_name ON admin_open_orders_cache(seller_name)`
+  ];
+  for (const q of idx) {
+    try { await dbQuery(q); } catch {}
+  }
+}
+__extraBootTasks.push(ensureAdminOpenOrdersDb);
+
+function adminOpenOrdersNormalizeSellerLabel(v = '') {
+  return String(v || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ');
+}
+
+const ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS = new Set([
+  'Luis Aguilar',
+  'RCI-01',
+  'RCI-02',
+  'RCI-03',
+  'Oficina',
+  '-Ningún empleado del departamento de ventas-'
+].map(adminOpenOrdersNormalizeSellerLabel));
+
+function adminOpenOrdersIsCancelled(row = {}) {
+  const raw = String(row?.CancelStatus ?? row?.Cancelled ?? row?.Canceled ?? '').trim().toLowerCase();
+  return raw === 'csyes' || raw === 'cancelled' || raw === 'canceled' || raw === 'yes' || raw === 'true' || raw === 'ttrue';
+}
+
+function adminOpenOrdersFirstWarehouse(lines = []) {
+  const arr = Array.isArray(lines) ? lines : [];
+  for (const ln of arr) {
+    const wh = String(
+      ln?.WarehouseCode ??
+      ln?.WhsCode ??
+      ln?.Warehouse ??
+      ln?.FromWarehouseCode ??
+      ln?.Whs ??
+      ''
+    ).trim();
+    if (wh) return wh;
+  }
+  return '';
+}
+
+async function adminOpenOrdersFetchLines(docEntry) {
+  const de = Number(docEntry || 0);
+  if (!(de > 0)) return [];
+
+  try {
+    const full = await getDoc('Orders', de);
+    if (Array.isArray(full?.DocumentLines) && full.DocumentLines.length) return full.DocumentLines;
+  } catch {}
+
+  const linePaths = [
+    `/Orders(${de})/DocumentLines?$top=500`,
+    `/Orders(${de})/DocumentLines`,
+    `/Orders?$filter=${encodeURIComponent(`DocEntry eq ${de}`)}&$select=DocEntry&$top=1`
+  ];
+
+  for (const p of linePaths) {
+    try {
+      const raw = await slFetch(p, { timeoutMs: 120000 });
+      const rows = Array.isArray(raw?.DocumentLines)
+        ? raw.DocumentLines
+        : Array.isArray(raw?.value)
+          ? raw.value
+          : Array.isArray(raw)
+            ? raw
+            : (typeof prodNormalizeSlCollection === 'function' ? prodNormalizeSlCollection(raw) : []);
+      if (Array.isArray(rows) && rows.length) return rows;
+    } catch {}
+  }
+  return [];
+}
+
+async function adminFetchOpenOrderHeadersFromSap({ top = 500 } = {}) {
+  if (missingSapEnv()) throw new Error('Faltan variables SAP');
+  const wanted = Math.max(20, Math.min(2000, Number(top || 500)));
+  const batchSize = 200;
+  const maxScan = Math.max(wanted * 3, 600);
+  const out = [];
+  const seen = new Set();
+
+  for (let skip = 0; skip < maxScan && out.length < wanted; skip += batchSize) {
+    const filter = `Cancelled eq 'tNO'`;
+    const path = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,CancelStatus,Cancelled,SlpCode,SalesPersonCode,SalesEmployeeCode&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=${batchSize}&$skip=${skip}`;
+    let rows = [];
+    try {
+      const res = await slFetch(path, { timeoutMs: 120000 });
+      rows = typeof prodNormalizeSlCollection === 'function' ? prodNormalizeSlCollection(res) : (Array.isArray(res?.value) ? res.value : []);
+    } catch {
+      const fallback = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,CancelStatus,Cancelled,SlpCode,SalesPersonCode,SalesEmployeeCode&$orderby=DocDate desc,DocEntry desc&$top=${batchSize}&$skip=${skip}`;
+      const res = await slFetch(fallback, { timeoutMs: 120000 });
+      rows = typeof prodNormalizeSlCollection === 'function' ? prodNormalizeSlCollection(res) : (Array.isArray(res?.value) ? res.value : []);
+    }
+    if (!rows.length) break;
+    for (const row of rows) {
+      const key = String(row?.DocEntry ?? row?.DocNum ?? '').trim();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      if (adminOpenOrdersIsCancelled(row)) continue;
+      if (typeof prodDocStatusIsOpen === 'function' && !prodDocStatusIsOpen(row?.DocumentStatus || row?.Status || '')) continue;
+      out.push(row);
+      if (out.length >= wanted) break;
+    }
+    if (rows.length < batchSize) break;
+  }
+  return out;
+}
+
+async function adminBuildOpenOrdersRows({ top = 500 } = {}) {
+  const headers = await adminFetchOpenOrderHeadersFromSap({ top });
+  const rows = [];
+
+  for (const head of headers) {
+    const docEntry = Number(head?.DocEntry || 0);
+    if (!(docEntry > 0)) continue;
+
+    const lines = await adminOpenOrdersFetchLines(docEntry).catch(() => []);
+    const warehouse = adminOpenOrdersFirstWarehouse(lines);
+    const sellerCodeRaw = head?.SlpCode ?? head?.SalesPersonCode ?? head?.SalesEmployeeCode ?? null;
+    const sellerCode = (sellerCodeRaw === null || sellerCodeRaw === undefined || String(sellerCodeRaw).trim() === '') ? '' : String(sellerCodeRaw).trim();
+    const sellerNameRaw = sellerCode ? await getSalesPersonNameFromSap(sellerCode).catch(() => '') : '';
+    const sellerName = String(sellerNameRaw || '').trim();
+    if (ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS.has(adminOpenOrdersNormalizeSellerLabel(sellerName))) continue;
+
+    rows.push({
+      docEntry,
+      docNum: Number(head?.DocNum || 0) || null,
+      docDate: String(head?.DocDate || '').slice(0, 10) || null,
+      docDueDate: String(head?.DocDueDate || '').slice(0, 10) || null,
+      cardCode: String(head?.CardCode || '').trim(),
+      cardName: String(head?.CardName || '').trim(),
+      warehouse: warehouse || '',
+      sellerCode,
+      sellerName,
+      status: String(head?.DocumentStatus || head?.Status || '').trim(),
+      comments: String(head?.Comments || '').trim(),
+    });
+  }
+
+  return rows.sort((a, b) => String(b.docDate || '').localeCompare(String(a.docDate || '')) || ((b.docNum || 0) - (a.docNum || 0)));
+}
+
+async function adminReplaceOpenOrdersCache(rows = []) {
+  if (!hasDb()) throw new Error('DB no configurada');
+  await dbQuery('BEGIN');
+  try {
+    await dbQuery('DELETE FROM admin_open_orders_cache');
+    for (const r of (Array.isArray(rows) ? rows : [])) {
+      await dbQuery(
+        `INSERT INTO admin_open_orders_cache(
+           doc_entry, doc_num, doc_date, doc_due_date, card_code, card_name,
+           warehouse, seller_code, seller_name, status, comments, updated_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())`,
+        [
+          Number(r.docEntry || 0),
+          r.docNum != null ? Number(r.docNum) : null,
+          r.docDate || null,
+          r.docDueDate || null,
+          String(r.cardCode || ''),
+          String(r.cardName || ''),
+          String(r.warehouse || ''),
+          String(r.sellerCode || ''),
+          String(r.sellerName || ''),
+          String(r.status || ''),
+          String(r.comments || ''),
+        ]
+      );
+    }
+    await dbQuery('COMMIT');
+  } catch (e) {
+    await dbQuery('ROLLBACK').catch(() => {});
+    throw e;
+  }
+}
+
+async function adminSyncOpenOrdersToDb({ top = 500 } = {}) {
+  const rows = await adminBuildOpenOrdersRows({ top });
+  await adminReplaceOpenOrdersCache(rows);
+  const at = new Date().toISOString();
+  await setState('admin_open_orders_last_sync_at', at);
+  await setState('admin_open_orders_last_sync_count', rows.length);
+  return { rowsSaved: rows.length, lastSyncAt: at };
+}
+
+async function adminReadOpenOrdersDb({ client = '', warehouse = '', seller = '', limit = 500 } = {}) {
+  if (!hasDb()) throw new Error('DB no configurada');
+  const where = [];
+  const params = [];
+  let p = 1;
+  const clientQ = String(client || '').trim().toLowerCase();
+  const warehouseQ = String(warehouse || '').trim().toLowerCase();
+  const sellerQ = String(seller || '').trim().toLowerCase();
+
+  if (clientQ) {
+    where.push(`(LOWER(COALESCE(card_code,'')) LIKE $${p} OR LOWER(COALESCE(card_name,'')) LIKE $${p})`);
+    params.push(`%${clientQ}%`);
+    p += 1;
+  }
+  if (warehouseQ) {
+    where.push(`LOWER(COALESCE(warehouse,'')) LIKE $${p}`);
+    params.push(`%${warehouseQ}%`);
+    p += 1;
+  }
+  if (sellerQ) {
+    where.push(`(LOWER(COALESCE(seller_code,'')) LIKE $${p} OR LOWER(COALESCE(seller_name,'')) LIKE $${p})`);
+    params.push(`%${sellerQ}%`);
+    p += 1;
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const lim = Math.max(1, Math.min(2000, Number(limit || 500)));
+  const sql = `
+    SELECT doc_entry, doc_num, doc_date, doc_due_date, card_code, card_name, warehouse, seller_code, seller_name, status, comments, updated_at
+    FROM admin_open_orders_cache
+    ${whereSql}
+    ORDER BY doc_date DESC NULLS LAST, doc_num DESC NULLS LAST
+    LIMIT ${lim}`;
+  const r = await dbQuery(sql, params);
+  return r.rows.map((x) => ({
+    docEntry: Number(x.doc_entry || 0) || null,
+    docNum: Number(x.doc_num || 0) || null,
+    docDate: x.doc_date ? String(x.doc_date).slice(0, 10) : '',
+    docDueDate: x.doc_due_date ? String(x.doc_due_date).slice(0, 10) : '',
+    cardCode: String(x.card_code || ''),
+    cardName: String(x.card_name || ''),
+    warehouse: String(x.warehouse || ''),
+    sellerCode: String(x.seller_code || ''),
+    sellerName: String(x.seller_name || ''),
+    status: String(x.status || ''),
+    comments: String(x.comments || ''),
+    updatedAt: x.updated_at ? new Date(x.updated_at).toISOString() : '',
+  }));
+}
+
+app.post('/api/admin/orders/sync', verifyAdmin, async (req, res) => {
+  try {
+    const top = Math.max(20, Math.min(2000, Number(req.body?.top || req.query?.top || 500)));
+    const out = await adminSyncOpenOrdersToDb({ top });
+    return safeJson(res, 200, { ok: true, ...out });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/orders/db', verifyAdmin, async (req, res) => {
+  try {
+    const rows = await adminReadOpenOrdersDb({
+      client: req.query?.client || '',
+      warehouse: req.query?.warehouse || '',
+      seller: req.query?.seller || '',
+      limit: req.query?.limit || 500,
+    });
+    const lastSyncAt = await getState('admin_open_orders_last_sync_at');
+    return safeJson(res, 200, { ok: true, orders: rows, lastSyncAt });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
+app.get('/api/admin/orders/open', verifyAdmin, async (req, res) => {
+  try {
+    const top = Math.max(20, Math.min(2000, Number(req.query?.top || 500)));
+    const sync = await adminSyncOpenOrdersToDb({ top });
+    const rows = await adminReadOpenOrdersDb({
+      client: req.query?.client || '',
+      warehouse: req.query?.warehouse || '',
+      seller: req.query?.seller || '',
+      limit: req.query?.limit || top,
+    });
+    return safeJson(res, 200, { ok: true, orders: rows, lastSyncAt: sync.lastSyncAt, rowsSaved: sync.rowsSaved, source: 'supabase_after_sync' });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: e.message || String(e) });
+  }
+});
+
 (async () => {
   try {
     await ensureDb();
@@ -19854,168 +20162,3 @@ app.post('/api/admin/production-close/orders/:absoluteEntry/process', verifyAdmi
     console.log(`PRODIMA API UNIFICADA listening on :${PORT}`);
   });
 })();
-
-/* =========================================================
-   Admin pedidos abiertos (Service Layer) - FIX sin $expand
-========================================================= */
-function adminOrdersNormalizeSellerLabel(v) {
-  return String(v || "")
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ");
-}
-
-const ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS = new Set([
-  'Luis Aguilar',
-  'RCI-01',
-  'RCI-02',
-  'RCI-03',
-  'Oficina',
-  '-Ningún empleado del departamento de ventas-'
-].map(adminOrdersNormalizeSellerLabel));
-
-function adminOrderIsoDateOnly(v) {
-  if (!v) return '';
-  if (typeof v === 'string') return v.slice(0, 10);
-  if (v instanceof Date && !Number.isNaN(v.getTime())) return v.toISOString().slice(0, 10);
-  return String(v).slice(0, 10);
-}
-
-function adminOrderPickWarehouseFromLines(lines = []) {
-  const first = (Array.isArray(lines) ? lines : []).find((ln) => {
-    const wh = String(ln?.WarehouseCode || ln?.WhsCode || '').trim();
-    return !!wh;
-  });
-  return String(first?.WarehouseCode || first?.WhsCode || '').trim();
-}
-
-async function adminFetchOrderLinesNoExpand(docEntry) {
-  const de = Number(docEntry || 0);
-  if (!(de > 0)) return [];
-
-  const paths = [
-    `/Orders(${de})/DocumentLines?$top=500`,
-    `/Orders(${de})/DocumentLines`
-  ];
-
-  for (const p of paths) {
-    try {
-      const raw = await slFetchFreshSession(p, { timeoutMs: 180000 });
-      const rows = Array.isArray(raw?.DocumentLines)
-        ? raw.DocumentLines
-        : Array.isArray(raw?.value)
-          ? raw.value
-          : Array.isArray(raw)
-            ? raw
-            : [];
-      if (Array.isArray(rows) && rows.length) return rows;
-    } catch {}
-  }
-  return [];
-}
-
-async function adminFetchOpenOrdersFromSap({ client = '', warehouse = '', seller = '', top = 200 } = {}) {
-  if (missingSapEnv()) throw new Error('Faltan variables SAP');
-
-  const topN = Math.max(1, Math.min(500, Number(top || 200)));
-  const clientNorm = adminOrdersNormalizeSellerLabel(client);
-  const warehouseSel = String(warehouse || '').trim();
-  const sellerSelNorm = adminOrdersNormalizeSellerLabel(seller);
-
-  const selectFields = [
-    'DocEntry',
-    'DocNum',
-    'CardCode',
-    'CardName',
-    'DocDate',
-    'DocDueDate',
-    'Comments',
-    'DocumentStatus',
-    'DocStatus',
-    'SlpCode',
-    'SalesPersonCode',
-    'SalesEmployeeCode'
-  ].join(',');
-
-  const filter = `(DocumentStatus eq 'bost_Open' or DocStatus eq 'O')`;
-
-  const raw = await slFetchFreshSession(
-    `/Orders?$select=${selectFields}&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocNum desc&$top=${topN}`,
-    { timeoutMs: 180000 }
-  );
-
-  const headers = Array.isArray(raw?.value) ? raw.value : [];
-  const out = [];
-
-  for (const h of headers) {
-    const de = Number(h?.DocEntry || 0);
-    if (!(de > 0)) continue;
-
-    let full = null;
-    try {
-      full = await getDoc('Orders', de);
-    } catch {
-      full = null;
-    }
-
-    const base = full && typeof full === 'object' ? full : h;
-    const sellerCodeRaw = base?.SlpCode ?? base?.SalesPersonCode ?? base?.SalesEmployeeCode ?? h?.SlpCode ?? h?.SalesPersonCode ?? h?.SalesEmployeeCode ?? null;
-    const sellerCode = Number.isFinite(Number(sellerCodeRaw)) ? Number(sellerCodeRaw) : null;
-    const sellerName = sellerCode !== null ? await getSalesPersonNameFromSap(sellerCode).catch(() => '') : '';
-    const sellerLabel = String(sellerName || sellerLabelFromCode(sellerCode)).trim();
-    const sellerNorm = adminOrdersNormalizeSellerLabel(sellerLabel);
-    if (ADMIN_OPEN_ORDERS_EXCLUDED_SELLERS.has(sellerNorm)) continue;
-
-    if (sellerSelNorm && sellerSelNorm !== '__all__') {
-      const sellerCodeNorm = adminOrdersNormalizeSellerLabel(String(sellerCode ?? ''));
-      if (sellerNorm !== sellerSelNorm && sellerCodeNorm !== sellerSelNorm) continue;
-    }
-
-    const cardName = String(base?.CardName || h?.CardName || '').trim();
-    const cardCode = String(base?.CardCode || h?.CardCode || '').trim();
-    const clientHay = adminOrdersNormalizeSellerLabel(`${cardCode} ${cardName}`);
-    if (clientNorm && clientNorm !== '__all__' && !clientHay.includes(clientNorm)) continue;
-
-    const lines = await adminFetchOrderLinesNoExpand(de);
-    const warehouseCode = adminOrderPickWarehouseFromLines(lines);
-    if (warehouseSel && warehouseSel !== '__ALL__' && String(warehouseCode || '').trim() !== warehouseSel) continue;
-
-    out.push({
-      docEntry: de,
-      docNum: Number(base?.DocNum || h?.DocNum || 0),
-      cardCode,
-      cardName,
-      warehouse: warehouseCode,
-      comments: String(base?.Comments || h?.Comments || '').trim(),
-      docDueDate: adminOrderIsoDateOnly(base?.DocDueDate || h?.DocDueDate || ''),
-      docDate: adminOrderIsoDateOnly(base?.DocDate || h?.DocDate || ''),
-      sellerCode,
-      sellerName: sellerLabel,
-      status: String(base?.DocumentStatus || base?.DocStatus || h?.DocumentStatus || h?.DocStatus || '').trim() || 'bost_Open'
-    });
-  }
-
-  return out.sort((a, b) => String(b.docDate || '').localeCompare(String(a.docDate || '')) || (Number(b.docNum || 0) - Number(a.docNum || 0)));
-}
-
-app.get('/api/admin/orders/open', verifyAdmin, async (req, res) => {
-  try {
-    const client = String(req.query?.client || '').trim();
-    const warehouse = String(req.query?.warehouse || '').trim();
-    const seller = String(req.query?.seller || '').trim();
-    const top = Math.max(1, Math.min(500, Number(req.query?.top || 200)));
-
-    const orders = await adminFetchOpenOrdersFromSap({ client, warehouse, seller, top });
-
-    return safeJson(res, 200, {
-      ok: true,
-      count: orders.length,
-      orders,
-      filters: { client, warehouse, seller, top }
-    });
-  } catch (e) {
-    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
-  }
-});
