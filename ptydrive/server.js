@@ -112,6 +112,10 @@ function asNum(v, fallback = null) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || "").trim());
+}
+
 function cleanPhone(v) {
   return asText(v).replace(/[^0-9+]/g, "").trim();
 }
@@ -398,6 +402,7 @@ function emitRide(row, event = "ride:update") {
 }
 
 async function getRideById(id) {
+  if (!isUuid(id)) return null;
   const r = await db(`SELECT * FROM ride_rides WHERE id=$1 LIMIT 1`, [id]);
   return r.rows[0] || null;
 }
@@ -656,10 +661,83 @@ app.get("/api/rides", authRequired, async (req, res) => {
   }
 });
 
+app.get("/api/rides/active", authRequired, async (req, res) => {
+  try {
+    await expireOldRides();
+
+    const r = await db(
+      `SELECT * FROM ride_rides
+       WHERE (rider_id=$1 OR driver_id=$1)
+         AND status IN ('requested','searching','assigned','in_progress')
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [req.user.id]
+    );
+
+    return safeJson(res, 200, {
+      ok: true,
+      ride: r.rows[0] ? normalizeRide(r.rows[0]) : null,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.get("/api/carreras/active", authRequired, async (req, res) => {
+  try {
+    await expireOldRides();
+
+    const r = await db(
+      `SELECT * FROM ride_rides
+       WHERE (rider_id=$1 OR driver_id=$1)
+         AND status IN ('requested','searching','assigned','in_progress')
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [req.user.id]
+    );
+
+    return safeJson(res, 200, {
+      ok: true,
+      ride: r.rows[0] ? normalizeRide(r.rows[0]) : null,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.get("/api/carrera-lite/active", authRequired, async (req, res) => {
+  try {
+    await expireOldRides();
+
+    const r = await db(
+      `SELECT * FROM ride_rides
+       WHERE (rider_id=$1 OR driver_id=$1)
+         AND status IN ('requested','searching','assigned','in_progress')
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [req.user.id]
+    );
+
+    return safeJson(res, 200, {
+      ok: true,
+      ride: r.rows[0] ? normalizeRide(r.rows[0]) : null,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
 app.get("/api/rides/:id", authRequired, async (req, res) => {
-  const ride = await getRideById(req.params.id);
-  if (!ride) return safeJson(res, 404, { ok: false, message: "Carrera no encontrada" });
-  return safeJson(res, 200, { ok: true, ride: normalizeRide(ride) });
+  try {
+    if (!isUuid(req.params.id)) {
+      return safeJson(res, 400, { ok: false, message: "ID de carrera inválido" });
+    }
+    const ride = await getRideById(req.params.id);
+    if (!ride) return safeJson(res, 404, { ok: false, message: "Carrera no encontrada" });
+    return safeJson(res, 200, { ok: true, ride: normalizeRide(ride) });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
 });
 
 async function acceptRideHandler(req, res) {
