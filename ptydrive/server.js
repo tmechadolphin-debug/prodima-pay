@@ -776,6 +776,67 @@ app.get("/api/rides", authRequired, async (req, res) => {
   }
 });
 
+
+/* PTY DRIVER PENDING FEED FIX V1 */
+async function ptyDriverPendingRows() {
+  try { if (typeof expireOldRides === "function") await expireOldRides(); } catch {}
+
+  const r = await db(
+    `SELECT
+        rr.*,
+        ru.id AS rider_user_id,
+        ru.name AS rider_name,
+        ru.email AS rider_email,
+        ru.phone AS rider_phone,
+        ru.marker_icon AS rider_marker_icon
+      FROM ride_rides rr
+      LEFT JOIN ride_users ru ON ru.id::text = rr.rider_id::text
+      WHERE LOWER(COALESCE(rr.status,'')) IN ('requested','searching','assigned','pending')
+        AND (rr.driver_id IS NULL OR rr.driver_id::text = '')
+        AND COALESCE(rr.created_at, NOW()) >= NOW() - (($1::int || ' minutes')::interval)
+      ORDER BY rr.created_at DESC
+      LIMIT 100`,
+    [Number(process.env.RIDE_EXPIRE_MINUTES || 10)]
+  );
+
+  return r.rows.map((row) => {
+    const normalized = typeof normalizeRide === "function" ? normalizeRide(row) : row;
+    return {
+      ...normalized,
+      id: normalized.id || row.id,
+      status: normalized.status || row.status || "requested",
+      riderId: normalized.riderId || row.rider_id || row.rider_user_id || "",
+      rider: {
+        ...(normalized.rider || {}),
+        id: row.rider_user_id || row.rider_id || normalized.rider?.id || "",
+        name: row.rider_name || normalized.rider?.name || "Rider",
+        email: row.rider_email || normalized.rider?.email || "",
+        phone: row.rider_phone || normalized.rider?.phone || "",
+        markerIcon: row.rider_marker_icon || normalized.rider?.markerIcon || "📍",
+      },
+    };
+  });
+}
+
+async function ptyDriverPendingHandler(req, res) {
+  try {
+    const rides = await ptyDriverPendingRows();
+    return safeJson(res, 200, {
+      ok: true,
+      rides,
+      count: rides.length,
+      serverTime: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("[PTY_DRIVER_PENDING_ERROR]", e);
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e), rides: [] });
+  }
+}
+
+app.get("/api/driver/pending", authOptional, ptyDriverPendingHandler);
+app.get("/api/rides/pending", authOptional, ptyDriverPendingHandler);
+app.get("/api/driver/rides/pending", authOptional, ptyDriverPendingHandler);
+
 app.get("/api/rides/active", authRequired, async (req, res) => {
   try {
     await expireOldRides();
