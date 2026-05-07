@@ -1,0 +1,1075 @@
+import express from "express";
+import http from "http";
+import pg from "pg";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import crypto from "crypto";
+import { Server as SocketIOServer } from "socket.io";
+
+const { Pool } = pg;
+
+const {
+  PORT = 4100,
+  NODE_ENV = "development",
+  DATABASE_URL = "",
+  JWT_SECRET = "",
+  CORS_ORIGIN = "*",
+  ADMIN_EMAIL = "",
+  ADMIN_PASSWORD = "",
+  ADMIN_NAME = "Administrador",
+  RIDE_EXPIRE_MINUTES = "10",
+  SOS_COOLDOWN_MINUTES = "5",
+} = process.env;
+
+if (!DATABASE_URL) {
+  console.warn("[WARN] DATABASE_URL vacío. Configúralo en Render.");
+}
+if (!JWT_SECRET || JWT_SECRET.length < 24) {
+  console.warn("[WARN] JWT_SECRET debe ser largo y seguro en producción.");
+}
+
+const app = express();
+const server = http.createServer(app);
+
+app.use(express.json({ limit: "20mb" }));
+
+/* =========================================================
+   CORS
+========================================================= */
+const allowedOrigins = new Set(
+  String(CORS_ORIGIN || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+const allowAllOrigins = !CORS_ORIGIN || CORS_ORIGIN === "*";
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (allowAllOrigins && origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  } else if (origin && allowedOrigins.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  } else if (allowAllOrigins && !origin) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,PUT,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-admin-token");
+  res.setHeader("Access-Control-Max-Age", "86400");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+/* =========================================================
+   Socket.io
+========================================================= */
+const io = new SocketIOServer(server, {
+  cors: {
+    origin: allowAllOrigins ? "*" : Array.from(allowedOrigins),
+    methods: ["GET", "POST", "PATCH", "PUT", "DELETE"],
+  },
+  transports: ["websocket", "polling"],
+  pingInterval: 25000,
+  pingTimeout: 20000,
+});
+
+/* =========================================================
+   DB
+========================================================= */
+const pool = new Pool({
+  connectionString: DATABASE_URL || undefined,
+  ssl: DATABASE_URL ? { rejectUnauthorized: false } : undefined,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+});
+
+async function db(text, params = []) {
+  return pool.query(text, params);
+}
+
+function uuid() {
+  return crypto.randomUUID();
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function safeJson(res, status, obj) {
+  return res.status(status).json(obj);
+}
+
+function asText(v) {
+  return String(v ?? "").trim();
+}
+
+function asNum(v, fallback = null) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function cleanPhone(v) {
+  return asText(v).replace(/[^0-9+]/g, "").trim();
+}
+
+function publicUser(u = {}) {
+  if (!u) return null;
+  return {
+    id: u.id,
+    email: u.email,
+    name: u.name || "",
+    role: u.role || "rider",
+    phone: u.phone || "",
+    markerIcon: u.marker_icon || "📍",
+    documentStatus: u.document_status || "pending",
+    trustedContact: u.trusted_contact || {},
+    createdAt: u.created_at,
+    updatedAt: u.updated_at,
+  };
+}
+
+function signToken(user) {
+  return jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      name: user.name || "",
+      role: user.role || "rider",
+    },
+    JWT_SECRET || "dev_secret_change_me_now_ptydrive",
+    { expiresIn: "30d" }
+  );
+}
+
+function readBearer(req) {
+  const h = asText(req.headers.authorization);
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1] : "";
+}
+
+async function authOptional(req, _res, next) {
+  const token = readBearer(req);
+  if (!token) return next();
+  try {
+    const payload = jwt.verify(token, JWT_SECRET || "dev_secret_change_me_now_ptydrive");
+    const r = await db(`SELECT * FROM ride_users WHERE id=$1 LIMIT 1`, [payload.id]);
+    req.user = r.rows[0] || null;
+  } catch {
+    req.user = null;
+  }
+  next();
+}
+
+async function authRequired(req, res, next) {
+  const token = readBearer(req);
+  if (!token) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET || "dev_secret_change_me_now_ptydrive");
+    const r = await db(`SELECT * FROM ride_users WHERE id=$1 LIMIT 1`, [payload.id]);
+    const user = r.rows[0];
+    if (!user) return safeJson(res, 401, { ok: false, message: "Invalid user" });
+    req.user = user;
+    next();
+  } catch {
+    return safeJson(res, 401, { ok: false, message: "Invalid token" });
+  }
+}
+
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== "admin") {
+    return safeJson(res, 403, { ok: false, message: "Admin requerido" });
+  }
+  next();
+}
+
+async function ensureDb() {
+  await db(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS ride_users (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      name TEXT DEFAULT '',
+      role TEXT DEFAULT 'rider',
+      phone TEXT DEFAULT '',
+      marker_icon TEXT DEFAULT '📍',
+      trusted_contact JSONB DEFAULT '{}'::jsonb,
+      driver_docs JSONB DEFAULT '{}'::jsonb,
+      document_status TEXT DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS ride_rides (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      rider_id UUID REFERENCES ride_users(id) ON DELETE SET NULL,
+      driver_id UUID REFERENCES ride_users(id) ON DELETE SET NULL,
+      status TEXT DEFAULT 'requested',
+      pickup JSONB DEFAULT '{}'::jsonb,
+      destination JSONB DEFAULT '{}'::jsonb,
+      route JSONB DEFAULT '{}'::jsonb,
+      fare NUMERIC(12,2) DEFAULT 2.00,
+      distance_km NUMERIC(12,3) DEFAULT 0,
+      duration_min NUMERIC(12,2) DEFAULT 0,
+      payment_method TEXT DEFAULT 'cash',
+      rider_snapshot JSONB DEFAULT '{}'::jsonb,
+      driver_snapshot JSONB DEFAULT '{}'::jsonb,
+      cancel_reason TEXT DEFAULT '',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '10 minutes',
+      accepted_at TIMESTAMPTZ,
+      started_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ,
+      cancelled_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS ride_locations (
+      user_id UUID REFERENCES ride_users(id) ON DELETE CASCADE,
+      role TEXT DEFAULT '',
+      lat NUMERIC(12,8) NOT NULL,
+      lng NUMERIC(12,8) NOT NULL,
+      heading NUMERIC(12,4),
+      speed NUMERIC(12,4),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY(user_id, role)
+    );
+  `);
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS ride_chat_messages (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      ride_id UUID REFERENCES ride_rides(id) ON DELETE CASCADE,
+      sender_id UUID REFERENCES ride_users(id) ON DELETE SET NULL,
+      sender_role TEXT DEFAULT '',
+      target_user_id UUID REFERENCES ride_users(id) ON DELETE SET NULL,
+      message TEXT NOT NULL,
+      source TEXT DEFAULT 'ride',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS ride_sos_alerts (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      ride_id UUID REFERENCES ride_rides(id) ON DELETE SET NULL,
+      user_id UUID REFERENCES ride_users(id) ON DELETE SET NULL,
+      user_role TEXT DEFAULT '',
+      status TEXT DEFAULT 'open',
+      location JSONB DEFAULT '{}'::jsonb,
+      route JSONB DEFAULT '{}'::jsonb,
+      ride_snapshot JSONB DEFAULT '{}'::jsonb,
+      user_snapshot JSONB DEFAULT '{}'::jsonb,
+      message TEXT DEFAULT '',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      closed_at TIMESTAMPTZ
+    );
+  `);
+
+  await db(`
+    CREATE TABLE IF NOT EXISTS ride_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      ride_id UUID REFERENCES ride_rides(id) ON DELETE CASCADE,
+      user_id UUID REFERENCES ride_users(id) ON DELETE SET NULL,
+      type TEXT NOT NULL,
+      payload JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await db(`CREATE INDEX IF NOT EXISTS idx_ride_rides_status ON ride_rides(status);`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_ride_rides_rider ON ride_rides(rider_id);`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_ride_rides_driver ON ride_rides(driver_id);`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_ride_rides_expires ON ride_rides(expires_at);`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_ride_locations_role ON ride_locations(role, updated_at);`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_ride_sos_status ON ride_sos_alerts(status, created_at);`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_ride_chat_ride ON ride_chat_messages(ride_id, created_at);`);
+
+  if (ADMIN_EMAIL && ADMIN_PASSWORD) {
+    const email = ADMIN_EMAIL.toLowerCase().trim();
+    const exists = await db(`SELECT id FROM ride_users WHERE email=$1 LIMIT 1`, [email]);
+    if (!exists.rows.length) {
+      const hash = await bcrypt.hash(ADMIN_PASSWORD, 10);
+      await db(
+        `INSERT INTO ride_users(email, password_hash, name, role, phone, document_status)
+         VALUES($1,$2,$3,'admin','', 'approved')`,
+        [email, hash, ADMIN_NAME]
+      );
+      console.log("[DB] Admin inicial creado:", email);
+    }
+  }
+}
+
+async function expireOldRides() {
+  const r = await db(
+    `UPDATE ride_rides
+     SET status='expired', cancel_reason='auto_expired_10min', cancelled_at=NOW(), updated_at=NOW()
+     WHERE status IN ('requested','searching')
+       AND expires_at < NOW()
+     RETURNING *`
+  );
+
+  for (const ride of r.rows) {
+    emitRide(ride, "ride:expired");
+  }
+  return r.rows.length;
+}
+
+function normalizePoint(input = {}) {
+  if (!input || typeof input !== "object") return {};
+  const lat = asNum(input.lat ?? input.latitude);
+  const lng = asNum(input.lng ?? input.longitude);
+  return {
+    ...input,
+    ...(lat !== null ? { lat } : {}),
+    ...(lng !== null ? { lng } : {}),
+    address: asText(input.address || input.title || input.short || input.name),
+  };
+}
+
+function getSnapshotUser(user = {}) {
+  return {
+    id: user.id,
+    name: user.name || "",
+    email: user.email || "",
+    phone: user.phone || "",
+    role: user.role || "",
+    markerIcon: user.marker_icon || "📍",
+  };
+}
+
+function normalizeRide(row = {}) {
+  const pickup = row.pickup || {};
+  const destination = row.destination || {};
+  const rider = row.rider_snapshot || {};
+  const driver = row.driver_snapshot || {};
+  return {
+    id: row.id,
+    riderId: row.rider_id,
+    driverId: row.driver_id,
+    status: row.status,
+    pickup,
+    destination,
+    route: row.route || {},
+    pickupAddress: pickup.address || pickup.title || pickup.short || "Recogida",
+    destinationAddress: destination.address || destination.title || destination.short || "Destino",
+    fare: Number(row.fare || 0),
+    price: Number(row.fare || 0),
+    total: Number(row.fare || 0),
+    distanceKm: Number(row.distance_km || 0),
+    routeDistanceKm: Number(row.distance_km || 0),
+    durationMin: Number(row.duration_min || 0),
+    paymentMethod: row.payment_method || "cash",
+    rider,
+    driver,
+    riderSnapshot: rider,
+    driverSnapshot: driver,
+    cancelReason: row.cancel_reason || "",
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    acceptedAt: row.accepted_at,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    cancelledAt: row.cancelled_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function emitToUser(userId, event, payload) {
+  if (!userId) return;
+  io.to(`user:${userId}`).emit(event, payload);
+}
+
+function emitRide(row, event = "ride:update") {
+  const ride = normalizeRide(row);
+  io.to("drivers").emit(event, ride);
+  if (ride.riderId) emitToUser(ride.riderId, event, ride);
+  if (ride.driverId) emitToUser(ride.driverId, event, ride);
+  io.to("admins").emit(event, ride);
+}
+
+async function getRideById(id) {
+  const r = await db(`SELECT * FROM ride_rides WHERE id=$1 LIMIT 1`, [id]);
+  return r.rows[0] || null;
+}
+
+async function cancelOpenRidesForRider(riderId, reason = "new_request_replaces_open") {
+  const r = await db(
+    `UPDATE ride_rides
+     SET status='auto_cancelled', cancel_reason=$2, cancelled_at=NOW(), updated_at=NOW()
+     WHERE rider_id=$1 AND status IN ('requested','searching','assigned')
+     RETURNING *`,
+    [riderId, reason]
+  );
+  for (const ride of r.rows) emitRide(ride, "ride:cancelled");
+  return r.rows;
+}
+
+/* =========================================================
+   Health
+========================================================= */
+app.get("/", (_req, res) => {
+  res.json({
+    ok: true,
+    app: "PTY Drive API",
+    env: NODE_ENV,
+    time: nowIso(),
+  });
+});
+
+app.get("/api/health", async (_req, res) => {
+  let dbOk = false;
+  try {
+    await db(`SELECT 1`);
+    dbOk = true;
+  } catch {}
+  res.json({
+    ok: true,
+    app: "PTY Drive API",
+    db: dbOk ? "on" : "off",
+    socket: "on",
+    time: nowIso(),
+  });
+});
+
+/* =========================================================
+   Auth
+========================================================= */
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const email = asText(req.body.email || req.body.username).toLowerCase();
+    const password = asText(req.body.password || req.body.pass);
+    const name = asText(req.body.name || req.body.fullName || req.body.full_name);
+    const role = asText(req.body.role || "rider").toLowerCase();
+    const phone = cleanPhone(req.body.phone);
+
+    if (!email || !email.includes("@")) {
+      return safeJson(res, 400, { ok: false, message: "Email requerido" });
+    }
+    if (!password || password.length < 4) {
+      return safeJson(res, 400, { ok: false, message: "Contraseña requerida" });
+    }
+    if (!phone || phone.length < 7) {
+      return safeJson(res, 400, { ok: false, message: "Teléfono obligatorio para registrar/verificar cuenta" });
+    }
+
+    const hash = await bcrypt.hash(password, 10);
+    const r = await db(
+      `INSERT INTO ride_users(email, password_hash, name, role, phone, document_status)
+       VALUES($1,$2,$3,$4,$5,'pending')
+       ON CONFLICT(email) DO UPDATE SET
+         name=COALESCE(NULLIF(EXCLUDED.name,''), ride_users.name),
+         phone=COALESCE(NULLIF(EXCLUDED.phone,''), ride_users.phone),
+         updated_at=NOW()
+       RETURNING *`,
+      [email, hash, name, ["rider", "driver", "admin"].includes(role) ? role : "rider", phone]
+    );
+
+    const user = r.rows[0];
+    const token = signToken(user);
+    return safeJson(res, 200, { ok: true, token, user: publicUser(user) });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    return safeJson(res, 500, { ok: false, message: msg });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const email = asText(req.body.email || req.body.username).toLowerCase();
+    const password = asText(req.body.password || req.body.pass);
+    const r = await db(`SELECT * FROM ride_users WHERE email=$1 LIMIT 1`, [email]);
+    const user = r.rows[0];
+
+    if (!user) return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
+
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) return safeJson(res, 401, { ok: false, message: "Credenciales inválidas" });
+
+    return safeJson(res, 200, { ok: true, token: signToken(user), user: publicUser(user) });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.get("/api/auth/me", authRequired, async (req, res) => {
+  return safeJson(res, 200, { ok: true, user: publicUser(req.user) });
+});
+
+app.patch("/api/users/profile", authRequired, async (req, res) => {
+  try {
+    const phone = req.body.phone !== undefined ? cleanPhone(req.body.phone) : undefined;
+    const markerIcon = req.body.markerIcon !== undefined ? asText(req.body.markerIcon) : undefined;
+    const trustedContact = req.body.trustedContact !== undefined ? req.body.trustedContact : undefined;
+    const name = req.body.name !== undefined ? asText(req.body.name) : undefined;
+
+    const r = await db(
+      `UPDATE ride_users SET
+        name=COALESCE($2, name),
+        phone=COALESCE($3, phone),
+        marker_icon=COALESCE($4, marker_icon),
+        trusted_contact=COALESCE($5::jsonb, trusted_contact),
+        updated_at=NOW()
+       WHERE id=$1
+       RETURNING *`,
+      [
+        req.user.id,
+        name ?? null,
+        phone ?? null,
+        markerIcon ?? null,
+        trustedContact !== undefined ? JSON.stringify(trustedContact || {}) : null,
+      ]
+    );
+
+    return safeJson(res, 200, { ok: true, user: publicUser(r.rows[0]) });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.patch("/api/profile", authRequired, async (req, res) => {
+  req.url = "/api/users/profile";
+  return app._router.handle(req, res);
+});
+
+/* =========================================================
+   Rides
+========================================================= */
+app.post("/api/rides", authRequired, async (req, res) => {
+  try {
+    await expireOldRides();
+
+    const hasActive = await db(
+      `SELECT id, status FROM ride_rides
+       WHERE rider_id=$1 AND status IN ('requested','searching','assigned','in_progress')
+       LIMIT 1`,
+      [req.user.id]
+    );
+
+    if (hasActive.rows.length) {
+      return safeJson(res, 409, {
+        ok: false,
+        message: "Ya tienes una carrera activa. Cancélala o finalízala antes de solicitar otra.",
+        activeRideId: hasActive.rows[0].id,
+      });
+    }
+
+    const pickup = normalizePoint(req.body.pickup || req.body.origin || req.body.from || {});
+    const destination = normalizePoint(req.body.destination || req.body.destino || req.body.to || {});
+    const distanceKm = Math.max(0, asNum(req.body.distanceKm ?? req.body.routeDistanceKm, 0));
+    const durationMin = Math.max(0, asNum(req.body.durationMin, 0));
+    const fareRaw = asNum(req.body.fare ?? req.body.price ?? req.body.total, 2);
+    const fare = Math.max(2.0, Number(fareRaw || 2));
+    const paymentMethod = asText(req.body.paymentMethod || req.body.payment || "cash");
+    const route = req.body.route || {
+      polyline: req.body.polyline || "",
+      coordinates: req.body.coordinates || [],
+      distanceKm,
+      durationMin,
+    };
+
+    if (pickup.lat == null || pickup.lng == null || destination.lat == null || destination.lng == null) {
+      return safeJson(res, 400, { ok: false, message: "pickup y destination con lat/lng son requeridos" });
+    }
+
+    const expiresMinutes = Math.max(1, Number(RIDE_EXPIRE_MINUTES || 10));
+
+    const r = await db(
+      `INSERT INTO ride_rides(
+        rider_id, status, pickup, destination, route, fare, distance_km, duration_min,
+        payment_method, rider_snapshot, expires_at
+       )
+       VALUES(
+        $1,'requested',$2::jsonb,$3::jsonb,$4::jsonb,$5,$6,$7,$8,$9::jsonb,
+        NOW() + ($10::text || ' minutes')::interval
+       )
+       RETURNING *`,
+      [
+        req.user.id,
+        JSON.stringify(pickup),
+        JSON.stringify(destination),
+        JSON.stringify(route || {}),
+        fare,
+        distanceKm,
+        durationMin,
+        paymentMethod,
+        JSON.stringify(getSnapshotUser(req.user)),
+        String(expiresMinutes),
+      ]
+    );
+
+    const ride = r.rows[0];
+    await db(
+      `INSERT INTO ride_events(ride_id, user_id, type, payload)
+       VALUES($1,$2,'ride_requested',$3::jsonb)`,
+      [ride.id, req.user.id, JSON.stringify({ fare, distanceKm, paymentMethod })]
+    );
+
+    emitRide(ride, "ride:new");
+    io.to("drivers").emit("ride:available", normalizeRide(ride));
+
+    return safeJson(res, 201, { ok: true, ride: normalizeRide(ride) });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.get("/api/rides", authRequired, async (req, res) => {
+  try {
+    await expireOldRides();
+
+    const status = asText(req.query.status || "");
+    const role = asText(req.query.role || req.user.role || "");
+    let q = `SELECT * FROM ride_rides`;
+    let params = [];
+    let where = [];
+
+    if (status === "open" || status === "pending" || role === "driver") {
+      where.push(`status IN ('requested','searching')`);
+      where.push(`expires_at > NOW()`);
+    } else if (role === "rider") {
+      params.push(req.user.id);
+      where.push(`rider_id=$${params.length}`);
+    } else if (role === "admin" || req.user.role === "admin") {
+      // admin ve todo
+    } else {
+      params.push(req.user.id);
+      where.push(`(rider_id=$${params.length} OR driver_id=$${params.length})`);
+    }
+
+    if (where.length) q += ` WHERE ${where.join(" AND ")}`;
+    q += ` ORDER BY created_at DESC LIMIT 200`;
+
+    const r = await db(q, params);
+    return safeJson(res, 200, { ok: true, rides: r.rows.map(normalizeRide) });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.get("/api/rides/:id", authRequired, async (req, res) => {
+  const ride = await getRideById(req.params.id);
+  if (!ride) return safeJson(res, 404, { ok: false, message: "Carrera no encontrada" });
+  return safeJson(res, 200, { ok: true, ride: normalizeRide(ride) });
+});
+
+async function acceptRideHandler(req, res) {
+  try {
+    await expireOldRides();
+
+    const rideId = asText(req.params.id || req.params.rideId);
+    const driverId = req.user?.id || asText(req.body.driverId);
+    const driverSnapshot = req.user
+      ? getSnapshotUser(req.user)
+      : {
+          id: driverId,
+          name: asText(req.body.driverName || "Driver"),
+          email: asText(req.body.driverEmail),
+          phone: cleanPhone(req.body.driverPhone),
+          role: "driver",
+        };
+
+    if (!rideId || !driverId) {
+      return safeJson(res, 400, { ok: false, message: "rideId y driverId requeridos" });
+    }
+
+    const r = await db(
+      `UPDATE ride_rides
+       SET status='assigned',
+           driver_id=$1,
+           driver_snapshot=$2::jsonb,
+           accepted_at=NOW(),
+           updated_at=NOW()
+       WHERE id=$3
+         AND status IN ('requested','searching')
+         AND expires_at > NOW()
+       RETURNING *`,
+      [driverId, JSON.stringify(driverSnapshot), rideId]
+    );
+
+    if (!r.rows.length) {
+      const current = await getRideById(rideId);
+      return safeJson(res, 409, {
+        ok: false,
+        message: current
+          ? `La carrera ya no está disponible. Estado actual: ${current.status}`
+          : "La carrera no existe",
+        ride: current ? normalizeRide(current) : null,
+      });
+    }
+
+    const ride = r.rows[0];
+    await db(
+      `INSERT INTO ride_events(ride_id, user_id, type, payload)
+       VALUES($1,$2,'ride_accepted',$3::jsonb)`,
+      [ride.id, driverId, JSON.stringify({ driver: driverSnapshot })]
+    );
+
+    emitRide(ride, "ride:accepted");
+    return safeJson(res, 200, { ok: true, ride: normalizeRide(ride) });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+}
+
+app.patch("/api/rides/:id/accept", authOptional, acceptRideHandler);
+app.patch("/api/carrera-lite/:id/accept", authOptional, acceptRideHandler);
+app.patch("/api/carreras/:id/accept", authOptional, acceptRideHandler);
+
+async function rideStatusPatch(req, res, nextStatus, eventName) {
+  try {
+    const rideId = asText(req.params.id || req.params.rideId);
+    const ride = await getRideById(rideId);
+    if (!ride) return safeJson(res, 404, { ok: false, message: "Carrera no encontrada" });
+
+    const fields =
+      nextStatus === "in_progress"
+        ? `status='in_progress', started_at=NOW(), updated_at=NOW()`
+        : nextStatus === "completed"
+          ? `status='completed', completed_at=NOW(), updated_at=NOW()`
+          : `status=$2, updated_at=NOW()`;
+
+    const r = nextStatus === "in_progress" || nextStatus === "completed"
+      ? await db(`UPDATE ride_rides SET ${fields} WHERE id=$1 RETURNING *`, [rideId])
+      : await db(`UPDATE ride_rides SET ${fields} WHERE id=$1 RETURNING *`, [rideId, nextStatus]);
+
+    emitRide(r.rows[0], eventName);
+    return safeJson(res, 200, { ok: true, ride: normalizeRide(r.rows[0]) });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+}
+
+app.patch("/api/rides/:id/start", authRequired, (req, res) => rideStatusPatch(req, res, "in_progress", "ride:started"));
+app.patch("/api/rides/:id/complete", authRequired, (req, res) => rideStatusPatch(req, res, "completed", "ride:completed"));
+
+app.patch("/api/rides/:id/cancel", authRequired, async (req, res) => {
+  try {
+    const reason = asText(req.body.reason || "cancelled_by_user");
+    const r = await db(
+      `UPDATE ride_rides
+       SET status='cancelled', cancel_reason=$2, cancelled_at=NOW(), updated_at=NOW()
+       WHERE id=$1
+         AND status NOT IN ('completed','cancelled','expired','auto_cancelled')
+       RETURNING *`,
+      [req.params.id, reason]
+    );
+
+    if (!r.rows.length) {
+      const current = await getRideById(req.params.id);
+      return safeJson(res, 409, { ok: false, message: "No se pudo cancelar", ride: current ? normalizeRide(current) : null });
+    }
+
+    emitRide(r.rows[0], "ride:cancelled");
+    return safeJson(res, 200, { ok: true, ride: normalizeRide(r.rows[0]) });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+/* Aliases */
+app.post("/api/carreras", authRequired, (req, res) => app._router.handle({ ...req, url: "/api/rides" }, res));
+app.get("/api/carreras", authRequired, (req, res) => app._router.handle({ ...req, url: "/api/rides" }, res));
+
+/* =========================================================
+   Locations
+========================================================= */
+app.post("/api/locations", authRequired, async (req, res) => {
+  try {
+    const role = asText(req.body.role || req.user.role || "rider");
+    const lat = asNum(req.body.lat ?? req.body.latitude);
+    const lng = asNum(req.body.lng ?? req.body.longitude);
+    const heading = asNum(req.body.heading);
+    const speed = asNum(req.body.speed);
+
+    if (lat === null || lng === null) return safeJson(res, 400, { ok: false, message: "lat/lng requeridos" });
+
+    const r = await db(
+      `INSERT INTO ride_locations(user_id, role, lat, lng, heading, speed, updated_at)
+       VALUES($1,$2,$3,$4,$5,$6,NOW())
+       ON CONFLICT(user_id, role) DO UPDATE SET
+         lat=EXCLUDED.lat, lng=EXCLUDED.lng,
+         heading=EXCLUDED.heading, speed=EXCLUDED.speed,
+         updated_at=NOW()
+       RETURNING *`,
+      [req.user.id, role, lat, lng, heading, speed]
+    );
+
+    const payload = { userId: req.user.id, role, lat, lng, heading, speed, updatedAt: r.rows[0].updated_at };
+    io.to(role === "driver" ? "riders" : "drivers").emit("location:update", payload);
+    io.to("admins").emit("location:update", payload);
+
+    return safeJson(res, 200, { ok: true, location: payload });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.post("/api/location", authRequired, (req, res) => app._router.handle({ ...req, url: "/api/locations" }, res));
+
+/* =========================================================
+   Documents / verification
+========================================================= */
+app.post("/api/documents", authRequired, async (req, res) => {
+  try {
+    const docs = req.body.documents || req.body.docs || req.body;
+    const r = await db(
+      `UPDATE ride_users
+       SET driver_docs=COALESCE(driver_docs,'{}'::jsonb) || $2::jsonb,
+           document_status='pending',
+           updated_at=NOW()
+       WHERE id=$1
+       RETURNING *`,
+      [req.user.id, JSON.stringify(docs || {})]
+    );
+    io.to("admins").emit("documents:pending", publicUser(r.rows[0]));
+    return safeJson(res, 200, { ok: true, user: publicUser(r.rows[0]) });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.get("/api/documents/status", authRequired, async (req, res) => {
+  return safeJson(res, 200, {
+    ok: true,
+    status: req.user.document_status || "pending",
+    user: publicUser(req.user),
+  });
+});
+
+app.patch("/api/admin/users/:id/document-status", authRequired, requireAdmin, async (req, res) => {
+  const status = asText(req.body.status || "approved");
+  const r = await db(
+    `UPDATE ride_users SET document_status=$2, updated_at=NOW() WHERE id=$1 RETURNING *`,
+    [req.params.id, status]
+  );
+  if (!r.rows.length) return safeJson(res, 404, { ok: false, message: "Usuario no encontrado" });
+  emitToUser(req.params.id, "documents:status", { status, user: publicUser(r.rows[0]) });
+  return safeJson(res, 200, { ok: true, user: publicUser(r.rows[0]) });
+});
+
+/* =========================================================
+   SOS
+========================================================= */
+app.post("/api/sos", authRequired, async (req, res) => {
+  try {
+    const cooldown = Math.max(1, Number(SOS_COOLDOWN_MINUTES || 5));
+    const recent = await db(
+      `SELECT id, created_at FROM ride_sos_alerts
+       WHERE user_id=$1 AND created_at > NOW() - ($2::text || ' minutes')::interval
+       ORDER BY created_at DESC LIMIT 1`,
+      [req.user.id, String(cooldown)]
+    );
+
+    if (recent.rows.length) {
+      return safeJson(res, 429, {
+        ok: false,
+        message: `SOS ya enviado. Espera ${cooldown} minutos antes de enviar otro.`,
+        lastSosId: recent.rows[0].id,
+      });
+    }
+
+    const rideId = asText(req.body.rideId || req.body.ride_id);
+    const ride = rideId ? await getRideById(rideId) : null;
+    const location = normalizePoint(req.body.location || req.body);
+    const route = req.body.route || ride?.route || {};
+    const message = asText(req.body.message || "SOS activado");
+
+    const r = await db(
+      `INSERT INTO ride_sos_alerts(
+        ride_id, user_id, user_role, location, route, ride_snapshot, user_snapshot, message
+       )
+       VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8)
+       RETURNING *`,
+      [
+        ride?.id || null,
+        req.user.id,
+        asText(req.body.role || req.user.role || ""),
+        JSON.stringify(location || {}),
+        JSON.stringify(route || {}),
+        JSON.stringify(ride ? normalizeRide(ride) : {}),
+        JSON.stringify(getSnapshotUser(req.user)),
+        message,
+      ]
+    );
+
+    const alert = r.rows[0];
+    const payload = { ok: true, sos: alert };
+    io.to("admins").emit("sos:new", payload);
+    emitToUser(req.user.id, "sos:received", {
+      message: "Tu seguridad es lo primero. El centro de ayuda se pondrá en contacto contigo, estamos monitoreando tu carrera.",
+      sos: alert,
+    });
+
+    return safeJson(res, 201, payload);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.get("/api/admin/sos", authRequired, requireAdmin, async (_req, res) => {
+  const r = await db(`SELECT * FROM ride_sos_alerts ORDER BY created_at DESC LIMIT 100`);
+  return safeJson(res, 200, { ok: true, alerts: r.rows });
+});
+
+app.patch("/api/admin/sos/:id/close", authRequired, requireAdmin, async (req, res) => {
+  const r = await db(
+    `UPDATE ride_sos_alerts SET status='closed', closed_at=NOW() WHERE id=$1 RETURNING *`,
+    [req.params.id]
+  );
+  if (!r.rows.length) return safeJson(res, 404, { ok: false, message: "SOS no encontrado" });
+  io.to("admins").emit("sos:closed", r.rows[0]);
+  return safeJson(res, 200, { ok: true, sos: r.rows[0] });
+});
+
+/* =========================================================
+   Chat
+========================================================= */
+app.get("/api/chats/:rideId/messages", authRequired, async (req, res) => {
+  const r = await db(
+    `SELECT * FROM ride_chat_messages WHERE ride_id=$1 ORDER BY created_at ASC LIMIT 500`,
+    [req.params.rideId]
+  );
+  return safeJson(res, 200, { ok: true, messages: r.rows });
+});
+
+app.post("/api/chats/:rideId/messages", authRequired, async (req, res) => {
+  try {
+    const ride = await getRideById(req.params.rideId);
+    if (!ride) return safeJson(res, 404, { ok: false, message: "Carrera no encontrada" });
+
+    const message = asText(req.body.message || req.body.text);
+    if (!message) return safeJson(res, 400, { ok: false, message: "Mensaje vacío" });
+
+    const targetUserId =
+      asText(req.body.targetUserId) ||
+      (req.user.role === "admin"
+        ? (ride.rider_id || ride.driver_id)
+        : req.user.id === ride.rider_id
+          ? ride.driver_id
+          : ride.rider_id);
+
+    const r = await db(
+      `INSERT INTO ride_chat_messages(ride_id, sender_id, sender_role, target_user_id, message, source)
+       VALUES($1,$2,$3,$4,$5,$6)
+       RETURNING *`,
+      [ride.id, req.user.id, req.user.role || "", targetUserId || null, message, asText(req.body.source || "ride")]
+    );
+
+    const payload = { ok: true, message: r.rows[0], ride: normalizeRide(ride) };
+    emitToUser(ride.rider_id, "chat:message", payload);
+    emitToUser(ride.driver_id, "chat:message", payload);
+    if (targetUserId) emitToUser(targetUserId, "support:message", payload);
+    io.to("admins").emit("chat:message", payload);
+
+    return safeJson(res, 201, payload);
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+/* =========================================================
+   Admin
+========================================================= */
+app.get("/api/admin/users", authRequired, requireAdmin, async (_req, res) => {
+  const r = await db(`SELECT * FROM ride_users ORDER BY created_at DESC LIMIT 500`);
+  return safeJson(res, 200, { ok: true, users: r.rows.map(publicUser) });
+});
+
+app.get("/api/admin/rides", authRequired, requireAdmin, async (_req, res) => {
+  await expireOldRides();
+  const r = await db(`SELECT * FROM ride_rides ORDER BY created_at DESC LIMIT 500`);
+  return safeJson(res, 200, { ok: true, rides: r.rows.map(normalizeRide) });
+});
+
+/* =========================================================
+   Socket handlers
+========================================================= */
+io.use(async (socket, next) => {
+  try {
+    const token =
+      socket.handshake.auth?.token ||
+      socket.handshake.query?.token ||
+      "";
+    if (!token) return next();
+
+    const payload = jwt.verify(String(token), JWT_SECRET || "dev_secret_change_me_now_ptydrive");
+    const r = await db(`SELECT * FROM ride_users WHERE id=$1 LIMIT 1`, [payload.id]);
+    socket.user = r.rows[0] || null;
+    next();
+  } catch {
+    next();
+  }
+});
+
+io.on("connection", (socket) => {
+  const user = socket.user;
+  if (user?.id) {
+    socket.join(`user:${user.id}`);
+    if (user.role === "driver") socket.join("drivers");
+    if (user.role === "rider") socket.join("riders");
+    if (user.role === "admin") socket.join("admins");
+  }
+
+  socket.on("join", (payload = {}) => {
+    if (payload.userId) socket.join(`user:${payload.userId}`);
+    if (payload.role === "driver") socket.join("drivers");
+    if (payload.role === "rider") socket.join("riders");
+    if (payload.role === "admin") socket.join("admins");
+    if (payload.rideId) socket.join(`ride:${payload.rideId}`);
+  });
+
+  socket.on("driver:online", () => socket.join("drivers"));
+  socket.on("admin:online", () => socket.join("admins"));
+
+  socket.on("location:update", async (payload = {}) => {
+    try {
+      if (!user?.id) return;
+      const role = asText(payload.role || user.role || "");
+      const lat = asNum(payload.lat ?? payload.latitude);
+      const lng = asNum(payload.lng ?? payload.longitude);
+      if (lat === null || lng === null) return;
+
+      await db(
+        `INSERT INTO ride_locations(user_id, role, lat, lng, heading, speed, updated_at)
+         VALUES($1,$2,$3,$4,$5,$6,NOW())
+         ON CONFLICT(user_id, role) DO UPDATE SET
+          lat=EXCLUDED.lat,lng=EXCLUDED.lng,heading=EXCLUDED.heading,speed=EXCLUDED.speed,updated_at=NOW()`,
+        [user.id, role, lat, lng, asNum(payload.heading), asNum(payload.speed)]
+      );
+
+      const out = { userId: user.id, role, lat, lng, heading: payload.heading, speed: payload.speed, updatedAt: nowIso() };
+      socket.broadcast.emit("location:update", out);
+    } catch (e) {
+      socket.emit("error:server", { message: String(e?.message || e) });
+    }
+  });
+
+  socket.on("disconnect", () => {});
+});
+
+/* =========================================================
+   Boot
+========================================================= */
+async function boot() {
+  await ensureDb();
+  await expireOldRides();
+
+  server.listen(Number(PORT), "0.0.0.0", () => {
+    console.log(`[PTY Drive] API lista en puerto ${PORT}`);
+  });
+}
+
+boot().catch((e) => {
+  console.error("[BOOT ERROR]", e);
+  process.exit(1);
+});
