@@ -217,6 +217,20 @@ function areDocumentsApproved(documents = [], role = "driver") {
   return { approved: missing.length === 0, missing, statusMap };
 }
 
+function buildDocumentUserPayload(userRow, role, approved, extra = {}) {
+  const base = publicUser(userRow || {});
+  const normalizedRole = String(role || base?.role || "").toLowerCase();
+  return {
+    ...base,
+    ...extra,
+    driverDocumentsApproved: normalizedRole === "driver" ? Boolean(approved) : Boolean(extra.driverDocumentsApproved),
+    canAcceptRides: normalizedRole === "driver" ? Boolean(approved) : Boolean(extra.canAcceptRides),
+    riderVerified: normalizedRole === "rider" ? Boolean(approved) : Boolean(extra.riderVerified),
+    identityVerified: normalizedRole === "rider" ? Boolean(approved) : Boolean(extra.identityVerified),
+    verificationStatus: approved ? "approved" : (base?.documentStatus || "pending"),
+  };
+}
+
 function signToken(user) {
   return jwt.sign(
     {
@@ -1147,6 +1161,129 @@ app.post("/api/driver/documents", authOptional, async (req, res) => {
   }
 });
 
+
+/* DOCUMENT STATUS ROUTES FOR MOBILE APP V3 */
+app.get("/api/driver/documents/status", authOptional, async (req, res) => {
+  try {
+    const userId = req.user?.id || asText(req.query.userId || req.body?.userId);
+    if (!userId) return safeJson(res, 400, { ok: false, message: "userId requerido" });
+
+    const docsR = await db(
+      `SELECT * FROM ride_documents
+       WHERE user_id::text=$1::text
+         AND role::text='driver'
+       ORDER BY created_at DESC`,
+      [String(userId)]
+    );
+
+    const documents = docsR.rows.map(documentToPublic);
+    const result = areDocumentsApproved(documents, "driver");
+    const userR = await db(`SELECT * FROM ride_users WHERE id::text=$1::text LIMIT 1`, [String(userId)]);
+    const user = buildDocumentUserPayload(userR.rows[0], "driver", result.approved);
+
+    return safeJson(res, 200, {
+      ok: true,
+      approved: result.approved,
+      status: result.approved ? "approved" : (documents.some((d) => d.status === "rejected") ? "rejected" : documents.length ? "pending" : "missing"),
+      driverDocumentsApproved: result.approved,
+      canAcceptRides: result.approved,
+      missing: result.missing,
+      statusMap: result.statusMap,
+      documents,
+      user,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.get("/api/rider/documents/status", authOptional, async (req, res) => {
+  try {
+    const userId = req.user?.id || asText(req.query.userId || req.body?.userId);
+    if (!userId) return safeJson(res, 400, { ok: false, message: "userId requerido" });
+
+    const docsR = await db(
+      `SELECT * FROM ride_documents
+       WHERE user_id::text=$1::text
+         AND role::text='rider'
+       ORDER BY created_at DESC`,
+      [String(userId)]
+    );
+
+    const documents = docsR.rows.map(documentToPublic);
+    const result = areDocumentsApproved(documents, "rider");
+    const status = result.approved
+      ? "approved"
+      : documents.some((d) => d.status === "rejected")
+        ? "rejected"
+        : documents.length
+          ? "pending"
+          : "missing";
+    const userR = await db(`SELECT * FROM ride_users WHERE id::text=$1::text LIMIT 1`, [String(userId)]);
+    const user = buildDocumentUserPayload(userR.rows[0], "rider", result.approved, {
+      riderVerified: result.approved,
+      identityVerified: result.approved,
+      verificationStatus: status,
+    });
+
+    return safeJson(res, 200, {
+      ok: true,
+      verified: result.approved,
+      approved: result.approved,
+      riderVerified: result.approved,
+      identityVerified: result.approved,
+      status,
+      missing: result.missing,
+      statusMap: result.statusMap,
+      documents,
+      user,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.get("/api/documents/status", authOptional, async (req, res) => {
+  try {
+    const role = asText(req.query.role || req.body?.role || req.user?.role || "driver").toLowerCase() === "rider" ? "rider" : "driver";
+    const userId = req.user?.id || asText(req.query.userId || req.body?.userId);
+    if (!userId) return safeJson(res, 400, { ok: false, message: "userId requerido" });
+
+    const docsR = await db(
+      `SELECT * FROM ride_documents
+       WHERE user_id::text=$1::text
+         AND role::text=$2::text
+       ORDER BY created_at DESC`,
+      [String(userId), role]
+    );
+
+    const documents = docsR.rows.map(documentToPublic);
+    const result = areDocumentsApproved(documents, role);
+    const status = result.approved
+      ? "approved"
+      : documents.some((d) => d.status === "rejected")
+        ? "rejected"
+        : documents.length
+          ? "pending"
+          : "missing";
+    const userR = await db(`SELECT * FROM ride_users WHERE id::text=$1::text LIMIT 1`, [String(userId)]);
+    const user = buildDocumentUserPayload(userR.rows[0], role, result.approved);
+
+    return safeJson(res, 200, {
+      ok: true,
+      approved: result.approved,
+      verified: result.approved,
+      status,
+      missing: result.missing,
+      statusMap: result.statusMap,
+      documents,
+      user,
+    });
+  } catch (e) {
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
 app.get("/api/driver/documents/approved", authOptional, async (req, res) => {
   try {
     const userId = req.user?.id || asText(req.query.userId || req.body?.userId);
@@ -1215,6 +1352,116 @@ app.get("/api/admin/documents", authRequired, requireAdmin, async (_req, res) =>
 
 
 /* SAFE DOC STATUS ROUTE CAST FIX V2 */
+
+/* SAFE DOC STATUS ROUTE V3 APPROVAL NOTIFY */
+app.patch("/api/admin/documents/:id/status", authRequired, requireAdmin, async (req, res) => {
+  try {
+    const docId = asText(req.params.id);
+    const status = asText(req.body.status || "pending").toLowerCase();
+    const reason = asText(req.body.reason || "");
+    const allowed = new Set(["pending", "approved", "rejected"]);
+
+    if (!docId) return safeJson(res, 400, { ok: false, message: "Documento requerido" });
+    if (!allowed.has(status)) return safeJson(res, 400, { ok: false, message: "status inválido" });
+
+    const updated = await db(
+      `UPDATE ride_documents
+       SET status=$2::text,
+           reason=$3::text,
+           updated_at=NOW()
+       WHERE id::text=$1::text
+       RETURNING *`,
+      [String(docId), status, reason]
+    );
+
+    if (!updated.rows.length) {
+      return safeJson(res, 404, { ok: false, message: "Documento no encontrado" });
+    }
+
+    const rawDoc = updated.rows[0];
+    const document = documentToPublic(rawDoc);
+    const userId = String(document.userId || rawDoc.user_id || "");
+    const role = String(document.role || rawDoc.role || "driver").toLowerCase() === "rider" ? "rider" : "driver";
+
+    const docsR = await db(
+      `SELECT * FROM ride_documents
+       WHERE user_id::text=$1::text
+         AND role::text=$2::text
+       ORDER BY created_at DESC`,
+      [userId, role]
+    );
+
+    const documents = docsR.rows.map(documentToPublic);
+    const result = areDocumentsApproved(documents, role);
+    const finalStatus = result.approved
+      ? "approved"
+      : documents.some((d) => String(d.status || "").toLowerCase() === "rejected")
+        ? "rejected"
+        : documents.length
+          ? "pending"
+          : "missing";
+
+    await db(
+      `UPDATE ride_users
+       SET document_status=$2::text,
+           driver_docs=COALESCE(driver_docs,'{}'::jsonb) || $3::jsonb,
+           updated_at=NOW()
+       WHERE id::text=$1::text`,
+      [
+        userId,
+        finalStatus,
+        JSON.stringify({
+          [`${document.type}Status`]: status,
+          documentStatus: finalStatus,
+          verificationStatus: finalStatus,
+          driverDocumentsApproved: role === "driver" ? result.approved : undefined,
+          canAcceptRides: role === "driver" ? result.approved : undefined,
+          riderVerified: role === "rider" ? result.approved : undefined,
+          identityVerified: role === "rider" ? result.approved : undefined,
+        }),
+      ]
+    );
+
+    const userR = await db(`SELECT * FROM ride_users WHERE id::text=$1::text LIMIT 1`, [userId]);
+    const user = buildDocumentUserPayload(userR.rows[0], role, result.approved, {
+      verificationStatus: finalStatus,
+      riderVerified: role === "rider" ? result.approved : false,
+      identityVerified: role === "rider" ? result.approved : false,
+      driverDocumentsApproved: role === "driver" ? result.approved : false,
+      canAcceptRides: role === "driver" ? result.approved : false,
+    });
+
+    const payload = {
+      ok: true,
+      document,
+      documents,
+      status,
+      documentStatus: finalStatus,
+      approved: result.approved,
+      missing: result.missing,
+      statusMap: result.statusMap,
+      user,
+      title: result.approved ? "Documentos aprobados" : status === "approved" ? "Documento aprobado" : status === "rejected" ? "Documento rechazado" : "Documento pendiente",
+      message: result.approved
+        ? "Tus documentos han sido aprobados exitosamente."
+        : status === "approved"
+          ? "Uno de tus documentos fue aprobado. Aún pueden quedar documentos pendientes."
+          : status === "rejected"
+            ? "Uno de tus documentos fue rechazado. Revisa el panel de verificación."
+            : "Tu documento quedó pendiente de revisión.",
+    };
+
+    emitToUser(userId, "documents:status", payload);
+    emitToUser(userId, "documents:approved", payload);
+    io.to("admins").emit("documents:status", payload);
+
+    return safeJson(res, 200, payload);
+  } catch (e) {
+    console.error("[ADMIN_DOCUMENT_STATUS_V3_ERROR]", e);
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
 app.patch("/api/admin/documents/:id/status", authRequired, requireAdmin, async (req, res) => {
   try {
     const docId = asText(req.params.id);
