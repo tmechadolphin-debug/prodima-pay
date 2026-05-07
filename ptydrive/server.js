@@ -190,7 +190,7 @@ function requiredDocumentTypesForRole(role = "driver") {
 
 async function listUserDocuments(userId, role = "") {
   const params = [userId];
-  let where = "user_id=$1";
+  let where = "user_id::text=$1::text";
   if (role) {
     params.push(role);
     where += ` AND role=${params.length}`;
@@ -241,7 +241,7 @@ async function authOptional(req, _res, next) {
   if (!token) return next();
   try {
     const payload = jwt.verify(token, JWT_SECRET || "dev_secret_change_me_now_ptydrive");
-    const r = await db(`SELECT * FROM ride_users WHERE id=$1 LIMIT 1`, [payload.id]);
+    const r = await db(`SELECT * FROM ride_users WHERE id::text=$1::text LIMIT 1`, [payload.id]);
     req.user = r.rows[0] || null;
   } catch {
     req.user = null;
@@ -254,7 +254,7 @@ async function authRequired(req, res, next) {
   if (!token) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
   try {
     const payload = jwt.verify(token, JWT_SECRET || "dev_secret_change_me_now_ptydrive");
-    const r = await db(`SELECT * FROM ride_users WHERE id=$1 LIMIT 1`, [payload.id]);
+    const r = await db(`SELECT * FROM ride_users WHERE id::text=$1::text LIMIT 1`, [payload.id]);
     const user = r.rows[0];
     if (!user) return safeJson(res, 401, { ok: false, message: "Invalid user" });
     req.user = user;
@@ -504,7 +504,7 @@ function emitRide(row, event = "ride:update") {
 
 async function getRideById(id) {
   if (!isUuid(id)) return null;
-  const r = await db(`SELECT * FROM ride_rides WHERE id=$1 LIMIT 1`, [id]);
+  const r = await db(`SELECT * FROM ride_rides WHERE id::text=$1::text LIMIT 1`, [id]);
   return r.rows[0] || null;
 }
 
@@ -625,7 +625,7 @@ app.patch("/api/users/profile", authRequired, async (req, res) => {
         marker_icon=COALESCE($4, marker_icon),
         trusted_contact=COALESCE($5::jsonb, trusted_contact),
         updated_at=NOW()
-       WHERE id=$1
+       WHERE id::text=$1::text
        RETURNING *`,
       [
         req.user.id,
@@ -918,8 +918,8 @@ async function rideStatusPatch(req, res, nextStatus, eventName) {
           : `status=$2, updated_at=NOW()`;
 
     const r = nextStatus === "in_progress" || nextStatus === "completed"
-      ? await db(`UPDATE ride_rides SET ${fields} WHERE id=$1 RETURNING *`, [rideId])
-      : await db(`UPDATE ride_rides SET ${fields} WHERE id=$1 RETURNING *`, [rideId, nextStatus]);
+      ? await db(`UPDATE ride_rides SET ${fields} WHERE id::text=$1::text RETURNING *`, [rideId])
+      : await db(`UPDATE ride_rides SET ${fields} WHERE id::text=$1::text RETURNING *`, [rideId, nextStatus]);
 
     emitRide(r.rows[0], eventName);
     return safeJson(res, 200, { ok: true, ride: normalizeRide(r.rows[0]) });
@@ -937,7 +937,7 @@ app.patch("/api/rides/:id/cancel", authRequired, async (req, res) => {
     const r = await db(
       `UPDATE ride_rides
        SET status='cancelled', cancel_reason=$2, cancelled_at=NOW(), updated_at=NOW()
-       WHERE id=$1
+       WHERE id::text=$1::text
          AND status NOT IN ('completed','cancelled','expired','auto_cancelled')
        RETURNING *`,
       [req.params.id, reason]
@@ -1021,7 +1021,7 @@ app.patch("/api/users/me/profile", authOptional, async (req, res) => {
         marker_icon=COALESCE($4, marker_icon),
         trusted_contact=COALESCE($5::jsonb, trusted_contact),
         updated_at=NOW()
-       WHERE id=$1
+       WHERE id::text=$1::text
        RETURNING *`,
       [
         userId,
@@ -1082,7 +1082,7 @@ app.post("/api/documents/upload", authOptional, documentUpload.single("file"), a
        SET document_status='pending',
            driver_docs=COALESCE(driver_docs,'{}'::jsonb) || $2::jsonb,
            updated_at=NOW()
-       WHERE id=$1`,
+       WHERE id::text=$1::text`,
       [
         userId,
         JSON.stringify({
@@ -1093,7 +1093,7 @@ app.post("/api/documents/upload", authOptional, documentUpload.single("file"), a
       ]
     );
 
-    const userR = await db(`SELECT * FROM ride_users WHERE id=$1 LIMIT 1`, [userId]);
+    const userR = await db(`SELECT * FROM ride_users WHERE id::text=$1::text LIMIT 1`, [userId]);
     io.to("admins").emit("documents:pending", { document, user: publicUser(userR.rows[0]) });
 
     return safeJson(res, 201, { ok: true, document, user: publicUser(userR.rows[0]) });
@@ -1125,7 +1125,7 @@ app.post("/api/driver/documents", authOptional, async (req, res) => {
            phone=COALESCE(NULLIF($2,''), phone),
            driver_docs=COALESCE(driver_docs,'{}'::jsonb) || $3::jsonb,
            updated_at=NOW()
-       WHERE id=$1
+       WHERE id::text=$1::text
        RETURNING *`,
       [
         userId,
@@ -1153,7 +1153,7 @@ app.get("/api/driver/documents/approved", authOptional, async (req, res) => {
     if (!userId) return safeJson(res, 400, { ok: false, message: "userId requerido" });
     const documents = await listUserDocuments(userId, "driver");
     const result = areDocumentsApproved(documents, "driver");
-    const userR = await db(`SELECT * FROM ride_users WHERE id=$1 LIMIT 1`, [userId]);
+    const userR = await db(`SELECT * FROM ride_users WHERE id::text=$1::text LIMIT 1`, [userId]);
     return safeJson(res, 200, {
       ok: true,
       approved: result.approved,
@@ -1175,7 +1175,7 @@ app.get("/api/rider/documents/approved", authOptional, async (req, res) => {
     if (!userId) return safeJson(res, 400, { ok: false, message: "userId requerido" });
     const documents = await listUserDocuments(userId, "rider");
     const result = areDocumentsApproved(documents, "rider");
-    const userR = await db(`SELECT * FROM ride_users WHERE id=$1 LIMIT 1`, [userId]);
+    const userR = await db(`SELECT * FROM ride_users WHERE id::text=$1::text LIMIT 1`, [userId]);
     return safeJson(res, 200, {
       ok: true,
       verified: result.approved,
@@ -1213,6 +1213,102 @@ app.get("/api/admin/documents", authRequired, requireAdmin, async (_req, res) =>
   }
 });
 
+
+/* SAFE DOC STATUS ROUTE CAST FIX V2 */
+app.patch("/api/admin/documents/:id/status", authRequired, requireAdmin, async (req, res) => {
+  try {
+    const docId = asText(req.params.id);
+    const status = asText(req.body.status || "pending").toLowerCase();
+    const reason = asText(req.body.reason || "");
+    const allowed = new Set(["pending", "approved", "rejected"]);
+
+    if (!docId) return safeJson(res, 400, { ok: false, message: "Documento requerido" });
+    if (!allowed.has(status)) return safeJson(res, 400, { ok: false, message: "status inválido" });
+
+    const r = await db(
+      `UPDATE ride_documents
+       SET status=$2::text,
+           reason=$3::text,
+           updated_at=NOW()
+       WHERE id::text=$1::text
+       RETURNING *`,
+      [String(docId), status, reason]
+    );
+
+    if (!r.rows.length) {
+      return safeJson(res, 404, { ok: false, message: "Documento no encontrado" });
+    }
+
+    const rawDoc = r.rows[0];
+    const doc = documentToPublic(rawDoc);
+    const userId = String(doc.userId || rawDoc.user_id || "");
+    const role = String(doc.role || rawDoc.role || "driver").toLowerCase();
+
+    const docsR = await db(
+      `SELECT * FROM ride_documents
+       WHERE user_id::text=$1::text
+         AND role::text=$2::text
+       ORDER BY created_at DESC`,
+      [userId, role]
+    );
+
+    const allDocs = docsR.rows.map(documentToPublic);
+    const result = areDocumentsApproved(allDocs, role);
+    const nextUserStatus = result.approved
+      ? "approved"
+      : allDocs.some((d) => String(d.status || "").toLowerCase() === "rejected")
+        ? "rejected"
+        : "pending";
+
+    if (userId) {
+      await db(
+        `UPDATE ride_users
+         SET document_status=$2::text,
+             driver_docs=COALESCE(driver_docs,'{}'::jsonb) || $3::jsonb,
+             updated_at=NOW()
+         WHERE id::text=$1::text`,
+        [
+          userId,
+          nextUserStatus,
+          JSON.stringify({
+            [`${doc.type}Status`]: status,
+            driverDocumentsApproved: role === "driver" ? result.approved : undefined,
+            canAcceptRides: role === "driver" ? result.approved : undefined,
+            riderVerified: role === "rider" ? result.approved : undefined,
+            identityVerified: role === "rider" ? result.approved : undefined,
+          }),
+        ]
+      );
+    }
+
+    emitToUser(userId, "documents:status", {
+      document: doc,
+      status,
+      approved: result.approved,
+      missing: result.missing,
+    });
+
+    io.to("admins").emit("documents:status", {
+      document: doc,
+      status,
+      approved: result.approved,
+      missing: result.missing,
+    });
+
+    return safeJson(res, 200, {
+      ok: true,
+      document: doc,
+      status,
+      approved: result.approved,
+      missing: result.missing,
+      userDocumentStatus: nextUserStatus,
+    });
+  } catch (e) {
+    console.error("[ADMIN_DOCUMENT_STATUS_ERROR]", e);
+    return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
+  }
+});
+
 app.patch("/api/admin/documents/:id/status", authRequired, requireAdmin, async (req, res) => {
   try {
     const status = asText(req.body.status || "pending").toLowerCase();
@@ -1223,7 +1319,7 @@ app.patch("/api/admin/documents/:id/status", authRequired, requireAdmin, async (
     const r = await db(
       `UPDATE ride_documents
        SET status=$2, reason=$3, updated_at=NOW()
-       WHERE id=$1
+       WHERE id::text=$1::text
        RETURNING *`,
       [req.params.id, status, reason]
     );
@@ -1237,7 +1333,7 @@ app.patch("/api/admin/documents/:id/status", authRequired, requireAdmin, async (
        SET document_status=$2,
            driver_docs=COALESCE(driver_docs,'{}'::jsonb) || $3::jsonb,
            updated_at=NOW()
-       WHERE id=$1`,
+       WHERE id::text=$1::text`,
       [
         doc.userId,
         result.approved ? "approved" : (allDocs.some((d) => d.status === "rejected") ? "rejected" : "pending"),
@@ -1269,7 +1365,7 @@ app.post("/api/documents", authRequired, async (req, res) => {
        SET driver_docs=COALESCE(driver_docs,'{}'::jsonb) || $2::jsonb,
            document_status='pending',
            updated_at=NOW()
-       WHERE id=$1
+       WHERE id::text=$1::text
        RETURNING *`,
       [req.user.id, JSON.stringify(docs || {})]
     );
@@ -1291,7 +1387,7 @@ app.get("/api/documents/status", authRequired, async (req, res) => {
 app.patch("/api/admin/users/:id/document-status", authRequired, requireAdmin, async (req, res) => {
   const status = asText(req.body.status || "approved");
   const r = await db(
-    `UPDATE ride_users SET document_status=$2, updated_at=NOW() WHERE id=$1 RETURNING *`,
+    `UPDATE ride_users SET document_status=$2, updated_at=NOW() WHERE id::text=$1::text RETURNING *`,
     [req.params.id, status]
   );
   if (!r.rows.length) return safeJson(res, 404, { ok: false, message: "Usuario no encontrado" });
@@ -1365,7 +1461,7 @@ app.get("/api/admin/sos", authRequired, requireAdmin, async (_req, res) => {
 
 app.patch("/api/admin/sos/:id/close", authRequired, requireAdmin, async (req, res) => {
   const r = await db(
-    `UPDATE ride_sos_alerts SET status='closed', closed_at=NOW() WHERE id=$1 RETURNING *`,
+    `UPDATE ride_sos_alerts SET status='closed', closed_at=NOW() WHERE id::text=$1::text RETURNING *`,
     [req.params.id]
   );
   if (!r.rows.length) return safeJson(res, 404, { ok: false, message: "SOS no encontrado" });
@@ -1445,7 +1541,7 @@ io.use(async (socket, next) => {
     if (!token) return next();
 
     const payload = jwt.verify(String(token), JWT_SECRET || "dev_secret_change_me_now_ptydrive");
-    const r = await db(`SELECT * FROM ride_users WHERE id=$1 LIMIT 1`, [payload.id]);
+    const r = await db(`SELECT * FROM ride_users WHERE id::text=$1::text LIMIT 1`, [payload.id]);
     socket.user = r.rows[0] || null;
     next();
   } catch {
