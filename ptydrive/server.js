@@ -34,6 +34,19 @@ const server = http.createServer(app);
 
 app.use(express.json({ limit: "20mb" }));
 
+/* PTY PERFORMANCE: medir endpoints lentos sin romper respuesta */
+app.use((req, res, next) => {
+  const started = Date.now();
+  res.on("finish", () => {
+    const ms = Date.now() - started;
+    if (ms > Number(process.env.PTY_SLOW_REQUEST_MS || 1500)) {
+      console.warn(`[HTTP SLOW] ${req.method} ${req.originalUrl || req.url} ${res.statusCode} ${ms}ms`);
+    }
+  });
+  next();
+});
+
+
 const documentUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -90,13 +103,31 @@ const io = new SocketIOServer(server, {
 const pool = new Pool({
   connectionString: DATABASE_URL || undefined,
   ssl: DATABASE_URL ? { rejectUnauthorized: false } : undefined,
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
+  max: Number(process.env.PG_POOL_MAX || 20),
+  idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS || 30000),
+  connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS || 5000),
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
+  statement_timeout: Number(process.env.PG_STATEMENT_TIMEOUT_MS || 8000),
+  query_timeout: Number(process.env.PG_QUERY_TIMEOUT_MS || 9000),
 });
 
 async function db(text, params = []) {
-  return pool.query(text, params);
+  const started = Date.now();
+  try {
+    const result = await pool.query(text, params);
+    const ms = Date.now() - started;
+    if (ms > Number(process.env.PTY_SLOW_QUERY_MS || 1200)) {
+      const compact = String(text || "").replace(/\s+/g, " ").trim().slice(0, 220);
+      console.warn(`[DB SLOW] ${ms}ms ${compact}`);
+    }
+    return result;
+  } catch (error) {
+    const ms = Date.now() - started;
+    const compact = String(text || "").replace(/\s+/g, " ").trim().slice(0, 220);
+    console.error(`[DB ERROR] ${ms}ms ${compact}`, error?.message || error);
+    throw error;
+  }
 }
 
 function uuid() {
@@ -986,6 +1017,737 @@ async function ptyGv2ReverseHandler(req, res) {
     return safeJson(res, 500, { ok: false, message: String(e?.message || e) });
   }
 }
+
+
+/* =========================================================
+   PTY DRIVE BACKEND PERFORMANCE HOTFIX V5
+   Rutas críticas registradas ANTES de los handlers antiguos.
+   Objetivo: aceptar / iniciar / cancelar / finalizar en < 1s cuando DB responde.
+========================================================= */
+const PTY_FAST_V5_ACTIVE_STATUSES = [
+  "requested",
+  "searching",
+  "accepted",
+  "assigned",
+  "arrived",
+  "in_progress",
+];
+
+const PTY_FAST_V5_FINAL_STATUSES = [
+  "completed",
+  "cancelled",
+  "expired",
+  "driver_cancelled",
+  "rider_cancelled",
+  "auto_cancelled",
+];
+
+const ptyFastV5Cache = new Map();
+
+function ptyFastV5AuthOptional(req, _res, next) {
+  if (req.user?.id) return next();
+  const token = readBearer(req);
+  if (!token) return next();
+  try {
+    req.user = jwt.verify(token, JWT_SECRET || "dev_secret_change_me_now_ptydrive");
+  } catch {
+    req.user = null;
+  }
+  return next();
+}
+
+function ptyFastV5AuthRequired(req, res, next) {
+  if (req.user?.id) return next();
+  const token = readBearer(req);
+  if (!token) return safeJson(res, 401, { ok: false, message: "Missing Bearer token" });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET || "dev_secret_change_me_now_ptydrive");
+    return next();
+  } catch {
+    return safeJson(res, 401, { ok: false, message: "Invalid token" });
+  }
+}
+
+
+function ptyFastV5CacheGet(key) {
+  const item = ptyFastV5Cache.get(key);
+  if (!item) return null;
+  if (Date.now() > item.expiresAt) {
+    ptyFastV5Cache.delete(key);
+    return null;
+  }
+  return item.value;
+}
+
+function ptyFastV5CacheSet(key, value, ttlMs = 30000) {
+  if (ptyFastV5Cache.size > 500) ptyFastV5Cache.clear();
+  ptyFastV5Cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+  return value;
+}
+
+function ptyFastV5Text(v = "") {
+  return String(v ?? "").trim();
+}
+
+function ptyFastV5Num(v, fallback = null) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function ptyFastV5Point(input = {}) {
+  const raw = input && typeof input === "object" ? input : {};
+  const lat = ptyFastV5Num(raw.lat ?? raw.latitude);
+  const lng = ptyFastV5Num(raw.lng ?? raw.lon ?? raw.longitude);
+  if (lat === null || lng === null) return null;
+  return {
+    ...raw,
+    lat,
+    lng,
+    address: ptyFastV5Text(raw.address || raw.title || raw.short || raw.name || raw.label),
+    title: ptyFastV5Text(raw.title || raw.name || raw.address || raw.label),
+    name: ptyFastV5Text(raw.name || raw.title || raw.address || raw.label),
+  };
+}
+
+function ptyFastV5Snapshot(user = {}, fallbackRole = "") {
+  return {
+    id: user.id || user.userId || "",
+    name: user.name || user.fullName || "",
+    email: user.email || "",
+    phone: user.phone || "",
+    role: user.role || fallbackRole || "",
+    markerIcon: user.marker_icon || user.markerIcon || "📍",
+  };
+}
+
+function ptyFastV5DistanceKm(a, b) {
+  const p1 = ptyFastV5Point(a);
+  const p2 = ptyFastV5Point(b);
+  if (!p1 || !p2) return 0;
+  const R = 6371;
+  const dLat = (p2.lat - p1.lat) * Math.PI / 180;
+  const dLng = (p2.lng - p1.lng) * Math.PI / 180;
+  const s1 = Math.sin(dLat / 2) ** 2;
+  const s2 = Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  return Number((R * 2 * Math.atan2(Math.sqrt(s1 + s2), Math.sqrt(1 - s1 - s2))).toFixed(3));
+}
+
+function ptyFastV5FallbackRoute(origin, destination) {
+  const o = ptyFastV5Point(origin);
+  const d = ptyFastV5Point(destination);
+  const distanceKm = ptyFastV5DistanceKm(o, d);
+  const durationMin = Math.max(1, Math.round((distanceKm / 28) * 60));
+  const coords = o && d ? [
+    { lat: o.lat, lng: o.lng },
+    { lat: d.lat, lng: d.lng },
+  ] : [];
+  return {
+    ok: true,
+    provider: "fast_fallback",
+    fallback: true,
+    coords,
+    routeCoords: coords,
+    coordinates: coords,
+    distanceKm,
+    distanceMeters: Math.round(distanceKm * 1000),
+    durationMin,
+    durationSeconds: durationMin * 60,
+    encodedPolyline: "",
+  };
+}
+
+async function ptyFastV5FetchJson(url, options = {}, timeoutMs = 2200) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    const json = await response.json().catch(() => ({}));
+    return { ok: response.ok, status: response.status, json };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function ptyFastV5GoogleKey() {
+  return String(process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_API_KEY || "").trim();
+}
+
+function ptyFastV5PlaceFromGoogle(result = {}, fallbackName = "") {
+  const loc = result?.geometry?.location || {};
+  const lat = ptyFastV5Num(loc.lat);
+  const lng = ptyFastV5Num(loc.lng);
+  const clean = (value, fallback = "") => {
+    const text = ptyFastV5Text(value || fallback)
+      .replace(/^[A-Z0-9]{3,}\+[A-Z0-9]{2,}\s*,\s*/i, "")
+      .replace(/,\s*Panamá\s*,\s*Panamá$/i, ", Panamá")
+      .replace(/,\s*Panama\s*,\s*Panama$/i, ", Panamá")
+      .replace(/\s+/g, " ")
+      .trim();
+    return text;
+  };
+  const name = clean(result.name || result.formatted_address || fallbackName || "Destino", fallbackName || "Destino");
+  const address = clean(result.formatted_address || result.vicinity || name, name);
+  return {
+    id: result.place_id || `google_${lat}_${lng}`,
+    placeId: result.place_id || "",
+    googlePlaceId: result.place_id || "",
+    source: "google_fast",
+    title: name,
+    short: name,
+    name,
+    placeName: name,
+    exactName: name,
+    destinationName: name,
+    destinationLabel: name,
+    destinationTitle: name,
+    lat,
+    lng,
+    address,
+    fullAddress: address,
+    display_name: address,
+    searchSubtitle: address,
+    subtitle: address,
+    types: result.types || [],
+    businessStatus: result.business_status || "",
+  };
+}
+
+async function ptyFastV5PlacesSearch(req, res) {
+  const q = ptyFastV5Text(req.query.q || req.query.input || req.query.query || "");
+  if (!q) return safeJson(res, 200, { ok: true, provider: "google_fast", places: [], results: [] });
+
+  const cacheKey = `places:${q}:${req.query.lat || ""}:${req.query.lng || ""}:${req.query.limit || ""}`.toLowerCase();
+  const cached = ptyFastV5CacheGet(cacheKey);
+  if (cached) return safeJson(res, 200, cached);
+
+  try {
+    const key = ptyFastV5GoogleKey();
+    if (!key) return safeJson(res, 200, { ok: true, provider: "local_fallback", places: [], results: [] });
+
+    const max = Math.max(1, Math.min(10, Number(req.query.limit || 8)));
+    const url = new URL("https://maps.googleapis.com/maps/api/place/textsearch/json");
+    url.searchParams.set("query", /panam[áa]/i.test(q) ? q : `${q}, Panamá`);
+    url.searchParams.set("language", "es");
+    url.searchParams.set("region", "pa");
+    url.searchParams.set("key", key);
+    const lat = ptyFastV5Num(req.query.lat);
+    const lng = ptyFastV5Num(req.query.lng);
+    if (lat !== null && lng !== null) {
+      url.searchParams.set("location", `${lat},${lng}`);
+      url.searchParams.set("radius", "60000");
+    }
+
+    const { json } = await ptyFastV5FetchJson(url, {}, Number(process.env.PTY_GOOGLE_TIMEOUT_MS || 2200));
+    const places = (Array.isArray(json.results) ? json.results : [])
+      .slice(0, max)
+      .map((r) => ptyFastV5PlaceFromGoogle(r, q))
+      .filter((p) => Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lng)));
+
+    const payload = { ok: true, provider: "google_fast_textsearch", places, results: places };
+    return safeJson(res, 200, ptyFastV5CacheSet(cacheKey, payload, 45000));
+  } catch (error) {
+    return safeJson(res, 200, { ok: true, provider: "fast_timeout_fallback", places: [], results: [], warning: String(error?.message || error) });
+  }
+}
+
+async function ptyFastV5Reverse(req, res) {
+  const lat = ptyFastV5Num(req.query.lat ?? req.body?.lat);
+  const lng = ptyFastV5Num(req.query.lng ?? req.body?.lng);
+  if (lat === null || lng === null) return safeJson(res, 400, { ok: false, message: "lat/lng requeridos" });
+
+  const cacheKey = `reverse:${lat.toFixed(6)},${lng.toFixed(6)}`;
+  const cached = ptyFastV5CacheGet(cacheKey);
+  if (cached) return safeJson(res, 200, cached);
+
+  try {
+    const key = ptyFastV5GoogleKey();
+    if (!key) throw new Error("GOOGLE_MAPS_API_KEY no configurada");
+
+    const url = new URL("https://maps.googleapis.com/maps/api/geocode/json");
+    url.searchParams.set("latlng", `${lat},${lng}`);
+    url.searchParams.set("language", "es");
+    url.searchParams.set("region", "pa");
+    url.searchParams.set("key", key);
+
+    const { json } = await ptyFastV5FetchJson(url, {}, Number(process.env.PTY_GOOGLE_TIMEOUT_MS || 2200));
+    const best = Array.isArray(json.results) ? json.results[0] : null;
+    const place = best ? ptyFastV5PlaceFromGoogle({ ...best, geometry: { location: { lat, lng } } }, "Punto seleccionado") : null;
+    const fallback = {
+      title: "Punto seleccionado",
+      name: "Punto seleccionado",
+      address: `${lat.toFixed(5)}, ${lng.toFixed(5)}`,
+      lat,
+      lng,
+    };
+    const selected = place || fallback;
+    const payload = {
+      ok: true,
+      provider: place ? "google_fast_geocode" : "fast_fallback",
+      label: selected.title || selected.address,
+      title: selected.title || selected.address,
+      name: selected.name || selected.title || selected.address,
+      address: selected.address || selected.title,
+      display_name: selected.address || selected.title,
+      place: { ...selected, lat, lng },
+      results: place ? [place] : [],
+    };
+    return safeJson(res, 200, ptyFastV5CacheSet(cacheKey, payload, 90000));
+  } catch (error) {
+    const payload = {
+      ok: true,
+      provider: "fast_timeout_fallback",
+      label: "Punto seleccionado",
+      title: "Punto seleccionado",
+      name: "Punto seleccionado",
+      address: `${lat.toFixed(5)}, ${lng.toFixed(5)}`,
+      display_name: `${lat.toFixed(5)}, ${lng.toFixed(5)}`,
+      place: { title: "Punto seleccionado", name: "Punto seleccionado", address: `${lat.toFixed(5)}, ${lng.toFixed(5)}`, lat, lng },
+      results: [],
+      warning: String(error?.message || error),
+    };
+    return safeJson(res, 200, ptyFastV5CacheSet(cacheKey, payload, 15000));
+  }
+}
+
+async function ptyFastV5Route(req, res) {
+  const body = req.body || {};
+  const origin = body.origin || body.from || {
+    lat: req.query.originLat || req.query.lat1 || req.query.fromLat,
+    lng: req.query.originLng || req.query.lng1 || req.query.fromLng,
+  };
+  const destination = body.destination || body.to || {
+    lat: req.query.destinationLat || req.query.lat2 || req.query.toLat,
+    lng: req.query.destinationLng || req.query.lng2 || req.query.toLng,
+  };
+  const fallback = ptyFastV5FallbackRoute(origin, destination);
+
+  const cacheKey = `route:${fallback.coordinates.map((p) => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join("|")}`;
+  const cached = ptyFastV5CacheGet(cacheKey);
+  if (cached) return safeJson(res, 200, cached);
+
+  try {
+    const key = ptyFastV5GoogleKey();
+    if (!key || !fallback.coordinates.length) return safeJson(res, 200, fallback);
+
+    const o = ptyFastV5Point(origin);
+    const d = ptyFastV5Point(destination);
+    const { ok, json } = await ptyFastV5FetchJson("https://routes.googleapis.com/directions/v2:computeRoutes", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": key,
+        "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline",
+      },
+      body: JSON.stringify({
+        origin: { location: { latLng: { latitude: o.lat, longitude: o.lng } } },
+        destination: { location: { latLng: { latitude: d.lat, longitude: d.lng } } },
+        travelMode: "DRIVE",
+        routingPreference: "TRAFFIC_AWARE",
+        computeAlternativeRoutes: false,
+        languageCode: "es",
+        units: "METRIC",
+        polylineQuality: "OVERVIEW",
+        polylineEncoding: "ENCODED_POLYLINE",
+      }),
+    }, Number(process.env.PTY_ROUTE_TIMEOUT_MS || 2500));
+
+    if (!ok || !json?.routes?.[0]) return safeJson(res, 200, fallback);
+    const route = json.routes[0];
+    const encodedPolyline = route.polyline?.encodedPolyline || "";
+    const distanceMeters = Number(route.distanceMeters || fallback.distanceMeters || 0);
+    const seconds = Number(String(route.duration || "0s").replace(/s$/, "") || fallback.durationSeconds || 0);
+    const payload = {
+      ...fallback,
+      provider: "google_routes_fast",
+      fallback: false,
+      encodedPolyline,
+      distanceMeters,
+      distanceKm: Number((distanceMeters / 1000).toFixed(3)),
+      durationSeconds: seconds,
+      durationMin: Math.max(1, Math.round(seconds / 60)),
+    };
+    return safeJson(res, 200, ptyFastV5CacheSet(cacheKey, payload, 60000));
+  } catch (error) {
+    return safeJson(res, 200, { ...fallback, warning: String(error?.message || error) });
+  }
+}
+
+function ptyFastV5EmitRide(row, event = "ride:update") {
+  const ride = normalizeRide(row);
+  try {
+    emitRide(row, event);
+    io.to(`ride:${ride.id}`).emit(event, ride);
+    io.to(`ride:${ride.id}`).emit("ride:update", ride);
+    if (event !== "ride:update") {
+      io.to("drivers").emit("ride:update", ride);
+      if (ride.riderId) emitToUser(ride.riderId, "ride:update", ride);
+      if (ride.driverId) emitToUser(ride.driverId, "ride:update", ride);
+    }
+  } catch (error) {
+    console.warn("[PTY_FAST_V5_EMIT_WARN]", error?.message || error);
+  }
+  return ride;
+}
+
+async function ptyFastV5CreateRide(req, res) {
+  try {
+    const user = req.user || {};
+    if (!user?.id) return safeJson(res, 401, { ok: false, message: "Sesión requerida" });
+
+    const pickup = normalizePoint(req.body.pickup || req.body.origin || req.body.from || {});
+    const destination = normalizePoint(req.body.destination || req.body.destino || req.body.to || {});
+    if (pickup.lat == null || pickup.lng == null || destination.lat == null || destination.lng == null) {
+      return safeJson(res, 400, { ok: false, message: "pickup y destination con lat/lng son requeridos" });
+    }
+
+    const active = await db(
+      `SELECT id, status
+         FROM ride_rides
+        WHERE rider_id::text=$1::text
+          AND status = ANY($2::text[])
+        ORDER BY updated_at DESC
+        LIMIT 1`,
+      [user.id, PTY_FAST_V5_ACTIVE_STATUSES]
+    );
+    if (active.rows.length) {
+      return safeJson(res, 409, {
+        ok: false,
+        message: "Ya tienes una carrera activa. Cancélala o finalízala antes de solicitar otra.",
+        activeRideId: active.rows[0].id,
+      });
+    }
+
+    const distanceKm = Math.max(0, asNum(req.body.distanceKm ?? req.body.routeDistanceKm, ptyFastV5DistanceKm(pickup, destination)));
+    const durationMin = Math.max(1, asNum(req.body.durationMin, Math.round((distanceKm / 28) * 60) || 1));
+    const fare = Math.max(2.0, asNum(req.body.fare ?? req.body.price ?? req.body.total, 2));
+    const route = req.body.route || {
+      coordinates: [
+        { lat: pickup.lat, lng: pickup.lng },
+        { lat: destination.lat, lng: destination.lng },
+      ],
+      distanceKm,
+      durationMin,
+      provider: "fast_create",
+    };
+    const expiresMinutes = Math.max(1, Number(RIDE_EXPIRE_MINUTES || 10));
+
+    const r = await db(
+      `INSERT INTO ride_rides(
+        rider_id, status, pickup, destination, route, fare, distance_km, duration_min,
+        payment_method, rider_snapshot, expires_at, updated_at
+       )
+       VALUES(
+        $1::uuid,'requested',$2::jsonb,$3::jsonb,$4::jsonb,$5,$6,$7,$8,$9::jsonb,
+        NOW() + ($10::text || ' minutes')::interval, NOW()
+       )
+       RETURNING *`,
+      [
+        user.id,
+        JSON.stringify(pickup),
+        JSON.stringify(destination),
+        JSON.stringify(route || {}),
+        fare,
+        distanceKm,
+        durationMin,
+        asText(req.body.paymentMethod || req.body.payment || "cash"),
+        JSON.stringify(getSnapshotUser(user)),
+        String(expiresMinutes),
+      ]
+    );
+
+    const ride = ptyFastV5EmitRide(r.rows[0], "ride:new");
+    io.to("drivers").emit("ride:available", ride);
+
+    // Auditoría no debe bloquear al usuario.
+    db(
+      `INSERT INTO ride_events(ride_id, user_id, type, payload)
+       VALUES($1,$2,'ride_requested',$3::jsonb)`,
+      [r.rows[0].id, user.id, JSON.stringify({ fare, distanceKm, fast: true })]
+    ).catch((e) => console.warn("[PTY_FAST_V5_EVENT_WARN]", e?.message || e));
+
+    return safeJson(res, 201, { ok: true, ride, fast: true });
+  } catch (error) {
+    return safeJson(res, 500, { ok: false, message: String(error?.message || error) });
+  }
+}
+
+async function ptyFastV5ListRides(req, res) {
+  try {
+    const status = asText(req.query.status || "");
+    const role = asText(req.query.role || req.user?.role || "");
+    const userId = asText(req.user?.id || req.query.userId || req.query.riderId || req.query.driverId || "");
+    let r;
+
+    if (status === "open" || status === "pending" || role === "driver") {
+      r = await db(
+        `SELECT * FROM ride_rides
+          WHERE status IN ('requested','searching')
+            AND expires_at > NOW()
+          ORDER BY created_at DESC
+          LIMIT 80`
+      );
+    } else if (role === "rider" && userId) {
+      r = await db(
+        `SELECT * FROM ride_rides
+          WHERE rider_id::text=$1::text
+          ORDER BY updated_at DESC
+          LIMIT 80`,
+        [userId]
+      );
+    } else if (role === "admin" || req.user?.role === "admin") {
+      r = await db(`SELECT * FROM ride_rides ORDER BY updated_at DESC LIMIT 150`);
+    } else if (userId) {
+      r = await db(
+        `SELECT * FROM ride_rides
+          WHERE rider_id::text=$1::text OR driver_id::text=$1::text
+          ORDER BY updated_at DESC
+          LIMIT 80`,
+        [userId]
+      );
+    } else {
+      r = { rows: [] };
+    }
+
+    return safeJson(res, 200, { ok: true, rides: r.rows.map(normalizeRide), fast: true });
+  } catch (error) {
+    return safeJson(res, 500, { ok: false, message: String(error?.message || error), rides: [] });
+  }
+}
+
+async function ptyFastV5ActiveRide(req, res) {
+  try {
+    const userId = asText(req.user?.id || req.query.userId || req.query.driverId || req.query.riderId || "");
+    if (!userId) return safeJson(res, 200, { ok: true, ride: null, fast: true });
+    const r = await db(
+      `SELECT *
+         FROM ride_rides
+        WHERE (rider_id::text=$1::text OR driver_id::text=$1::text)
+          AND status = ANY($2::text[])
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC
+        LIMIT 1`,
+      [userId, PTY_FAST_V5_ACTIVE_STATUSES]
+    );
+    return safeJson(res, 200, { ok: true, ride: r.rows[0] ? normalizeRide(r.rows[0]) : null, fast: true });
+  } catch (error) {
+    return safeJson(res, 500, { ok: false, message: String(error?.message || error), ride: null });
+  }
+}
+
+async function ptyFastV5AcceptRide(req, res) {
+  try {
+    const rideId = asText(req.params.id || req.params.rideId || req.body.rideId);
+    const driverId = asText(req.user?.id || req.body.driverId || req.body.userId || req.body.driver?.id || req.body.driver?.driverId || "");
+    if (!rideId || !driverId) return safeJson(res, 400, { ok: false, message: "rideId/driverId requerido" });
+    if (!isUuid(rideId) || !isUuid(driverId)) return safeJson(res, 400, { ok: false, message: "ID inválido" });
+
+    const driverSnapshot = {
+      ...ptyFastV5Snapshot(req.user || {}, "driver"),
+      ...(req.body.driver && typeof req.body.driver === "object" ? req.body.driver : {}),
+      id: driverId,
+      role: "driver",
+    };
+
+    const r = await db(
+      `UPDATE ride_rides
+          SET driver_id=$2::uuid,
+              status='accepted',
+              accepted_at=COALESCE(accepted_at, NOW()),
+              driver_snapshot=CASE
+                WHEN driver_snapshot IS NULL OR driver_snapshot='{}'::jsonb THEN $3::jsonb
+                ELSE driver_snapshot || $3::jsonb
+              END,
+              updated_at=NOW()
+        WHERE id::text=$1::text
+          AND status = ANY($4::text[])
+          AND (driver_id IS NULL OR driver_id::text=$2::text)
+        RETURNING *`,
+      [rideId, driverId, JSON.stringify(driverSnapshot), ["requested", "searching", "accepted", "assigned"]]
+    );
+
+    if (!r.rows.length) {
+      const existing = await db(`SELECT * FROM ride_rides WHERE id::text=$1::text LIMIT 1`, [rideId]).catch(() => ({ rows: [] }));
+      return safeJson(res, 409, {
+        ok: false,
+        message: "La carrera ya no está disponible",
+        ride: existing.rows[0] ? normalizeRide(existing.rows[0]) : null,
+      });
+    }
+
+    const ride = ptyFastV5EmitRide(r.rows[0], "ride:accepted");
+    ptyFastV5EmitRide(r.rows[0], "ride.accepted");
+    return safeJson(res, 200, { ok: true, ride, status: "accepted", fast: true });
+  } catch (error) {
+    return safeJson(res, 500, { ok: false, message: String(error?.message || error) });
+  }
+}
+
+function ptyFastV5StatusFromAction(action, body = {}) {
+  const raw = asText(body.status || body.nextStatus || action).toLowerCase();
+  if (["start", "started", "iniciar", "in_progress", "progress"].includes(raw)) return "in_progress";
+  if (["arrive", "arrived", "llegar", "llegue"].includes(raw)) return "arrived";
+  if (["complete", "completed", "finish", "finished", "finalizar", "finalizada"].includes(raw)) return "completed";
+  if (["cancel", "cancelled", "canceled", "cancelar"].includes(raw)) {
+    const role = asText(body.role || "").toLowerCase();
+    if (role === "driver") return "driver_cancelled";
+    if (role === "rider") return "rider_cancelled";
+    return "cancelled";
+  }
+  if (["accepted", "assigned"].includes(raw)) return raw;
+  return raw || "in_progress";
+}
+
+function ptyFastV5EventFromStatus(status) {
+  if (status === "in_progress") return "ride:started";
+  if (status === "arrived") return "ride:arrived";
+  if (status === "completed") return "ride:completed";
+  if (status.includes("cancel")) return "ride:cancelled";
+  if (status === "accepted" || status === "assigned") return "ride:accepted";
+  return "ride:update";
+}
+
+async function ptyFastV5PatchStatus(req, res, forcedAction = "") {
+  try {
+    const rideId = asText(req.params.id || req.params.rideId || req.body.rideId);
+    const userId = asText(req.user?.id || req.body.userId || req.body.driverId || req.body.riderId || "");
+    const status = ptyFastV5StatusFromAction(forcedAction, req.body || {});
+    if (!rideId || !isUuid(rideId)) return safeJson(res, 400, { ok: false, message: "rideId inválido" });
+    if (!PTY_FAST_V5_ACTIVE_STATUSES.includes(status) && !PTY_FAST_V5_FINAL_STATUSES.includes(status)) {
+      return safeJson(res, 400, { ok: false, message: `status inválido: ${status}` });
+    }
+
+    const stampSql =
+      status === "in_progress" ? ", started_at=COALESCE(started_at,NOW())" :
+      status === "completed" ? ", completed_at=COALESCE(completed_at,NOW())" :
+      status.includes("cancel") ? ", cancelled_at=COALESCE(cancelled_at,NOW()), cancel_reason=COALESCE(NULLIF($4,''), cancel_reason)" :
+      "";
+
+    const r = await db(
+      `UPDATE ride_rides
+          SET status=$2,
+              updated_at=NOW()
+              ${stampSql}
+        WHERE id::text=$1::text
+          AND ($3::text='' OR rider_id::text=$3::text OR driver_id::text=$3::text OR $5::text='admin')
+        RETURNING *`,
+      [
+        rideId,
+        status,
+        userId,
+        asText(req.body.reason || req.body.cancelReason || ""),
+        asText(req.user?.role || req.body.role || ""),
+      ]
+    );
+
+    if (!r.rows.length) {
+      return safeJson(res, 404, { ok: false, message: "Carrera no encontrada o no autorizada" });
+    }
+
+    const event = ptyFastV5EventFromStatus(status);
+    const ride = ptyFastV5EmitRide(r.rows[0], event);
+    db(
+      `INSERT INTO ride_events(ride_id, user_id, type, payload)
+       VALUES($1, NULLIF($2,'')::uuid, $3, $4::jsonb)`,
+      [rideId, userId, event.replace(":", "_"), JSON.stringify({ status, fast: true })]
+    ).catch(() => null);
+
+    return safeJson(res, 200, { ok: true, ride, status, fast: true });
+  } catch (error) {
+    return safeJson(res, 500, { ok: false, message: String(error?.message || error) });
+  }
+}
+
+async function ptyFastV5Location(req, res, role) {
+  try {
+    const userId = asText(req.user?.id || req.body.userId || req.body.driverId || req.body.riderId || req.query.userId || "");
+    const point = ptyFastV5Point(req.body.location || req.body.currentLocation || req.body || req.query);
+    if (!userId || !point) return safeJson(res, 400, { ok: false, message: "userId/location requerido" });
+
+    const heading = ptyFastV5Num(req.body.heading ?? req.query.heading);
+    const speed = ptyFastV5Num(req.body.speed ?? req.query.speed);
+
+    await db(
+      `INSERT INTO ride_locations(user_id, role, lat, lng, heading, speed, updated_at)
+       VALUES($1::uuid,$2,$3,$4,$5,$6,NOW())
+       ON CONFLICT(user_id, role) DO UPDATE SET
+         lat=EXCLUDED.lat,
+         lng=EXCLUDED.lng,
+         heading=EXCLUDED.heading,
+         speed=EXCLUDED.speed,
+         updated_at=NOW()`,
+      [userId, role, point.lat, point.lng, heading, speed]
+    );
+
+    const payload = { ok: true, userId, role, lat: point.lat, lng: point.lng, heading, speed, updatedAt: nowIso(), fast: true };
+    io.emit("location:update", payload);
+    return safeJson(res, 200, payload);
+  } catch (error) {
+    return safeJson(res, 500, { ok: false, message: String(error?.message || error) });
+  }
+}
+
+app.get("/api/perf/ping", async (_req, res) => {
+  const started = Date.now();
+  let dbMs = null;
+  let dbOk = false;
+  try {
+    const t = Date.now();
+    await db("SELECT 1");
+    dbMs = Date.now() - t;
+    dbOk = true;
+  } catch {}
+  return safeJson(res, 200, {
+    ok: true,
+    pong: true,
+    fastPatch: "v5",
+    db: dbOk ? "on" : "off",
+    dbMs,
+    totalMs: Date.now() - started,
+    time: nowIso(),
+  });
+});
+
+// Lugares y rutas rápidos: evitan bloquear la app por Google/Routes.
+app.get("/api/places/search", ptyFastV5AuthOptional, ptyFastV5PlacesSearch);
+app.get("/api/places/autocomplete", ptyFastV5AuthOptional, ptyFastV5PlacesSearch);
+app.get("/api/google/places/autocomplete", ptyFastV5AuthOptional, ptyFastV5PlacesSearch);
+app.get("/api/places/reverse", ptyFastV5AuthOptional, ptyFastV5Reverse);
+app.get("/api/geocode/reverse", ptyFastV5AuthOptional, ptyFastV5Reverse);
+app.get("/api/google/geocode/reverse", ptyFastV5AuthOptional, ptyFastV5Reverse);
+app.get("/api/routes/drive", ptyFastV5AuthOptional, ptyFastV5Route);
+app.post("/api/routes/drive", ptyFastV5AuthOptional, ptyFastV5Route);
+app.get("/api/google/routes/drive", ptyFastV5AuthOptional, ptyFastV5Route);
+app.post("/api/google/routes/drive", ptyFastV5AuthOptional, ptyFastV5Route);
+app.get("/api/directions/drive", ptyFastV5AuthOptional, ptyFastV5Route);
+app.post("/api/directions/drive", ptyFastV5AuthOptional, ptyFastV5Route);
+
+// Rutas críticas de carrera.
+app.post("/api/rides", ptyFastV5AuthRequired, ptyFastV5CreateRide);
+app.get("/api/rides", ptyFastV5AuthOptional, ptyFastV5ListRides);
+app.get("/api/rides/active", ptyFastV5AuthOptional, ptyFastV5ActiveRide);
+app.patch("/api/rides/:id/accept", ptyFastV5AuthOptional, ptyFastV5AcceptRide);
+app.post("/api/rides/:id/accept", ptyFastV5AuthOptional, ptyFastV5AcceptRide);
+app.patch("/api/carrera-lite/:id/accept", ptyFastV5AuthOptional, ptyFastV5AcceptRide);
+app.patch("/api/carreras/:id/accept", ptyFastV5AuthOptional, ptyFastV5AcceptRide);
+app.patch("/api/rides/:id/start", ptyFastV5AuthOptional, (req, res) => ptyFastV5PatchStatus(req, res, "start"));
+app.post("/api/rides/:id/start", ptyFastV5AuthOptional, (req, res) => ptyFastV5PatchStatus(req, res, "start"));
+app.patch("/api/rides/:id/arrive", ptyFastV5AuthOptional, (req, res) => ptyFastV5PatchStatus(req, res, "arrive"));
+app.post("/api/rides/:id/arrive", ptyFastV5AuthOptional, (req, res) => ptyFastV5PatchStatus(req, res, "arrive"));
+app.patch("/api/rides/:id/complete", ptyFastV5AuthOptional, (req, res) => ptyFastV5PatchStatus(req, res, "complete"));
+app.post("/api/rides/:id/complete", ptyFastV5AuthOptional, (req, res) => ptyFastV5PatchStatus(req, res, "complete"));
+app.patch("/api/rides/:id/cancel", ptyFastV5AuthOptional, (req, res) => ptyFastV5PatchStatus(req, res, "cancel"));
+app.post("/api/rides/:id/cancel", ptyFastV5AuthOptional, (req, res) => ptyFastV5PatchStatus(req, res, "cancel"));
+app.patch("/api/rides/:id/status", ptyFastV5AuthOptional, (req, res) => ptyFastV5PatchStatus(req, res, ""));
+app.post("/api/rides/:id/status", ptyFastV5AuthOptional, (req, res) => ptyFastV5PatchStatus(req, res, ""));
+app.patch("/api/rides/:id/fast-status", ptyFastV5AuthOptional, (req, res) => ptyFastV5PatchStatus(req, res, ""));
+app.post("/api/rides/:id/fast-status", ptyFastV5AuthOptional, (req, res) => ptyFastV5PatchStatus(req, res, ""));
+
+// Ubicación rápida para evitar lag del mapa.
+app.post("/api/driver/location", ptyFastV5AuthOptional, (req, res) => ptyFastV5Location(req, res, "driver"));
+app.patch("/api/driver/location", ptyFastV5AuthOptional, (req, res) => ptyFastV5Location(req, res, "driver"));
+app.post("/api/rider/location", ptyFastV5AuthOptional, (req, res) => ptyFastV5Location(req, res, "rider"));
+app.patch("/api/rider/location", ptyFastV5AuthOptional, (req, res) => ptyFastV5Location(req, res, "rider"));
+
+/* FIN PTY DRIVE BACKEND PERFORMANCE HOTFIX V5 */
 
 app.get("/api/places/search", authOptional, ptyGv2SearchHandler);
 app.get("/api/places/autocomplete", authOptional, ptyGv2SearchHandler);
