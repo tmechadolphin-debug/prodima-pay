@@ -1676,10 +1676,12 @@ async function ptyV9AcceptRide(req, res) {
     const rideId = ptyV9Text(req.params.id || req.params.rideId);
     const driverId = ptyV9Text(req.user?.id || req.body.driverId || req.body.driver?.id || req.body.driver?.driverId || "");
     if (!rideId || !driverId) return safeJson(res, 400, { ok: false, message: "rideId/driverId requerido" });
+    if (typeof isUuid === "function" && !isUuid(driverId)) return safeJson(res, 400, { ok: false, message: "driverId inválido" });
+    if (typeof isUuid === "function" && !isUuid(rideId)) return safeJson(res, 400, { ok: false, message: "rideId inválido" });
 
     const upd = await db(
       `UPDATE ride_rides
-          SET driver_id=$2,
+          SET driver_id=$2::uuid,
               status='accepted',
               accepted_at=COALESCE(accepted_at, NOW()),
               updated_at=NOW()
@@ -2071,11 +2073,13 @@ app.patch("/api/rides/:id/accept", ptyV8AuthOptional, async (req, res) => {
     const rideId = ptyV8Txt(req.params.id);
     const driverId = ptyV8Txt(req.user?.id || req.body.driverId || req.body.driver?.id || req.body.driver?.driverId || "");
     if (!rideId || !driverId) return ptyV8SafeJson(res, 400, { ok: false, message: "rideId/driverId requerido" });
+    if (typeof isUuid === "function" && !isUuid(driverId)) return ptyV8SafeJson(res, 400, { ok: false, message: "driverId inválido" });
+    if (typeof isUuid === "function" && !isUuid(rideId)) return ptyV8SafeJson(res, 400, { ok: false, message: "rideId inválido" });
 
     const upd = await db(
       `UPDATE ride_rides
-       SET driver_id=$2,
-           status='accepted',
+       SET driver_id=$2::uuid,
+              status='accepted',
            updated_at=NOW()
        WHERE id::text=$1::text
          AND LOWER(COALESCE(status,'')) NOT IN ('completed','cancelled','expired','driver_cancelled','rider_cancelled')
@@ -3003,8 +3007,8 @@ app.patch("/api/rides/:id/accept", authOptional, async (req, res) => {
     try {
       updated = await db(
         `UPDATE ride_rides
-         SET driver_id=$2,
-             status='accepted',
+         SET driver_id=$2::uuid,
+              status='accepted',
              updated_at=NOW()
          WHERE id::text=$1::text
          RETURNING *`,
@@ -3013,8 +3017,8 @@ app.patch("/api/rides/:id/accept", authOptional, async (req, res) => {
     } catch {
       updated = await db(
         `UPDATE ride_rides
-         SET driver_id=$2,
-             status='accepted'
+         SET driver_id=$2::uuid,
+              status='accepted'
          WHERE id::text=$1::text
          RETURNING *`,
         [rideId, driverId]
