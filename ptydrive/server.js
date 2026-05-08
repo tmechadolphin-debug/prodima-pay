@@ -438,6 +438,9 @@ async function ensureDb() {
   await db(`CREATE INDEX IF NOT EXISTS idx_ride_rides_rider ON ride_rides(rider_id);`);
   await db(`CREATE INDEX IF NOT EXISTS idx_ride_rides_driver ON ride_rides(driver_id);`);
   await db(`CREATE INDEX IF NOT EXISTS idx_ride_rides_expires ON ride_rides(expires_at);`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_ride_rides_rider_status_updated ON ride_rides(rider_id, status, updated_at DESC);`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_ride_rides_driver_status_updated ON ride_rides(driver_id, status, updated_at DESC);`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_ride_rides_open_fast ON ride_rides(status, expires_at, created_at DESC);`);
   await db(`CREATE INDEX IF NOT EXISTS idx_ride_locations_role ON ride_locations(role, updated_at);`);
   await db(`CREATE INDEX IF NOT EXISTS idx_ride_sos_status ON ride_sos_alerts(status, created_at);`);
   await db(`CREATE INDEX IF NOT EXISTS idx_ride_chat_ride ON ride_chat_messages(ride_id, created_at);`);
@@ -1020,7 +1023,7 @@ async function ptyGv2ReverseHandler(req, res) {
 
 
 /* =========================================================
-   PTY DRIVE BACKEND PERFORMANCE HOTFIX V5
+   PTY DRIVE BACKEND PERFORMANCE HOTFIX V6
    Rutas críticas registradas ANTES de los handlers antiguos.
    Objetivo: aceptar / iniciar / cancelar / finalizar en < 1s cuando DB responde.
 ========================================================= */
@@ -1540,11 +1543,30 @@ async function ptyFastV5AcceptRide(req, res) {
     if (!rideId || !driverId) return safeJson(res, 400, { ok: false, message: "rideId/driverId requerido" });
     if (!isUuid(rideId) || !isUuid(driverId)) return safeJson(res, 400, { ok: false, message: "ID inválido" });
 
+    const bodyDriver = req.body.driver && typeof req.body.driver === "object" ? req.body.driver : {};
+    const vehicle = bodyDriver.vehicle || bodyDriver.driverVehicle || req.body.vehicle || {};
     const driverSnapshot = {
-      ...ptyFastV5Snapshot(req.user || {}, "driver"),
-      ...(req.body.driver && typeof req.body.driver === "object" ? req.body.driver : {}),
       id: driverId,
+      driverId,
+      userId: driverId,
       role: "driver",
+      name: ptyFastV5Text(req.user?.name || bodyDriver.name || bodyDriver.fullName || req.body.driverName || "Conductor"),
+      fullName: ptyFastV5Text(req.user?.name || bodyDriver.fullName || bodyDriver.name || req.body.driverName || "Conductor"),
+      email: ptyFastV5Text(req.user?.email || bodyDriver.email || ""),
+      phone: ptyFastV5Text(req.user?.phone || bodyDriver.phone || ""),
+      markerIcon: bodyDriver.markerIcon || bodyDriver.marker_icon || "📍",
+      lat: ptyFastV5Num(bodyDriver.lat ?? bodyDriver.currentLocation?.lat),
+      lng: ptyFastV5Num(bodyDriver.lng ?? bodyDriver.currentLocation?.lng),
+      currentLocation: bodyDriver.currentLocation || null,
+      vehicle,
+      driverVehicle: vehicle,
+      plate: ptyFastV5Text(bodyDriver.plate || vehicle.plate || vehicle.placa || ""),
+      rating: ptyFastV5Num(bodyDriver.rating, 5),
+      reviewsCount: ptyFastV5Num(bodyDriver.reviewsCount, 0),
+      documentStatus: bodyDriver.documentStatus || bodyDriver.verificationStatus || "approved",
+      verificationStatus: bodyDriver.verificationStatus || bodyDriver.documentStatus || "approved",
+      driverDocumentsApproved: bodyDriver.driverDocumentsApproved !== false,
+      canAcceptRides: bodyDriver.canAcceptRides !== false,
     };
 
     const r = await db(
@@ -1574,7 +1596,11 @@ async function ptyFastV5AcceptRide(req, res) {
     }
 
     const ride = ptyFastV5EmitRide(r.rows[0], "ride:accepted");
-    ptyFastV5EmitRide(r.rows[0], "ride.accepted");
+    try {
+      io.to(`ride:${ride.id}`).emit("ride.accepted", ride);
+      if (ride.riderId) emitToUser(ride.riderId, "ride.accepted", ride);
+      if (ride.driverId) emitToUser(ride.driverId, "ride.accepted", ride);
+    } catch {}
     return safeJson(res, 200, { ok: true, ride, status: "accepted", fast: true });
   } catch (error) {
     return safeJson(res, 500, { ok: false, message: String(error?.message || error) });
@@ -1618,13 +1644,17 @@ async function ptyFastV5PatchStatus(req, res, forcedAction = "") {
     const stampSql =
       status === "in_progress" ? ", started_at=COALESCE(started_at,NOW())" :
       status === "completed" ? ", completed_at=COALESCE(completed_at,NOW())" :
-      status.includes("cancel") ? ", cancelled_at=COALESCE(cancelled_at,NOW()), cancel_reason=COALESCE(NULLIF($4,''), cancel_reason)" :
+      status.includes("cancel") ? ", cancelled_at=COALESCE(cancelled_at,NOW())" :
       "";
+
+    const reason = asText(req.body.reason || req.body.cancelReason || "");
+    const userRole = asText(req.user?.role || req.body.role || "");
 
     const r = await db(
       `UPDATE ride_rides
-          SET status=$2,
-              updated_at=NOW()
+          SET status=$2::text,
+              updated_at=NOW(),
+              cancel_reason=CASE WHEN $4::text<>'' THEN $4::text ELSE cancel_reason END
               ${stampSql}
         WHERE id::text=$1::text
           AND ($3::text='' OR rider_id::text=$3::text OR driver_id::text=$3::text OR $5::text='admin')
@@ -1633,8 +1663,8 @@ async function ptyFastV5PatchStatus(req, res, forcedAction = "") {
         rideId,
         status,
         userId,
-        asText(req.body.reason || req.body.cancelReason || ""),
-        asText(req.user?.role || req.body.role || ""),
+        reason,
+        userRole,
       ]
     );
 
@@ -1698,7 +1728,7 @@ app.get("/api/perf/ping", async (_req, res) => {
   return safeJson(res, 200, {
     ok: true,
     pong: true,
-    fastPatch: "v5",
+    fastPatch: "v6",
     db: dbOk ? "on" : "off",
     dbMs,
     totalMs: Date.now() - started,
@@ -1747,7 +1777,7 @@ app.patch("/api/driver/location", ptyFastV5AuthOptional, (req, res) => ptyFastV5
 app.post("/api/rider/location", ptyFastV5AuthOptional, (req, res) => ptyFastV5Location(req, res, "rider"));
 app.patch("/api/rider/location", ptyFastV5AuthOptional, (req, res) => ptyFastV5Location(req, res, "rider"));
 
-/* FIN PTY DRIVE BACKEND PERFORMANCE HOTFIX V5 */
+/* FIN PTY DRIVE BACKEND PERFORMANCE HOTFIX V6 */
 
 app.get("/api/places/search", authOptional, ptyGv2SearchHandler);
 app.get("/api/places/autocomplete", authOptional, ptyGv2SearchHandler);
