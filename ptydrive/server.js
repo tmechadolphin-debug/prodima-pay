@@ -1375,19 +1375,147 @@ async function ptyFastV5Route(req, res) {
   }
 }
 
-function ptyFastV5EmitRide(row, event = "ride:update") {
+function ptyFastV7CompactPoint(p = {}, fallback = "") {
+  if (!p || typeof p !== "object") return {};
+  const lat = ptyFastV5Num(p.lat ?? p.latitude);
+  const lng = ptyFastV5Num(p.lng ?? p.lon ?? p.longitude);
+  const label = ptyFastV5Text(
+    p.address || p.title || p.name || p.short || p.label || p.destinationLabel || fallback
+  );
+  const out = {
+    ...(lat !== null ? { lat } : {}),
+    ...(lng !== null ? { lng } : {}),
+    address: label,
+    title: label,
+    name: label,
+    short: label,
+    label,
+    displayName: label,
+    fullAddress: ptyFastV5Text(p.fullAddress || p.full_address || label),
+  };
+  if (p.id) out.id = String(p.id);
+  if (p.placeId || p.googlePlaceId) out.placeId = String(p.placeId || p.googlePlaceId);
+  return out;
+}
+
+function ptyFastV7CompactVehicle(v = {}) {
+  if (!v || typeof v !== "object") return {};
+  return {
+    plate: ptyFastV5Text(v.plate || v.placa || ""),
+    brand: ptyFastV5Text(v.brand || v.marca || ""),
+    model: ptyFastV5Text(v.model || v.modelo || ""),
+    color: ptyFastV5Text(v.color || ""),
+    type: ptyFastV5Text(v.type || v.tipo || ""),
+  };
+}
+
+function ptyFastV7CompactUser(u = {}, fallbackRole = "") {
+  if (!u || typeof u !== "object") return {};
+  const id = ptyFastV5Text(u.id || u.userId || u.driverId || u.riderId || u._id || "");
+  const role = ptyFastV5Text(u.role || fallbackRole || "");
+  const vehicle = ptyFastV7CompactVehicle(u.vehicle || u.driverVehicle || {});
+  const lat = ptyFastV5Num(u.lat ?? u.currentLocation?.lat);
+  const lng = ptyFastV5Num(u.lng ?? u.currentLocation?.lng);
+  return {
+    id,
+    userId: id,
+    ...(role === "driver" ? { driverId: id } : {}),
+    ...(role === "rider" ? { riderId: id } : {}),
+    role,
+    name: ptyFastV5Text(u.name || u.fullName || u.email || (role === "driver" ? "Conductor" : "Usuario")),
+    fullName: ptyFastV5Text(u.fullName || u.name || ""),
+    email: ptyFastV5Text(u.email || ""),
+    phone: ptyFastV5Text(u.phone || ""),
+    markerIcon: u.markerIcon || u.marker_icon || "📍",
+    ...(lat !== null ? { lat } : {}),
+    ...(lng !== null ? { lng } : {}),
+    vehicle,
+    driverVehicle: vehicle,
+    plate: ptyFastV5Text(u.plate || vehicle.plate || ""),
+    rating: ptyFastV5Num(u.rating, 5),
+    reviewsCount: ptyFastV5Num(u.reviewsCount, 0),
+    documentStatus: ptyFastV5Text(u.documentStatus || u.document_status || ""),
+    verificationStatus: ptyFastV5Text(u.verificationStatus || u.documentStatus || u.document_status || ""),
+    driverDocumentsApproved: u.driverDocumentsApproved === undefined ? undefined : Boolean(u.driverDocumentsApproved),
+    canAcceptRides: u.canAcceptRides === undefined ? undefined : Boolean(u.canAcceptRides),
+  };
+}
+
+function ptyFastV7CompactRoute(route = {}, fallbackDistanceKm = 0, fallbackDurationMin = 0) {
+  if (!route || typeof route !== "object") route = {};
+  const coords = Array.isArray(route.coords) ? route.coords : (Array.isArray(route.coordinates) ? route.coordinates : []);
+  const safeCoords = coords
+    .map((p) => ptyFastV5Point(p))
+    .filter(Boolean)
+    .slice(0, 250);
+  return {
+    ...(safeCoords.length ? { coords: safeCoords, coordinates: safeCoords } : {}),
+    ...(route.polyline ? { polyline: String(route.polyline) } : {}),
+    ...(route.encodedPolyline ? { encodedPolyline: String(route.encodedPolyline) } : {}),
+    distanceKm: ptyFastV5Num(route.distanceKm ?? route.routeDistanceKm, fallbackDistanceKm) || 0,
+    durationMin: ptyFastV5Num(route.durationMin, fallbackDurationMin) || 0,
+    provider: ptyFastV5Text(route.provider || "fast_v7"),
+  };
+}
+
+function ptyFastV7CompactRide(row = {}) {
   const ride = normalizeRide(row);
+  const pickup = ptyFastV7CompactPoint(ride.pickup || row.pickup || {}, "Recogida");
+  const destination = ptyFastV7CompactPoint(ride.destination || row.destination || {}, "Destino");
+  const rider = ptyFastV7CompactUser(ride.rider || ride.riderSnapshot || row.rider_snapshot || {}, "rider");
+  const driver = ptyFastV7CompactUser(ride.driver || ride.driverSnapshot || row.driver_snapshot || {}, "driver");
+  return {
+    id: ride.id,
+    riderId: ride.riderId,
+    driverId: ride.driverId,
+    status: ride.status,
+    pickup,
+    destination,
+    pickupAddress: pickup.address || "Recogida",
+    destinationAddress: destination.address || "Destino",
+    route: ptyFastV7CompactRoute(ride.route || row.route || {}, ride.distanceKm, ride.durationMin),
+    fare: Number(ride.fare || 0),
+    price: Number(ride.price || ride.fare || 0),
+    total: Number(ride.total || ride.fare || 0),
+    distanceKm: Number(ride.distanceKm || 0),
+    routeDistanceKm: Number(ride.routeDistanceKm || ride.distanceKm || 0),
+    durationMin: Number(ride.durationMin || 0),
+    paymentMethod: ride.paymentMethod || "cash",
+    rider,
+    driver,
+    riderSnapshot: rider,
+    driverSnapshot: driver,
+    cancelReason: ride.cancelReason || "",
+    createdAt: ride.createdAt,
+    expiresAt: ride.expiresAt,
+    acceptedAt: ride.acceptedAt,
+    startedAt: ride.startedAt,
+    completedAt: ride.completedAt,
+    cancelledAt: ride.cancelledAt,
+    updatedAt: ride.updatedAt,
+  };
+}
+
+function ptyFastV5EmitRide(row, event = "ride:update") {
+  const ride = ptyFastV7CompactRide(row);
   try {
-    emitRide(row, event);
-    io.to(`ride:${ride.id}`).emit(event, ride);
-    io.to(`ride:${ride.id}`).emit("ride:update", ride);
+    // V7: una emisión compacta por canal. Antes se enviaba la carrera completa varias
+    // veces (drivers + user rooms + ride room + admins) con snapshots grandes.
+    if (event === "ride:new" || event === "ride:available") {
+      io.to("drivers").emit("ride:available", ride);
+      io.to("drivers").emit("ride:new", ride);
+    } else {
+      io.to("drivers").emit(event, ride);
+    }
+    if (ride.riderId) emitToUser(ride.riderId, event, ride);
+    if (ride.driverId) emitToUser(ride.driverId, event, ride);
     if (event !== "ride:update") {
-      io.to("drivers").emit("ride:update", ride);
       if (ride.riderId) emitToUser(ride.riderId, "ride:update", ride);
       if (ride.driverId) emitToUser(ride.driverId, "ride:update", ride);
     }
+    io.to("admins").emit(event, ride);
   } catch (error) {
-    console.warn("[PTY_FAST_V5_EMIT_WARN]", error?.message || error);
+    console.warn("[PTY_FAST_V7_EMIT_WARN]", error?.message || error);
   }
   return ride;
 }
@@ -1487,31 +1615,31 @@ async function ptyFastV5ListRides(req, res) {
           WHERE status IN ('requested','searching')
             AND expires_at > NOW()
           ORDER BY created_at DESC
-          LIMIT 80`
+          LIMIT 30`
       );
     } else if (role === "rider" && userId) {
       r = await db(
         `SELECT * FROM ride_rides
           WHERE rider_id::text=$1::text
           ORDER BY updated_at DESC
-          LIMIT 80`,
+          LIMIT 30`,
         [userId]
       );
     } else if (role === "admin" || req.user?.role === "admin") {
-      r = await db(`SELECT * FROM ride_rides ORDER BY updated_at DESC LIMIT 150`);
+      r = await db(`SELECT * FROM ride_rides ORDER BY updated_at DESC LIMIT 80`);
     } else if (userId) {
       r = await db(
         `SELECT * FROM ride_rides
           WHERE rider_id::text=$1::text OR driver_id::text=$1::text
           ORDER BY updated_at DESC
-          LIMIT 80`,
+          LIMIT 30`,
         [userId]
       );
     } else {
       r = { rows: [] };
     }
 
-    return safeJson(res, 200, { ok: true, rides: r.rows.map(normalizeRide), fast: true });
+    return safeJson(res, 200, { ok: true, rides: r.rows.map(ptyFastV7CompactRide), fast: true, compact: true });
   } catch (error) {
     return safeJson(res, 500, { ok: false, message: String(error?.message || error), rides: [] });
   }
@@ -1530,7 +1658,7 @@ async function ptyFastV5ActiveRide(req, res) {
         LIMIT 1`,
       [userId, PTY_FAST_V5_ACTIVE_STATUSES]
     );
-    return safeJson(res, 200, { ok: true, ride: r.rows[0] ? normalizeRide(r.rows[0]) : null, fast: true });
+    return safeJson(res, 200, { ok: true, ride: r.rows[0] ? ptyFastV7CompactRide(r.rows[0]) : null, fast: true, compact: true });
   } catch (error) {
     return safeJson(res, 500, { ok: false, message: String(error?.message || error), ride: null });
   }
@@ -1544,7 +1672,17 @@ async function ptyFastV5AcceptRide(req, res) {
     if (!isUuid(rideId) || !isUuid(driverId)) return safeJson(res, 400, { ok: false, message: "ID inválido" });
 
     const bodyDriver = req.body.driver && typeof req.body.driver === "object" ? req.body.driver : {};
-    const vehicle = bodyDriver.vehicle || bodyDriver.driverVehicle || req.body.vehicle || {};
+    const vehicleRaw = bodyDriver.vehicle || bodyDriver.driverVehicle || req.body.vehicle || {};
+    const vehicle = {
+      plate: ptyFastV5Text(bodyDriver.plate || vehicleRaw.plate || vehicleRaw.placa || ""),
+      brand: ptyFastV5Text(vehicleRaw.brand || vehicleRaw.marca || ""),
+      model: ptyFastV5Text(vehicleRaw.model || vehicleRaw.modelo || ""),
+      color: ptyFastV5Text(vehicleRaw.color || ""),
+      type: ptyFastV5Text(vehicleRaw.type || vehicleRaw.tipo || ""),
+    };
+    // V7: snapshot liviano. Antes se guardaba/enviaba todo el objeto del driver,
+    // incluyendo currentLocation, driverDocs y vehicle completo. Eso hacía respuestas
+    // muy grandes y congelaba React Native/console aunque el HTTP fuera 200 rápido.
     const driverSnapshot = {
       id: driverId,
       driverId,
@@ -1557,10 +1695,9 @@ async function ptyFastV5AcceptRide(req, res) {
       markerIcon: bodyDriver.markerIcon || bodyDriver.marker_icon || "📍",
       lat: ptyFastV5Num(bodyDriver.lat ?? bodyDriver.currentLocation?.lat),
       lng: ptyFastV5Num(bodyDriver.lng ?? bodyDriver.currentLocation?.lng),
-      currentLocation: bodyDriver.currentLocation || null,
       vehicle,
       driverVehicle: vehicle,
-      plate: ptyFastV5Text(bodyDriver.plate || vehicle.plate || vehicle.placa || ""),
+      plate: vehicle.plate,
       rating: ptyFastV5Num(bodyDriver.rating, 5),
       reviewsCount: ptyFastV5Num(bodyDriver.reviewsCount, 0),
       documentStatus: bodyDriver.documentStatus || bodyDriver.verificationStatus || "approved",
@@ -1596,12 +1733,7 @@ async function ptyFastV5AcceptRide(req, res) {
     }
 
     const ride = ptyFastV5EmitRide(r.rows[0], "ride:accepted");
-    try {
-      io.to(`ride:${ride.id}`).emit("ride.accepted", ride);
-      if (ride.riderId) emitToUser(ride.riderId, "ride.accepted", ride);
-      if (ride.driverId) emitToUser(ride.driverId, "ride.accepted", ride);
-    } catch {}
-    return safeJson(res, 200, { ok: true, ride, status: "accepted", fast: true });
+    return safeJson(res, 200, { ok: true, ride, status: "accepted", fast: true, compact: true });
   } catch (error) {
     return safeJson(res, 500, { ok: false, message: String(error?.message || error) });
   }
@@ -1680,7 +1812,7 @@ async function ptyFastV5PatchStatus(req, res, forcedAction = "") {
       [rideId, userId, event.replace(":", "_"), JSON.stringify({ status, fast: true })]
     ).catch(() => null);
 
-    return safeJson(res, 200, { ok: true, ride, status, fast: true });
+    return safeJson(res, 200, { ok: true, ride, status, fast: true, compact: true });
   } catch (error) {
     return safeJson(res, 500, { ok: false, message: String(error?.message || error) });
   }
@@ -1728,7 +1860,7 @@ app.get("/api/perf/ping", async (_req, res) => {
   return safeJson(res, 200, {
     ok: true,
     pong: true,
-    fastPatch: "v6",
+    fastPatch: "v7",
     db: dbOk ? "on" : "off",
     dbMs,
     totalMs: Date.now() - started,
@@ -1777,7 +1909,7 @@ app.patch("/api/driver/location", ptyFastV5AuthOptional, (req, res) => ptyFastV5
 app.post("/api/rider/location", ptyFastV5AuthOptional, (req, res) => ptyFastV5Location(req, res, "rider"));
 app.patch("/api/rider/location", ptyFastV5AuthOptional, (req, res) => ptyFastV5Location(req, res, "rider"));
 
-/* FIN PTY DRIVE BACKEND PERFORMANCE HOTFIX V6 */
+/* FIN PTY DRIVE BACKEND PERFORMANCE HOTFIX V7 */
 
 app.get("/api/places/search", authOptional, ptyGv2SearchHandler);
 app.get("/api/places/autocomplete", authOptional, ptyGv2SearchHandler);
