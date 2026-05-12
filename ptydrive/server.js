@@ -565,6 +565,380 @@ async function cancelOpenRidesForRider(riderId, reason = "new_request_replaces_o
   return r.rows;
 }
 
+/* =========================================================
+   PTY V14 HARD REALTIME CORE
+   Rutas críticas primero: chat, aceptar, iniciar, finalizar, cancelar y calificar.
+   Este bloque está antes de las rutas viejas para evitar reintentos/lentitud.
+========================================================= */
+const PTY_V14_PATCH = "v14-hard-realtime";
+const PTY_V14_ACTIVE = ["requested","searching","pending","assigned","accepted","arrived","driver_arrived","in_progress","on_trip","en_curso"];
+const PTY_V14_DONE = ["completed","cancelled","canceled","rider_cancelled","driver_cancelled","expired","auto_cancelled","rider_disconnected_cancelled"];
+let __ptyV14Ready = false;
+
+function ptyV14Text(v = "") { return String(v ?? "").trim(); }
+function ptyV14Num(v, fallback = 0) { const n = Number(v); return Number.isFinite(n) ? n : fallback; }
+function ptyV14Json(v, fallback = {}) { if (!v) return fallback; if (typeof v === "object") return v; try { return JSON.parse(v); } catch { return fallback; } }
+function ptyV14First(...values) { for (const v of values) { const t = ptyV14Text(v); if (t && !["undefined","null","---","pendiente"].includes(t.toLowerCase())) return t; } return ""; }
+function ptyV14Point(v = {}, label = "") {
+  const s = ptyV14Json(v, v || {});
+  const lat = ptyV14Num(s.lat ?? s.latitude, null);
+  const lng = ptyV14Num(s.lng ?? s.lon ?? s.longitude, null);
+  return {
+    lat, lng,
+    address: ptyV14First(s.address, s.title, s.name, s.short, s.label, label),
+    title: ptyV14First(s.title, s.name, s.address, s.short, label),
+    name: ptyV14First(s.name, s.title, s.address, s.short, label),
+    short: ptyV14First(s.short, s.title, s.name, s.address, label),
+    label: ptyV14First(s.label, s.title, s.name, s.address, label),
+  };
+}
+function ptyV14VehicleFrom(row = {}, docs = {}, fallback = {}) {
+  const src = docs?.driverVehicle || docs?.vehicle || docs?.vehiculo || docs || {};
+  const fb = fallback?.driverVehicle || fallback?.vehicle || fallback || {};
+  const rawType = ptyV14First(src.type, src.vehicleType, src.serviceTier, src.enrollmentType, fb.type, fb.vehicleType, fb.serviceTier, row.vehicle_type, "car").toLowerCase();
+  const typeMap = { moto: "Moto", motorcycle: "Moto", bike: "Moto", car: "Auto", auto: "Auto", viaje: "Auto", sedan: "Auto", comfort: "Comfort", premium: "Comfort", suv: "SUV", entregas: "Entregas", delivery: "Entregas" };
+  const typeLabel = typeMap[rawType] || ptyV14First(src.typeLabel, src.tipo, fb.typeLabel, rawType, "Auto");
+  const brand = ptyV14First(src.brand, src.make, src.marca, src.marcaVehiculo, fb.brand, fb.make, fb.marcaVehiculo, row.vehicle_brand);
+  const model = ptyV14First(src.model, src.modelo, src.modeloVehiculo, fb.model, fb.modeloVehiculo, row.vehicle_model);
+  const color = ptyV14First(src.color, src.colorName, src.colorLabel, src.colorVehiculo, fb.color, fb.colorVehiculo, row.vehicle_color);
+  const year = ptyV14First(src.year, src.anio, src.anioVehiculo, fb.year, fb.anioVehiculo, row.vehicle_year);
+  const plate = ptyV14First(src.plate, src.placa, fb.plate, fb.placa, row.plate);
+  return { type: rawType || "car", typeLabel, vehicleType: rawType || "car", serviceTier: rawType || "car", brand, make: brand, model, color, year, plate, placa: plate };
+}
+async function ptyV14Ensure() {
+  if (__ptyV14Ready) return;
+  await db(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`).catch(() => null);
+  await db(`
+    CREATE TABLE IF NOT EXISTS ride_chat_v14_threads (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      ride_id TEXT UNIQUE NOT NULL,
+      rider_id TEXT DEFAULT '',
+      driver_id TEXT DEFAULT '',
+      rider_name TEXT DEFAULT '',
+      driver_name TEXT DEFAULT '',
+      title TEXT DEFAULT '',
+      last_message TEXT DEFAULT '',
+      last_at TIMESTAMPTZ DEFAULT NOW(),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await db(`
+    CREATE TABLE IF NOT EXISTS ride_chat_v14_messages (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      ride_id TEXT NOT NULL,
+      sender_id TEXT DEFAULT '',
+      sender_role TEXT DEFAULT '',
+      sender_name TEXT DEFAULT '',
+      text TEXT NOT NULL,
+      meta JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await db(`
+    CREATE TABLE IF NOT EXISTS ride_reviews (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      ride_id TEXT DEFAULT '',
+      reviewer_id TEXT DEFAULT '',
+      reviewer_role TEXT DEFAULT '',
+      target_id TEXT DEFAULT '',
+      target_role TEXT DEFAULT '',
+      rating NUMERIC(3,2) DEFAULT 5,
+      comment TEXT DEFAULT '',
+      meta JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `).catch(() => null);
+  await db(`CREATE INDEX IF NOT EXISTS idx_pty_v14_chat_msg_ride ON ride_chat_v14_messages(ride_id, created_at);`).catch(() => null);
+  await db(`CREATE INDEX IF NOT EXISTS idx_pty_v14_chat_threads_users ON ride_chat_v14_threads(rider_id, driver_id, updated_at DESC);`).catch(() => null);
+  await db(`CREATE INDEX IF NOT EXISTS idx_pty_v14_reviews_target ON ride_reviews(target_id, target_role, created_at DESC);`).catch(() => null);
+  await db(`CREATE INDEX IF NOT EXISTS idx_pty_v14_rides_active_rider ON ride_rides(rider_id, status, updated_at DESC);`).catch(() => null);
+  await db(`CREATE INDEX IF NOT EXISTS idx_pty_v14_rides_active_driver ON ride_rides(driver_id, status, updated_at DESC);`).catch(() => null);
+  __ptyV14Ready = true;
+}
+async function ptyV14DriverStats(driverId = "") {
+  await ptyV14Ensure();
+  if (!driverId) return { rating: 5, reviewsCount: 0, reviews: [] };
+  const r = await db(`SELECT id, ride_id, reviewer_id, reviewer_role, rating, comment, created_at FROM ride_reviews WHERE target_id::text=$1::text AND target_role='driver' ORDER BY created_at DESC LIMIT 30`, [driverId]);
+  const reviews = (r.rows || []).map((x) => ({ id: x.id, rideId: x.ride_id, reviewerId: x.reviewer_id, reviewerRole: x.reviewer_role, rating: Number(x.rating || 5), comment: x.comment || '', createdAt: x.created_at }));
+  const avg = reviews.length ? reviews.reduce((a,x)=>a+Number(x.rating||0),0)/reviews.length : 5;
+  return { rating: Number(avg.toFixed(1)), avgRating: Number(avg.toFixed(1)), averageRating: Number(avg.toFixed(1)), reviewsCount: reviews.length, reviewCount: reviews.length, reviews };
+}
+async function ptyV14PhotoFromDocs(userId = "") {
+  if (!userId) return "";
+  const r = await db(`SELECT url FROM ride_documents WHERE user_id::text=$1::text AND type IN ('fotoPerfilConductor','driverProfilePhoto','profilePhoto','selfieConLicencia') AND COALESCE(url,'')<>'' ORDER BY CASE WHEN status='approved' THEN 0 ELSE 1 END, updated_at DESC, created_at DESC LIMIT 1`, [userId]).catch(() => ({ rows: [] }));
+  return ptyV14Text(r.rows?.[0]?.url || "");
+}
+async function ptyV14BuildDriver(driverId = "", fallback = {}) {
+  const id = ptyV14Text(driverId || fallback.id || fallback.driverId || fallback.userId);
+  const r = id ? await db(`SELECT * FROM ride_users WHERE id::text=$1::text LIMIT 1`, [id]).catch(() => ({ rows: [] })) : { rows: [] };
+  const row = r.rows?.[0] || {};
+  const docs = ptyV14Json(row.driver_docs || fallback.driverDocs || fallback.driverDocuments || fallback.documents || {}, {});
+  const vehicle = ptyV14VehicleFrom(row, docs, fallback);
+  const stats = await ptyV14DriverStats(id).catch(() => ({ rating: Number(fallback.rating || 5), reviewsCount: Number(fallback.reviewsCount || 0), reviews: Array.isArray(fallback.reviews) ? fallback.reviews : [] }));
+  const docPhoto = await ptyV14PhotoFromDocs(id).catch(() => "");
+  const photoUrl = ptyV14First(fallback.photoUrl, fallback.driverPhotoUrl, fallback.driverPhoto, fallback.profilePhoto, fallback.avatarUrl, docs.fotoPerfilConductor, docs.driverProfilePhoto, docs.profilePhoto, docs.selfieConLicencia, docPhoto);
+  return {
+    id, userId: id, driverId: id, role: "driver",
+    name: ptyV14First(row.name, fallback.name, fallback.fullName, row.email, "Conductor"),
+    fullName: ptyV14First(row.name, fallback.fullName, fallback.name, row.email, "Conductor"),
+    email: ptyV14First(row.email, fallback.email),
+    phone: ptyV14First(row.phone, fallback.phone),
+    markerIcon: ptyV14First(row.marker_icon, fallback.markerIcon, "📍"),
+    documentStatus: ptyV14First(row.document_status, fallback.documentStatus, "approved"),
+    photoUrl, driverPhotoUrl: photoUrl, driverPhoto: photoUrl, profilePhoto: photoUrl, avatarUrl: photoUrl,
+    vehicle, driverVehicle: vehicle, vehicleType: vehicle.vehicleType, serviceTier: vehicle.serviceTier,
+    plate: vehicle.plate, placa: vehicle.plate,
+    rating: stats.rating || 5, averageRating: stats.averageRating || stats.rating || 5, avgRating: stats.avgRating || stats.rating || 5,
+    reviewsCount: stats.reviewsCount || 0, reviewCount: stats.reviewCount || stats.reviewsCount || 0, reviews: stats.reviews || [],
+    lat: ptyV14Num(fallback.lat ?? fallback.currentLocation?.lat, null),
+    lng: ptyV14Num(fallback.lng ?? fallback.currentLocation?.lng, null),
+  };
+}
+function ptyV14User(snapshot = {}, fallbackId = "", role = "rider") {
+  const s = ptyV14Json(snapshot, snapshot || {});
+  const id = ptyV14Text(s.id || s.userId || s.riderId || s.driverId || fallbackId);
+  return { id, userId: id, [`${role}Id`]: id, role, name: ptyV14First(s.name, s.fullName, s.email, role === 'driver' ? 'Conductor' : 'Rider'), fullName: ptyV14First(s.fullName, s.name, s.email), email: ptyV14Text(s.email || ''), phone: ptyV14Text(s.phone || ''), markerIcon: ptyV14Text(s.markerIcon || s.marker_icon || '📍') };
+}
+function ptyV14Ride(row = {}, driverOverride = null) {
+  const pickup = ptyV14Point(row.pickup || {}, 'Recogida');
+  const destination = ptyV14Point(row.destination || {}, 'Destino');
+  const distanceKm = Number(row.distance_km || row.distanceKm || 0);
+  const durationMin = Number(row.duration_min || row.durationMin || 0);
+  const rider = ptyV14User(row.rider_snapshot || {}, row.rider_id || '', 'rider');
+  const driver = driverOverride || ptyV14User(row.driver_snapshot || {}, row.driver_id || '', 'driver');
+  return {
+    id: row.id, riderId: row.rider_id, driverId: row.driver_id, status: row.status,
+    pickup, destination, pickupAddress: pickup.address || 'Recogida', destinationAddress: destination.address || 'Destino',
+    route: { distanceKm, durationMin, provider: PTY_V14_PATCH },
+    fare: Number(row.fare || 0), price: Number(row.fare || 0), total: Number(row.fare || 0), distanceKm, routeDistanceKm: distanceKm, durationMin,
+    paymentMethod: row.payment_method || 'cash', rider, driver, riderSnapshot: rider, driverSnapshot: driver,
+    driverPhoto: driver?.photoUrl || '', driverPhotoUrl: driver?.photoUrl || '', vehicle: driver?.vehicle || {}, driverVehicle: driver?.driverVehicle || {},
+    driverRating: driver?.rating || 5, driverReviewsCount: driver?.reviewsCount || 0, driverReviews: driver?.reviews || [],
+    cancelReason: row.cancel_reason || '', createdAt: row.created_at, expiresAt: row.expires_at, acceptedAt: row.accepted_at, startedAt: row.started_at, completedAt: row.completed_at, cancelledAt: row.cancelled_at, updatedAt: row.updated_at,
+    fastPatch: PTY_V14_PATCH,
+  };
+}
+function ptyV14EmitRide(row = {}, event = 'ride:update', driver = null) {
+  const ride = ptyV14Ride(row, driver);
+  const payload = { ok: true, fast: true, fastPatch: PTY_V14_PATCH, rideId: ride.id, status: ride.status, ride };
+  try {
+    io.to(`ride:${ride.id}`).emit(event, payload);
+    io.to(`ride:${ride.id}`).emit(event.replace(':','.'), payload);
+    if (ride.riderId) io.to(`user:${ride.riderId}`).emit(event, payload), io.to(`user:${ride.riderId}`).emit(event.replace(':','.'), payload);
+    if (ride.driverId) io.to(`user:${ride.driverId}`).emit(event, payload), io.to(`user:${ride.driverId}`).emit(event.replace(':','.'), payload);
+    io.to('drivers').emit(event, payload);
+    io.to('admins').emit(event, payload);
+  } catch {}
+  return ride;
+}
+function ptyV14Status(action = '', body = {}) {
+  const raw = ptyV14Text(body.status || body.nextStatus || action).toLowerCase();
+  if (['start','started','begin','in_progress','on_trip','en_curso'].includes(raw)) return 'in_progress';
+  if (['complete','completed','finish','finished','end','done'].includes(raw)) return 'completed';
+  if (['arrive','arrived','driver_arrived'].includes(raw)) return 'arrived';
+  if (['cancel','cancelled','canceled'].includes(raw)) return ptyV14Text(body.role).toLowerCase() === 'rider' ? 'rider_cancelled' : 'driver_cancelled';
+  return raw || 'accepted';
+}
+async function ptyV14Accept(req, res) {
+  try {
+    await ptyV14Ensure();
+    const rideId = ptyV14Text(req.params.id || req.body.rideId);
+    const driverId = ptyV14Text(req.user?.id || req.body.driverId || req.body.userId || req.body.driver?.id || req.body.driver?.driverId);
+    if (!rideId || !isUuid(rideId) || !driverId || !isUuid(driverId)) return safeJson(res, 400, { ok: false, fastPatch: PTY_V14_PATCH, message: 'rideId/driverId inválido' });
+    const driver = await ptyV14BuildDriver(driverId, { ...(req.user || {}), ...(req.body.driver || {}), ...(req.body.driverVehicle ? { driverVehicle: req.body.driverVehicle } : {}) });
+    const r = await db(`
+      UPDATE ride_rides
+         SET status='accepted', driver_id=$2::uuid, driver_snapshot=$3::jsonb, accepted_at=COALESCE(accepted_at,NOW()), updated_at=NOW()
+       WHERE id::text=$1::text AND status IN ('requested','searching','pending','assigned')
+       RETURNING *`, [rideId, driverId, JSON.stringify(driver)]);
+    if (!r.rows.length) {
+      const existing = await db(`SELECT * FROM ride_rides WHERE id::text=$1::text LIMIT 1`, [rideId]).catch(() => ({ rows: [] }));
+      return safeJson(res, 409, { ok: false, fastPatch: PTY_V14_PATCH, message: 'La carrera ya no está disponible', ride: existing.rows[0] ? ptyV14Ride(existing.rows[0]) : null });
+    }
+    await ptyV14EnsureThread(r.rows[0]).catch(() => null);
+    const ride = ptyV14EmitRide(r.rows[0], 'ride:accepted', driver);
+    return safeJson(res, 200, { ok: true, fast: true, fastPatch: PTY_V14_PATCH, essentialCompact: true, status: 'accepted', ride });
+  } catch (error) {
+    console.error('[PTY_V14_ACCEPT_ERROR]', error?.message || error);
+    return safeJson(res, 500, { ok: false, fastPatch: PTY_V14_PATCH, message: String(error?.message || error) });
+  }
+}
+async function ptyV14StatusHandler(req, res, forced = '') {
+  try {
+    await ptyV14Ensure();
+    const rideId = ptyV14Text(req.params.id || req.body.rideId);
+    const userId = ptyV14Text(req.user?.id || req.body.userId || req.body.driverId || req.body.riderId || '');
+    const userRole = ptyV14Text(req.user?.role || req.body.role || '');
+    const status = ptyV14Status(forced, req.body || {});
+    if (!rideId || !isUuid(rideId)) return safeJson(res, 400, { ok: false, fastPatch: PTY_V14_PATCH, message: 'rideId inválido' });
+    let sql = '';
+    let params = [];
+    if (status === 'in_progress') {
+      sql = `UPDATE ride_rides SET status=$2::text, started_at=COALESCE(started_at,NOW()), updated_at=NOW() WHERE id::text=$1::text AND ($3::text='' OR rider_id::text=$3::text OR driver_id::text=$3::text OR $4::text='admin') RETURNING *`;
+      params = [rideId, status, userId, userRole];
+    } else if (status === 'completed') {
+      sql = `UPDATE ride_rides SET status=$2::text, completed_at=COALESCE(completed_at,NOW()), updated_at=NOW() WHERE id::text=$1::text AND ($3::text='' OR rider_id::text=$3::text OR driver_id::text=$3::text OR $4::text='admin') RETURNING *`;
+      params = [rideId, status, userId, userRole];
+    } else if (String(status).includes('cancel')) {
+      sql = `UPDATE ride_rides SET status=$2::text, cancelled_at=COALESCE(cancelled_at,NOW()), cancel_reason=COALESCE(NULLIF($4::text,''), cancel_reason), updated_at=NOW() WHERE id::text=$1::text AND ($3::text='' OR rider_id::text=$3::text OR driver_id::text=$3::text OR $5::text='admin') RETURNING *`;
+      params = [rideId, status, userId, ptyV14Text(req.body.reason || req.body.cancelReason || ''), userRole];
+    } else {
+      sql = `UPDATE ride_rides SET status=$2::text, updated_at=NOW() WHERE id::text=$1::text AND ($3::text='' OR rider_id::text=$3::text OR driver_id::text=$3::text OR $4::text='admin') RETURNING *`;
+      params = [rideId, status, userId, userRole];
+    }
+    const r = await db(sql, params);
+    if (!r.rows.length) return safeJson(res, 404, { ok: false, fastPatch: PTY_V14_PATCH, message: 'Carrera no encontrada o no autorizada' });
+    const row = r.rows[0];
+    const driver = row.driver_id ? await ptyV14BuildDriver(String(row.driver_id), ptyV14Json(row.driver_snapshot || {}, {})).catch(() => null) : null;
+    const event = status === 'completed' ? 'ride:completed' : status === 'in_progress' ? 'ride:started' : String(status).includes('cancel') ? 'ride:cancelled' : 'ride:update';
+    await ptyV14EnsureThread(row).catch(() => null);
+    const ride = ptyV14EmitRide(row, event, driver);
+    db(`INSERT INTO ride_events(ride_id, user_id, type, payload) VALUES($1::uuid, NULLIF($2,'')::uuid, $3::text, $4::jsonb)`, [rideId, userId, event.replace(':','_'), JSON.stringify({ status, fastPatch: PTY_V14_PATCH })]).catch(() => null);
+    return safeJson(res, 200, { ok: true, fast: true, fastPatch: PTY_V14_PATCH, essentialCompact: true, status, ride });
+  } catch (error) {
+    console.error('[PTY_V14_STATUS_ERROR]', error?.message || error);
+    return safeJson(res, 500, { ok: false, fastPatch: PTY_V14_PATCH, message: String(error?.message || error) });
+  }
+}
+async function ptyV14EnsureThread(rideRow = {}) {
+  await ptyV14Ensure();
+  const rideId = ptyV14Text(rideRow.id || rideRow.ride_id);
+  if (!rideId) return null;
+  const rider = ptyV14User(rideRow.rider_snapshot || {}, rideRow.rider_id || '', 'rider');
+  const driver = ptyV14User(rideRow.driver_snapshot || {}, rideRow.driver_id || '', 'driver');
+  const title = ptyV14First(driver.name, rider.name, `Viaje ${rideId.slice(-6)}`);
+  const r = await db(`
+    INSERT INTO ride_chat_v14_threads(ride_id,rider_id,driver_id,rider_name,driver_name,title,updated_at,last_at)
+    VALUES($1,$2,$3,$4,$5,$6,NOW(),NOW())
+    ON CONFLICT(ride_id) DO UPDATE SET
+      rider_id=COALESCE(NULLIF(EXCLUDED.rider_id,''), ride_chat_v14_threads.rider_id),
+      driver_id=COALESCE(NULLIF(EXCLUDED.driver_id,''), ride_chat_v14_threads.driver_id),
+      rider_name=COALESCE(NULLIF(EXCLUDED.rider_name,''), ride_chat_v14_threads.rider_name),
+      driver_name=COALESCE(NULLIF(EXCLUDED.driver_name,''), ride_chat_v14_threads.driver_name),
+      title=COALESCE(NULLIF(EXCLUDED.title,''), ride_chat_v14_threads.title),
+      updated_at=NOW()
+    RETURNING *`, [rideId, rider.id || '', driver.id || '', rider.name || '', driver.name || '', title]);
+  return r.rows[0];
+}
+async function ptyV14ThreadFromRideId(rideId = '') {
+  await ptyV14Ensure();
+  if (!rideId) return null;
+  const ride = await db(`SELECT * FROM ride_rides WHERE id::text=$1::text LIMIT 1`, [rideId]).catch(() => ({ rows: [] }));
+  if (ride.rows?.[0]) return ptyV14EnsureThread(ride.rows[0]);
+  const r = await db(`SELECT * FROM ride_chat_v14_threads WHERE ride_id=$1 LIMIT 1`, [rideId]).catch(() => ({ rows: [] }));
+  return r.rows?.[0] || null;
+}
+function ptyV14Message(row = {}) { return { id: String(row.id || ''), rideId: row.ride_id || row.rideId || '', senderId: row.sender_id || '', senderRole: row.sender_role || '', senderName: row.sender_name || '', author: row.sender_name || '', text: row.text || row.message || '', message: row.text || row.message || '', createdAt: row.created_at || row.createdAt || new Date().toISOString(), at: row.created_at || row.createdAt || new Date().toISOString() }; }
+function ptyV14Thread(row = {}, messages = []) { return { id: row.ride_id || row.id, threadId: row.id, rideId: row.ride_id, title: row.title || row.driver_name || row.rider_name || `Viaje ${String(row.ride_id || '').slice(-6)}`, riderId: row.rider_id || '', driverId: row.driver_id || '', riderName: row.rider_name || '', driverName: row.driver_name || '', lastMessage: row.last_message || (messages[messages.length - 1]?.text || ''), updatedAt: row.updated_at || row.last_at || row.created_at, messages }; }
+async function ptyV14PostChat({ rideId = '', user = {}, body = {} } = {}) {
+  await ptyV14Ensure();
+  const cleanRideId = ptyV14Text(rideId || body.rideId);
+  const text = ptyV14Text(body.text || body.message || body.body || '');
+  if (!cleanRideId || !text) throw new Error('rideId/message requerido');
+  const thread = await ptyV14ThreadFromRideId(cleanRideId);
+  const senderId = ptyV14Text(user.id || body.senderId || body.userId || '');
+  const senderRole = ptyV14Text(user.role || body.senderRole || body.role || 'user').toLowerCase();
+  const senderName = ptyV14First(user.name, body.senderName, body.author, senderRole === 'driver' ? thread?.driver_name : thread?.rider_name, senderRole === 'driver' ? 'Conductor' : 'Rider');
+  const ins = await db(`INSERT INTO ride_chat_v14_messages(ride_id,sender_id,sender_role,sender_name,text,meta) VALUES($1,$2,$3,$4,$5,$6::jsonb) RETURNING *`, [cleanRideId, senderId, senderRole, senderName, text, JSON.stringify(body || {})]);
+  await db(`UPDATE ride_chat_v14_threads SET last_message=$2,last_at=NOW(),updated_at=NOW() WHERE ride_id=$1`, [cleanRideId, text]).catch(() => null);
+  const message = ptyV14Message(ins.rows[0]);
+  const payload = { ok: true, chatPatch: PTY_V14_PATCH, rideId: cleanRideId, message };
+  try {
+    io.to(`ride:${cleanRideId}`).emit('chat.message', payload);
+    io.to(`chat:${cleanRideId}`).emit('chat.message', payload);
+    if (thread?.rider_id) io.to(`user:${thread.rider_id}`).emit('chat.message', payload);
+    if (thread?.driver_id) io.to(`user:${thread.driver_id}`).emit('chat.message', payload);
+  } catch {}
+  return { thread, message };
+}
+
+app.get('/api/perf/ping', async (_req, res) => {
+  const started = Date.now(); let dbOk = false; let dbMs = null;
+  try { const t = Date.now(); await db('SELECT 1'); dbMs = Date.now() - t; dbOk = true; } catch {}
+  return safeJson(res, 200, { ok: true, pong: true, fastPatch: PTY_V14_PATCH, chatPatch: PTY_V14_PATCH, db: dbOk ? 'on' : 'off', dbMs, totalMs: Date.now() - started, time: nowIso() });
+});
+app.get('/api/chat/health', async (_req, res) => { let dbOk = false; try { await ptyV14Ensure(); dbOk = true; } catch {} return safeJson(res, 200, { ok: true, chatPatch: PTY_V14_PATCH, db: dbOk ? 'on' : 'off', time: nowIso() }); });
+app.patch('/api/rides/:id/accept', authOptional, ptyV14Accept);
+app.post('/api/rides/:id/accept', authOptional, ptyV14Accept);
+app.patch('/api/carrera-lite/:id/accept', authOptional, ptyV14Accept);
+app.patch('/api/carreras/:id/accept', authOptional, ptyV14Accept);
+app.patch('/api/rides/:id/start', authOptional, (req,res)=>ptyV14StatusHandler(req,res,'start'));
+app.post('/api/rides/:id/start', authOptional, (req,res)=>ptyV14StatusHandler(req,res,'start'));
+app.patch('/api/rides/:id/complete', authOptional, (req,res)=>ptyV14StatusHandler(req,res,'complete'));
+app.post('/api/rides/:id/complete', authOptional, (req,res)=>ptyV14StatusHandler(req,res,'complete'));
+app.patch('/api/rides/:id/finish', authOptional, (req,res)=>ptyV14StatusHandler(req,res,'complete'));
+app.post('/api/rides/:id/finish', authOptional, (req,res)=>ptyV14StatusHandler(req,res,'complete'));
+app.patch('/api/rides/:id/cancel', authOptional, (req,res)=>ptyV14StatusHandler(req,res,'cancel'));
+app.post('/api/rides/:id/cancel', authOptional, (req,res)=>ptyV14StatusHandler(req,res,'cancel'));
+app.patch('/api/rides/:id/fast-status', authOptional, (req,res)=>ptyV14StatusHandler(req,res,''));
+app.post('/api/rides/:id/fast-status', authOptional, (req,res)=>ptyV14StatusHandler(req,res,''));
+app.get('/api/chat/threads', authOptional, async (req, res) => {
+  try {
+    await ptyV14Ensure();
+    const userId = ptyV14Text(req.user?.id || req.query.userId || '');
+    if (!userId) return safeJson(res, 200, { ok: true, chatPatch: PTY_V14_PATCH, threads: [] });
+    const r = await db(`SELECT * FROM ride_chat_v14_threads WHERE rider_id=$1 OR driver_id=$1 ORDER BY updated_at DESC LIMIT 100`, [userId]);
+    const threads = [];
+    for (const row of r.rows || []) {
+      const m = await db(`SELECT * FROM ride_chat_v14_messages WHERE ride_id=$1 ORDER BY created_at DESC LIMIT 1`, [row.ride_id]).catch(() => ({ rows: [] }));
+      threads.push(ptyV14Thread(row, (m.rows || []).reverse().map(ptyV14Message)));
+    }
+    return safeJson(res, 200, { ok: true, chatPatch: PTY_V14_PATCH, threads, chats: threads });
+  } catch (e) { return safeJson(res, 500, { ok: false, chatPatch: PTY_V14_PATCH, message: String(e?.message || e), threads: [] }); }
+});
+app.get('/api/chat/rides/:rideId/messages', authOptional, async (req, res) => {
+  try { await ptyV14Ensure(); const rideId = ptyV14Text(req.params.rideId); await ptyV14ThreadFromRideId(rideId).catch(() => null); const r = await db(`SELECT * FROM ride_chat_v14_messages WHERE ride_id=$1 ORDER BY created_at ASC LIMIT 500`, [rideId]); return safeJson(res, 200, { ok: true, chatPatch: PTY_V14_PATCH, rideId, messages: (r.rows || []).map(ptyV14Message), chat: (r.rows || []).map(ptyV14Message) }); }
+  catch (e) { return safeJson(res, 500, { ok: false, chatPatch: PTY_V14_PATCH, message: String(e?.message || e), messages: [] }); }
+});
+app.post('/api/chat/rides/:rideId/messages', authOptional, async (req, res) => {
+  try { const { thread, message } = await ptyV14PostChat({ rideId: req.params.rideId, user: req.user || {}, body: req.body || {} }); return safeJson(res, 201, { ok: true, chatPatch: PTY_V14_PATCH, rideId: req.params.rideId, thread: ptyV14Thread(thread, [message]), message }); }
+  catch (e) { return safeJson(res, 500, { ok: false, chatPatch: PTY_V14_PATCH, message: String(e?.message || e) }); }
+});
+app.post('/api/rides/:id/rate', authOptional, async (req, res) => {
+  try {
+    await ptyV14Ensure();
+    const rideId = ptyV14Text(req.params.id || req.body.rideId);
+    const ride = await db(`SELECT * FROM ride_rides WHERE id::text=$1::text LIMIT 1`, [rideId]);
+    const row = ride.rows?.[0];
+    if (!row) return safeJson(res, 404, { ok: false, fastPatch: PTY_V14_PATCH, message: 'Viaje no encontrado' });
+    const reviewerId = ptyV14Text(req.user?.id || req.body.reviewerId || req.body.userId || '');
+    const reviewerRole = ptyV14Text(req.user?.role || req.body.reviewerRole || req.body.role || '');
+    const targetRole = ptyV14Text(req.body.targetRole || 'driver').toLowerCase() === 'rider' ? 'rider' : 'driver';
+    const targetId = ptyV14Text(req.body.targetId || (targetRole === 'driver' ? row.driver_id : row.rider_id) || '');
+    const rating = Math.max(1, Math.min(5, ptyV14Num(req.body.rating || req.body.stars || 5, 5)));
+    const comment = ptyV14Text(req.body.comment || req.body.message || '');
+    const ins = await db(`INSERT INTO ride_reviews(ride_id,reviewer_id,reviewer_role,target_id,target_role,rating,comment,meta) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb) RETURNING *`, [rideId, reviewerId, reviewerRole, targetId, targetRole, rating, comment, JSON.stringify(req.body || {})]);
+    const stats = targetRole === 'driver' ? await ptyV14DriverStats(targetId).catch(() => ({ rating, reviewsCount: 1 })) : { rating, averageRating: rating, avgRating: rating, reviewsCount: 1, reviewCount: 1, reviews: [] };
+    return safeJson(res, 201, { ok: true, fastPatch: PTY_V14_PATCH, review: ins.rows[0], rating: { rating: stats.rating || rating, average: stats.averageRating || stats.rating || rating, avg: stats.avgRating || stats.rating || rating, count: stats.reviewsCount || 1 }, ...stats });
+  } catch (e) { return safeJson(res, 500, { ok: false, fastPatch: PTY_V14_PATCH, message: String(e?.message || e) }); }
+});
+app.get('/api/drivers/:id/reviews', authOptional, async (req, res) => { try { const stats = await ptyV14DriverStats(req.params.id); return safeJson(res, 200, { ok: true, fastPatch: PTY_V14_PATCH, ...stats }); } catch(e) { return safeJson(res, 500, { ok: false, message: String(e?.message || e), reviews: [] }); } });
+
+io.on('connection', (socket) => {
+  const joinRooms = (payload = {}) => {
+    try {
+      const userId = ptyV14Text(payload.userId || payload.id || payload.driverId || payload.riderId || payload.user?.id || '');
+      const rideId = ptyV14Text(payload.rideId || payload.idRide || payload.chatRideId || '');
+      const role = ptyV14Text(payload.role || '');
+      if (userId) socket.join(`user:${userId}`);
+      if (rideId) { socket.join(`ride:${rideId}`); socket.join(`chat:${rideId}`); }
+      if (role === 'driver') socket.join('drivers');
+      if (role === 'admin') socket.join('admins');
+    } catch {}
+  };
+  socket.on('join', joinRooms);
+  socket.on('ride.join', joinRooms);
+  socket.on('chat.join', joinRooms);
+  socket.on('auth:identify', joinRooms);
+  socket.on('chat.message', async (payload = {}, ack) => {
+    try { joinRooms(payload); const rideId = ptyV14Text(payload.rideId || payload.message?.rideId); const body = { ...(payload || {}), ...(payload.message || {}) }; const { message } = await ptyV14PostChat({ rideId, user: {}, body }); if (typeof ack === 'function') ack({ ok: true, chatPatch: PTY_V14_PATCH, message }); }
+    catch (e) { if (typeof ack === 'function') ack({ ok: false, message: String(e?.message || e) }); }
+  });
+});
+
+
+
 
 
 /* =========================================================
