@@ -565,6 +565,270 @@ async function cancelOpenRidesForRider(riderId, reason = "new_request_replaces_o
   return r.rows;
 }
 
+
+
+/* =========================================================
+   PTY V11 CLEAN CHAT + FAST THREADS
+   Respuesta mínima, chat persistente y socket rooms reales.
+========================================================= */
+const PTY_V11_CHAT_PATCH = "v11-clean-chat";
+
+function ptyV11Text(value = "") {
+  return String(value ?? "").trim();
+}
+function ptyV11Json(value, fallback = {}) {
+  if (!value) return fallback;
+  if (typeof value === "object") return value;
+  try { return JSON.parse(value); } catch { return fallback; }
+}
+function ptyV11PointLabel(value = {}, fallback = "") {
+  const source = ptyV11Json(value, value || {});
+  return ptyV11Text(source.address || source.title || source.short || source.name || source.label || fallback);
+}
+function ptyV11PublicPerson(snapshot = {}, fallbackId = "", fallbackRole = "") {
+  const source = ptyV11Json(snapshot, snapshot || {});
+  const vehicle = source.vehicle || source.driverVehicle || {};
+  return {
+    id: ptyV11Text(source.id || source.userId || source.driverId || source.riderId || fallbackId),
+    name: ptyV11Text(source.name || source.fullName || source.displayName || (fallbackRole === "driver" ? "Conductor" : "Usuario")),
+    email: ptyV11Text(source.email || ""),
+    phone: ptyV11Text(source.phone || source.telefonoContacto || ""),
+    role: ptyV11Text(source.role || fallbackRole),
+    photoUrl: ptyV11Text(source.photoUrl || source.driverPhotoUrl || source.driverPhoto || source.profilePhoto || source.avatarUrl || ""),
+    rating: Number(source.rating || 5),
+    reviewsCount: Number(source.reviewsCount || 0),
+    vehicle: fallbackRole === "driver" ? {
+      type: ptyV11Text(vehicle.type || vehicle.vehicleType || source.vehicleType || source.enrollmentType || "viaje"),
+      brand: ptyV11Text(vehicle.brand || vehicle.make || source.marcaVehiculo || ""),
+      model: ptyV11Text(vehicle.model || source.modeloVehiculo || ""),
+      color: ptyV11Text(vehicle.color || vehicle.colorName || source.colorVehiculo || ""),
+      year: ptyV11Text(vehicle.year || source.anioVehiculo || ""),
+      plate: ptyV11Text(vehicle.plate || source.plate || source.placa || ""),
+    } : undefined,
+  };
+}
+function ptyV11CompactThreadFromRide(row = {}, last = {}) {
+  const riderId = ptyV11Text(row.rider_id || row.riderId || "");
+  const driverId = ptyV11Text(row.driver_id || row.driverId || "");
+  const rider = ptyV11PublicPerson(row.rider_snapshot, riderId, "rider");
+  const driver = ptyV11PublicPerson(row.driver_snapshot, driverId, "driver");
+  const pickupAddress = ptyV11PointLabel(row.pickup, "Recogida");
+  const destinationAddress = ptyV11PointLabel(row.destination, "Destino");
+  const rideId = ptyV11Text(row.id || row.ride_id || row.rideId || last.ride_id || "");
+  return {
+    id: rideId,
+    rideId,
+    riderId,
+    driverId,
+    rider,
+    driver,
+    riderName: rider.name,
+    driverName: driver.name,
+    pickupAddress,
+    destinationAddress,
+    routeLabel: `${pickupAddress} → ${destinationAddress}`,
+    title: driver.name || rider.name || `Viaje ${rideId.slice(-6)}`,
+    subtitle: `${pickupAddress} → ${destinationAddress}`,
+    status: row.status || "",
+    lastMessage: last.message || last.text || "",
+    updatedAt: last.created_at || row.updated_at || row.created_at || new Date().toISOString(),
+    unread: false,
+  };
+}
+function ptyV11Message(row = {}) {
+  return {
+    id: ptyV11Text(row.id || ""),
+    rideId: ptyV11Text(row.ride_id || row.rideId || ""),
+    senderId: ptyV11Text(row.sender_id || row.senderId || ""),
+    senderRole: ptyV11Text(row.sender_role || row.senderRole || "user"),
+    senderName: ptyV11Text(row.sender_name || row.senderName || row.author || "Usuario"),
+    author: ptyV11Text(row.sender_name || row.senderName || row.author || "Usuario"),
+    text: ptyV11Text(row.message || row.text || ""),
+    message: ptyV11Text(row.message || row.text || ""),
+    createdAt: row.created_at || row.createdAt || new Date().toISOString(),
+    at: row.created_at || row.createdAt || new Date().toISOString(),
+  };
+}
+async function ptyV11EnsureChatTables() {
+  if (globalThis.__PTY_V11_CHAT_READY__) return;
+  await db(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
+  await db(`
+    CREATE TABLE IF NOT EXISTS ride_chat_v11_messages (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      ride_id TEXT NOT NULL,
+      sender_id TEXT DEFAULT '',
+      sender_role TEXT DEFAULT '',
+      sender_name TEXT DEFAULT '',
+      message TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await db(`
+    CREATE TABLE IF NOT EXISTS ride_chat_v11_threads (
+      ride_id TEXT PRIMARY KEY,
+      rider_id TEXT DEFAULT '',
+      driver_id TEXT DEFAULT '',
+      last_message TEXT DEFAULT '',
+      last_at TIMESTAMPTZ DEFAULT NOW(),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await db(`CREATE INDEX IF NOT EXISTS idx_chat_v11_msg_ride_time ON ride_chat_v11_messages(ride_id, created_at);`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_chat_v11_threads_rider ON ride_chat_v11_threads(rider_id, updated_at DESC);`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_chat_v11_threads_driver ON ride_chat_v11_threads(driver_id, updated_at DESC);`);
+  await db(`CREATE INDEX IF NOT EXISTS idx_rides_user_fast_v11 ON ride_rides(rider_id, driver_id, updated_at DESC);`).catch(() => null);
+  globalThis.__PTY_V11_CHAT_READY__ = true;
+}
+function ptyV11AuthOptional(req, _res, next) {
+  try {
+    if (typeof authOptional === "function") return authOptional(req, _res, next);
+  } catch {}
+  return next();
+}
+function ptyV11EmitMessage(rideRow = {}, message = {}) {
+  const rideId = ptyV11Text(rideRow.id || message.rideId || message.ride_id || "");
+  const payload = { ok: true, chatPatch: PTY_V11_CHAT_PATCH, rideId, message: ptyV11Message(message) };
+  try {
+    io.to(`ride:${rideId}`).emit("chat.message", payload);
+    io.to(`chat:${rideId}`).emit("chat.message", payload);
+    if (rideRow.rider_id) io.to(`user:${rideRow.rider_id}`).emit("chat.message", payload);
+    if (rideRow.driver_id) io.to(`user:${rideRow.driver_id}`).emit("chat.message", payload);
+    io.emit("chat.v11.message", payload);
+  } catch (e) {
+    console.warn("[PTY_V11_SOCKET_WARN]", e?.message || e);
+  }
+}
+try {
+  io.on("connection", (socket) => {
+    const joinRooms = (raw = {}) => {
+      const userId = ptyV11Text(raw.userId || raw.id || raw.driverId || raw.riderId || "");
+      const rideId = ptyV11Text(raw.rideId || raw.chatId || raw.threadId || "");
+      if (userId) socket.join(`user:${userId}`);
+      if (rideId) {
+        socket.join(`ride:${rideId}`);
+        socket.join(`chat:${rideId}`);
+      }
+    };
+    socket.on("join", joinRooms);
+    socket.on("ride.join", joinRooms);
+    socket.on("chat.join", joinRooms);
+  });
+} catch {}
+
+app.get("/api/chat/health", async (_req, res) => {
+  let dbOk = false;
+  try { await ptyV11EnsureChatTables(); await db("SELECT 1"); dbOk = true; } catch {}
+  return safeJson(res, 200, { ok: true, chatPatch: PTY_V11_CHAT_PATCH, db: dbOk ? "on" : "off", time: nowIso() });
+});
+
+app.get("/api/chat/threads", ptyV11AuthOptional, async (req, res) => {
+  try {
+    await ptyV11EnsureChatTables();
+    const userId = ptyV11Text(req.user?.id || req.query.userId || req.query.driverId || req.query.riderId || "");
+    const email = ptyV11Text(req.user?.email || req.query.email || "").toLowerCase();
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit || 80)));
+    if (!userId && !email) return safeJson(res, 200, { ok: true, chatPatch: PTY_V11_CHAT_PATCH, threads: [] });
+    const rows = await db(`
+      WITH user_rides AS (
+        SELECT *
+        FROM ride_rides
+        WHERE ($1::text <> '' AND (rider_id::text=$1::text OR driver_id::text=$1::text))
+           OR ($2::text <> '' AND (LOWER(COALESCE(rider_snapshot->>'email',''))=$2::text OR LOWER(COALESCE(driver_snapshot->>'email',''))=$2::text))
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC
+        LIMIT $3
+      ), last_msg AS (
+        SELECT DISTINCT ON (ride_id) *
+        FROM ride_chat_v11_messages
+        WHERE ride_id IN (SELECT id::text FROM user_rides)
+        ORDER BY ride_id, created_at DESC
+      )
+      SELECT r.*, m.id AS msg_id, m.message AS msg_message, m.sender_id AS msg_sender_id, m.sender_role AS msg_sender_role, m.sender_name AS msg_sender_name, m.created_at AS msg_created_at
+      FROM user_rides r
+      LEFT JOIN last_msg m ON m.ride_id = r.id::text
+      ORDER BY COALESCE(m.created_at, r.updated_at, r.created_at) DESC
+      LIMIT $3
+    `, [userId, email, limit]);
+    const threads = rows.rows.map((row) => ptyV11CompactThreadFromRide(row, {
+      id: row.msg_id,
+      ride_id: row.id,
+      message: row.msg_message,
+      sender_id: row.msg_sender_id,
+      sender_role: row.msg_sender_role,
+      sender_name: row.msg_sender_name,
+      created_at: row.msg_created_at,
+    }));
+    return safeJson(res, 200, { ok: true, chatPatch: PTY_V11_CHAT_PATCH, threads });
+  } catch (e) {
+    console.error("[PTY_V11_THREADS_ERROR]", e?.message || e);
+    return safeJson(res, 500, { ok: false, chatPatch: PTY_V11_CHAT_PATCH, message: String(e?.message || e), threads: [] });
+  }
+});
+
+app.get("/api/chat/rides/:rideId/messages", ptyV11AuthOptional, async (req, res) => {
+  try {
+    await ptyV11EnsureChatTables();
+    const rideId = ptyV11Text(req.params.rideId || "");
+    const limit = Math.max(1, Math.min(300, Number(req.query.limit || 250)));
+    const r = await db(`
+      SELECT * FROM ride_chat_v11_messages
+      WHERE ride_id=$1::text
+      ORDER BY created_at ASC
+      LIMIT $2
+    `, [rideId, limit]);
+    const messages = r.rows.map(ptyV11Message);
+    return safeJson(res, 200, { ok: true, chatPatch: PTY_V11_CHAT_PATCH, rideId, messages, chat: messages });
+  } catch (e) {
+    console.error("[PTY_V11_MESSAGES_ERROR]", e?.message || e);
+    return safeJson(res, 500, { ok: false, chatPatch: PTY_V11_CHAT_PATCH, message: String(e?.message || e), messages: [] });
+  }
+});
+
+app.post("/api/chat/rides/:rideId/messages", ptyV11AuthOptional, async (req, res) => {
+  try {
+    await ptyV11EnsureChatTables();
+    const rideId = ptyV11Text(req.params.rideId || req.body.rideId || "");
+    const text = ptyV11Text(req.body.text || req.body.message || req.body.body || "");
+    if (!rideId || !text) return safeJson(res, 400, { ok: false, message: "rideId y message son requeridos" });
+    const rideResult = await db(`SELECT * FROM ride_rides WHERE id::text=$1::text LIMIT 1`, [rideId]);
+    const rideRow = rideResult.rows?.[0] || { id: rideId, rider_id: "", driver_id: "" };
+    const senderId = ptyV11Text(req.user?.id || req.body.senderId || req.body.userId || "");
+    const senderRole = ptyV11Text(req.body.senderRole || req.user?.role || "user");
+    const senderName = ptyV11Text(req.body.senderName || req.user?.name || (senderRole === "driver" ? "Conductor" : "Rider"));
+    const inserted = await db(`
+      INSERT INTO ride_chat_v11_messages(ride_id, sender_id, sender_role, sender_name, message)
+      VALUES($1,$2,$3,$4,$5)
+      RETURNING *
+    `, [rideId, senderId, senderRole, senderName, text]);
+    const message = inserted.rows[0];
+    await db(`
+      INSERT INTO ride_chat_v11_threads(ride_id, rider_id, driver_id, last_message, last_at, updated_at)
+      VALUES($1,$2,$3,$4,NOW(),NOW())
+      ON CONFLICT(ride_id) DO UPDATE SET
+        rider_id=COALESCE(NULLIF(EXCLUDED.rider_id,''), ride_chat_v11_threads.rider_id),
+        driver_id=COALESCE(NULLIF(EXCLUDED.driver_id,''), ride_chat_v11_threads.driver_id),
+        last_message=EXCLUDED.last_message,
+        last_at=NOW(),
+        updated_at=NOW()
+    `, [rideId, ptyV11Text(rideRow.rider_id || ""), ptyV11Text(rideRow.driver_id || ""), text]);
+    ptyV11EmitMessage(rideRow, message);
+    return safeJson(res, 201, { ok: true, chatPatch: PTY_V11_CHAT_PATCH, rideId, message: ptyV11Message(message) });
+  } catch (e) {
+    console.error("[PTY_V11_SEND_ERROR]", e?.message || e);
+    return safeJson(res, 500, { ok: false, chatPatch: PTY_V11_CHAT_PATCH, message: String(e?.message || e) });
+  }
+});
+
+// Compatibilidad: las rutas viejas ahora caen en el mismo motor V11.
+app.get("/api/rides/:rideId/chat", ptyV11AuthOptional, (req, res) => {
+  req.url = `/api/chat/rides/${encodeURIComponent(req.params.rideId)}/messages`;
+  return app._router.handle(req, res);
+});
+app.post("/api/rides/:rideId/chat", ptyV11AuthOptional, (req, res) => {
+  req.url = `/api/chat/rides/${encodeURIComponent(req.params.rideId)}/messages`;
+  return app._router.handle(req, res);
+});
+
 /* =========================================================
    Health
 ========================================================= */
@@ -691,555 +955,6 @@ app.patch("/api/profile", authRequired, async (req, res) => {
   req.url = "/api/users/profile";
   return app._router.handle(req, res);
 });
-
-
-/* =========================================================
-   PTY BACKEND CHAT + REVIEWS V10 - WhatsApp style, persistent, fast
-   - Usa tablas nuevas para evitar conflictos entre columnas viejas message/text.
-   - Mantiene datos esenciales, evita arrays grandes y hace push en tiempo real.
-========================================================= */
-const PTY_V10_CHAT_EVENTS = [
-  "chat.message",
-  "chat:message",
-  "ride.chat.message",
-  "ride:chat:message",
-  "message:new",
-];
-
-function ptyV10Text(v = "") {
-  try { if (typeof asText === "function") return asText(v); } catch {}
-  return String(v ?? "").trim();
-}
-function ptyV10Json(v, fallback = {}) {
-  if (!v) return fallback;
-  if (typeof v === "object") return v;
-  try { return JSON.parse(v); } catch { return fallback; }
-}
-function ptyV10Num(v, fallback = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
-function ptyV10SafeJson(res, status, payload) {
-  try { if (typeof safeJson === "function") return safeJson(res, status, payload); } catch {}
-  return res.status(status).json(payload);
-}
-function ptyV10Point(value = {}) {
-  const raw = ptyV10Json(value, value || {});
-  const lat = Number(raw.lat ?? raw.latitude);
-  const lng = Number(raw.lng ?? raw.lon ?? raw.longitude);
-  return {
-    ...(raw || {}),
-    ...(Number.isFinite(lat) ? { lat } : {}),
-    ...(Number.isFinite(lng) ? { lng } : {}),
-  };
-}
-function ptyV10Name(user = {}, fallback = "Usuario") {
-  return ptyV10Text(user.name || user.fullName || user.full_name || user.email || fallback) || fallback;
-}
-function ptyV10MiniUser(row = {}, fallback = {}, role = "") {
-  const docs = ptyV10Json(row.driver_docs || fallback.driverDocs || fallback.driver_docs || {}, {});
-  const vehicleRaw = { ...(docs.vehicle || docs.vehiculo || {}), ...(fallback.vehicle || fallback.driverVehicle || {}) };
-  const photo = ptyV10Text(
-    fallback.photoUrl || fallback.driverPhoto || fallback.driverPhotoUrl ||
-    docs.fotoPerfilConductor || docs.driverProfilePhoto || docs.profilePhoto || docs.fotoConductor || docs.selfieConLicencia ||
-    row.photo_url || row.avatar_url || row.profile_photo || ""
-  );
-  const serviceTier = ptyV10Text(vehicleRaw.serviceTier || vehicleRaw.vehicleType || docs.serviceTier || docs.enrollmentType || "car").toLowerCase();
-  const vehicle = {
-    serviceTier,
-    vehicleType: serviceTier.includes("moto") ? "moto" : serviceTier.includes("comfort") ? "comfort" : "car",
-    typeLabel: serviceTier.includes("moto") ? "Moto" : serviceTier.includes("comfort") ? "Comfort" : "Auto",
-    brand: ptyV10Text(vehicleRaw.brand || vehicleRaw.make || vehicleRaw.marca || docs.marcaVehiculo || docs.marca),
-    make: ptyV10Text(vehicleRaw.make || vehicleRaw.brand || vehicleRaw.marca || docs.marcaVehiculo || docs.marca),
-    model: ptyV10Text(vehicleRaw.model || vehicleRaw.modelo || docs.modeloVehiculo || docs.modelo),
-    color: ptyV10Text(vehicleRaw.color || docs.colorVehiculo || docs.color),
-    year: ptyV10Text(vehicleRaw.year || vehicleRaw.anio || docs.anioVehiculo || docs.year),
-    plate: ptyV10Text(vehicleRaw.plate || vehicleRaw.placa || docs.placa),
-  };
-  vehicle.label = [vehicle.typeLabel, vehicle.brand, vehicle.model, vehicle.year, vehicle.plate ? `Placa ${vehicle.plate}` : ""].filter(Boolean).join(" · ") || "Vehículo";
-  const id = ptyV10Text(row.id || fallback.id || fallback.userId || fallback.driverId || fallback.riderId || "");
-  const out = {
-    id,
-    userId: id,
-    role: ptyV10Text(row.role || fallback.role || role),
-    name: ptyV10Name(row, ptyV10Name(fallback, role === "driver" ? "Conductor" : "Rider")),
-    fullName: ptyV10Name(row, ptyV10Name(fallback, role === "driver" ? "Conductor" : "Rider")),
-    email: ptyV10Text(row.email || fallback.email),
-    phone: ptyV10Text(row.phone || fallback.phone),
-    markerIcon: ptyV10Text(row.marker_icon || fallback.markerIcon || (role === "driver" ? "🚗" : "📍")),
-  };
-  if (role === "driver" || out.role === "driver") {
-    out.photoUrl = photo;
-    out.avatarUrl = photo;
-    out.profilePhoto = photo;
-    out.driverPhoto = photo;
-    out.driverPhotoUrl = photo;
-    out.vehicle = vehicle;
-    out.driverVehicle = vehicle;
-    out.vehicleType = vehicle.vehicleType;
-    out.serviceTier = vehicle.serviceTier;
-    out.plate = vehicle.plate;
-    out.rating = ptyV10Num(docs.rating || docs.averageRating || fallback.rating, 5) || 5;
-    out.reviewsCount = ptyV10Num(docs.reviewsCount || docs.reviewCount || fallback.reviewsCount, 0);
-    out.driverDocumentsApproved = true;
-    out.canAcceptRides = true;
-    out.documentStatus = row.document_status || fallback.documentStatus || "approved";
-  }
-  return out;
-}
-
-async function ptyV10EnsureTables() {
-  if (globalThis.__PTY_V10_CHAT_REVIEWS_READY__) return;
-  await db(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`).catch(() => null);
-  await db(`
-    CREATE TABLE IF NOT EXISTS ride_chat_threads (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      ride_id TEXT UNIQUE NOT NULL,
-      rider_id TEXT DEFAULT '',
-      driver_id TEXT DEFAULT '',
-      rider_name TEXT DEFAULT '',
-      driver_name TEXT DEFAULT '',
-      rider_email TEXT DEFAULT '',
-      driver_email TEXT DEFAULT '',
-      title TEXT DEFAULT '',
-      subtitle TEXT DEFAULT '',
-      last_message TEXT DEFAULT '',
-      last_sender_id TEXT DEFAULT '',
-      last_at TIMESTAMPTZ DEFAULT NOW(),
-      unread_for_rider INTEGER DEFAULT 0,
-      unread_for_driver INTEGER DEFAULT 0,
-      meta JSONB DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-  await db(`
-    CREATE TABLE IF NOT EXISTS ride_chat_v10_messages (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      thread_id UUID REFERENCES ride_chat_threads(id) ON DELETE CASCADE,
-      ride_id TEXT NOT NULL,
-      sender_id TEXT DEFAULT '',
-      sender_role TEXT DEFAULT '',
-      sender_name TEXT DEFAULT '',
-      text TEXT NOT NULL,
-      message_type TEXT DEFAULT 'text',
-      attachments JSONB DEFAULT '[]'::jsonb,
-      reactions JSONB DEFAULT '{}'::jsonb,
-      status TEXT DEFAULT 'sent',
-      meta JSONB DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-  await db(`
-    CREATE TABLE IF NOT EXISTS ride_reviews (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      ride_id TEXT DEFAULT '',
-      reviewer_id TEXT DEFAULT '',
-      reviewer_role TEXT DEFAULT '',
-      reviewer_name TEXT DEFAULT '',
-      target_id TEXT DEFAULT '',
-      target_role TEXT DEFAULT '',
-      target_name TEXT DEFAULT '',
-      rating NUMERIC DEFAULT 5,
-      comment TEXT DEFAULT '',
-      meta JSONB DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-  await db(`ALTER TABLE ride_reviews ADD COLUMN IF NOT EXISTS reviewer_name TEXT DEFAULT '';`).catch(() => null);
-  await db(`ALTER TABLE ride_reviews ADD COLUMN IF NOT EXISTS target_name TEXT DEFAULT '';`).catch(() => null);
-  await db(`ALTER TABLE ride_reviews ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();`).catch(() => null);
-  await db(`CREATE INDEX IF NOT EXISTS idx_pty_v10_threads_user ON ride_chat_threads(rider_id, driver_id, updated_at DESC);`).catch(() => null);
-  await db(`CREATE INDEX IF NOT EXISTS idx_pty_v10_threads_ride ON ride_chat_threads(ride_id);`).catch(() => null);
-  await db(`CREATE INDEX IF NOT EXISTS idx_pty_v10_messages_ride ON ride_chat_v10_messages(ride_id, created_at);`).catch(() => null);
-  await db(`CREATE INDEX IF NOT EXISTS idx_pty_v10_messages_thread ON ride_chat_v10_messages(thread_id, created_at);`).catch(() => null);
-  await db(`CREATE INDEX IF NOT EXISTS idx_pty_v10_reviews_target ON ride_reviews(target_id, target_role, created_at DESC);`).catch(() => null);
-  await db(`CREATE INDEX IF NOT EXISTS idx_pty_v10_reviews_ride ON ride_reviews(ride_id);`).catch(() => null);
-  globalThis.__PTY_V10_CHAT_REVIEWS_READY__ = true;
-}
-
-async function ptyV10GetUser(userId = "", fallback = {}, role = "") {
-  const id = ptyV10Text(userId || fallback.id || fallback.userId || "");
-  if (!id) return ptyV10MiniUser({}, fallback, role);
-  const r = await db(`SELECT id::text, email, name, phone, role, marker_icon, driver_docs, document_status FROM ride_users WHERE id::text=$1::text LIMIT 1`, [id]).catch(() => ({ rows: [] }));
-  return ptyV10MiniUser(r.rows?.[0] || {}, fallback, role);
-}
-
-async function ptyV10BuildThreadFromRide(rideId = "") {
-  await ptyV10EnsureTables();
-  const id = ptyV10Text(rideId);
-  if (!id) return null;
-  const rideR = await db(`SELECT * FROM ride_rides WHERE id::text=$1::text LIMIT 1`, [id]).catch(() => ({ rows: [] }));
-  const ride = rideR.rows?.[0] || {};
-  const riderSnapshot = ptyV10Json(ride.rider_snapshot, {});
-  const driverSnapshot = ptyV10Json(ride.driver_snapshot, {});
-  const riderId = ptyV10Text(ride.rider_id || riderSnapshot.id || riderSnapshot.userId || riderSnapshot.riderId || "");
-  const driverId = ptyV10Text(ride.driver_id || driverSnapshot.id || driverSnapshot.userId || driverSnapshot.driverId || "");
-  const rider = await ptyV10GetUser(riderId, riderSnapshot, "rider");
-  const driver = await ptyV10GetUser(driverId, driverSnapshot, "driver");
-  const pickup = ptyV10Point(ride.pickup || {});
-  const destination = ptyV10Point(ride.destination || {});
-  const pickupLabel = ptyV10Text(pickup.address || pickup.title || pickup.short || "Recogida");
-  const destLabel = ptyV10Text(destination.address || destination.title || destination.short || "Destino");
-  const title = driver?.name && rider?.name ? `${rider.name} ↔ ${driver.name}` : `Viaje ${id.slice(-6)}`;
-  const subtitle = `${pickupLabel} → ${destLabel}`;
-  const meta = {
-    rideId: id,
-    status: ride.status || "",
-    pickup: pickupLabel,
-    destination: destLabel,
-    fare: Number(ride.fare || 0),
-    paymentMethod: ride.payment_method || "",
-  };
-  const up = await db(`
-    INSERT INTO ride_chat_threads(ride_id,rider_id,driver_id,rider_name,driver_name,rider_email,driver_email,title,subtitle,meta,updated_at,last_at)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,NOW(),NOW())
-    ON CONFLICT(ride_id) DO UPDATE SET
-      rider_id=COALESCE(NULLIF(EXCLUDED.rider_id,''), ride_chat_threads.rider_id),
-      driver_id=COALESCE(NULLIF(EXCLUDED.driver_id,''), ride_chat_threads.driver_id),
-      rider_name=COALESCE(NULLIF(EXCLUDED.rider_name,''), ride_chat_threads.rider_name),
-      driver_name=COALESCE(NULLIF(EXCLUDED.driver_name,''), ride_chat_threads.driver_name),
-      rider_email=COALESCE(NULLIF(EXCLUDED.rider_email,''), ride_chat_threads.rider_email),
-      driver_email=COALESCE(NULLIF(EXCLUDED.driver_email,''), ride_chat_threads.driver_email),
-      title=COALESCE(NULLIF(EXCLUDED.title,''), ride_chat_threads.title),
-      subtitle=COALESCE(NULLIF(EXCLUDED.subtitle,''), ride_chat_threads.subtitle),
-      meta=ride_chat_threads.meta || EXCLUDED.meta,
-      updated_at=NOW()
-    RETURNING *`,
-    [id, riderId, driverId, rider.name || "", driver.name || "", rider.email || "", driver.email || "", title, subtitle, JSON.stringify(meta)]
-  );
-  return { row: up.rows[0], ride, rider, driver };
-}
-
-function ptyV10NormalizeThread(row = {}, currentUserId = "", currentRole = "", messages = null) {
-  const role = ptyV10Text(currentRole).toLowerCase();
-  const current = ptyV10Text(currentUserId);
-  const title = role === "driver"
-    ? (row.rider_name || row.rider_email || row.title || `Viaje ${String(row.ride_id).slice(-6)}`)
-    : (row.driver_name || row.driver_email || row.title || `Viaje ${String(row.ride_id).slice(-6)}`);
-  const unread = role === "driver" ? Number(row.unread_for_driver || 0) : role === "rider" ? Number(row.unread_for_rider || 0) : 0;
-  return {
-    id: `ride:${row.ride_id}`,
-    threadId: String(row.id || ""),
-    rideId: String(row.ride_id || ""),
-    chatType: "ride",
-    title,
-    subtitle: row.subtitle || "Chat del viaje",
-    lastMessage: row.last_message || "",
-    updatedAt: row.updated_at || row.last_at || row.created_at,
-    lastAt: row.last_at || row.updated_at || row.created_at,
-    unread: unread > 0,
-    unreadCount: unread,
-    riderId: row.rider_id || "",
-    driverId: row.driver_id || "",
-    riderName: row.rider_name || "",
-    driverName: row.driver_name || "",
-    riderEmail: row.rider_email || "",
-    driverEmail: row.driver_email || "",
-    avatar: role === "driver" ? "🙂" : "🚗",
-    messages: Array.isArray(messages) ? messages : [],
-  };
-}
-function ptyV10NormalizeMessage(row = {}) {
-  return {
-    id: String(row.id || ""),
-    messageId: String(row.id || ""),
-    threadId: String(row.thread_id || ""),
-    rideId: String(row.ride_id || ""),
-    senderId: row.sender_id || "",
-    senderRole: row.sender_role || "",
-    senderName: row.sender_name || "",
-    author: row.sender_name || row.sender_role || "Usuario",
-    text: row.text || row.message || "",
-    message: row.text || row.message || "",
-    messageType: row.message_type || "text",
-    attachments: row.attachments || [],
-    reactions: row.reactions || {},
-    status: row.status || "sent",
-    createdAt: row.created_at,
-    at: row.created_at,
-    updatedAt: row.updated_at || row.created_at,
-  };
-}
-
-async function ptyV10ReadMessages(rideId = "", limit = 500) {
-  await ptyV10EnsureTables();
-  const r = await db(`
-    SELECT * FROM ride_chat_v10_messages
-     WHERE ride_id::text=$1::text
-     ORDER BY created_at ASC
-     LIMIT $2`, [ptyV10Text(rideId), Math.max(1, Math.min(1000, Number(limit || 500)))])
-    .catch(() => ({ rows: [] }));
-  return (r.rows || []).map(ptyV10NormalizeMessage);
-}
-
-async function ptyV10HydrateUserRideThreads(userId = "") {
-  const id = ptyV10Text(userId);
-  if (!id) return;
-  const r = await db(`
-    SELECT id::text FROM ride_rides
-     WHERE rider_id::text=$1::text OR driver_id::text=$1::text
-     ORDER BY updated_at DESC NULLS LAST, created_at DESC
-     LIMIT 60`, [id]).catch(() => ({ rows: [] }));
-  for (const row of r.rows || []) {
-    await ptyV10BuildThreadFromRide(row.id).catch(() => null);
-  }
-}
-
-async function ptyV10ListThreads(req, res) {
-  try {
-    await ptyV10EnsureTables();
-    const userId = ptyV10Text(req.user?.id || req.params.userId || req.query.userId || req.query.driverId || req.query.riderId || "");
-    const email = ptyV10Text(req.user?.email || req.query.email || "").toLowerCase();
-    const role = ptyV10Text(req.query.role || req.params.role || req.user?.role || "").toLowerCase();
-    if (userId) await ptyV10HydrateUserRideThreads(userId);
-    if (!userId && !email && role !== "admin" && req.user?.role !== "admin") {
-      return ptyV10SafeJson(res, 200, { ok: true, threads: [], chats: [], conversations: [] });
-    }
-    const r = await db(`
-      SELECT * FROM ride_chat_threads
-       WHERE ($1::text='' OR rider_id::text=$1::text OR driver_id::text=$1::text)
-         AND ($2::text='' OR LOWER(rider_email)=LOWER($2::text) OR LOWER(driver_email)=LOWER($2::text))
-       ORDER BY COALESCE(last_at, updated_at, created_at) DESC
-       LIMIT 200`, [userId, email]).catch(() => ({ rows: [] }));
-    const threads = [];
-    for (const row of r.rows || []) {
-      const messages = await ptyV10ReadMessages(row.ride_id, 40).catch(() => []);
-      threads.push(ptyV10NormalizeThread(row, userId, role, messages));
-    }
-    return ptyV10SafeJson(res, 200, { ok: true, threads, chats: threads, conversations: threads, data: threads, fastChat: "v10" });
-  } catch (e) {
-    return ptyV10SafeJson(res, 500, { ok: false, message: String(e?.message || e), threads: [], chats: [] });
-  }
-}
-
-async function ptyV10GetRideMessages(req, res) {
-  try {
-    const rideId = ptyV10Text(req.params.id || req.params.rideId || req.params.rideIdOrThreadId || req.query.rideId || "").replace(/^ride:/, "");
-    if (!rideId) return ptyV10SafeJson(res, 400, { ok: false, message: "rideId requerido", messages: [] });
-    const built = await ptyV10BuildThreadFromRide(rideId).catch(() => null);
-    const messages = await ptyV10ReadMessages(rideId, req.query.limit || 500);
-    return ptyV10SafeJson(res, 200, {
-      ok: true,
-      fastChat: "v10",
-      rideId,
-      thread: built?.row ? ptyV10NormalizeThread(built.row, req.user?.id || "", req.user?.role || "", messages) : null,
-      messages,
-      chat: messages,
-      data: messages,
-    });
-  } catch (e) {
-    return ptyV10SafeJson(res, 500, { ok: false, message: String(e?.message || e), messages: [] });
-  }
-}
-
-async function ptyV10PersistChatMessage({ rideId, user, body = {}, socket = null } = {}) {
-  await ptyV10EnsureTables();
-  const cleanRideId = ptyV10Text(rideId || body.rideId || body.id).replace(/^ride:/, "");
-  const text = ptyV10Text(body.text || body.message || body.body || body.content || "");
-  if (!cleanRideId) throw new Error("rideId requerido");
-  if (!text) throw new Error("Mensaje vacío");
-  const built = await ptyV10BuildThreadFromRide(cleanRideId);
-  const thread = built?.row;
-  if (!thread?.id) throw new Error("No se pudo abrir el chat del viaje");
-  const senderId = ptyV10Text(user?.id || body.senderId || body.userId || "");
-  const senderRole = ptyV10Text(user?.role || body.senderRole || body.role || (senderId && senderId === thread.driver_id ? "driver" : senderId && senderId === thread.rider_id ? "rider" : "user")).toLowerCase();
-  const senderName = ptyV10Text(user?.name || body.senderName || body.author || body.name || (senderRole === "driver" ? thread.driver_name : thread.rider_name) || "Usuario");
-  const messageType = ptyV10Text(body.messageType || body.type || "text") || "text";
-  const attachments = Array.isArray(body.attachments) ? body.attachments : [];
-  const ins = await db(`
-    INSERT INTO ride_chat_v10_messages(thread_id,ride_id,sender_id,sender_role,sender_name,text,message_type,attachments,meta)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb)
-    RETURNING *`,
-    [thread.id, cleanRideId, senderId, senderRole, senderName, text, messageType, JSON.stringify(attachments), JSON.stringify({ source: body.source || "app", clientId: body.clientId || "" })]
-  );
-  const targetForDriver = senderRole === "rider" || (senderId && senderId === thread.rider_id);
-  const targetForRider = senderRole === "driver" || (senderId && senderId === thread.driver_id);
-  const upd = await db(`
-    UPDATE ride_chat_threads SET
-      last_message=$2,
-      last_sender_id=$3,
-      last_at=NOW(),
-      updated_at=NOW(),
-      unread_for_driver=CASE WHEN $4::boolean THEN unread_for_driver + 1 ELSE unread_for_driver END,
-      unread_for_rider=CASE WHEN $5::boolean THEN unread_for_rider + 1 ELSE unread_for_rider END
-    WHERE id=$1
-    RETURNING *`, [thread.id, text, senderId, targetForDriver, targetForRider]
-  );
-  const message = ptyV10NormalizeMessage(ins.rows[0]);
-  const nextThread = ptyV10NormalizeThread(upd.rows[0] || thread, senderId, senderRole, [message]);
-  const payload = { ok: true, fastChat: "v10", rideId: cleanRideId, thread: nextThread, message, chatMessage: message, data: message };
-  try {
-    const targetRooms = new Set([`ride:${cleanRideId}`, `chat:${cleanRideId}`, "admins"]);
-    if (thread.rider_id) targetRooms.add(`user:${thread.rider_id}`);
-    if (thread.driver_id) targetRooms.add(`user:${thread.driver_id}`);
-    for (const room of targetRooms) {
-      for (const eventName of PTY_V10_CHAT_EVENTS) io.to(room).emit(eventName, payload);
-    }
-    // Fallback para clientes viejos que aún no se unieron a rooms.
-    io.emit("chat.message", payload);
-  } catch {}
-  return payload;
-}
-
-async function ptyV10PostRideMessage(req, res) {
-  try {
-    const rideId = ptyV10Text(req.params.id || req.params.rideId || req.params.rideIdOrThreadId || req.body.rideId || "").replace(/^ride:/, "");
-    const payload = await ptyV10PersistChatMessage({ rideId, user: req.user || {}, body: req.body || {} });
-    return ptyV10SafeJson(res, 201, payload);
-  } catch (e) {
-    return ptyV10SafeJson(res, 400, { ok: false, message: String(e?.message || e) });
-  }
-}
-
-async function ptyV10MarkChatRead(req, res) {
-  try {
-    await ptyV10EnsureTables();
-    const rideId = ptyV10Text(req.params.id || req.params.rideId || req.body.rideId || "").replace(/^ride:/, "");
-    const role = ptyV10Text(req.user?.role || req.body.role || req.query.role || "").toLowerCase();
-    const field = role === "driver" ? "unread_for_driver" : "unread_for_rider";
-    await db(`UPDATE ride_chat_threads SET ${field}=0, updated_at=NOW() WHERE ride_id::text=$1::text`, [rideId]).catch(() => null);
-    return ptyV10SafeJson(res, 200, { ok: true, rideId, read: true });
-  } catch (e) {
-    return ptyV10SafeJson(res, 500, { ok: false, message: String(e?.message || e) });
-  }
-}
-
-async function ptyV10DriverReviews(req, res) {
-  try {
-    await ptyV10EnsureTables();
-    const driverId = ptyV10Text(req.params.id || req.params.driverId || req.query.driverId || "");
-    if (!driverId) return ptyV10SafeJson(res, 400, { ok: false, message: "driverId requerido", reviews: [] });
-    const r = await db(`
-      SELECT id, ride_id, reviewer_id, reviewer_role, reviewer_name, target_id, target_role, target_name, rating, comment, created_at, updated_at
-      FROM ride_reviews
-      WHERE target_id::text=$1::text AND LOWER(COALESCE(target_role,'driver'))='driver'
-      ORDER BY created_at DESC
-      LIMIT 100`, [driverId]).catch(() => ({ rows: [] }));
-    const reviews = (r.rows || []).map((x) => ({
-      id: x.id,
-      rideId: x.ride_id,
-      reviewerId: x.reviewer_id,
-      reviewerRole: x.reviewer_role,
-      reviewerName: x.reviewer_name || "Rider",
-      fromUserName: x.reviewer_name || "Rider",
-      riderName: x.reviewer_name || "Rider",
-      targetId: x.target_id,
-      targetRole: x.target_role,
-      rating: Number(x.rating || 5),
-      stars: Number(x.rating || 5),
-      comment: x.comment || "",
-      message: x.comment || "",
-      createdAt: x.created_at,
-      at: x.created_at,
-    }));
-    const average = reviews.length ? reviews.reduce((a, b) => a + Number(b.rating || 0), 0) / reviews.length : 5;
-    return ptyV10SafeJson(res, 200, {
-      ok: true,
-      fastReviews: "v10",
-      driverId,
-      reviews,
-      items: reviews,
-      data: reviews,
-      rating: Number(average.toFixed(1)),
-      averageRating: Number(average.toFixed(1)),
-      avgRating: Number(average.toFixed(1)),
-      reviewsCount: reviews.length,
-      reviewCount: reviews.length,
-    });
-  } catch (e) {
-    return ptyV10SafeJson(res, 500, { ok: false, message: String(e?.message || e), reviews: [] });
-  }
-}
-
-async function ptyV10PostRating(req, res) {
-  try {
-    await ptyV10EnsureTables();
-    const rideId = ptyV10Text(req.params.id || req.body.rideId || "");
-    const targetRole = ptyV10Text(req.body.targetRole || req.body.role || "driver").toLowerCase() === "rider" ? "rider" : "driver";
-    const rating = Math.max(1, Math.min(5, Number(req.body.rating || req.body.stars || 5)));
-    const comment = ptyV10Text(req.body.comment || req.body.message || req.body.note || "");
-    const rideR = await db(`SELECT * FROM ride_rides WHERE id::text=$1::text LIMIT 1`, [rideId]).catch(() => ({ rows: [] }));
-    const ride = rideR.rows?.[0] || {};
-    const targetId = targetRole === "driver" ? ptyV10Text(ride.driver_id || req.body.targetId || req.body.driverId || "") : ptyV10Text(ride.rider_id || req.body.targetId || req.body.riderId || "");
-    const reviewerId = ptyV10Text(req.user?.id || req.body.reviewerId || req.body.userId || "");
-    const reviewerRole = ptyV10Text(req.user?.role || req.body.reviewerRole || "");
-    const reviewerName = ptyV10Text(req.user?.name || req.body.reviewerName || req.body.userName || (reviewerRole === "driver" ? "Conductor" : "Rider"));
-    const targetName = targetRole === "driver" ? ptyV10Text(ptyV10Json(ride.driver_snapshot, {}).name || req.body.targetName || "Conductor") : ptyV10Text(ptyV10Json(ride.rider_snapshot, {}).name || req.body.targetName || "Rider");
-    if (!targetId) return ptyV10SafeJson(res, 400, { ok: false, message: "No se encontró el usuario a calificar" });
-    const ins = await db(`
-      INSERT INTO ride_reviews(ride_id,reviewer_id,reviewer_role,reviewer_name,target_id,target_role,target_name,rating,comment,meta,updated_at)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,NOW())
-      RETURNING *`, [rideId, reviewerId, reviewerRole, reviewerName, targetId, targetRole, targetName, rating, comment, JSON.stringify(req.body || {})]
-    );
-    const statsReq = { params: { id: targetId }, query: {}, user: req.user };
-    const statsR = await db(`SELECT AVG(rating)::numeric(10,2) AS avg, COUNT(*)::int AS count FROM ride_reviews WHERE target_id::text=$1::text AND target_role=$2`, [targetId, targetRole]).catch(() => ({ rows: [{ avg: rating, count: 1 }] }));
-    const avg = Number(statsR.rows?.[0]?.avg || rating);
-    const count = Number(statsR.rows?.[0]?.count || 1);
-    const review = {
-      id: ins.rows[0].id,
-      rideId,
-      reviewerId,
-      reviewerRole,
-      reviewerName,
-      fromUserName: reviewerName,
-      targetId,
-      targetRole,
-      targetName,
-      rating,
-      stars: rating,
-      comment,
-      message: comment,
-      createdAt: ins.rows[0].created_at,
-      at: ins.rows[0].created_at,
-    };
-    try {
-      io.to("admins").emit("review.created", { review, targetId, targetRole });
-      if (targetId) io.to(`user:${targetId}`).emit("review.created", { review, targetId, targetRole });
-    } catch {}
-    return ptyV10SafeJson(res, 201, {
-      ok: true,
-      fastReviews: "v10",
-      review,
-      rating: { rating, average: Number(avg.toFixed(1)), avg: Number(avg.toFixed(1)), count },
-      averageRating: Number(avg.toFixed(1)),
-      avgRating: Number(avg.toFixed(1)),
-      reviewsCount: count,
-      reviewCount: count,
-    });
-  } catch (e) {
-    return ptyV10SafeJson(res, 500, { ok: false, message: String(e?.message || e) });
-  }
-}
-
-app.get("/api/chat/health", async (_req, res) => {
-  try { await ptyV10EnsureTables(); return ptyV10SafeJson(res, 200, { ok: true, chatPatch: "v10", db: "on" }); }
-  catch (e) { return ptyV10SafeJson(res, 500, { ok: false, chatPatch: "v10", message: String(e?.message || e) }); }
-});
-app.get("/api/chats", authOptional, ptyV10ListThreads);
-app.get("/api/chat/threads", authOptional, ptyV10ListThreads);
-app.get("/api/users/:userId/chats", authOptional, ptyV10ListThreads);
-app.get("/api/:role/:userId/chats", authOptional, ptyV10ListThreads);
-app.get("/api/rides/:id/chat", authOptional, ptyV10GetRideMessages);
-app.get("/api/rides/:id/messages", authOptional, ptyV10GetRideMessages);
-app.get("/api/chat/rides/:id/messages", authOptional, ptyV10GetRideMessages);
-app.get("/api/chats/:id/messages", authOptional, ptyV10GetRideMessages);
-app.get("/api/chat/:id", authOptional, ptyV10GetRideMessages);
-app.post("/api/rides/:id/chat", authOptional, ptyV10PostRideMessage);
-app.post("/api/rides/:id/messages", authOptional, ptyV10PostRideMessage);
-app.post("/api/chat/rides/:id/messages", authOptional, ptyV10PostRideMessage);
-app.post("/api/chats/:id/messages", authOptional, ptyV10PostRideMessage);
-app.post("/api/chat/:id", authOptional, ptyV10PostRideMessage);
-app.patch("/api/chats/:id/read", authOptional, ptyV10MarkChatRead);
-app.post("/api/chats/:id/read", authOptional, ptyV10MarkChatRead);
-app.get("/api/drivers/:id/reviews", authOptional, ptyV10DriverReviews);
-app.get("/api/reviews/drivers/:id", authOptional, ptyV10DriverReviews);
-app.post("/api/rides/:id/rate", authOptional, ptyV10PostRating);
-app.post("/api/rides/:id/reviews", authOptional, ptyV10PostRating);
-app.post("/api/reviews", authOptional, ptyV10PostRating);
-
 
 
 
@@ -2247,7 +1962,7 @@ app.get("/api/perf/ping", async (_req, res) => {
   return safeJson(res, 200, {
     ok: true,
     pong: true,
-    fastPatch: "v10-chat-reviews",
+    fastPatch: "v11-clean-chat",
     db: dbOk ? "on" : "off",
     dbMs,
     totalMs: Date.now() - started,
@@ -6654,37 +6369,7 @@ io.on("connection", (socket) => {
     if (payload.role === "driver") socket.join("drivers");
     if (payload.role === "rider") socket.join("riders");
     if (payload.role === "admin") socket.join("admins");
-    if (payload.rideId) {
-      socket.join(`ride:${payload.rideId}`);
-      socket.join(`chat:${payload.rideId}`);
-    }
-  });
-
-  socket.on("ride.join", (payload = {}) => {
-    if (payload.rideId) {
-      socket.join(`ride:${payload.rideId}`);
-      socket.join(`chat:${payload.rideId}`);
-    }
-    if (payload.userId) socket.join(`user:${payload.userId}`);
-  });
-
-  socket.on("chat.join", (payload = {}) => {
-    if (payload.rideId) {
-      socket.join(`ride:${payload.rideId}`);
-      socket.join(`chat:${payload.rideId}`);
-    }
-    if (payload.userId) socket.join(`user:${payload.userId}`);
-  });
-
-  socket.on("chat.message", async (payload = {}) => {
-    try {
-      const rideId = ptyV10Text(payload.rideId || payload.id || "");
-      if (!rideId) return;
-      const out = await ptyV10PersistChatMessage({ rideId, user: socket.user || {}, body: payload || {}, socket });
-      socket.emit("chat.message:ack", out);
-    } catch (e) {
-      socket.emit("chat.message:error", { ok: false, message: String(e?.message || e) });
-    }
+    if (payload.rideId) socket.join(`ride:${payload.rideId}`);
   });
 
   socket.on("driver:online", () => socket.join("drivers"));
