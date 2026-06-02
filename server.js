@@ -5959,6 +5959,7 @@ async function aoo20260414EnsureDb() {
       seller_code TEXT DEFAULT '',
       seller_name TEXT DEFAULT '',
       document_status TEXT DEFAULT '',
+      doc_total NUMERIC(19,6) DEFAULT 0,
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
@@ -5974,6 +5975,7 @@ async function aoo20260414EnsureDb() {
     `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS seller_code TEXT DEFAULT ''`,
     `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS seller_name TEXT DEFAULT ''`,
     `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS document_status TEXT DEFAULT ''`,
+    `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS doc_total NUMERIC(19,6) DEFAULT 0`,
     `ALTER TABLE admin_open_orders_cache ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()`
   ];
   for (const q of alters) {
@@ -6049,7 +6051,7 @@ async function aoo20260414FetchHeaders({ maxDocs = 500 } = {}) {
   for (const filter of filters) {
     let skip = 0;
     while (skip < top && out.length < top) {
-      const path = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=100&$skip=${skip}`;
+      const path = `/Orders?$select=DocEntry,DocNum,DocDate,DocDueDate,CardCode,CardName,Comments,DocumentStatus,Cancelled,DocTotal&$filter=${encodeURIComponent(filter)}&$orderby=DocDate desc,DocEntry desc&$top=100&$skip=${skip}`;
       let batch = [];
       try {
         const res = await slFetch(path, { timeoutMs: 120000 });
@@ -6168,6 +6170,7 @@ async function aoo20260414BuildRows({ maxDocs = 5000 } = {}) {
       seller_code: sellerCode,
       seller_name: sellerName,
       document_status: headerStatus || 'bost_Open',
+      doc_total: Number(src?.DocTotal ?? h?.DocTotal ?? 0) || 0,
     });
   }
 
@@ -6185,8 +6188,8 @@ async function aoo20260414ReplaceCache(rows = []) {
       await dbQuery(
         `INSERT INTO admin_open_orders_cache (
           doc_entry, doc_num, card_code, card_name, warehouse_code, comments,
-          doc_due_date, doc_date, seller_code, seller_name, document_status, updated_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())`,
+          doc_due_date, doc_date, seller_code, seller_name, document_status, doc_total, updated_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())`,
         [
           Number(r.doc_entry || 0),
           r.doc_num == null ? null : Number(r.doc_num),
@@ -6199,6 +6202,7 @@ async function aoo20260414ReplaceCache(rows = []) {
           aoo20260414Str(r.seller_code),
           aoo20260414Str(r.seller_name),
           aoo20260414Str(r.document_status),
+          Number(r.doc_total || 0),
         ]
       );
     }
@@ -6253,7 +6257,7 @@ async function aoo20260414ReadDb({ client = '', warehouse = '', seller = '', lim
 
   const lim = Math.max(50, Math.min(10000, Number(limit || 5000)));
   const rs = await dbQuery(
-    `SELECT doc_entry, doc_num, card_code, card_name, warehouse_code, comments, doc_due_date, doc_date, seller_code, seller_name, document_status, updated_at
+    `SELECT doc_entry, doc_num, card_code, card_name, warehouse_code, comments, doc_due_date, doc_date, seller_code, seller_name, document_status, doc_total, updated_at
      FROM admin_open_orders_cache
      ${whereSql}
      ORDER BY doc_date DESC NULLS LAST, doc_num DESC NULLS LAST
@@ -6275,6 +6279,8 @@ async function aoo20260414ReadDb({ client = '', warehouse = '', seller = '', lim
       sellerCode: aoo20260414Str(r.seller_code),
       sellerName: aoo20260414Str(r.seller_name),
       status: aoo20260414Str(r.document_status),
+      monto: Number(r.doc_total || 0),
+      docTotal: Number(r.doc_total || 0),
       updatedAt: r.updated_at,
     }))
   };
